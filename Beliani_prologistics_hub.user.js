@@ -24577,10 +24577,18 @@
           brand: 'CHECK24', short: 'Check24', host: 'mc.moebel.check24.de', kind: 'c24', shop: 'Check24 DE' },
         // Limango placi bezposrednio, a w tytul wpisuje numery gutschrift — te same, ktore
         // stoja w nazwach plikow („Gutschrift_MP-72830-…csv"). JEDEN przelew potrafi objac
-        // KILKA rozliczen: 5 644.60 z 07.08.2026 nioslo trzy numery naraz, sklejone bez
-        // odstepow („NR.MP-76095/30.6.2026N R.230253/1.7.2026NR.MP-76877/31. 7.2026").
-        // Bierzemy PIERWSZY numer MP — sluzy do nazwania zlecenia, nie do kontroli.
-        { mp: 'Limango',        ok: true,  payer: /LIMANGO/i, ref: /\bNR\.\s*(MP-\d+)/i,
+        // KILKA dokumentow, sklejonych bez zadnego odstepu:
+        //   „0004680857NR.MP-72830/28.2.2026NR.MP2026-011/31.1.2026NR.MP-71990/31.1.2026"
+        //
+        // NIE opieramy sie na slowie „NR." ani na granicy slowa: miedzy „7" a „N" granicy
+        // NIE MA, wiec „\bNR\." nie trafialo, a nietrafiony wzorzec referencji KASUJE
+        // cala regule (mkDetect robi wtedy `continue`) i wplata zostawala nierozpoznana.
+        // Zadamy tylko, zeby przed „MP-" stal znak nie bedacy litera ani cyfra.
+        { mp: 'Limango',        ok: true,  payer: /LIMANGO/i,
+          ref: /(?:^|[^A-Za-z0-9])(MP-\d{3,})/i,
+          // Komplet numerow „MP-…" z tytulu — tak samo jak przy Manorze. Przelew
+          // na 16 557,83 regulowal cztery pozycje, a nota MP-72830 to z nich 16 473,35.
+          docs: /(?:^|[^A-Za-z0-9])(MP-\d{3,})/gi,
           // Nazwa sklepu WPROST, a nie przez MK_LIM_SHOP: ta stala stoi kilkaset linii
           // nizej, a `const` nie jest wynoszony na gore. Odwolanie do niej z MK_RULES
           // wywalaloby CALY modul przy starcie — „Cannot access before initialization".
