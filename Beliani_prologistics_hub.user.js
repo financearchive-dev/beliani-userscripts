@@ -23088,12 +23088,27 @@
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2297': { bank: '', booking: '9', acct: '1354' },
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2298': { bank: '', booking: '9', acct: '1354' }
     };
+    // Klucze SKASOWANE RECZNIE. Bez tej listy usuniecie nie mialo szans: setLoad dosiewa
+    // brakujace klucze z MK_SET_SEED przy kazdym odczycie, wiec wiersz wracal w tej samej
+    // chwili — i wygladalo to jak „X resetuje pola zamiast usuwac pozycje".
+    const MK_SET_DEL_KEY = 'mkt_set_usuniete_v1';
+    function setDelLoad(){
+        try { const a = JSON.parse(GM_getValue(MK_SET_DEL_KEY, '[]')); return Array.isArray(a) ? a : []; }
+        catch (e){ return []; }
+    }
+    function setDelSave(a){ try { GM_setValue(MK_SET_DEL_KEY, JSON.stringify(a || [])); } catch (e){} }
+    function setDelDodaj(k){ const a = setDelLoad(); if (a.indexOf(k) < 0){ a.push(k); setDelSave(a); } }
+    function setDelUsun(k){ setDelSave(setDelLoad().filter(function (x){ return x !== k; })); }
     function setLoad(){
         let d = null;
         try { d = JSON.parse(GM_getValue(MK_SET_KEY, 'null')); } catch (e){}
         if (!d || typeof d !== 'object') d = {};
         let add = 0;
-        Object.keys(MK_SET_SEED).forEach(function (k){ if (!d[k]){ d[k] = MK_SET_SEED[k]; add++; } });
+        // Dosiewamy tylko to, czego czlowiek sam nie odrzucil.
+        const skas = setDelLoad();
+        Object.keys(MK_SET_SEED).forEach(function (k){
+            if (!d[k] && skas.indexOf(k) < 0){ d[k] = MK_SET_SEED[k]; add++; }
+        });
         // Jednorazowe poprawki juz ZAPISANYCH ustawien. Seed ich nie tknie, bo dopisuje
         // wylacznie brakujace klucze — a wartosc z bledem siedzi pod kluczem, ktory
         // istnieje. Kazda poprawka odhacza sie po wykonaniu, zeby nie deptac pozniejszej
@@ -36397,7 +36412,31 @@
               +  '<span style="font-size:10px;color:#888">bank_setting to identyfikator ustawienia importu — nie numer konta (Vente DE = 157). '
               +  'booking mówi, PO CZYM prologistics dopasowuje wiersze: 9 = Fulfillment No, 12 = Invoice No. '
               +  'Zły booking to paczka, w której nic się nie dopasowało.</span></div>';
+            // Skasowane recznie — widoczne i odwracalne. Ciche usuniecie na zawsze byloby
+            // gorsze od braku usuwania: nikt by nie wiedzial, czego brakuje ani dlaczego.
+            const skasowane = setDelLoad();
+            if (skasowane.length){
+                h += '<div style="margin-top:8px;padding:6px 9px;background:#fff;border:1px dashed #ccc;'
+                   + 'border-radius:6px;font-size:11px;color:#666">'
+                   + 'Usunięte ręcznie (' + skasowane.length + ') — nie wrócą same:<br>'
+                   + skasowane.map(function (k){
+                        return '<span style="display:inline-block;margin:3px 6px 0 0">' + esc(k)
+                             + ' <button class="mk-s-wroc" data-k="' + esc(k) + '" type="button"'
+                             + ' style="padding:1px 7px;border:1px solid #5b21b6;border-radius:5px;background:#fff;'
+                             + 'color:#5b21b6;cursor:pointer;font-size:10px">przywróć</button></span>';
+                     }).join(' · ')
+                   + '</div>';
+            }
             box.innerHTML = h;
+            box.querySelectorAll('.mk-s-wroc').forEach(function (b){
+                b.onclick = function(){
+                    const kk = b.getAttribute('data-k') || '';
+                    setDelUsun(kk);
+                    renderSet();
+                    const m = $('#mk-set') && $('#mk-set').querySelector('#mk-set-msg');
+                    if (m){ m.style.color = '#0a7a2f'; m.textContent = '✓ przywrócone: ' + kk; }
+                };
+            });
             if (bsN){
                 const m0 = box.querySelector('#mk-set-msg');
                 if (m0){
@@ -36430,11 +36469,14 @@
                         + '  konto        : ' + (c0.acct || '—') + '\n\n'
                         + 'Bez bank_setting nie da się zaksięgować paczki tego sklepu — trzeba będzie wpisać go od nowa.\n'
                         + 'Jeśli w module czeka zlecenie z tego sklepu, wiersz wróci (pusty) po odświeżeniu.')) return;
+                    // NAJPIERW znacznik, dopiero potem kasowanie: renderSet czyta przez
+                    // setLoad, ktore bez znacznika dosialoby klucz z powrotem.
+                    setDelDodaj(kk);
                     delete cur[kk];
                     setSave(cur);
                     renderSet();
                     const m = $('#mk-set') && $('#mk-set').querySelector('#mk-set-msg');
-                    if (m){ m.style.color = '#0a7a2f'; m.textContent = '✓ usunięte: ' + kk; }
+                    if (m){ m.style.color = '#0a7a2f'; m.textContent = '✓ usunięte: ' + kk + ' — do przywrócenia poniżej'; }
                 };
             });
             box.querySelector('#mk-set-save').onclick = function(){
