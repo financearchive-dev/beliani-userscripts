@@ -23085,6 +23085,8 @@
         // Leen Bakker: oba sklepy na konto 1354 „Leen Bakker Beliani NL" (uzgodnione).
         // Nazwy sklepow to numery z tytulow przelewow — panel poda wlasne, ale te sa
         // pewne i nie zmienia sie po przelaczeniu sklepu.
+        // Limango — podane przez uzytkownika 27.08.2026.
+        'Limango · Limango DE': { bank: '200', booking: '9', acct: '1515' },
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2297': { bank: '', booking: '9', acct: '1354' },
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2298': { bank: '', booking: '9', acct: '1354' }
     };
@@ -24573,6 +24575,16 @@
         // i PDF pisza go z myslnikiem. Porownanie idzie przez c24Key, wiec to nie przeszkadza.
         { mp: 'Check24',        ok: true,  payer: /CHECK24/i, ref: /GUTSCHRIFT\s*(MCRM[-_ ]?[A-Z0-9]{6,})/i,
           brand: 'CHECK24', short: 'Check24', host: 'mc.moebel.check24.de', kind: 'c24', shop: 'Check24 DE' },
+        // Limango placi bezposrednio, a w tytul wpisuje numery gutschrift — te same, ktore
+        // stoja w nazwach plikow („Gutschrift_MP-72830-…csv"). JEDEN przelew potrafi objac
+        // KILKA rozliczen: 5 644.60 z 07.08.2026 nioslo trzy numery naraz, sklejone bez
+        // odstepow („NR.MP-76095/30.6.2026N R.230253/1.7.2026NR.MP-76877/31. 7.2026").
+        // Bierzemy PIERWSZY numer MP — sluzy do nazwania zlecenia, nie do kontroli.
+        { mp: 'Limango',        ok: true,  payer: /LIMANGO/i, ref: /\bNR\.\s*(MP-\d+)/i,
+          // Nazwa sklepu WPROST, a nie przez MK_LIM_SHOP: ta stala stoi kilkaset linii
+          // nizej, a `const` nie jest wynoszony na gore. Odwolanie do niej z MK_RULES
+          // wywalaloby CALY modul przy starcie — „Cannot access before initialization".
+          brand: 'Limango', short: 'Limango', host: '', kind: 'lim', shop: 'Limango DE' },
         { mp: 'Worten',         ok: false, payer: /WORTEN/i },
         { mp: 'JD / Joybuy',    ok: false, payer: /JINGDONG/i },
         // Cnova FR (Cdiscount) placi jako „CNOVA PAY", a w tytule podaje numer virement
@@ -25660,6 +25672,28 @@
         });
         return '﻿' + lin.join('\n') + '\n';
     }
+    // Kilka rozliczen skladajacych sie na JEDEN przelew. Sumujemy je po numerze
+    // zamowienia — to samo zamowienie moze stac w dwoch rozliczeniach (sprzedaz w jednym,
+    // zwrot w drugim), a do importu ma pojsc jedna kwota.
+    function limScal(a, b){
+        if (!a) return b;
+        const out = { hdr: a.hdr, cG: a.cG, ord: {}, ref: {}, pierwszy: {},
+                      kolejnosc: a.kolejnosc.slice(),
+                      gross: r2(a.gross + b.gross), refund: r2(a.refund + b.refund),
+                      net: r2(a.net + b.net), com: r2(a.com + b.com),
+                      poz: a.poz + b.poz, bezK: a.bezK + b.bezK,
+                      pliki: (a.pliki || []).concat(b.pliki || []) };
+        Object.keys(a.ord).forEach(function (k){ out.ord[k] = a.ord[k]; out.pierwszy[k] = a.pierwszy[k]; });
+        Object.keys(b.ord).forEach(function (k){
+            if (out.ord[k] == null){ out.ord[k] = 0; out.kolejnosc.push(k); out.pierwszy[k] = b.pierwszy[k]; }
+            out.ord[k] = r2(out.ord[k] + b.ord[k]);
+        });
+        Object.keys(a.ref).forEach(function (k){ out.ref[k] = a.ref[k]; });
+        Object.keys(b.ref).forEach(function (k){ out.ref[k] = r2((out.ref[k] || 0) + b.ref[k]); });
+        out.nPos = Object.keys(out.ord).length;
+        out.nRef = Object.keys(out.ref).length;
+        return out;
+    }
     // Przepisanie rozliczenia do zlecenia — jedna droga dla pliku wrzuconego recznie
     // i dla kazdej innej, ktora kiedys dojdzie.
     function limApply(j, p, how){
@@ -25675,8 +25709,13 @@
         const bad = [];
         // Wyplata to suma CALEJ kolumny „Net paypout amount" — sprzedaze minus zwroty.
         // To ona ma sie zgadzac z wyciagiem, a nie brutto zamowien.
-        if (!eq(p.net, j.amount))
-            bad.push('wypłata z rozliczenia ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        // Jeden przelew bywa zlozony z kilku rozliczen, wiec roznica nie musi znaczyc
+        // bledu — czesto znaczy „brakuje jeszcze jednego pliku". Mowimy to wprost.
+        if (!eq(p.net, j.amount)){
+            const brak = r2(j.amount - p.net);
+            bad.push('wypłata z rozliczeń ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu'
+                   + (brak > 0 ? (' — brakuje ' + f2(brak) + ', dorzuć kolejny plik Gutschrift') : ''));
+        }
         if (p.bezK)
             bad.push(p.bezK + ' wierszy bez kwoty wypłaty — pominięte (tak samo robiła stara aplikacja)');
         return bad;
@@ -36310,26 +36349,42 @@
             rd.onload = function(){
                 const jobs = jobsLoad();
                 const waiting = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'lim'; });
-                const p = mkParseLimango(mkDecode(rd.result));
-                if (p.err){ say(p.err, '#c00'); return; }
-                // Szukamy zlecenia po KWOCIE WYPLATY — to ona przychodzi na konto.
-                const hit = waiting.filter(function (k){ return eq(jobs[k].amount, p.net); });
-                if (!hit.length){
-                    say('Wczytałem rozliczenie Limango na ' + f2(p.net)
-                        + ' — ale nie mam zlecenia z wyciągu na tę kwotę'
-                        + (waiting.length ? (' (czekają: ' + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ') + ')')
-                                          : ' — dodaj wpłatę ręcznie albo wczytaj wyciąg')
-                        + '.', '#c47f00');
+                const p0 = mkParseLimango(mkDecode(rd.result));
+                if (p0.err){ say(p0.err, '#c00'); return; }
+                p0.pliki = [f.name];
+                if (!waiting.length){
+                    say('Wczytałem rozliczenie Limango na ' + f2(p0.net)
+                        + ' — ale nie ma ani jednego zlecenia Limango. Wczytaj wyciąg albo dodaj wpłatę ręcznie.', '#c47f00');
                     return;
                 }
-                if (hit.length > 1){
-                    say('Ta sama kwota pasuje do ' + hit.length + ' wpłat — nie zgaduję, którą uzupełnić. Wyczyść zbędne zlecenia i powtórz.', '#c47f00');
+                // JEDEN przelew potrafi objac KILKA rozliczen, wiec rowna kwota jest
+                // szczesliwym trafem, a nie regula. Kolejnosc szukania:
+                //   1. zlecenie, ktoremu ten plik DOMYKA kwote (juz cos ma i sie zgadza),
+                //   2. zlecenie o rownej kwocie (jeden plik = jedna wplata),
+                //   3. jedyne czekajace zlecenie — dokladamy i mowimy, ile brakuje.
+                const doTego = function (k){
+                    const st = jobs[k].data && jobs[k].data.lim;
+                    return st ? r2(st.net + p0.net) : p0.net;
+                };
+                let klucz = waiting.filter(function (k){ return eq(doTego(k), jobs[k].amount); })[0];
+                if (!klucz) klucz = waiting.filter(function (k){ return eq(jobs[k].amount, p0.net); })[0];
+                if (!klucz && waiting.length === 1) klucz = waiting[0];
+                if (!klucz){
+                    say('Wczytałem rozliczenie Limango na ' + f2(p0.net)
+                        + ' — czeka ' + waiting.length + ' wpłat Limango ('
+                        + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ')
+                        + ') i żadna się nie domyka. Nie zgaduję, do której dołożyć — zostaw jedną i powtórz.', '#c47f00');
                     return;
                 }
-                const j = jobs[hit[0]];
+                const j = jobs[klucz];
+                const stare = (j.data && j.data.lim) || null;
+                const p = limScal(stare, p0);
                 const bad = limApply(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
-                say('Rozliczenie Limango wczytane: ' + p.nPos + ' zamówień brutto ' + f2(p.gross)
+                const ile = (p.pliki || []).length;
+                say('Rozliczenie Limango wczytane'
+                    + (ile > 1 ? (' (' + ile + '. plik do tej wpłaty)') : '') + ': '
+                    + p.nPos + ' zamówień brutto ' + f2(p.gross)
                     + (p.refund ? (', zwrotów ' + p.nRef + ' na ' + f2(p.refund)) : '')
                     + ', na konto ' + f2(p.net) + '.' + (bad.length ? ' Uwaga: ' + bad.join('; ') : ''),
                     bad.length ? '#c47f00' : '#0a7a2f');
