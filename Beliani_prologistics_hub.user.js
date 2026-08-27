@@ -25374,10 +25374,11 @@
     // sa konta. Sklep ma PIERWSZENSTWO: Leroy to cztery kraje na jednym panelu i kazdy
     // z nich ma osobne ustawienie importu w prologistics.
     const MK_KOL_KWOTA = { 'Manor': 13, 'Mirakl (But)': 13, 'Mirakl (Maxeda)': 13,
-        // Sprawdzone na pliku, ktory prologistics przyjal („03.08.2026 Leroy PT do prolo.csv"):
-        // 26 kolumn, „Amount" na 14. pozycji, czyli w N. Pozostale kraje Leroya zostaja
-        // przy domyslnym ukladzie Mirakla, dopoki nie bedzie na nie takiego samego dowodu.
-        'Mirakl (Leroy) · Leroy Merlin PT': 13 };
+        // Leroy — WSZYSTKIE cztery kraje. Ustawienie importu po stronie prologistics czyta
+        // kwote z 14. kolumny (N), a domyslny uklad Mirakla stawia ja w 15. (O). Zaczelo sie
+        // od dowodu na PT („03.08.2026 Leroy PT do prolo.csv" — 26 kolumn, „Amount" w N),
+        // a 27.08.2026 potwierdzone przez uzytkownika dla calego panelu ADEO.
+        'Mirakl (Leroy)': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -25579,6 +25580,106 @@
         // (Galaxus wyeksportowal 23 kolumny), trzeba ja WSTAWIC, a nie nadpisac sasiada.
         c.vat = (c.price > 0 && !String(hdr[c.price - 1] || '').trim()) ? (c.price - 1) : -1;
         return c;
+    }
+    // ================= LIMANGO =================
+    // Rozliczenie: „Gutschrift_MP-…csv", jedenascie kolumn, jeden wiersz na POZYCJE.
+    // Jedno zamowienie bywa w kilku wierszach — kilka produktow w tej samej przesylce.
+    const MK_LIM_SHOP = 'Limango DE';
+    // Komplet nazw kolumn. „Net paypout amount" niesie literowke z oryginalu i wlasnie
+    // ona jest najlepszym podpisem tego pliku — zaden inny obslugiwany plik jej nie ma.
+    const MK_LIM_KOL = ['Order ID', 'Return ID', 'Transaction Number', 'Variant Number',
+        'Description', 'Net Price', 'VAT', 'Gross Unit Price', 'Commission%',
+        'Commission amount', 'Net paypout amount'];
+    // Kwoty przychodza w dwoch postaciach: po niemiecku („1.234,56" — kropka dzieli
+    // tysiace) i z kropka dziesietna („79.99" — tak wychodzily z Excela w starej
+    // aplikacji). Obie musza dac to samo, wiec o roli kropki decyduje OBECNOSC przecinka.
+    function limKwota(v){
+        const s0 = String(v == null ? '' : v).trim();
+        if (!s0) return null;
+        const t = /,/.test(s0) ? s0.replace(/\./g, '').replace(',', '.') : s0;
+        const n = parseFloat(t.replace(/[^\d.\-]/g, ''));
+        return isFinite(n) ? n : null;
+    }
+    function mkParseLimango(txt){
+        const rows = mkCsvRows(txt).filter(function (r){ return r && r.join('').trim(); });
+        if (!rows.length) return { err: 'pusty plik' };
+        const hdr = rows[0].map(function (h){ return String(h == null ? '' : h).replace(/^﻿/, '').trim(); });
+        const ix = {};
+        hdr.forEach(function (h, i){ if (ix[h] == null) ix[h] = i; });
+        const brak = MK_LIM_KOL.filter(function (k){ return ix[k] == null; });
+        if (brak.length)
+            return { err: 'to nie wygląda na rozliczenie Limango — brakuje kolumn: ' + brak.join(', ') };
+        const cOrd = ix['Order ID'], cG = ix['Gross Unit Price'], cK = ix['Net paypout amount'];
+        const ord = {}, ref = {}, pierwszy = {}, nOrd = [], nRef = [];
+        let gross = 0, refund = 0, net = 0, com = 0, poz = 0, bezK = 0;
+        for (let i = 1; i < rows.length; i++){
+            const r = rows[i];
+            const id = String(r[cOrd] == null ? '' : r[cOrd]).trim();
+            if (!id) continue;
+            const kTxt = String(r[cK] == null ? '' : r[cK]).trim();
+            // Wiersz bez wyplaty nie jest ani sprzedaza, ani zwrotem. Stara aplikacja
+            // wyrzucala go z obu arkuszy — robimy tak samo, ale go LICZYMY i mowimy o tym.
+            if (!kTxt){ bezK++; continue; }
+            poz++;
+            const g = limKwota(r[cG]);
+            const k = limKwota(kTxt);
+            if (k != null) net = r2(net + k);
+            const cm = limKwota(r[ix['Commission amount']]);
+            if (cm != null) com = r2(com + Math.abs(cm));
+            if (g == null || g === 0) continue;
+            // ZNAK WYPLATY, nie brutto: przy zwrocie brutto jest dodatnie.
+            if (kTxt.charAt(0) === '-'){
+                if (ref[id] == null){ ref[id] = 0; nRef.push(id); }
+                ref[id] = r2(ref[id] + Math.abs(g));
+                refund = r2(refund + Math.abs(g));
+            } else {
+                if (ord[id] == null){ ord[id] = 0; nOrd.push(id); pierwszy[id] = r.slice(); }
+                ord[id] = r2(ord[id] + g);
+                gross = r2(gross + g);
+            }
+        }
+        if (!poz) return { err: 'rozliczenie Limango bez ani jednej pozycji z wypłatą' };
+        return { hdr: hdr, ord: ord, ref: ref, kolejnosc: nOrd, pierwszy: pierwszy,
+                 gross: gross, refund: refund, net: net, com: com,
+                 cG: cG, poz: poz, bezK: bezK, nPos: nOrd.length, nRef: nRef.length };
+    }
+    // Plik do importu: te same jedenascie kolumn, jeden wiersz na ZAMOWIENIE. Brutto
+    // zsumowane, reszta pol z PIERWSZEGO wiersza zamowienia — dokladnie tak wygladaja
+    // pliki, ktore prologistics przyjmowal. Kwota z KROPKA dziesietna, tak jak tam.
+    // Zwroty do importu nie ida: w paczce zostawalyby na zawsze jako CHECK.
+    function mkCsvLimango(p){
+        const q = function (v){
+            const s0 = (v == null) ? '' : String(v);
+            return /[;"\n\r]/.test(s0) ? ('"' + s0.replace(/"/g, '""') + '"') : s0;
+        };
+        const lin = [p.hdr.map(q).join(';')];
+        (p.kolejnosc || []).forEach(function (id){
+            const r = (p.pierwszy[id] || []).slice();
+            r[p.cG] = (p.ord[id] == null ? 0 : p.ord[id]).toFixed(2);
+            lin.push(r.map(q).join(';'));
+        });
+        return '﻿' + lin.join('\n') + '\n';
+    }
+    // Przepisanie rozliczenia do zlecenia — jedna droga dla pliku wrzuconego recznie
+    // i dla kazdej innej, ktora kiedys dojdzie.
+    function limApply(j, p, how){
+        j.data = { lim: p, shop: j.shop || MK_LIM_SHOP, gross: p.gross, refund: p.refund,
+                   net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                   unknown: {}, skipped: {}, full: true,
+                   // Zamowienie potrafi byc JEDNOCZESNIE sprzedaza i zwrotem: sprzedane,
+                   // potem oddane, a oba wiersze siedza w tym samym rozliczeniu. Do importu
+                   // idzie wtedy sama sprzedaz, a zwrot na liste zwrotow — ale trzeba
+                   // widziec, ze tak jest.
+                   both: Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; }),
+                   pays: 1, split: false, rows: p.nPos, total: p.nPos, pages: 1, how: how };
+        const bad = [];
+        // Wyplata to suma CALEJ kolumny „Net paypout amount" — sprzedaze minus zwroty.
+        // To ona ma sie zgadzac z wyciagiem, a nie brutto zamowien.
+        if (!eq(p.net, j.amount))
+            bad.push('wypłata z rozliczenia ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
+        if (p.bezK)
+            bad.push(p.bezK + ' wierszy bez kwoty wypłaty — pominięte (tak samo robiła stara aplikacja)');
+        return bad;
     }
     function mkParseGalx(src, shop){
         // Przyjmujemy jedno i drugie: tekst CSV (plik wrzucony recznie) albo gotowe
@@ -29867,7 +29968,11 @@
         { label: 'Galaxus CH', mp: 'Galaxus', brand: 'Galaxus', short: 'Galaxus', kind: 'galx',
           host: 'partner.galaxus.ch', shop: 'Galaxus CH', cur: 'CHF' },
         { label: 'Wayfair DE', mp: 'Wayfair', brand: 'Wayfair', short: 'Wayfair', kind: 'wayf',
-          host: 'partners.wayfair.com', shop: 'Wayfair DE', cur: 'EUR' }
+          host: 'partners.wayfair.com', shop: 'Wayfair DE', cur: 'EUR' },
+        // Limango nie ma u nas portalu — rozliczenie wrzuca sie plikiem, a wplate
+        // dodaje z wyciagu albo recznie.
+        { label: 'Limango DE', mp: 'Limango', brand: 'Limango', short: 'Limango', kind: 'lim',
+          shop: MK_LIM_SHOP, cur: 'EUR' }
     ];
     // Ta sama wplata nie moze trafic do modulu dwa razy — raz recznie, raz z wyciagu.
     // Klucze byloby wtedy rozne, a skutkiem podwojny import i podwojne ksiegowanie.
@@ -30447,6 +30552,7 @@
     function csvFor(j){
         if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
         if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
+        if (j.kind === 'lim'  && j.data && j.data.lim)  return mkCsvLimango(j.data.lim);
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         if (j.kind === 'obich' && j.data && j.data.obich) return mkCsvObiCh(j.data.obich);
         if (j.kind === 'ebay' && j.data && j.data.ebay) return mkCsvEbay(j.data.ebay);
@@ -33606,6 +33712,7 @@
     // Dokladajac nowy marketplace NIE dopisuj go tutaj bez pytania.
     const MK_KOM_MP = { wayf: 1, amz: 1 };
     const MK_KIND_NAZWA = { wayf: 'Wayfair', mano: 'ManoMano', amz: 'Amazon', ebay: 'eBay',
+                            lim: 'Limango',
                             c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
                             joy: 'JOOM', vtex: 'OBI', bank: 'wyciag',
                             // Manor, Vente-Unique i Home24 jada wspolna sciezka Mirakla —
@@ -35133,6 +35240,7 @@
         const MK_TYPY_ETYK = { bank: 'wyciąg', mir: 'zestawienie Mirakla',
             amz: 'raport Amazon', mano: 'rozliczenie ManoMano',
             ebay: 'raport eBay', galx: 'raport Galaxus', wayf: 'raport Wayfair',
+            lim: 'rozliczenie Limango',
             c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
             alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro',
             hd: 'rozliczenie Homedeco', brico: 'rozliczenie Brico Bravo' };
@@ -35148,6 +35256,9 @@
             // Amazon pyta sie WCZESNIE, bo jego warunek wejscia jest najostrzejszy z calej
             // listy: pierwsza kolumna naglowka musi brzmiec doslownie „settlement-id".
             try { if (!mkParseAmz(txt).err) return 'amz'; } catch (e){}
+            // Limango pyta sie wczesnie, bo jego warunek jest ostry: komplet jedenastu
+            // nazw kolumn, w tym „Net paypout amount" z literowka z oryginalu.
+            try { if (!mkParseLimango(txt).err) return 'lim'; } catch (e){}
             try { if (!mkParseEbay(txt).err) return 'ebay'; } catch (e){}
             try { if (!mkParseGalx(txt, 'Galaxus CH').err) return 'galx'; } catch (e){}
             try { if (!mkParseWayf(txt).err) return 'wayf'; } catch (e){}
@@ -35173,7 +35284,7 @@
             try { this.value = ''; } catch (e){}
             if (!fs.length) return;
             if (MK_PULLING){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
-            const kubelki = { bank: [], mir: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], c24: [], c24pdf: [], cnov: [],
+            const kubelki = { bank: [], mir: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], lim: [], c24: [], c24pdf: [], cnov: [],
                               alleops: [], allemap: [], allebil: [], hd: [], obich: [], brico: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
@@ -35245,6 +35356,7 @@
             kubelki.ebay.forEach(function (f){ ebayWczytaj(f); });
             kubelki.galx.forEach(function (f){ galxWczytaj(f); });
             kubelki.wayf.forEach(function (f){ wayfWczytaj(f); });
+            kubelki.lim.forEach(function (f){ limWczytaj(f); });
             // CHECK24: najpierw „Details" (buduje zlecenie), potem „Abrechnung" (dokłada
             // kwote wyplaty). Kolejnosc w jednym rzucie ma znaczenie, przy osobnym
             // wrzucaniu nie — obie drogi dopisuja sie do tego samego zlecenia po numerze.
@@ -36192,6 +36304,38 @@
         // Rozliczenie Wayfaira wrzucane recznie. Dopasowanie idzie po SUMIE wyplaty
         // (pozycje + potracenia), bo to ona trafia na konto — numer z tytulu przelewu
         // sluzy dopiero do potwierdzenia, ze to wlasciwy plik.
+        function limWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                const jobs = jobsLoad();
+                const waiting = Object.keys(jobs).filter(function (k){ return jobs[k].kind === 'lim'; });
+                const p = mkParseLimango(mkDecode(rd.result));
+                if (p.err){ say(p.err, '#c00'); return; }
+                // Szukamy zlecenia po KWOCIE WYPLATY — to ona przychodzi na konto.
+                const hit = waiting.filter(function (k){ return eq(jobs[k].amount, p.net); });
+                if (!hit.length){
+                    say('Wczytałem rozliczenie Limango na ' + f2(p.net)
+                        + ' — ale nie mam zlecenia z wyciągu na tę kwotę'
+                        + (waiting.length ? (' (czekają: ' + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ') + ')')
+                                          : ' — dodaj wpłatę ręcznie albo wczytaj wyciąg')
+                        + '.', '#c47f00');
+                    return;
+                }
+                if (hit.length > 1){
+                    say('Ta sama kwota pasuje do ' + hit.length + ' wpłat — nie zgaduję, którą uzupełnić. Wyczyść zbędne zlecenia i powtórz.', '#c47f00');
+                    return;
+                }
+                const j = jobs[hit[0]];
+                const bad = limApply(j, p, 'plik ' + f.name);
+                jobsSave(jobs); render();
+                say('Rozliczenie Limango wczytane: ' + p.nPos + ' zamówień brutto ' + f2(p.gross)
+                    + (p.refund ? (', zwrotów ' + p.nRef + ' na ' + f2(p.refund)) : '')
+                    + ', na konto ' + f2(p.net) + '.' + (bad.length ? ' Uwaga: ' + bad.join('; ') : ''),
+                    bad.length ? '#c47f00' : '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        }
         function wayfWczytaj(f){
             if (!f) return;
             const rd = new FileReader();
