@@ -25622,8 +25622,14 @@
         if (brak.length)
             return { err: 'to nie wygląda na rozliczenie Limango — brakuje kolumn: ' + brak.join(', ') };
         const cOrd = ix['Order ID'], cG = ix['Gross Unit Price'], cK = ix['Net paypout amount'];
+        const cVat = ix['VAT'];
         const ord = {}, ref = {}, pierwszy = {}, nOrd = [], nRef = [];
-        let gross = 0, refund = 0, net = 0, com = 0, poz = 0, bezK = 0;
+        // „netto" to suma kolumny wyplat. „kwota" to ta sama suma Z VAT-em — i to ona
+        // wchodzi na konto, bo Limango przelewa brutto noty kredytowej.
+        // VAT liczymy OD SUMY w danej stawce, a nie od kazdego wiersza z osobna: przy
+        // 318 wierszach zaokraglanie kazdego zjada 15 groszy i nota przestaje sie zgadzac.
+        const nettoVat = {};
+        let gross = 0, refund = 0, netto = 0, com = 0, poz = 0, bezK = 0;
         for (let i = 1; i < rows.length; i++){
             const r = rows[i];
             const id = String(r[cOrd] == null ? '' : r[cOrd]).trim();
@@ -25635,9 +25641,18 @@
             poz++;
             const g = limKwota(r[cG]);
             const k = limKwota(kTxt);
-            if (k != null) net = r2(net + k);
+            if (k != null){
+                netto = r2(netto + k);
+                // Stawka Z WIERSZA. Brak stawki traktujemy jak zero, zeby nie dopisac
+                // VAT-u tam, gdzie pliku nie rozumiemy.
+                const vt = (cVat == null) ? null : limKwota(r[cVat]);
+                const st = String(vt == null ? 0 : vt);
+                nettoVat[st] = r2((nettoVat[st] || 0) + k);
+            }
+            // Prowizja ZE ZNAKIEM: przy zwrocie wraca i stoi w pliku z minusem. Suma
+            // wartosci bezwzglednych dawala 3 146,33 zamiast 2 306,33 z noty.
             const cm = limKwota(r[ix['Commission amount']]);
-            if (cm != null) com = r2(com + Math.abs(cm));
+            if (cm != null) com = r2(com + cm);
             if (g == null || g === 0) continue;
             // ZNAK WYPLATY, nie brutto: przy zwrocie brutto jest dodatnie.
             if (kTxt.charAt(0) === '-'){
@@ -25651,8 +25666,20 @@
             }
         }
         if (!poz) return { err: 'rozliczenie Limango bez ani jednej pozycji z wypłatą' };
+        // Droga, ktora liczy to osoba od sald — inna niz nota, a wynik ten sam:
+        //     obrot brutto (sprzedaz - zwroty) - prowizja - VAT od prowizji = kwota noty
+        // „VAT od prowizji" wychodzi z tego rownania jako reszta i NIE jest rowny
+        // prowizja x 19%: to suma zaokraglen z poszczegolnych wierszy.
+        const obrot = r2(gross - refund);
+        // Brutto noty: do KAZDEJ sumy netto doliczamy jej wlasny VAT, kazda raz.
+        let kwota = 0;
+        Object.keys(nettoVat).forEach(function (st){
+            kwota = r2(kwota + r2(nettoVat[st] * (1 + (parseFloat(st) || 0) / 100)));
+        });
         return { hdr: hdr, ord: ord, ref: ref, kolejnosc: nOrd, pierwszy: pierwszy,
-                 gross: gross, refund: refund, net: net, com: com,
+                 gross: gross, refund: refund, netto: netto, kwota: kwota,
+                 obrot: obrot, vatProw: r2(obrot - Math.abs(com) - kwota),
+                 com: Math.abs(com), nettoVat: nettoVat,
                  cG: cG, poz: poz, bezK: bezK, nPos: nOrd.length, nRef: nRef.length };
     }
     // Plik do importu: te same jedenascie kolumn, jeden wiersz na ZAMOWIENIE. Brutto
@@ -25680,7 +25707,8 @@
         const out = { hdr: a.hdr, cG: a.cG, ord: {}, ref: {}, pierwszy: {},
                       kolejnosc: a.kolejnosc.slice(),
                       gross: r2(a.gross + b.gross), refund: r2(a.refund + b.refund),
-                      net: r2(a.net + b.net), com: r2(a.com + b.com),
+                      netto: r2(a.netto + b.netto), kwota: r2(a.kwota + b.kwota),
+                      com: r2(a.com + b.com),
                       poz: a.poz + b.poz, bezK: a.bezK + b.bezK,
                       pliki: (a.pliki || []).concat(b.pliki || []) };
         Object.keys(a.ord).forEach(function (k){ out.ord[k] = a.ord[k]; out.pierwszy[k] = a.pierwszy[k]; });
@@ -25697,8 +25725,9 @@
     // Przepisanie rozliczenia do zlecenia — jedna droga dla pliku wrzuconego recznie
     // i dla kazdej innej, ktora kiedys dojdzie.
     function limApply(j, p, how){
+        // „net" w zleceniu znaczy „ile weszlo na konto" — a wchodzi BRUTTO noty.
         j.data = { lim: p, shop: j.shop || MK_LIM_SHOP, gross: p.gross, refund: p.refund,
-                   net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
+                   net: p.kwota, netOk: eq(p.kwota, j.amount), ord: p.ord, ref: p.ref,
                    unknown: {}, skipped: {}, full: true,
                    // Zamowienie potrafi byc JEDNOCZESNIE sprzedaza i zwrotem: sprzedane,
                    // potem oddane, a oba wiersze siedza w tym samym rozliczeniu. Do importu
@@ -25709,12 +25738,24 @@
         const bad = [];
         // Wyplata to suma CALEJ kolumny „Net paypout amount" — sprzedaze minus zwroty.
         // To ona ma sie zgadzac z wyciagiem, a nie brutto zamowien.
-        // Jeden przelew bywa zlozony z kilku rozliczen, wiec roznica nie musi znaczyc
-        // bledu — czesto znaczy „brakuje jeszcze jednego pliku". Mowimy to wprost.
-        if (!eq(p.net, j.amount)){
-            const brak = r2(j.amount - p.net);
-            bad.push('wypłata z rozliczeń ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu'
-                   + (brak > 0 ? (' — brakuje ' + f2(brak) + ', dorzuć kolejny plik Gutschrift') : ''));
+        // Rachunek widziany od strony sald — ta sama kwota, inna droga. Dopisujemy go
+        // do zlecenia, zeby dalo sie porownac liczba w liczbe z arkuszem.
+        j.note = 'obrót brutto ' + f2(p.obrot) + ' − prowizja ' + f2(p.com)
+               + ' − VAT prowizji ' + f2(p.vatProw) + ' = nota ' + f2(p.kwota)
+               + ' (netto ' + f2(p.netto) + ' + VAT ' + f2(r2(p.kwota - p.netto)) + ')'
+               + ((p.pliki || []).length > 1 ? (' · rozliczeń: ' + p.pliki.length) : '');
+        // Roznica wobec wyciagu ma DWIE typowe przyczyny i obie da sie nazwac.
+        if (!eq(p.kwota, j.amount)){
+            const brak = r2(j.amount - p.kwota);
+            bad.push('kwota not ' + f2(p.kwota) + ' ≠ ' + f2(j.amount) + ' z wyciągu'
+                   + ' (różnica ' + f2(brak) + ')'
+                   + (brak > 0 ? ' — albo brakuje kolejnego pliku Gutschrift do tego przelewu' : '')
+                   // Sprawdzone na trzech miesiacach: kwiecien -20,40 (faktura MP-74521
+                   // „Commission for Cancellations"), marzec -7,20, luty +84,48.
+                   + (Math.abs(brak) < 500
+                        ? ', albo Limango dołożyło osobny dokument do tego przelewu'
+                          + ' (przy MP-74520 była to faktura MP-74521 na 20,40 za anulowania)'
+                        : ''));
         }
         if (p.bezK)
             bad.push(p.bezK + ' wierszy bez kwoty wypłaty — pominięte (tak samo robiła stara aplikacja)');
@@ -36353,7 +36394,7 @@
                 if (p0.err){ say(p0.err, '#c00'); return; }
                 p0.pliki = [f.name];
                 if (!waiting.length){
-                    say('Wczytałem rozliczenie Limango na ' + f2(p0.net)
+                    say('Wczytałem rozliczenie Limango na ' + f2(p0.kwota)
                         + ' — ale nie ma ani jednego zlecenia Limango. Wczytaj wyciąg albo dodaj wpłatę ręcznie.', '#c47f00');
                     return;
                 }
@@ -36364,13 +36405,13 @@
                 //   3. jedyne czekajace zlecenie — dokladamy i mowimy, ile brakuje.
                 const doTego = function (k){
                     const st = jobs[k].data && jobs[k].data.lim;
-                    return st ? r2(st.net + p0.net) : p0.net;
+                    return st ? r2(st.kwota + p0.kwota) : p0.kwota;
                 };
                 let klucz = waiting.filter(function (k){ return eq(doTego(k), jobs[k].amount); })[0];
-                if (!klucz) klucz = waiting.filter(function (k){ return eq(jobs[k].amount, p0.net); })[0];
+                if (!klucz) klucz = waiting.filter(function (k){ return eq(jobs[k].amount, p0.kwota); })[0];
                 if (!klucz && waiting.length === 1) klucz = waiting[0];
                 if (!klucz){
-                    say('Wczytałem rozliczenie Limango na ' + f2(p0.net)
+                    say('Wczytałem rozliczenie Limango na ' + f2(p0.kwota)
                         + ' — czeka ' + waiting.length + ' wpłat Limango ('
                         + waiting.map(function (k){ return f2(jobs[k].amount); }).join(', ')
                         + ') i żadna się nie domyka. Nie zgaduję, do której dołożyć — zostaw jedną i powtórz.', '#c47f00');
@@ -36386,7 +36427,8 @@
                     + (ile > 1 ? (' (' + ile + '. plik do tej wpłaty)') : '') + ': '
                     + p.nPos + ' zamówień brutto ' + f2(p.gross)
                     + (p.refund ? (', zwrotów ' + p.nRef + ' na ' + f2(p.refund)) : '')
-                    + ', na konto ' + f2(p.net) + '.' + (bad.length ? ' Uwaga: ' + bad.join('; ') : ''),
+                    + ', na konto ' + f2(p.kwota) + ' (netto ' + f2(p.netto) + ' + VAT).'
+                    + (bad.length ? ' Uwaga: ' + bad.join('; ') : ''),
                     bad.length ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
