@@ -1,4 +1,4 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
 // @version      5.13
@@ -59,8 +59,8 @@
 // @grant        GM_cookie
 // @grant        GM_getResourceText
 // @run-at       document-idle
-// @updateURL   https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
-// @downloadURL https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
+// @updateURL   https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
+// @downloadURL https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js
 // ==/UserScript==
 
 (function () {
@@ -45027,7 +45027,7 @@
         const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
 
         function checkUpdate(){
-            var RAW = 'https://raw.githubusercontent.com/dawidgrzegowski-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
+            var RAW = 'https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
             try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) RAW = GM_info.script.downloadURL; } catch(e){}
             var copied = false;
             try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(RAW, 'text'); copied = true; } } catch(e){}
