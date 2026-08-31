@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.15
+// @version      5.16
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -8440,11 +8440,17 @@
         #ilp-btn{position:fixed;right:16px;bottom:150px;z-index:2147483000;background:#FF2F00;color:#fff;border:none;border-radius:24px;padding:12px 16px;font:600 13px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)}
         #ilp-btn:hover{background:#cc2600}
         #ilp-ov{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:2147483001;display:none;align-items:flex-start;justify-content:center}
-        #ilp-panel{background:#fff;margin:20px;width:min(1250px,97vw);max-height:93vh;border-radius:12px;display:flex;flex-direction:column;overflow:hidden;font:13px system-ui;color:#111}
+        /* resize dziala, bo overflow nie jest visible. Dolne granice pilnuja, zeby
+           panelu nie dalo sie scisnac do paska, w ktorym nic nie widac. */
+        #ilp-panel{background:#fff;margin:20px;width:min(1250px,97vw);height:min(860px,93vh);max-width:99vw;max-height:97vh;min-width:560px;min-height:340px;resize:both;border-radius:12px;display:flex;flex-direction:column;overflow:hidden;font:13px system-ui;color:#111}
+        #ilp-wynik{margin:8px 0 0;padding:7px 10px;border-radius:6px;font-size:12px;line-height:1.45;display:none}
+        #ilp-wynik.ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46}
+        #ilp-wynik.zle{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
+        #ilp-wynik.pracuje{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
         .ilp-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #e5e7eb;background:#f8fafc}
         .ilp-head h2{margin:0;font-size:15px}
         .ilp-x{margin-left:auto;background:#ef4444;color:#fff;border:none;border-radius:6px;width:28px;height:28px;cursor:pointer;font-size:16px}
-        .ilp-body{padding:12px 16px;overflow:auto}
+        .ilp-body{padding:12px 16px;overflow:auto;flex:1 1 auto;display:flex;flex-direction:column;min-height:0}
         .ilp-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
         .ilp-bar button{padding:7px 11px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;font:600 12px system-ui}
         .ilp-bar button.primary{background:#FF2F00;color:#fff;border-color:#7c3aed}
@@ -8490,6 +8496,24 @@
             </div>
           </div>`;
         document.body.appendChild(ov); panel = ov;
+        // Rozmiar okna zapamietany miedzy otwarciami. Zapisujemy z opoznieniem, bo
+        // ResizeObserver strzela przy kazdym pikselu ciagniecia myszka.
+        (function pamietajRozmiar(){
+            const box = ov.querySelector('#ilp-panel');
+            if (!box) return;
+            try {
+                const z = JSON.parse(GM_getValue('ilp_rozmiar', 'null'));
+                if (z && z.w > 300 && z.h > 200){ box.style.width = z.w + 'px'; box.style.height = z.h + 'px'; }
+            } catch (e){}
+            if (typeof ResizeObserver === 'undefined') return;
+            let t = null;
+            new ResizeObserver(function (){
+                clearTimeout(t);
+                t = setTimeout(function (){
+                    try { GM_setValue('ilp_rozmiar', JSON.stringify({ w: Math.round(box.offsetWidth), h: Math.round(box.offsetHeight) })); } catch (e){}
+                }, 400);
+            }).observe(box);
+        })();
         ov.querySelector('.ilp-x').onclick = () => ov.style.display = 'none';
         ov.addEventListener('click', e => { if (e.target === ov) ov.style.display = 'none'; });
 
@@ -8531,7 +8555,8 @@
             <button id="ilp-cmts-load">💬 Wczytaj komentarze zaznaczonych</button>
             <div class="ilp-sum" id="ilp-summary"></div>
           </div>
-          <div style="max-height:64vh;overflow:auto;border:1px solid #e5e7eb;border-radius:6px">
+          <div id="ilp-wynik"></div>
+          <div id="ilp-tabbox" style="flex:1 1 auto;min-height:160px;overflow:auto;border:1px solid #e5e7eb;border-radius:6px">
           <table class="ilp-t"><thead><tr>
             <th style="width:26px"><input type="checkbox" id="ilp-cba"></th>
             <th>Issue</th><th>Spolka</th><th>Company</th><th>FV</th><th>Amount</th><th>Ccy</th><th>Approval</th><th>Payment Confirm.</th><th>PAID</th><th>Reassign</th><th>Komentarze</th><th>Dodaj kom.</th><th>Pliki</th><th>Status</th>
@@ -9054,18 +9079,73 @@
         } catch (e) { line.innerHTML = '<span class="st-err">✗ ' + esc(e.message) + '</span>'; }
     }
     function findTr(id) { return [...tbody.children].find(x => { const a = x.querySelector('a'); return a && a.textContent === String(id); }); }
+    // Ile pozycji naraz. Kazda z nich to zapis PLUS odczyt potwierdzajacy, wiec po kolei
+    // trzydziesci sztuk to kilka minut. Rownoleglosc jest bezpieczna, bo kazda pozycja
+    // sprawdza siebie sama i pisze do wlasnego wiersza tabeli.
+    const ILP_NARAZ = 5;
+    async function ilPula(lista, fn, ile){
+        const n = Math.max(1, ile || ILP_NARAZ);
+        let i = 0;
+        async function jeden(){
+            while (i < lista.length){
+                const k = i++;
+                try { await fn(lista[k], k); } catch (e){}
+            }
+        }
+        const p = [];
+        for (let w = 0; w < Math.min(n, lista.length); w++) p.push(jeden());
+        await Promise.all(p);
+    }
+    // Wynik operacji zbiorczej ZOSTAJE na ekranie. Toast znika po 3,2 s, a przy
+    // trzydziestu pozycjach nikt nie zdazy go przeczytac — i potem nie wiadomo,
+    // czy komentarz wszedl.
+    function ilWynik(html, stan){
+        const e = document.getElementById('ilp-wynik');
+        if (!e) return;
+        e.className = stan || '';
+        e.innerHTML = html;
+        e.style.display = 'block';
+    }
+    // Wspolna stopka: ile potwierdzono i KTORE numery zawiodly. Sam licznik bledow
+    // zmusza do przegladania calej tabeli.
+    function ilPodsumowanie(co, ok, zle){
+        const razem = ok + zle.length;
+        let h = '<b>' + co + '</b>: potwierdzone <b>' + ok + '</b> z ' + razem;
+        if (zle.length){
+            h += ' · <b>nie potwierdzono ' + zle.length + '</b>: ' + zle.join(', ')
+               + '<div style="margin-top:3px">Te pozycje zostaw zaznaczone i spróbuj ponownie — '
+               + 'reszta jest już zrobiona i drugi raz nie wejdzie.</div>';
+        }
+        h += '<div style="margin-top:3px;opacity:.85">„Potwierdzone" znaczy, że wpis został '
+           + 'odczytany z powrotem z prologistics, a nie tylko wysłany.</div>';
+        ilWynik(h, zle.length ? 'zle' : 'ok');
+    }
     async function bulkComment(text) {
         text = (text || '').trim(); if (!text) { toast('Wpisz treść komentarza.'); return; }
         const sel = rows.filter(r => r.sel && !r.error);
         if (!sel.length) { toast('Zaznacz wiersze.'); return; }
-        let ok = 0, fail = 0;
-        for (const r of sel) {
+        let ok = 0; const zle = []; let zrobione = 0;
+        ilWynik('Dodaję komentarz do ' + sel.length + ' pozycji — po ' + ILP_NARAZ + ' naraz…', 'pracuje');
+        await ilPula(sel, async function (r){
             const tr = findTr(r.id); const line = tr ? statusLine(tr) : null;
             if (line) line.innerHTML = '<span class="st-busy">komentarz…</span>';
-            try { if (await postComment(r.id, text)) { ok++; if (line) line.innerHTML = '<span class="st-ok">✓ komentarz: „' + esc(text) + '"</span>'; } else { fail++; if (line) line.innerHTML = '<span class="st-err">✗ komentarz</span>'; } }
-            catch (e) { fail++; if (line) line.innerHTML = '<span class="st-err">✗</span>'; }
-        }
-        toast(`Komentarz: OK ${ok}, błąd ${fail}.`);
+            try {
+                if (await postComment(r.id, text)) {
+                    ok++;
+                    if (line) line.innerHTML = '<span class="st-ok">✓ komentarz dodany i potwierdzony: „' + esc(text) + '"</span>';
+                } else {
+                    zle.push(r.id);
+                    if (line) line.innerHTML = '<span class="st-err">✗ komentarz NIE potwierdzony</span>';
+                }
+            } catch (e) {
+                zle.push(r.id);
+                if (line) line.innerHTML = '<span class="st-err">✗ ' + esc(e.message) + '</span>';
+            }
+            zrobione++;
+            ilWynik('Dodaję komentarz — ' + zrobione + '/' + sel.length + ' (po ' + ILP_NARAZ + ' naraz)…', 'pracuje');
+        }, ILP_NARAZ);
+        ilPodsumowanie('Komentarz „' + esc(text) + '"', ok, zle);
+        toast('Komentarz: potwierdzone ' + ok + ' z ' + sel.length + '.');
     }
 
     async function togglePaid(r, tr, target) {
@@ -9099,13 +9179,19 @@
     async function bulkPaid(target) {
         const sel = rows.filter(r => r.sel && r.paidField && r.paidField.yes && r.paidField.no);
         if (!sel.length) { toast('Zaznacz wiersze z polem PAID.'); return; }
-        let ok = 0, fail = 0;
-        for (const r of sel) {
-            const tr = findTr(r.id); if (!tr) { fail++; continue; }
+        let ok = 0; const zle = []; let zrobione = 0;
+        ilWynik('Zmieniam PAID na ' + target + ' w ' + sel.length + ' pozycjach — po ' + ILP_NARAZ + ' naraz…', 'pracuje');
+        await ilPula(sel, async function (r){
+            const tr = findTr(r.id);
+            if (!tr) { zle.push(r.id); return; }
             const opt = target === 'Yes' ? r.paidField.yes : r.paidField.no;
-            if (opt && await changePaid(r, tr, opt, null)) ok++; else fail++;
-        }
-        toast(`PAID=${target}: OK ${ok}, błąd ${fail}.`);
+            if (opt && await changePaid(r, tr, opt, null)) ok++; else zle.push(r.id);
+            zrobione++;
+            ilWynik('Zmieniam PAID na ' + target + ' — ' + zrobione + '/' + sel.length
+                  + ' (po ' + ILP_NARAZ + ' naraz)…', 'pracuje');
+        }, ILP_NARAZ);
+        ilPodsumowanie('Status PAID = ' + target, ok, zle);
+        toast('PAID=' + target + ': potwierdzone ' + ok + ' z ' + sel.length + '.');
     }
 
     function updateSummary() {
@@ -21082,10 +21168,21 @@
         // Numer zamowienia z obu kotwic naraz. Zgodne — bierzemy; rozne — odmawiamy.
         function pcEpoOrder(info){
             var zE2E = (String(info.e2e || '').match(/^BEL-(\d+)-/i) || [])[1] || '';
-            var zMsg = (String(info.msg || '').match(/\bOrder\s*(\d+)/i) || [])[1] || '';
-            if (zE2E && zMsg && zE2E !== zMsg)
-                return { err: 'rozjazd w pliku: treść mówi o zamówieniu ' + zMsg
+            // CALA lista zamowien z tresci, nie sam pierwszy numer. Przelew bywa na kilka
+            // zamowien („Order 21747, 21748, 21749, Deposit 10%"), a EndToEndID niesie
+            // JEDEN — ten reprezentujacy grupe. Porownanie z samym pierwszym numerem
+            // zglaszalo wtedy rozjazd, choc oba napisy dotycza tej samej platnosci
+            // i sklada je ten sam modul przy generowaniu przelewu.
+            var lista = pcEpoOrderyZTresci(info.msg);
+            if (!lista.length) lista = pcEpoOrderyZTresci(info.msgZb);
+            var zMsg = lista[0] || '';
+            // Rozjazd dopiero wtedy, gdy numeru z EndToEndID NIE MA wsrod wymienionych.
+            if (zE2E && lista.length && lista.indexOf(zE2E) < 0)
+                return { err: 'rozjazd w pliku: treść mówi o zamówieni'
+                            + (lista.length > 1 ? ('ach ' + lista.join(', ')) : ('u ' + zMsg))
                             + ', a EndToEndID o ' + zE2E + ' — nie zgaduję, który jest właściwy' };
+            // Numer glowny z EndToEndID, gdy jest: to identyfikator, ktory sami wstawilismy
+            // w przelew, wiec jest pewniejszy niz kolejnosc numerow w tresci.
             var nr = zE2E || zMsg;
             if (!nr) return { err: 'nie ma w pliku numeru zamówienia (ani w treści, ani w EndToEndID)' };
             return { order: nr, zgodne: !!(zE2E && zMsg) };
@@ -25395,6 +25492,16 @@
         // zlozona przez mkShort („XXXLutz DE") trafia w pozycje z listy _Markety.
         '2026': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz DE' },
+        // Momax — TEN SAM panel co XXXLutz (marketplace.xxxlgroup.com), ale osobny sklep.
+        // Numer 6740 wprost z wgranego eksportu: kolumna „Shop ID", ta sama wartosc
+        // w kazdym z 391 wierszy. Kraju nie zgadujemy — mowia o nim dwie niezalezne
+        // kolumny: „Sales channel" = moemax.de i nazwa sklepu „Beliani MMX DE".
+        // Nazwe wpisujemy (jak przy XXXLutz DE, inaczej niz przy 3752, gdzie kraju
+        // z danych nie bylo widac), zeby klucz ustawien importu byl wlasny dla tego
+        // sklepu. `mp`, `brand` i `short` sa przepisane doslownie z reguly wyciagu —
+        // wyciag bankowy i wgrany eksport musza nazywac ten marketplace tak samo.
+        '6740': { mp: 'Mirakl (XXXLutz)', brand: 'Mömax', short: 'Mömax',
+                  host: 'marketplace.xxxlgroup.com', shop: 'Mömax DE' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
