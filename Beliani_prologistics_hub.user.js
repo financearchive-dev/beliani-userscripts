@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.14
+// @version      5.15
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5683,7 +5683,11 @@
                     };
                 }
 
-                await loadInFrame(ticketHref, 20000, ctx);
+                // ODCZYT, nie zapis — wiec szybka droga. Na wolnym serwerze roznica
+                // to ~32 s (ramka) kontra ~13 s (fetch) na kazde wejscie, a wejsc na
+                // jedno ksiegowanie jest okolo trzynastu. Sleep zostaje: dotyczy zwloki
+                // SERWERA w utrwaleniu zapisu, a nie renderowania strony.
+                await loadForRead(ticketHref, 20000, ctx);
                 await sleep(900);
 
                 let verify = verifyTicketBooking(
@@ -5705,7 +5709,9 @@
                 for (let retryNum = 1; retryNum <= verifyBackoff.length && !verify.ok; retryNum++) {
                     await sleep(verifyBackoff[retryNum - 1]);
                     try {
-                        await loadInFrame(ticketHref, 25000, ctx);
+                        // Tez czysty odczyt. To sa najdrozsze wejscia w calym przebiegu,
+                        // bo przy wyscigu z serwerem powtarzaja sie do trzech razy.
+                        await loadForRead(ticketHref, 25000, ctx);
                         await sleep(1500);
                     } catch (e) { /* reload fail — verify i tak zwróci coś */ }
                     verify = verifyTicketBooking(
@@ -5751,6 +5757,13 @@
                             ? 'category_check'
                             : fillResult.fallbackReason;
                         try {
+                            // POWROT NA RAMKE. Kontrola wyzej idzie fetch-em, wiec biezaca
+                            // strona zyje w dokumencie odlaczonym — a eskalacja PISZE
+                            // (dodaje komentarz) i `getFrameWin` celowo rzuca wtedy
+                            // wyjatkiem. Placimy jedno wczytanie, ale tylko przy eskalacji,
+                            // czyli tam, gdzie i tak placilismy je dotad.
+                            await loadInFrame(ticketHref, 20000, ctx);
+                            await sleep(600);
                             escalation = await escalateNoSolutionTicket(ctx, ticketHref, escReason, escComment);
                         } catch (e) {
                             escalation = { reason: escReason, escalationError: e.message };
@@ -10580,7 +10593,9 @@
 
             const note = f[5];
             const full = balNum(note);
-            const gross = (full == null) ? paid : full;
+            // `let`, bo przy samym numerze roszczenia kwote brutto uzupelniamy nizej
+            // z prologistics — arkusz jej wtedy nie niesie.
+            let gross = (full == null) ? paid : full;
             const claims = balClaims(note);
             const label = balClaimLabel(claims);
             const contRaw = f[1];
@@ -10589,7 +10604,51 @@
             // Sub-order: kolumna „sub" albo kontener w nawiasie. Kontener nalezy wtedy do orderu
             // nadrzednego, wiec na stronie tego orderu moze go w ogole nie byc — nie sprawdzamy.
             const isSub = /^sub$/i.test(f[2]) || /^\(.*\)$/.test(contRaw.trim());
-            const diff = bal2(gross - paid);
+            let diff = bal2(gross - paid);
+            // ---- numer roszczenia bez kwoty: dociagamy kwote z prologistics ----
+            // Arkusz podaje wtedy tylko to, co zaplacono, a ile potracono wie system:
+            // „Penalty: applied · Open amount: -100.00 · Claim: penalty no. 603".
+            // Bez tego wiersz ksiegowal sam przelew i zostawial order z otwarta reszta.
+            // Zakres waski celowo — patrz komentarz przy warunku nizej.
+            let dociagnieta = 0;
+            if (!diff && hasCont && claims.length){
+                const rodzaje = [];
+                balClaimTypes(claims).forEach(function (t){
+                    const k = balKindName(t);
+                    if (rodzaje.indexOf(k) < 0) rodzaje.push(k);
+                });
+                // Tylko JEDEN rodzaj (przy kilku dziala starsza sciezka podzialu)
+                // i tylko taki, ktory POMNIEJSZA przelew. Przy overpayment kierunku
+                // nie zgadujemy — bywa doplata i bywa zwrot, a zly znak zaksiegowalby
+                // kwote po niewlasciwej stronie.
+                if (rodzaje.length === 1 && (rodzaje[0] === 'penalty' || rodzaje[0] === 'discount')){
+                    balClaimIds(claims).forEach(function (id){
+                        if (needClaims.indexOf(id) < 0) needClaims.push(id);
+                    });
+                    const inf = balClaimInfo(claims, claimData);
+                    if (inf.missing.length){
+                        // Rozroznienie jest tu wazne: „wlasnie pobieram" to nie to samo,
+                        // co „nie ma w prologistics", a dotad oba konczyly sie tym samym
+                        // zdaniem „sprawdz, czy tak ma byc".
+                        warns.push('wiersz ' + no + ': notatka podaje „' + label + '", ale bez kwoty. '
+                            + (pending ? 'Pobieram kwotę roszczenia z prologistics — poczekaj chwilę.'
+                                       : ('Nie znalazłem w prologistics roszczenia nr '
+                                          + inf.missing.join(', ') + ' — sprawdź numer albo dopisz kwotę brutto w 6. kolumnie.')));
+                    } else {
+                        let suma = 0;
+                        inf.recs.forEach(function (r){ suma += Math.abs(Number(r.amt) || 0); });
+                        suma = bal2(suma);
+                        if (suma){
+                            gross = bal2(paid + suma);
+                            diff = suma;
+                            dociagnieta = suma;
+                        } else {
+                            warns.push('wiersz ' + no + ': roszczenie „' + label
+                                + '" ma w prologistics kwotę zerową — księguję sam przelew.');
+                        }
+                    }
+                }
+            }
             const base = { id: order, debit: debit, credit: credit, comment: '', loading: false, error: null, line: no, supplier: f[0], noStatus: true, sub: isSub, cont: hasCont ? cont : '', src: 'bal' };
 
             addPaid(f[0], paid);
@@ -10603,7 +10662,14 @@
             if (!diff) {
                 const desc = hasCont ? cont : label;
                 if (!desc) { errors.push('wiersz ' + no + ': nie ma czego wpisać w opis — brak numeru kontenera i brak numeru penalty/overpayment — ' + balShort(line)); continue; }
-                if (hasCont && label) warns.push('wiersz ' + no + ': w opisie idzie numer kontenera (' + cont + '), a notatka wspomina też „' + label + '" bez różnicy kwot — sprawdź, czy tak ma być.');
+                // Tu docieramy juz tylko wtedy, gdy kwoty roszczenia NIE dalo sie ustalic
+                // (inny rodzaj niz penalty/discount albo kilka rodzajow). Powody, ktore
+                // umiemy nazwac, sa zglaszane wyzej — nie powtarzamy ich drugi raz.
+                if (hasCont && label && !warns.some(function (w){ return w.indexOf('wiersz ' + no + ':') === 0; }))
+                    warns.push('wiersz ' + no + ': w opisie idzie numer kontenera (' + cont
+                        + '), a notatka wspomina też „' + label + '" bez kwoty — księguję sam przelew, '
+                        + 'więc jeśli to roszczenie potrąca coś z tego zamówienia, dopisz kwotę brutto '
+                        + 'w 6. kolumnie albo zaksięguj nogę ręcznie.');
                 entries.push(Object.assign({}, base, { amount: balFix(paid), comment: desc, kind: hasCont ? 'kontener' : (claims[0] || '').split(' ')[0] }));
                 continue;
             }
@@ -10649,6 +10715,12 @@
                         '", a w prologistics jako „' + m.prolo + '" — sprawdź numer.');
                 });
             }
+            // Kwota wzieta z prologistics, a nie z arkusza — mowimy o tym wprost, bo to
+            // jedyna liczba w tym wierszu, ktorej uzytkownik nie wpisal sam.
+            if (dociagnieta)
+                warns.push('wiersz ' + no + ': notatka podaje „' + label + '" bez kwoty — wziąłem ją '
+                    + 'z prologistics: ' + balFix(dociagnieta) + '. Przelew ' + balFix(paid)
+                    + ' + roszczenie ' + balFix(dociagnieta) + ' = ' + balFix(gross) + '.');
             // Kazdy rodzaj roszczenia to osobna „druga noga" ze swoim kontem i swoja kwota.
             // Przy jednym rodzaju noga jest jedna i wychodzi dokladnie to, co przed 1.83.
             const legs = [];
@@ -19245,6 +19317,43 @@
             while ((m = re.exec(txt)) !== null){ var dg = normAcc(m[1]); if (dg.length >= 8 && dg.length <= 24 && dg.length > best.length) best = dg; }
             return best;
         }
+        // Ile czekamy na JEDEN plik. Potwierdzenie EPO to jedna strona i 650 znakow,
+        // wiec sekundy wystarcza z zapasem; limit jest po to, zeby zawieszenie nie
+        // zabralo calej listy, a nie po to, zeby przycinac uczciwie dlugie odczyty.
+        var PDF_LIMIT_MS = 25000;
+        // Obietnica, ktora NIE KONCZY SIE WCALE, jest gorsza niz blad: petla czytajaca
+        // staje na pierwszym pliku, pasek zamiera na „Czytam 1/10…" i nie wiadomo ani
+        // ktory plik, ani czy cokolwiek sie dzieje. pdf.js potrafi tak zrobic, gdy nie
+        // uda sie wstac jego workerowi (workerSrc wskazuje na zasob spoza strony).
+        // Zamieniamy to na zwykly, opisany blad przy JEDNYM pliku.
+        function pdfZLimitem(p, ms, opis){
+            var t = null;
+            return Promise.race([
+                Promise.resolve(p).then(function (v){ clearTimeout(t); return v; },
+                                        function (e){ clearTimeout(t); throw e; }),
+                new Promise(function (_, odrzuc){
+                    t = setTimeout(function (){
+                        // Do komunikatu dokladamy to, co rozstrzyga: czy biblioteka
+                        // w ogole jest i na co wskazuje worker. Bez tych dwoch wartosci
+                        // „nie doczekalem sie" nie mowi nic i trzeba zgadywac.
+                        var bib = 'nie wiem', wrk = 'nie wiem';
+                        try {
+                            var l0 = (typeof pdfjsLib !== 'undefined') ? pdfjsLib
+                                   : (window && window.pdfjsLib) || null;
+                            bib = l0 ? ('jest, wersja ' + (l0.version || '?')) : 'BRAK';
+                            wrk = (l0 && l0.GlobalWorkerOptions && l0.GlobalWorkerOptions.workerSrc)
+                                || 'nie ustawiony';
+                        } catch (e0){}
+                        odrzuc(new Error(opis + ' — przerwałem po '
+                             + Math.round(ms / 1000) + ' s. Biblioteka pdf.js: ' + bib
+                             + '. Worker: ' + wrk
+                             + '. Najczęstsza przyczyna to worker, po który pdf.js sięga sam '
+                             + 'w trakcie czytania — jeśli strona go nie przepuści, odczyt '
+                             + 'nie kończy się wcale.'));
+                    }, ms);
+                })
+            ]);
+        }
         function getPdfjs(){
             var lib = null;
             try { if (typeof pdfjsLib !== 'undefined') lib = pdfjsLib; } catch(e){}
@@ -19272,7 +19381,26 @@
             var lib = await getPdfjs();
             if (!lib) return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie (brak pdf.js)' };
             var txt = '', lines = '';
-            try { var doc = await lib.getDocument({ data: u8 }).promise; for (var pg = 1; pg <= doc.numPages; pg++){ var page = await doc.getPage(pg); var tc = await page.getTextContent(); txt += tc.items.map(function(it){ return it.str; }).join(' ') + '\n'; lines += pdfLinesFromItems(tc.items) + '\n'; } } catch(e){ return { manual: true, err: 'PDF \u2013 sprawd\u017a r\u0119cznie' }; }
+            // Ta sama pulapka co przy potwierdzeniach EPO — limit stawiamy tu od razu,
+            // zeby nie zostawic jej obok naprawionej sciezki.
+            try {
+                var w0 = await pdfZLimitem((async function (){
+                    var a = '', b = '';
+                    var doc = await lib.getDocument({ data: u8 }).promise;
+                    for (var pg = 1; pg <= doc.numPages; pg++){
+                        var page = await doc.getPage(pg);
+                        var tc = await page.getTextContent();
+                        a += tc.items.map(function(it){ return it.str; }).join(' ') + '\n';
+                        b += pdfLinesFromItems(tc.items) + '\n';
+                    }
+                    return { txt: a, lines: b };
+                })(), PDF_LIMIT_MS, 'nie doczekałem się tekstu z PDF-a');
+                txt = w0.txt; lines = w0.lines;
+            } catch(e){
+                var m1 = (e && e.message) || '';
+                return { manual: true, err: /przerwałem po/.test(m1) ? m1
+                                          : 'PDF \u2013 sprawd\u017a r\u0119cznie' };
+            }
             var dep = extractPdfDeposit(lines) || extractPdfDeposit(txt);
             var acc = extractPdfAccount(lines) || extractPdfAccount(txt);
             // Do 4.48 P/I w PDF nie zwracalo bloku bankowego W OGOLE, wiec kazdy taki
@@ -20799,8 +20927,19 @@
         // jako „E n d T o E n d I D" i zaden wzorzec go nie lapie.
         // Prog przerwy liczymy z szerokosci poprzedniego znaku, wiec nie zalezy on
         // od rozmiaru pisma.
+        // Tolerancja wysokosci: dwa elementy blizej niz tyle stoja w tym samym wierszu.
+        var PDF_WIERSZ = 3;
         function pdfTekstZPozycji(items){
-            var rows = [];
+            // KUBELKI, a nie przeglad calej listy. Poprzednia wersja szukala wiersza,
+            // przechodzac dla KAZDEGO elementu wszystkie dotychczasowe — przy gesto
+            // rozstawionych wysokosciach (skan, tekst obrocony, uklad wielokolumnowy)
+            // to jest kwadrat: 10 tys. elementow 143 ms, 30 tys. 2,2 s, 60 tys. 13 s.
+            // A przy potwierdzeniu EPO element to POJEDYNCZY GLIF, wiec elementow jest
+            // tyle, co znakow — i odczyt stawal na pierwszym pliku, na glownym watku,
+            // nie odswiezajac nawet paska („Czytam 1/10…" i cisza).
+            // Szerokosc kubelka rowna tolerancji, wiec wiersz w tolerancji lezy w tym
+            // samym kubelku albo w sasiednim — sprawdzamy trzy zamiast wszystkich.
+            var rows = [], kubel = Object.create(null);
             (items || []).forEach(function (it){
                 var s0 = it && it.str;
                 if (s0 == null || s0 === '') return;
@@ -20808,9 +20947,22 @@
                 var w = +it.width || 0;
                 // Niektore PDF-y nie podaja szerokosci — szacujemy ja z rozmiaru pisma.
                 if (!w) w = String(s0).length * (Math.abs(+tr[0]) || 6) * 0.5;
-                var row = null;
-                for (var i = 0; i < rows.length; i++){ if (Math.abs(rows[i].y - y) <= 3){ row = rows[i]; break; } }
-                if (!row){ row = { y: y, items: [] }; rows.push(row); }
+                var k = Math.floor(y / PDF_WIERSZ), row = null, naj = PDF_WIERSZ + 1;
+                for (var d = -1; d <= 1; d++){
+                    var g = kubel[k + d];
+                    if (!g) continue;
+                    for (var i = 0; i < g.length; i++){
+                        var odl = Math.abs(g[i].y - y);
+                        // NAJBLIZSZY, nie pierwszy napotkany. Przy dobrze ulozonym
+                        // dokumencie kandydat jest najwyzej jeden i wychodzi to samo.
+                        if (odl <= PDF_WIERSZ && odl < naj){ naj = odl; row = g[i]; }
+                    }
+                }
+                if (!row){
+                    row = { y: y, items: [] };
+                    rows.push(row);
+                    (kubel[k] = kubel[k] || []).push(row);
+                }
                 row.items.push({ x: x, w: w, s: String(s0) });
             });
             rows.sort(function (a, b){ return b.y - a.y; });
@@ -20836,24 +20988,65 @@
             if (!lib) return { err: 'nie mam pdf.js — nie odczytam tego PDF-a' };
             var txt = '';
             try {
-                var doc = await lib.getDocument({ data: u8 }).promise;
-                for (var pg = 1; pg <= doc.numPages; pg++){
-                    var page = await doc.getPage(pg);
-                    var tc = await page.getTextContent();
-                    txt += pdfTekstZPozycji(tc.items) + '\n';
+                // Limit obejmuje CALY odczyt, nie samo otwarcie: zawiesic sie moze tak samo
+                // pobranie tekstu kolejnej strony.
+                txt = await pdfZLimitem((async function (){
+                    var out = '';
+                    var doc = await lib.getDocument({ data: u8 }).promise;
+                    for (var pg = 1; pg <= doc.numPages; pg++){
+                        var page = await doc.getPage(pg);
+                        var tc = await page.getTextContent();
+                        out += pdfTekstZPozycji(tc.items) + '\n';
+                    }
+                    return out;
+                })(), PDF_LIMIT_MS, 'nie doczekałem się tekstu z PDF-a');
+            } catch (e){
+                var m0 = (e && e.message) || '';
+                // JEDNA PROBA BEZ WORKERA. pdf.js umie pracowac na glownym watku —
+                // wolniej, ale bez sieciowania po zasob, ktorego strona moze nie
+                // przepuscic. Jesli to worker byl winny, plik przeczyta sie teraz
+                // i uzytkownik nie zauwazy niczego. Koszt ponosimy tylko wtedy,
+                // gdy pierwsza proba i tak zawiodla.
+                if (/przerwałem po/.test(m0)){
+                    try {
+                        if (lib.GlobalWorkerOptions) lib.GlobalWorkerOptions.workerSrc = '';
+                        txt = await pdfZLimitem((async function (){
+                            var out = '';
+                            var doc = await lib.getDocument({ data: u8 }).promise;
+                            for (var pg = 1; pg <= doc.numPages; pg++){
+                                var page = await doc.getPage(pg);
+                                var tc = await page.getTextContent();
+                                out += pdfTekstZPozycji(tc.items) + '\n';
+                            }
+                            return out;
+                        })(), PDF_LIMIT_MS, 'nie doczekałem się tekstu z PDF-a (druga próba, bez workera)');
+                    } catch (e2){
+                        return { err: ((e2 && e2.message) || m0) };
+                    }
+                } else {
+                    // Powod przepuszczamy DALEJ tylko przy limicie — zwykly wyjatek
+                    // pdf.js nie mowi uzytkownikowi nic uzytecznego.
+                    return { err: 'nie umiem odczytać tego PDF-a' };
                 }
-            } catch (e){ return { err: 'nie umiem odczytać tego PDF-a' }; }
+            }
             var s0 = txt.replace(/\s+/g, ' ').trim();
             // Druga siatka: etykiety szukane w tekscie ZBITYM. Etykieta jest jednym
             // slowem, wiec zbicie jej nie psuje, a uodparnia odczyt na dowolny sposob
             // rozstawiania znakow w pliku.
             var zb = s0.replace(/\s+/g, '');
-            if (!/EndToEndID/i.test(s0) && !/EndToEndID/i.test(zb))
+            // Etykieta bywa rozstrzelona: „End To End ID". Dopuszczamy odstepy —
+            // do 5.14 trafial w to wylacznie tekst zbity, a on gubi odstepy potrzebne
+            // do zlozenia nazwy pliku.
+            var RE_E2E = /End\s*To\s*End\s*ID/i;
+            if (!RE_E2E.test(s0) && !RE_E2E.test(zb))
                 return { err: 'to nie wygląda na potwierdzenie z EPO (nie ma EndToEndID)',
                          probka: s0.slice(0, 160) };
-            var e2e = (s0.match(/EndToEndID\s*([A-Za-z0-9\-]+)/i)
+            var e2e = (s0.match(/End\s*To\s*End\s*ID\s*([A-Za-z0-9\-]+)/i)
                     || zb.match(/EndToEndID([A-Za-z0-9\-]+?)(?:Transfer|Status|Payment|$)/i) || [])[1] || '';
-            var msg = (s0.match(/Message\s*(.*?)\s*EndToEndID/i) || [])[1] || '';
+            // Tresc przelewu — Z ODSTEPAMI, bo sklada sie z niej nazwa pliku. Zbity
+            // tekst nizej zostaje droga zapasowa, ale on odstepy gubi i modul musial
+            // je potem odtwarzac z numerow zamowien.
+            var msg = (s0.match(/Message\s*(.*?)\s*End\s*To\s*End\s*ID/i) || [])[1] || '';
             // Etykieta i wartosc stoja w dwoch kolumnach i nie zawsze trafiaja do jednej
             // linii — wtedy wzorzec wyzej nie ma czego zlapac. Tekst ZBITY jest na taki
             // uklad odporny: etykieta zostaje etykieta, a numery numerami.
@@ -21408,6 +21601,24 @@
             var status = wp.querySelector('#wp-status');
             var pliki = Array.prototype.slice.call(this.files || []);
             if (!pliki.length) return;
+            // BLAD MA BYC WIDOCZNY. Ta funkcja jest `async`, wiec wyjatek nie wywraca
+            // niczego na wierzchu — zamienia sie w odrzucona obietnice, ktorej nikt nie
+            // odbiera. Pasek zostaje na ostatnim komunikacie, tabela sie nie rysuje
+            // i wyglada to jak zawieszenie. Tak wlasnie wygladal blad przy pustej tabeli
+            // P/I: „Czytam 1/9…" i cisza. Od teraz kazdy blad tej funkcji ląduje w pasku
+            // razem z nazwa pliku, przy ktorym wystapil.
+            var epoPlikTeraz = '';
+            try {
+                await epoWczytajPliki(pliki, status, function (n){ epoPlikTeraz = n; });
+            } catch (e){
+                status.textContent = 'Odczyt przerwany'
+                    + (epoPlikTeraz ? (' przy pliku ' + epoPlikTeraz) : '')
+                    + ': ' + ((e && e.message) || e);
+                status.style.color = '#c00';
+                try { epoRysuj(); } catch (e2){}
+            }
+        };
+        async function epoWczytajPliki(pliki, status, oznacz){
             status.textContent = 'Czytam ' + pliki.length + ' plików…';
             // Wiersze pain sluza do dwoch rzeczy: nazwy beneficjenta (w PDF-ie stoi razem
             // z miastem i krajem) i do sprawdzenia kwoty.
@@ -21416,6 +21627,7 @@
             for (var i = 0; i < pliki.length; i++){
                 var f = pliki[i];
                 status.textContent = 'Czytam ' + (i + 1) + '/' + pliki.length + ' — ' + f.name + '…';
+                if (oznacz) oznacz(f.name);
                 var w = { plik: f.name, blob: f, sel: false, blok: '', uwaga: '' };
                 var info = null;
                 try { info = await pcEpoCzytaj(new Uint8Array(await f.arrayBuffer())); }
@@ -21481,7 +21693,11 @@
                     w.uwaga = 'nie znalazłem tej płatności wśród przetworzonych — nazwa i kwota z PDF-a';
                     w.lekka = true;                       // to nie jest powód, żeby nie wysyłać
                 }
-                else if (w.kwota != null && Math.abs(r.amount - w.kwota) > 0.005)
+                // `r` MUSI byc w warunku. Gdy wiersza nie ma, a tabela jest pusta,
+                // pierwsza galaz nie wchodzi — i ta siegala po `r.amount` na null,
+                // przerywajac odczyt na PIERWSZYM pliku. Pusta tabela to stan normalny
+                // przy samym wrzucaniu potwierdzen, o czym mowi komentarz wyzej.
+                else if (r && w.kwota != null && Math.abs(r.amount - w.kwota) > 0.005)
                     w.uwaga = 'KWOTA: w pliku ' + w.kwota.toFixed(2) + ', a w przelewie ' + r.amount.toFixed(2)
                            + ' — sprawdź, zanim dołączysz';
                 w.nazwa = epoNazwaPliku(w);
@@ -21493,7 +21709,7 @@
             }
             status.textContent = 'Odczytane. Sprawdź tabelę i kliknij „Wyślij zaznaczone".';
             epoRysuj();
-        };
+        }
         wp.querySelector('#wp-upload-pc').onclick = function(){
             var status = wp.querySelector('#wp-status');
             var orders = pcSelectedOrders();
@@ -24637,6 +24853,32 @@
         // NAZWANY. Warunek trzyma sie pelniejszego „BUT INTERNATI", zeby nie zabrac
         // wplat pozostalych Miraklow — one tez przychodza od MANGOPAY.
         { mp: 'But',          ok: false, payer: /MANGOPAY/i, ref: /(BUT\s+INTERNATI)/i },
+        // Maisons du Monde — panel maisonsdumonde-prod.mirakl.net. Placi przez Mangopay,
+        // tytul ma ten sam uklad co Maxeda i But: „Mangopay 328641 MAISONS DU MO
+        // CUSTOMER REF <32 hex>". Nazwa jest przez bank UCIETA („MAISONS DU MO", bez
+        // „NDE") i wzorzec musi sie zaczepiac wlasnie o ten fragment — pelna nazwa nie
+        // trafilaby w nic. Cyfry przed nazwa to numer wyplaty, po ktorym mkMatchCycle
+        // trafia w cykl wprost; hex po „CUSTOMER REF" to identyfikator przelewu Mangopaya
+        // i o rozliczeniu nie mowi nic.
+        // Sprawdzone na sierpniu: 22 151,22 (04.08), 11 558,25 (11.08) i 21 277,38 (21.08)
+        // — ta ostatnia zgadza sie co do grosza z zestawieniem „Maison IT 21.08.2026".
+        { mp: 'Mirakl (Maisons du Monde)', ok: true, payer: /MANGOPAY/i,
+          ref: /\b(\d{4,})\s+MAISONS?\s+DU\s+MO/i,
+          brand: 'Maisons du Monde', short: 'Maisons du Monde',
+          host: 'maisonsdumonde-prod.mirakl.net' },
+        // Gdyby referencji zabraklo albo miala inny ksztalt — wiersz ma zostac NAZWANY.
+        { mp: 'Maisons du Monde', ok: false, payer: /MANGOPAY/i, ref: /(MAISONS?\s+DU\s+MO)/i },
+        // Gamm Vert — panel teractfr-prod.mirakl.net. Na przelewie stoi nazwa GRUPY
+        // („TERACT (GROUP", tez ucieta), a nie sklepu; w arkuszu ten marketplace nazywa
+        // sie Gamm Vert i tak go tu podpisujemy. Nawias w „TERACT (GROUPE)" jest czescia
+        // nazwy, wiec wzorzec konczy sie na samym slowie — dopisanie nawiasu zwiazaloby
+        // regule z tym, ile znakow bank akurat zmiescil.
+        // Sprawdzone na sierpniu: 354,43 (11.08) i 110,07 (18.08) — ta druga to skladnik
+        // rozliczenia 826,64 − 110,07 − 163,01 = 553,56.
+        { mp: 'Mirakl (Gamm Vert)', ok: true, payer: /MANGOPAY/i,
+          ref: /\b(\d{4,})\s+TERACT\b/i,
+          brand: 'Gamm Vert', short: 'Gamm Vert', host: 'teractfr-prod.mirakl.net' },
+        { mp: 'Gamm Vert',      ok: false, payer: /MANGOPAY/i, ref: /(TERACT)/i },
         // Zapasowa: inny, NIEZNANY Mirakl przez MANGOPAY z tym samym ksztaltem referencji.
         // Regula Carrefoura powyzej ma IDENTYCZNY wzorzec ref, wiec ta linia nie odbiera
         // jej niczego — zostaje jako siatka bezpieczenstwa, gdyby doszedl piaty taki sklep.
@@ -43477,6 +43719,34 @@
         // Ile zlapal ktory sposob — para po nazwisku jest slabsza od pary po numerze
         // i raport ma to pokazywac, a nie chowac pod wspolna liczba.
         const jakIle = { id: 0, ref: 0, kwota: 0, zwrot: 0 };
+        const SAL_SP_DOBA = 86400000;
+        // Pary, w ktorych wiersz ksiegi ma inna DATE KALENDARZOWA niz wplata.
+        // Albo data ksiegowania jest zla, albo skojarzenie — z danych nie da sie
+        // rozstrzygnac ktore, wiec protokol prosi o SPRAWDZENIE, a nie o poprawke.
+        const zlaData = [];
+        // KTORY wiersz kubelka jest „tym". To rozstrzyga o rozmiarze sekcji bardziej
+        // niz prog: przy naiwnym „pierwszy wiersz" sekcja ma 203 pozycje (199 z nich to
+        // noty kredytowe i storna ksiegowane na koniec miesiaca — maja Z DEFINICJI te sama
+        // kwote co wplata, wiec kontrola kwoty ich nie odsiewa), przy regule ponizej — 4.
+        function slWierszDaty(x, wiersze){
+            const kwx = x.kw == null ? null : Math.abs(Math.round(x.kw * 100));
+            if (kwx == null || !x.chwila) return null;
+            let naj = null;
+            (wiersze || []).forEach(function (y){
+                // 1. Tylko PLATNOSC — i sprawdzamy OBIE rzeczy. Samo „brak CREDIT" nie
+                //    wystarcza: storno auf „15121926 / 3" nie ma tego slowa i rozpoznaje
+                //    je dopiero flaga `zwrot`.
+                if (y.zwrot || /CREDIT/i.test(String(y.aufTekst || ''))) return;
+                // 2. Tylko wiersz O TEJ SAMEJ KWOCIE. Doplata do tego samego auftraga
+                //    stoi w tym samym kubelku i ma wlasna, POPRAWNA date — bez tego
+                //    warunku to ona wygrywalaby jako „najblizsza".
+                if (y.kw == null || Math.abs(Math.round(y.kw * 100)) !== kwx) return;
+                if (!y.chwila) return;
+                // 3. Gdy zostalo kilka — najblizszy w czasie.
+                if (!naj || Math.abs(y.chwila - x.chwila) < Math.abs(naj.chwila - x.chwila)) naj = y;
+            });
+            return naj;
+        }
         function szukajInaczej(x){
             // Doba — i to nie jest zlagodzenie reguly „platnosc co do minuty", tylko inna
             // populacja. Minuta rzadzi ksiegowaniami AUTOMATYCZNYMI, a tu pracujemy
@@ -43485,12 +43755,39 @@
             // Saferpay 20:40, ksiega 11:38 tego samego dnia, ta sama kwota i nazwisko.
             // Poszerzenie z minuty do doby daje 121 -> 183 par, trzy doby nie daja juz nic,
             // a drugi kandydat nie pojawia sie przy zadnym oknie.
-            const tol = 86400000;
-            // 2. Numer auftraga wprost w eksporcie. „Reference number" bywa tez 32-znakowym
-            //    hashem sklepu — bierzemy tylko wtedy, gdy to sa SAME cyfry.
+            // TRZY DOBY, nie jedna. Te wiersze ksieguje sie RECZNIE i data bywa wpisana
+            // zle — auftrag 14262936: wplata 04.07 o 02:09, ksiegowanie 06.07 o 10:48.
+            //
+            // UCZCIWIE O TYM, CO TA LICZBA DAJE: na lipcu i sierpniu koszt jest ZEROWY,
+            // ale zysk TEZ. Przy oknach 1, 2, 3, 5, 7, 10 i 30 dob liczba par nie drgnela
+            // ani razu (3769 / 4215 / 1207), zero nowych, zero straconych. Kortekaasa —
+            // jedyna pare, ktora okno kiedykolwiek kupowalo — bierze teraz parowanie po
+            // NUMERZE AUFTRAGA, kluczem twardszym. To nie sa dwie pary, tylko dwie drogi
+            // do tej samej.
+            //
+            // Okno zostaje jako siatka na miesiace, w ktorych numeru auftraga w referencji
+            // zabraknie, a data bedzie wpisana zle. Zabezpiecza je sekcja „Sprawdz date
+            // ksiegowania": para zlapana szerszym oknem ma z definicji rozjazd ponad dobe,
+            // wiec kazda sie tam pokaze i zaden bledny wybor nie przejdzie po cichu.
+            //
+            // SZERZEJ NIE. Ochrona bierze sie WYLACZNIE stad, ze parowanie po identyfikatorze
+            // zabiera 99,5% ksiegi i tutaj dochodzi 1-8 platnosci na komplet. Przy tak pustej
+            // puli 3, 10 i 30 dob daje ten sam wynik, wiec pomiar nie odroznia tych wartosci
+            // i zadnej z nich nie uzasadnia. Zrodlo bez kolumny „Transaction ID" odslonilo by
+            // cala pule naraz — i wtedy szersze okno zaczyna GUBIC pary, bo warunek
+            // „dokladnie jeden kandydat" przestaje byc spelniony.
+            const tol = 3 * SAL_SP_DOBA;
+            // 2. Numer auftraga wprost w eksporcie. Rozbieramy tym samym slAuftrag,
+            //    co reszta modulu — bo „Reference number" bywa zapisany jako
+            //    „14262936 / 3" i warunek „same cyfry" go wywalal, mimo ze ksiega ma
+            //    dokladnie taki auftrag. Od SIEDMIU cyfr w gore: auftragi maja tu osiem,
+            //    a krotkie numery z tego pola (29022, 667671 — ten drugi jest numerem
+            //    TICKETU) nie prowadza do zadnego zamowienia. „Reference number" bywa tez
+            //    32-znakowym hashem sklepu — ten odpada sam, bo nie jest numerem.
             const ref = String(x.ref == null ? '' : x.ref).trim();
-            if (/^[0-9]{4,}$/.test(ref) && poAuf[ref] && poAuf[ref].length)
-                return { w: poAuf[ref].slice(), jak: 'ref' };
+            const refA = slAuftrag(ref);
+            if (refA && String(refA.nr).length >= 7 && poAuf[refA.nr] && poAuf[refA.nr].length)
+                return { w: poAuf[refA.nr].slice(), jak: 'ref' };
             // Po numerze TICKETU nie parujemy — patrz komentarz przy budowie `poTicket`.
             // 3. Kwota i nazwisko, w oknie czasu. Tylko przy JEDNYM kandydacie: brak pary
             //    jest mniej szkodliwy niz para zla.
@@ -43530,6 +43827,19 @@
                 }
             }
             if (x.jak) jakIle[x.jak]++;
+            // Para powstala, ale NIE PO CICHU. Znacznik zapalamy na KAZDEJ drodze, takze
+            // po identyfikatorze: pod regula wyboru wiersza para po identyfikatorze nie
+            // odpala go ani razu (0 na 9 137 par; mediana rozjazdu 8 s, 99. centyl 326 s),
+            // wiec nic to nie kosztuje — a jest jedynym miejscem, gdzie wyszloby na jaw,
+            // gdyby ksiegowanie automatyczne kiedys zaczelo sie rozjezdzac.
+            // Prog DZIENNY, nie godzinowy: godzina przy ksiegowaniu recznym to godzina
+            // siedzenia przy komputerze, nie godzina wplaty — w danych stoi ksiegowanie
+            // o 07:48 przy wplacie o 19:08 tego samego dnia.
+            if (y && x.jak){
+                const wd = slWierszDaty(x, y.w);
+                const dn = wd ? slDni(x.data, wd.data) : 0;
+                if (wd && dn >= 1) zlaData.push({ x: x, y: wd, dni: dn, jak: x.jak });
+            }
             // Terminal sprawdzamy NIEZALEZNIE od tego, czy transakcja jest zaksiegowana:
             // zly wybor jest bledem sam w sobie.
             if (SAL_SP_NIEUZYWANE.indexOf(x.term) >= 0) nieuzywany.push(x);
@@ -43694,8 +44004,34 @@
                 });
                 return d;
             };
-            k.sort(function (p, q){ return dyst(p) - dyst(q); });
+            // NAZWISKO ma pierwszenstwo przed data. Stoi w obu plikach, a parowanie
+            // zwrotow go nie uzywalo — przez to zwrot Sjerpsa dostawal note de Cloe,
+            // a oba wlasciwe wiersze ladowaly w dwoch roznych sekcjach brakow.
+            // To PREFERENCJA, nie warunek: czesc rozjazdow jest prawidlowa, bo placi
+            // firma albo fundacja („De IJsfabriek" za „Remery"). Gdy zaden kandydat nie
+            // pasuje nazwiskiem, wybor jest taki jak dotad.
+            const poNazwisku = function (g){
+                return (x.tok || []).some(function (q){
+                    return g.some(function (y){ return (y.tok || []).indexOf(q) >= 0; });
+                }) ? 0 : 1;
+            };
+            // DOBA KALENDARZOWA przed zegarem. Wiersze zwrotu w ksiedze nie maja godziny
+            // — stoi przy nich 00:00:00 — wiec zwrot z 29.07 o 13:42 ma do polnocy
+            // wlasnego dnia 13 h 42 min, a do polnocy nastepnego tylko 10 h 18 min.
+            // Sam zegar wybieral przez to note z JUTRA. Zegar zostaje jako remis.
+            const dniKal = function (g){
+                let d = 9999;
+                g.forEach(function (y){ d = Math.min(d, slDni(x.data, y.data)); });
+                return d;
+            };
+            k.sort(function (p, q){
+                return (poNazwisku(p) - poNazwisku(q))
+                    || (dniKal(p) - dniKal(q))
+                    || (dyst(p) - dyst(q));
+            });
             x.wielu = k.length;
+            // Do protokolu: para po nazwisku jest mocniejsza niz para po samej dacie.
+            x.poNazwisku = poNazwisku(k[0]) === 0;
             wezZwrot(x, k[0]);
         });
         jakIle.zwrot = zwrotSpar.length;
@@ -43716,7 +44052,7 @@
                  zgodne: zgodne, rozne: rozne, tylkoSP: tylkoSP,
                  tylkoPL: tylkoPL, zlyTerm: zlyTerm, nieuzywany: nieuzywany,
                  zwrotBezPary: zwrotNieznane, zwrotSpar: zwrotSpar,
-                 wTicketach: wTicketach, jakIle: jakIle };
+                 wTicketach: wTicketach, jakIle: jakIle, zlaData: zlaData };
     }
 
     async function salRysujSP(){
@@ -44467,6 +44803,49 @@
                 if (wolneZw.length > 300)
                     h += '<div style="font-size:11px;color:#888">…i ' + (wolneZw.length - 300) + ' dalszych.</div>';
             }
+        }
+
+        // ---------- rozjazd daty ksiegowania ----------
+        // Para powstala, ale siegnela po wiersz odlegly o wiecej niz dobe. Sekcja NICZEGO
+        // NIE ROZSTRZYGA: albo data jest zla, albo skojarzenie. Dlatego prosi o sprawdzenie,
+        // a nie o poprawke — „popraw date" bylo by przy blednym skojarzeniu poleceniem
+        // falszywym, a takie polecenie jest gorsze niz jego brak, bo zostanie wykonane.
+        const zd = (r.zlaData || []).slice().sort(function (a, b){ return b.dni - a.dni; });
+        h += sek('Sprawdź datę księgowania — para spoza zwykłego okna (' + zd.length + ')');
+        if (!zd.length){
+            h += '<div style="color:#6b7280;font-size:12px">Nie ma — każda para trafiła w wiersz z tego samego dnia.</div>';
+            L.push(''); L.push('SPRAWDZ DATE KSIEGOWANIA: brak');
+        } else {
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+               + 'Kwota się zgadza, ale data księgowania jest odległa od daty wpłaty o więcej niż dobę. '
+               + 'Te wpłaty księguje się ręcznie, więc <b>albo ktoś wpisał złą datę</b> — wtedy popraw ją '
+               + 'w programie księgowym — <b>albo skojarzenie jest błędne</b> i trzeba je odrzucić. '
+               + 'Otwórz auftrag i sprawdź, o co chodzi. Para po <b>numerze auftraga</b> jest pewna '
+               + '(oba systemy podają ten sam numer zamówienia), po <b>kwocie i nazwisku</b> — tylko prawdopodobna.'
+               + '</div>';
+            h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
+               + '<tr><td style="' + TH + '">auftrag</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<td style="' + TH + '">wpłata (Saferpay)</td><td style="' + TH + '">księgowanie</td>'
+               + '<td style="' + TH + ';text-align:right">różnica</td>'
+               + '<td style="' + TH + '">po czym sparowane</td></tr>';
+            L.push(''); L.push('SPRAWDZ DATE KSIEGOWANIA — PARA SPOZA ZWYKLEGO OKNA (' + zd.length + ')');
+            zd.forEach(function (z){
+                const jak = z.jak === 'ref' ? 'numer auftraga'
+                          : (z.jak === 'id' ? 'numer transakcji' : 'kwota i nazwisko');
+                const dni = z.dni + (z.dni === 1 ? ' dzień' : ' dni');
+                h += '<tr><td style="' + TD + ';font-size:11px">' + slAufKom(z.y.auf, z.y.aufTekst) + '</td>'
+                   + '<td style="' + TDR + '">' + kw(Math.abs(z.x.kw || 0)) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(z.x.data || '') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(z.y.data || '') + '</td>'
+                   + '<td style="' + TDR + '">' + dni + '</td>'
+                   + '<td style="' + TD + ';font-size:11px' + (z.jak === 'kwota' ? ';color:#a15c00' : '') + '">'
+                   + jak + '</td></tr>';
+                L.push('  ' + ((z.y.auf ? (z.y.auf.nr + ' / ' + z.y.auf.txn) : (z.y.aufTekst || '?')))
+                     + '  ' + kw(Math.abs(z.x.kw || 0))
+                     + '  wplata ' + (z.x.data || '') + '  ksiegowanie ' + (z.y.data || '')
+                     + '  roznica ' + dni + '  po: ' + jak);
+            });
+            h += '</table>';
         }
 
         // ---------- noty kredytowe z ticketow ----------
