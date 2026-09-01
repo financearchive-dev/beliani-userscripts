@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.19
+// @version      5.20
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -2634,6 +2634,14 @@
         return ctx.iframe.contentDocument || ctx.iframe.contentWindow.document;
     }
 
+    function getFrameHtml(ctx = defaultFrameCtx) {
+        // v5.20. SUROWE zrodlo strony pobranej fetch-em. Potrzebne, bo status auftragu
+        // („Deleted"/„Active") stoi w zrodle tylko jako wartosc dla skryptu strony —
+        // patrz deletedFromSource. Ramka go nie ma i nie musi: tam plakietka jest juz
+        // zlozona i widac ja w drzewie.
+        return ctx._html || '';
+    }
+
     function getFrameWin(ctx = defaultFrameCtx) {
         // ZABEZPIECZENIE. Okno ramki sluzy wylacznie do ZAPISU (klikniecia, zmiany pol).
         // Gdy biezaca strona pochodzi z fetch-a, zyje w dokumencie odlaczonym od ramki —
@@ -2932,6 +2940,9 @@
             const tParse = performance.now();
             ksDodajCzas('odczyt: sieć', tParse - t0);
             ctx._doc = new DOMParser().parseFromString(txt, 'text/html');
+            // v5.20: obok drzewa trzymamy tekst strony — status auftragu da sie odczytac
+            // TYLKO z niego, bo plakietke w naglowku dokladaja skrypty strony.
+            ctx._html = txt;
             // Parsowanie liczymy OSOBNO od sieci, bo to dwie zupelnie rozne dzwignie.
             // search.php ma ponad megabajt i jesli jego rozbior kosztuje sekundy, da sie
             // to naprawic bez ruszania czegokolwiek po stronie zapisu.
@@ -2945,6 +2956,7 @@
             // Nie udalo sie — wracamy na ramke. Szybka droga nigdy nie moze zablokowac
             // ksiegowania; najgorsze, co wolno jej zrobic, to byc rownie wolna jak stara.
             ctx._doc = null;
+            ctx._html = null;
             try { ksLog('odczyt', 'fetch NIEUDANY (' + ((e && e.message) || e) + ') → wracam na ramkę  ' + ksUrlKrotko(url)); } catch (e2){}
             await loadInFrame(url, ms, ctx);
             return false;
@@ -2956,6 +2968,7 @@
         // zabezpieczenia: kazda sciezka zapisu zaczyna sie od loadInFrame, wiec po niej
         // getFrameDoc znow oddaje ZYWY dokument ramki.
         ctx._doc = null;
+        ctx._html = null;
         const effectiveMs = Math.round(ms * tmTimeoutMultiplier);
         const t0 = performance.now();
         return new Promise((resolve, reject) => {
@@ -3761,8 +3774,50 @@
         return { ok: true };
     }
 
-    function isAuctionDeleted(doc) {
-        try { return !!(doc && doc.querySelector('.auftrag-status--deleted')); } catch (e) { return false; }
+    // Status auftragu prosto z SUROWEGO zrodla strony. Serwer wpisuje tam linie
+    //     const isDeleted = +"1";
+    // i dopiero skrypt strony sklada z niej plakietke w naglowku:
+    //     `<span class="auftrag-status auftrag-status${isDeleted ? '--deleted' : '--active'}">`
+    // Dlatego w HTML-u z fetcha klasy „auftrag-status--deleted" NIE MA — jest tylko
+    // regula CSS o tej nazwie, ta sama na kazdej stronie auftragu, takze zywego.
+    // (Szukanie tej nazwy w tekscie strony mowilo wiec „skasowany" ZAWSZE. Tak wygladal
+    //  przebieg z 1.09: dwie sprawdzane pozycje, obie „Auftrag jest Deleted", obie zle.)
+    //
+    // Ta linia dotyczy TEJ transakcji — strona jest renderowana pod number+txnid —
+    // i wystepuje w zrodle dokladnie raz. Sprawdzone na 15222935/3 (skasowany).
+    // Rozstrzygamy tylko wartosci, ktore znamy; cokolwiek innego to null, nie zgadujemy.
+    function deletedFromSource(html) {
+        const m = String(html || '').match(/\bconst\s+isDeleted\s*=\s*([^;\n]{0,40});/);
+        if (!m) return null;
+        const v = m[1].replace(/[\s+"']/g, '').toLowerCase();
+        if (v === '1' || v === 'true') return true;
+        if (v === '0' || v === '' || v === 'false' || v === 'null') return false;
+        return null;
+    }
+
+    // Czy auftrag jest skasowany: true, false albo NULL — „nie wiadomo". Trzeci stan
+    // jest tu najwazniejszy i wolajacy MUSI go odroznic od false: „nie wiadomo" nie ma
+    // prawa niczego zablokowac.
+    function auctionDeletedState(doc, html) {
+        // 1. Gotowa plakietka w naglowku. Jest w stronie WYRENDEROWANEJ (ramka) i opisuje
+        //    te transakcje, ktora czytamy — wiec rozstrzyga.
+        try {
+            const nag = doc && doc.querySelector('h1.header-title, .header-title');
+            const stat = nag ? nag.querySelector('[class*="auftrag-status--"]') : null;
+            if (stat) return /auftrag-status--deleted/i.test(String(stat.className || ''));
+        } catch (e) {}
+        // 2. Znacznik w zrodle — to jedyna droga przy „szybkim odczycie".
+        const zZrodla = deletedFromSource(html);
+        if (zZrodla !== null) return zZrodla;
+        // 3. Ostatnia szansa: jeden jedyny znacznik statusu na stronie moze byc tylko jej
+        //    wlasny. Przy kilku NIE zgadujemy — strona wymienia takze pozostale transakcje
+        //    tego numeru i wystarczylaby jedna skasowana, zeby zywy auftrag wyszedl na
+        //    skasowany (15409076/3, Praxis NL).
+        try {
+            const wsz = doc ? doc.querySelectorAll('[class*="auftrag-status--"]') : [];
+            if (wsz.length === 1) return /auftrag-status--deleted/i.test(String(wsz[0].className || ''));
+        } catch (e) {}
+        return null;
     }
 
     async function detectVatRefund(orderNumber, amount, bookingDate, ctx = defaultFrameCtx) {
@@ -3771,6 +3826,9 @@
         const expectedAbs = Math.abs(parseFloat(normalizeAmount(amount)));
         const ticketsByAuction = {}; // v3.33: linki ticketów z tego samego wejścia co Payments
         let anyDeleted = false;
+        // Stan skasowania KAZDEGO znalezionego auftragu — po to, zeby wiersz z bledem
+        // mogl go pokazac bez powtornego czytania strony. Wartosci: true / false / null.
+        const stanUsun = {};
         // Zwrot w obcej walucie z nadplata na auftragu. NIE jest to sciezka VAT (ta jest
         // polska i tylko dla PLN) — to kandydat do WYBORU miejsca ksiegowania, ktory
         // rozstrzyga czlowiek. Zapamietujemy pierwszy pasujacy auftrag.
@@ -3780,7 +3838,11 @@
             // ticketow i parsujemy tabele platnosci. Zadnego zapisu.
             // Pomiar z 4.18: te trzy wczytania to bylo 28,9 s z 91,5 s calego przebiegu.
             if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(500);
-            if (isAuctionDeleted(getFrameDoc(ctx))) { anyDeleted = true; continue; } // Deleted -> nie księgujemy
+            const stanU = auctionDeletedState(getFrameDoc(ctx), getFrameHtml(ctx));
+            stanUsun[auctionUrl] = stanU;
+            // Pomijamy tylko przy PEWNYM „skasowany". Przy null („nie wiadomo") pozycja
+            // idzie dalej jak dotad — falszywe pominiecie kosztuje wiecej niz proba.
+            if (stanU === true) { anyDeleted = true; continue; }
             ticketsByAuction[auctionUrl] = getTicketLinks(ctx);
             const payments = parsePaymentsTable(getFrameDoc(ctx));
             if (!payments.found || payments.rows.length === 0) continue;
@@ -3803,7 +3865,7 @@
             // v3.32: jest nadpłata (ujemny open) w PLN, ale 1 stawka VAT i kwota z Excela nie pasuje do open amount
             // → to wariant VAT z błędną kwotą; zgłoś błąd kwoty i NIE szukaj ticketu.
             if (!vatCorrected && !matchesExcel) {
-                return { applicable: false, amountMismatch: true, auctionUrl, openAmount: payments.openAmount, expectedAbs, search, ticketsByAuction };
+                return { applicable: false, amountMismatch: true, auctionUrl, openAmount: payments.openAmount, expectedAbs, search, ticketsByAuction, stanUsun };
             }
             return {
                 applicable: true, auctionUrl,
@@ -3814,7 +3876,7 @@
                 search
             };
         }
-        return { applicable: false, obcyKand: obcyKand, deleted: anyDeleted && Object.keys(ticketsByAuction).length === 0, search, ticketsByAuction };
+        return { applicable: false, obcyKand: obcyKand, deleted: anyDeleted && Object.keys(ticketsByAuction).length === 0, search, ticketsByAuction, stanUsun };
     }
 
     // opisPlatnosci: przy polskim zwrocie VAT zostaje „VAT refund" (domyslnie, bez zmian).
@@ -4043,11 +4105,13 @@
         let preSearch = null;
         let preTickets = null;
         let obcyKand = null;
+        let stanUsun = null;                 // v5.20: auftrag -> skasowany? (true/false/null)
         try {
             const vat = await detectVatRefund(orderNumber, amount, bookingDate, ctx);
             preSearch = vat.search || null;
             preTickets = vat.ticketsByAuction || null;
             obcyKand = vat.obcyKand || null;
+            stanUsun = vat.stanUsun || null;
             if (vat.applicable) {
                 return {
                     ok: true, vatRefund: true, vatAuctionUrl: vat.auctionUrl,
@@ -4063,7 +4127,8 @@
                     ok: false,
                     error: `Kwota z Excela (${normalizeAmount(amount)}) nie pasuje do open amount (PLN ${Number(vat.openAmount).toFixed(2)}). Sprawdź kwotę — ticket nie był sprawdzany.`,
                     reportType: 'amount_mismatch',
-                    auctionUrls: vat.auctionUrl ? [vat.auctionUrl] : []
+                    auctionUrls: vat.auctionUrl ? [vat.auctionUrl] : [],
+                    stanUsun
                 };
             }
             if (vat.deleted) {
@@ -4072,7 +4137,8 @@
                     error: 'Auftrag jest Deleted — pomijam (nic nie księguję).',
                     reportType: 'deleted',
                     deleted: true,
-                    auctionUrls: (preSearch && preSearch.urls) || []
+                    auctionUrls: (preSearch && preSearch.urls) || [],
+                    stanUsun
                 };
             }
         } catch (e) { preSearch = null; }
@@ -4087,7 +4153,8 @@
                 checkedTickets: found.checkedTickets || 0,
                 noSolutionTickets: found.noSolutionTickets || [],
                 allCandidates: found.allCandidates || [],
-                auctionUrls: found.auctionUrls || []
+                auctionUrls: found.auctionUrls || [],
+                stanUsun
             };
         }
 
@@ -5870,6 +5937,36 @@
         return td;
     }
 
+    // v5.20: kratka do ODCZYTU — dla wiersza, ktorego i tak nie da sie zaznaczyc.
+    // Ten sam wyglad co makePopupEditTd, tylko bez olowka: nie ma czego zapisywac,
+    // a chodzi o to, zeby bylo widac kwote, konto i date.
+    function makeReadTd(value, minWidth) {
+        const td = document.createElement('td');
+        td.style.cssText = `padding:4px 6px;border:1px solid #e5e7eb;min-width:${minWidth};font-size:12px;color:#374151;`;
+        td.textContent = (value === 0 || value) ? String(value) : '—';
+        return td;
+    }
+
+    // v5.20: co stoi w kolumnie „Status" wiersza z bledem — tam, gdzie przy zwyklym
+    // wierszu jest Open/Closed. Czytamy TYLKO to, co ustalilo sprawdzanie (row.stanUsun);
+    // zadnego dodatkowego pobierania strony tu nie ma, bo przy szybkim odczycie i tak
+    // nie dalo by odpowiedzi — patrz auctionDeletedState.
+    function ksOpisUsuniecia(row, urls) {
+        const lista = (urls && urls.length) ? urls : (row.auctionUrls || []);
+        if (!lista.length) return '<span style="color:#9ca3af;" title="Nie znaleziono auftragu — nie ma czego sprawdzać">—</span>';
+        const stan = row.stanUsun || {};
+        const wiele = lista.length > 1;
+        return lista.map(u => {
+            const m = String(u).match(/number=(\d+)/);
+            const num = m ? m[1] : '';
+            const pre = (wiele && num) ? `<span style="color:#6b7280;font-family:monospace;">#${num}</span> ` : '';
+            const s = stan[u];
+            if (s === true)  return pre + '<span style="color:#dc2626;font-weight:700;">🗑️ DELETED</span>';
+            if (s === false) return pre + '<span style="color:#6b7280;">✔️ nie skasowany</span>';
+            return pre + '<span style="color:#9ca3af;" title="Nie znalazłem na stronie auftragu ani plakietki statusu, ani linii „const isDeleted” — nie zgaduję.">? nie ustaliłem</span>';
+        }).join('<br>');
+    }
+
     function createTr(row, i) {
         const tr = document.createElement('tr');
         tr.dataset.row = i;
@@ -5917,17 +6014,38 @@
             }
             tr.appendChild(tdTicket);
 
-            // Pozostałe kolumny (Status, Gdzie księgować, Kwota, Konto, Data) zwijamy w jedną z błędem
-            const tdErr = document.createElement('td');
-            tdErr.colSpan = 5;
-            tdErr.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;color:#dc2626;white-space:normal;word-break:break-word;font-size:11px;line-height:1.35;';
-            tdErr.textContent = row.error;
-            tr.appendChild(tdErr);
+            // v5.20: kolumny Kwota / Konto / Data NIE sa juz zwijane. Wiersz z bledem
+            // mowil dotad tylko „Brak ticketu" i nie bylo z niego widac, NA JAKA KWOTE,
+            // na KTORE KONTO i z JAKA DATA szedl zwrot — a wlasnie z tym trzeba pojsc do
+            // prologistics recznie. Te trzy wartosci sa w wierszu od chwili wklejenia
+            // listy i nikt ich nie czysci, wiec pokazanie ich nic nie kosztuje.
+            // Tresc bledu przenosi sie do ostatniej kolumny, obok „❌ błąd".
 
-            // Status weryfikacji
+            // Status — przy bledzie nie ma Open/Closed, wiec stoi tu odpowiedz na pytanie
+            // „czy auftrag jest skasowany", ustalona przy sprawdzaniu pozycji.
+            const tdDel = document.createElement('td');
+            tdDel.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;white-space:nowrap;font-size:11px;line-height:1.35;';
+            tdDel.innerHTML = ksOpisUsuniecia(row, urls);
+            tr.appendChild(tdDel);
+
+            // Gdzie księgować — przy błędzie nie ma czego wybierać.
+            const tdGdzieE = document.createElement('td');
+            tdGdzieE.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;';
+            tr.appendChild(tdGdzieE);
+
+            tr.appendChild(makeReadTd(row.amount, '70px'));
+            tr.appendChild(makeReadTd(row.accountNum, '70px'));
+            tr.appendChild(makeReadTd(row.bookingDate, '100px'));
+
+            // Status weryfikacji — tu stoi teraz TAKZE tresc bledu. Wpisujemy ja przez
+            // textContent, bo to tekst z serwera: przy innerHTML wystarczyloby, zeby
+            // komunikat niosl „<", i wiersz rozjechalby sie na widoku.
             const tdS = document.createElement('td');
-            tdS.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;text-align:center;';
-            tdS.innerHTML = '<span style="color:#dc2626">❌ błąd</span>';
+            tdS.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;text-align:center;white-space:normal;word-break:break-word;min-width:130px;';
+            const spErr = document.createElement('span');
+            spErr.style.cssText = 'color:#dc2626;font-size:11px;line-height:1.35;';
+            spErr.textContent = `❌ błąd: ${row.error}`;
+            tdS.appendChild(spErr);
             tr.appendChild(tdS);
             return tr;
         }
@@ -6316,6 +6434,7 @@
                     previewRows[i].checkedAuctions = result.checkedAuctions || 0;
                     previewRows[i].checkedTickets = result.checkedTickets || 0;
                     previewRows[i].auctionUrls = result.auctionUrls || [];
+                    previewRows[i].stanUsun = result.stanUsun || null;
                     previewRows[i].noSolutionTickets = result.noSolutionTickets || [];
                 }
             } catch (e) {
@@ -6453,6 +6572,7 @@
                 previewRows[i].checkedAuctions = checkResult.checkedAuctions || 0;
                 previewRows[i].checkedTickets = checkResult.checkedTickets || 0;
                 previewRows[i].auctionUrls = checkResult.auctionUrls || [];
+                previewRows[i].stanUsun = checkResult.stanUsun || null;
                 logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong> — ${checkResult.error}`;
                 logRow.style.color = '#dc2626';
                 updateRow(i);
@@ -27513,10 +27633,14 @@
     // ani „1071", ani niczego, co by je rozroznialo.
     const MK_ALLE_SPRZ = {
         'BELIANI':   { acc: '1071', nazwa: 'Allegro Beliani' },
-        '58578594':  { acc: '1071', nazwa: 'Allegro Beliani' }
-        // 1069 („Allegro Beliani Polska") — DOPISZ tu login i SellerId, gdy beda znane.
-        // Do tego czasu pliki tego konta nie rozpoznaja sie same i modul o tym powie,
-        // zamiast przypisac je po cichu do 1071.
+        '58578594':  { acc: '1071', nazwa: 'Allegro Beliani' },
+        // 1069 („Allegro Beliani Polska"). Login i numer wprost z raportow zamowien:
+        // dwanascie miesiecy archiwum, 7 501 wierszy, wszystkie z jednym sprzedawca
+        // „BELIANI_POLSKA" o numerze 29243126. Ten sam numer stal w pliku od dawna
+        // w konfiguracji modulu zwrotow (`pl1069`) — nigdy nie zostal tu przepisany.
+        // Oba klucze, bo nie kazdy eksport ma komplet kolumn, a wystarczy jeden z nich.
+        'BELIANI_POLSKA': { acc: '1069', nazwa: 'Allegro Beliani Polska' },
+        '29243126':       { acc: '1069', nazwa: 'Allegro Beliani Polska' }
     };
     // Sprzedawcow, ktorych nie ma w tabeli, modul UCZY SIE od uzytkownika: przy pierwszym
     // pliku pyta raz i zapamietuje. Lepsze niz wpisywanie na sztywno, bo pierwsze
