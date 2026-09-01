@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.20
+// @version      5.21
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -43383,8 +43383,15 @@
     function slCzytajPL(wiersze, konto) {
         const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
         const K = {};
+        // „VAT Account" i „Invoice Date" DOPISANE — bez nich obie ponizsze rzeczy byly
+        // martwe, choc kod pod nie napisano:
+        //   * vat: warunek „rozne konto VAT" ponizej porownywal dwa puste napisy, wiec
+        //     ZAWSZE wychodzil na rowne i wykrywanie przeksiegowan VAT nigdy nie ruszalo.
+        //     Na sierpniu to 1 para na koncie 1156 (119,99) i 13 par na 1022 (8 749,70),
+        //     z ktorych kazda podnosila OBIE strony porownania o te sama kwote;
+        //   * fdata: data faktury rozstrzyga, czy numer platnosci ma prawo byc w eksporcie.
         ['Payment Date', 'Amount', 'Comment', 'Debit', 'Credit', 'Name', 'Invoice Number',
-         'Auftrag number', 'Transaction ID']
+         'Auftrag number', 'Transaction ID', 'VAT Account', 'Invoice Date']
             .forEach(function (k) { K[k] = h.indexOf(k); });
         if (K['Amount'] < 0 || K['Debit'] < 0 || K['Comment'] < 0)
             throw new Error('to nie wygląda na eksport płatności — brak kolumn Amount/Debit/Comment');
@@ -43403,6 +43410,10 @@
                           // Konto VAT rozstrzyga, czy para storno+ksiegowanie jest
                           // PRZEKSIEGOWANIEM PODATKU, czy zwyklym odwroceniem.
                           vat: String(r[K['VAT Account']] == null ? '' : r[K['VAT Account']]).replace(/\.0$/, ''),
+                          // Data faktury: KIEDY powstala sprzedaz, ktorej dotyczy wiersz.
+                          // Jedyne pole, ktorym da sie SPRAWDZIC — a nie zalozyc — ze
+                          // numeru platnosci nie ma prawa byc w tym eksporcie.
+                          fdata: slData(r[K['Invoice Date']]),
                           auf: slAuftrag(r[K['Auftrag number']]),
                           // Surowy tekst kolumny. slAuftrag oddaje OBIEKT albo null —
                           // przy „CREDIT 11374974 TICKET 662028" null, bo to nie numer.
@@ -44769,8 +44780,20 @@
         const TH = 'padding:4px 6px;font-weight:400;color:#888;border-bottom:1px solid #e5e5e5';
         const TD = 'padding:3px 6px';
         const TDR = 'padding:3px 6px;text-align:right;font-variant-numeric:tabular-nums';
-        const sek = function (t){
-            return '<div style="margin:12px 0 4px;font-size:11px;letter-spacing:.06em;'
+        // v5.21. Sekcje powstaja w kolejnosci, w jakiej liczy je kod, a czytac trzeba
+        // je w zupelnie innej: najpierw CZEGO BRAKUJE i po ktorej stronie, potem co
+        // sprawdzic, a na koncu dlaczego czegos w porownaniu nie ma. Zamiast przestawiac
+        // siedemset linii, kazda sekcja zostawia ZNACZNIK — ten sam w HTML-u i w tekscie
+        // do schowka — a skladanie na koncu funkcji (tnijH/tnijL + UKLAD) tnie po nim
+        // i uklada sekcje w zadanej kolejnosci.
+        // Dzieki temu tresc sekcji zostaje nietknieta, zmienia sie tylko ich porzadek.
+        const SEKZ = '\u0001SEK:';
+        const sek = function (t, klucz){
+            // Znacznik do schowka ida ZAWSZE — takze dla sekcji, ktore nic nie pisza
+            // do L. Inaczej ciecie tekstu rozjechaloby sie z cieciem HTML-a.
+            L.push(SEKZ + (klucz || '?'));
+            return '<!--' + SEKZ + (klucz || '?') + '-->'
+                 + '<div style="margin:12px 0 4px;font-size:11px;letter-spacing:.06em;'
                  + 'text-transform:uppercase;color:#750000;font-weight:700">' + t + '</div>';
         };
         const kw = function (v){ return (Math.round(v * 100) / 100).toFixed(2); };
@@ -44791,7 +44814,7 @@
         if (r.sp.zawezenie) L.push('zawezone do: ' + r.sp.zawezenie
             + (r.sp.wszystkich ? (' — ' + r.sp.poz.length + ' z ' + r.sp.wszystkich) : ''));
 
-        h += sek('Zestawienie zbiorcze')
+        h += sek('Zestawienie zbiorcze', 'zbiorcze')
           + '<table style="border-collapse:collapse;font-size:12px;width:100%">'
           + '<tr><td style="' + TD + '">transakcji w Saferpayu</td><td style="' + TDR + '">' + r.sp.poz.length + '</td></tr>'
           + '<tr><td style="' + TD + '">wierszy w Export payments</td><td style="' + TDR + '">' + r.pl.poz.length
@@ -44859,7 +44882,7 @@
                  + '<td style="' + TDR + ';color:' + (Math.abs(roz) < 0.005 ? '#0a7a2f' : '#b45309')
                  + ';font-weight:700">' + kw(roz) + '</td></tr>';
         };
-        h += sek('Wpłaty i zwroty — sumy');
+        h += sek('Wpłaty i zwroty — sumy', 'sumy');
         h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
            + '<tr><td style="' + TH + '"></td>'
            + '<td style="' + TH + ';text-align:right" colspan="2">Saferpay</td>'
@@ -44887,7 +44910,7 @@
         const vp = r.vatPrzeks || [];
         if (vp.length){
             const sumaVp = vp.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
-            h += sek('Przeksięgowania VAT — poza porównaniem (' + vp.length + ')');
+            h += sek('Przeksięgowania VAT — poza porównaniem (' + vp.length + ')', 'vat');
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
                + 'Klient podał numer VAT UE, więc faktura poszła na 0%. Wpłata przyszła już '
                + 'z podatkiem, więc księgowo <b>wyksięgowano ją w całości i zaksięgowano z powrotem</b> '
@@ -44928,7 +44951,7 @@
             // Bez „⚠": to nie jest blad ani zly terminal (ta sekcja ma wlasna, osobna
             // liste). To brakujace PRZYPISANIE terminala do konta — i tak wlasnie
             // ma sie czytac, bo inaczej wyglada na usterke ksiegowania.
-            h += sek('Poza uzgodnieniem — terminal nieprzypisany do konta (' + poza.length + ')');
+            h += sek('Poza uzgodnieniem — terminal nieprzypisany do konta (' + poza.length + ')', 'poza');
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Te transakcje są '
                + '<b>w walucie tego konta</b>, ale stoją na terminalu, którego nie ma na jego liście, '
                + 'więc do uzgodnienia nie weszły. <b>To nie znaczy, że terminal jest zły</b> — '
@@ -44966,7 +44989,7 @@
         const wgl = (r.sp.poz || []).filter(function (x){ return x.wglad; });
         if (wgl.length){
             const sumaWg = wgl.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
-            h += sek('Do wglądu — terminal innej spółki (' + wgl.length + ')');
+            h += sek('Do wglądu — terminal innej spółki (' + wgl.length + ')', 'wglad');
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Wpłaty w walucie tego '
                + 'konta, ale z terminala należącego do innej spółki. <b>To nie jest błąd</b> — '
                + 'weszły do uzgodnienia normalnie i liczą się we wszystkich sumach. '
@@ -44994,7 +45017,7 @@
         }
 
         // ---------- 1. zly terminal ----------
-        h += sek('Zły terminal (' + r.zlyTerm.length + ')');
+        h += sek('Zły terminal (' + r.zlyTerm.length + ')', 'zlyTerm');
         h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Terminale ręczne — '
            + 'wybiera je człowiek, więc tylko tu da się wybrać nie ten. Rozstrzyga waluta: '
            + 'żadne inne pole eksportu nie mówi, czyja to płatność.</div>';
@@ -45028,7 +45051,7 @@
 
         // ---------- 2. roznice kwot ----------
         const podw = r.rozne.filter(function (x){ return x.podwojne; });
-        h += sek('Różnice kwot (' + r.rozne.length + ')');
+        h += sek('Różnice kwot (' + r.rozne.length + ')', 'rozne');
         L.push(''); L.push('ROZNICE KWOT (' + r.rozne.length + ')');
         if (!r.rozne.length){
             h += '<div style="color:#0a7a2f;font-size:12px">Nie ma — każda dopasowana transakcja zgadza się co do grosza.</div>';
@@ -45088,23 +45111,54 @@
             });
             (sameZwroty ? zwBezTx : plBezTx).push(x);
         });
-        h += sek('W księdze, a nie ma w Saferpayu (' + r.tylkoPL.length + ')');
-        L.push(''); L.push('W KSIEDZE, A NIE MA W SAFERPAYU (' + r.tylkoPL.length + ')');
+        // TEZE SPRAWDZAMY, ZAMIAST JA POWTARZAC. „Zwrot dotyczy platnosci sprzed okresu"
+        // brzmi rozsadnie, ale dopoki nikt tego nie liczyl, bylo to zalozenie — a pod nim
+        // moglaby sie chowac realna luka. Rozstrzyga DATA FAKTURY: gdy sprzedaz jest
+        // wczesniejsza niz pierwsza transakcja w eksporcie, numeru platnosci nie ma prawa
+        // tu byc i nie ma czego szukac. Gdy jest pozniejsza — numer POWINIEN tu stac,
+        // a jego brak jest pytaniem i wchodzi do „Do wyjasnienia".
+        //
+        // Sprawdzone 1.09.2026 na czterech ukladach (sierpien i lipiec+sierpien, konta
+        // 1156 i 1022): regula wyjasnia 693 z 693 kubelkow, zero nierozstrzygnietych.
+        // Poszerzenie eksportu o lipiec zbija ich liczbe ze 160 do 49 (1156) i z 533
+        // do 183 (1022) — czyli dokladnie tyle, ile znajduje sie w lipcowej czesci pliku.
+        let spOd = '';
+        (r.sp.poz || []).forEach(function (x){ if (x.data && (!spOd || x.data < spOd)) spOd = x.data; });
+        const zwStare = [], zwPytanie = [];
+        zwBezTx.forEach(function (x){
+            let f = '';
+            ((x.y && x.y.w) || []).forEach(function (y){ if (y.fdata && (!f || y.fdata < f)) f = y.fdata; });
+            x.fdata = f;
+            // Bez daty faktury NIE zgadujemy — taki wiersz idzie do pytan.
+            ((f && spOd && f < spOd) ? zwStare : zwPytanie).push(x);
+        });
+        h += sek('Wpłaty i zwroty — jest w księdze, nie ma w Saferpayu (' + r.tylkoPL.length + ')', 'plBrak');
+        L.push(''); L.push('WPLATY I ZWROTY — JEST W KSIEDZE, NIE MA W SAFERPAYU (' + r.tylkoPL.length + ')');
         if (!r.tylkoPL.length){
             h += '<div style="color:#0a7a2f;font-size:12px">Nie ma.</div>';
             L.push('  brak');
         } else {
             h += '<table style="border-collapse:collapse;font-size:12px;width:100%;margin-bottom:6px">'
-               + '<tr><td style="' + TD + '">zwroty i noty kredytowe</td><td style="' + TDR + ';color:#0a7a2f">'
-               + zwBezTx.length + '</td></tr>'
+               + '<tr><td style="' + TD + '">zwroty i noty — faktura sprzed eksportu</td>'
+               + '<td style="' + TDR + ';color:#0a7a2f">' + zwStare.length + '</td></tr>'
+               + '<tr><td style="' + TD + '">zwroty i noty — <b>numer powinien tu być</b></td><td style="' + TDR
+               + (zwPytanie.length ? ';color:#b45309;font-weight:700' : ';color:#0a7a2f') + '">' + zwPytanie.length + '</td></tr>'
                + '<tr><td style="' + TD + '">płatności</td><td style="' + TDR
                + (plBezTx.length ? ';color:#b45309' : ';color:#0a7a2f') + '">' + plBezTx.length + '</td></tr></table>';
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
-               + '<b>Zwrot</b> bez transakcji w eksporcie tłumaczy się sam: dotyczy płatności sprzed '
-               + 'okresu, więc jej numeru w tym pliku nie ma i być nie może. '
-               + '<b>Płatność</b> bez transakcji to co innego — zaksięgowano coś na koncie Saferpaya, '
+               + '<b>Zwrot</b> bez transakcji w eksporcie zwykle tłumaczy się sam: dotyczy płatności '
+               + 'sprzed okresu, więc jej numeru w tym pliku nie ma i być nie może. Nie zakładam tego '
+               + '— <b>sprawdzam po dacie faktury</b>: eksport zaczyna się '
+               + (spOd ? ('<b>' + salEsc(spOd) + '</b>') : '(nie znam daty)')
+               + ', więc sprzedaż wcześniejsza niż ta data zamyka sprawę. '
+               + (zwPytanie.length
+                   ? ('<b>' + zwPytanie.length + '</b> zwrotów jej nie zamyka — ich faktura jest '
+                      + 'z okresu eksportu, więc numer płatności powinien w nim stać. To pytanie.')
+                   : 'Każdy zwrot z tej sekcji sprawdzian przechodzi — nie ma tu nic do roboty.')
+               + ' <b>Płatność</b> bez transakcji to co innego — zaksięgowano coś na koncie Saferpaya, '
                + 'czego Saferpay nie zna, i to warto sprawdzić.</div>';
-            L.push('  zwroty i noty kredytowe: ' + zwBezTx.length + ' · platnosci: ' + plBezTx.length);
+            L.push('  zwroty i noty: ' + zwStare.length + ' wyjasnionych fakturą sprzed ' + (spOd || '?')
+                 + ' · ' + zwPytanie.length + ' do wyjasnienia · platnosci: ' + plBezTx.length);
             if (plBezTx.length){
                 h += '<div style="font-weight:700;margin:6px 0 3px">Płatności (' + plBezTx.length + ')</div>';
                 h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
@@ -45160,8 +45214,8 @@
                               && r.sp.zawezenie.indexOf('nie znam') < 0);
         const kontoNr = jednoKonto ? String(r.sp.zawezenie).split(' ')[0] : '';
         h += sek(jednoKonto
-            ? ('W eksporcie, a nie zaksięgowane na koncie ' + salEsc(kontoNr) + ' (' + r.tylkoSP.length + ')')
-            : ('Spoza wyeksportowanych kont (' + r.tylkoSP.length + ')'));
+            ? ('Wpłaty — jest w Saferpayu, nie ma na koncie ' + salEsc(kontoNr) + ' (' + r.tylkoSP.length + ')')
+            : ('Spoza wyeksportowanych kont (' + r.tylkoSP.length + ')'), 'spWpl');
         h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
            + (jednoKonto
                ? ('Te transakcje mają walutę i terminal konta ' + salEsc(kontoNr)
@@ -45172,7 +45226,7 @@
            + '</div>';
         L.push('');
         L.push(jednoKonto
-            ? ('W EKSPORCIE, A NIE ZAKSIEGOWANE NA KONCIE ' + kontoNr + ' (' + r.tylkoSP.length + ')')
+            ? ('WPLATY — JEST W SAFERPAYU, NIE MA NA KONCIE ' + kontoNr + ' (' + r.tylkoSP.length + ')')
             : ('SPOZA WYEKSPORTOWANYCH KONT (' + r.tylkoSP.length + ') — to nie blad'));
         const gr = {};
         r.tylkoSP.forEach(function (x){
@@ -45237,7 +45291,7 @@
         // Zwroty bez pary — osobno i bez alarmu. Wrzucone do „nie zaksiegowane" wygladaly
         // jak luka, a sa tylko roznica w tym, jak oba systemy numeruja zwrot.
         const zbp = r.zwrotBezPary || [], zsp = r.zwrotSpar || [];
-        h += sek('Zwroty (' + (zsp.length + zbp.length) + ')');
+        h += sek('Zwroty — jest w Saferpayu, nie ma w księdze (' + zbp.length + ')', 'spZwr');
         h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
            + 'Saferpay nadaje zwrotowi <b>własny</b> numer, a prologistics księguje go pod numerem '
            + 'płatności, której dotyczy — po numerze nie ma więc czego szukać. Paruję je po '
@@ -45259,7 +45313,8 @@
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Zwrot bywa zaksięgowany '
                + '<b>pozycja po pozycji</b> — 3 000 w Saferpayu to 1 500 + 1 500 w księdze, bo artykuły '
                + 'są dwa. Takie składam po nocie kredytowej: wszystkie jej wiersze to jeden zwrot.</div>';
-        L.push(''); L.push('ZWROTY — sparowane: ' + zsp.length
+        L.push('ZWROTY — JEST W SAFERPAYU, NIE MA W KSIEDZE (' + zbp.length + ')');
+        L.push('  sparowane: ' + zsp.length
              + (rozbite.length ? (' (w tym rozbitych na pozycje: ' + rozbite.length + ')') : '')
              + ' · bez pary: ' + zbp.length);
         if (!zbp.length){
@@ -45379,7 +45434,7 @@
         // a nie o poprawke — „popraw date" bylo by przy blednym skojarzeniu poleceniem
         // falszywym, a takie polecenie jest gorsze niz jego brak, bo zostanie wykonane.
         const zd = (r.zlaData || []).slice().sort(function (a, b){ return b.dni - a.dni; });
-        h += sek('Sprawdź datę księgowania — para spoza zwykłego okna (' + zd.length + ')');
+        h += sek('Sprawdź datę księgowania — para spoza zwykłego okna (' + zd.length + ')', 'zlaData');
         if (!zd.length){
             h += '<div style="color:#6b7280;font-size:12px">Nie ma — każda para trafiła w wiersz z tego samego dnia.</div>';
             L.push(''); L.push('SPRAWDZ DATE KSIEGOWANIA: brak');
@@ -45432,7 +45487,7 @@
         (r.wTicketach || []).forEach(function (x){
             if (x.wTickecie) spDoNoty[String(x.wTickecie)] = x;
         });
-        h += sek('Wpłaty zaksięgowane w tickecie — do ręcznego przeklikania (' + zTicketu.length + ')');
+        h += sek('Wpłaty zaksięgowane w tickecie — do ręcznego przeklikania (' + zTicketu.length + ')', 'wTickecie');
         if (!zTicketu.length){
             h += '<div style="color:#6b7280;font-size:12px">Nie ma.</div>';
             L.push(''); L.push('WPLATY ZAKSIEGOWANE W TICKECIE: brak');
@@ -45465,9 +45520,123 @@
                 h += '<div style="font-size:11px;color:#888">…i ' + (zTicketu.length - 400) + ' dalszych.</div>';
         }
 
+        // ---------- DO WYJASNIENIA ----------
+        // Jedna tabela na gorze, ktorej dotad nie bylo. Reszta protokolu odpowiada na
+        // pytanie „co sie z czym zgadza"; ta odpowiada na jedyne pytanie, z ktorym
+        // siada sie do tego raportu: CO ZOSTALO DO ZROBIENIA i po ktorej stronie.
+        // Budujemy ja na koncu, bo dopiero tu znane sa wszystkie liczby — a na gore
+        // trafia i tak, bo o kolejnosci decyduje skladanie nizej, a nie miejsce w kodzie.
+        const sumaKw = function (lista, we){
+            let s = 0;
+            (lista || []).forEach(function (x){ s += Math.abs(Number(we(x)) || 0); });
+            return Math.round(s * 100) / 100;
+        };
+        // Zwrot bez pary to DWIE rozne sprawy i sam licznik by je zlepil: „nie ma wiersza
+        // na te kwote" to luka, a „tylko jako platnosc" to przypadkowa zbieznosc kwot,
+        // przy ktorej nie ma czego szukac. Do podsumowania idzie sama luka.
+        const zbpLuka = zbp.filter(function (x){ return /nie ma wiersza/.test(String(x.powod || '')); });
+        const POZ = [
+            ['glowa', 'Saferpay ma, w księdze nie ma', null, null],
+            ['brak',  'wpłaty', r.tylkoSP.length, sumaKw(r.tylkoSP, function (x){ return x.kw; })],
+            ['brak',  'zwroty — realna luka', zbpLuka.length, sumaKw(zbpLuka, function (x){ return x.kw; })],
+            ['cicho', 'zwroty — zbieżność kwot, nie ma czego szukać',
+                      zbp.length - zbpLuka.length, sumaKw(zbp.filter(function (x){ return !/nie ma wiersza/.test(String(x.powod || '')); }), function (x){ return x.kw; })],
+            ['glowa', 'Księga ma, w Saferpayu nie ma', null, null],
+            ['brak',  'wpłaty', plBezTx.length, sumaKw(plBezTx, function (x){ return x.y.suma; })],
+            ['brak',  'zwroty i noty — numer powinien być w eksporcie',
+                      zwPytanie.length, sumaKw(zwPytanie, function (x){ return Math.abs(x.y.zwrot || 0) + Math.abs(x.y.kredyt || 0); })],
+            ['cicho', 'zwroty i noty — faktura sprzed eksportu, sprawdzone',
+                      zwStare.length, sumaKw(zwStare, function (x){ return Math.abs(x.y.zwrot || 0) + Math.abs(x.y.kredyt || 0); })],
+            ['glowa', 'Do sprawdzenia', null, null],
+            ['brak',  'różnice kwot', r.rozne.length, sumaKw(r.rozne, function (x){ return x.roz; })],
+            ['brak',  'zły terminal', r.zlyTerm.length, sumaKw(r.zlyTerm, function (x){ return x.x && x.x.kw; })],
+            ['brak',  'data poza zwykłym oknem', zd.length, sumaKw(zd, function (x){ return x.x && x.x.kw; })],
+            ['brak',  'wpłaty zaksięgowane w tickecie', zTicketu.length, sumaKw(zTicketu, function (y){ return y.kw; })]
+        ];
+        let doZrobienia = 0;
+        POZ.forEach(function (p){ if (p[0] === 'brak') doZrobienia += (p[2] || 0); });
+        h += sek('Do wyjaśnienia (' + doZrobienia + ')', 'dowyj');
+        h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Wszystko, co nie sparowało '
+           + 'się samo — po obu stronach naraz. Szarym drukiem to, co tłumaczy się samo '
+           + 'i nie wymaga niczego.</div>';
+        h += '<table style="border-collapse:collapse;font-size:12px;width:100%">';
+        L.push(''); L.push('DO WYJASNIENIA (' + doZrobienia + ')');
+        POZ.forEach(function (p){
+            if (p[0] === 'glowa'){
+                h += '<tr><td colspan="3" style="' + TD + ';font-weight:700;padding-top:7px">'
+                   + salEsc(p[1]) + '</td></tr>';
+                L.push('  ' + p[1] + ':');
+                return;
+            }
+            const zero = !p[2];
+            const kol = p[0] === 'cicho' ? '#888' : (zero ? '#0a7a2f' : '#b45309');
+            h += '<tr><td style="' + TD + ';padding-left:16px;color:' + (p[0] === 'cicho' ? '#888' : 'inherit') + '">'
+               + salEsc(p[1]) + '</td>'
+               + '<td style="' + TDR + ';color:' + kol + ';font-weight:' + (zero ? '400' : '700') + '">' + p[2] + '</td>'
+               + '<td style="' + TDR + ';color:' + kol + '">' + (p[2] ? kw(p[3]) : '—') + '</td></tr>';
+            L.push('    ' + p[1] + ': ' + p[2] + (p[2] ? (' na ' + kw(p[3])) : ''));
+        });
+        h += '</table>';
+
+        // ---------- SKLADANIE ----------
+        // Kolejnosc czytania, nie liczenia. Pasy oddzielaja to, co wymaga ręki, od tego,
+        // co tylko tlumaczy, dlaczego czegos w porownaniu nie ma.
+        const UKLAD = [
+            ['',                                 ['zbiorcze', 'sumy', 'dowyj']],
+            ['Saferpay ma, w księdze nie ma',    ['spWpl', 'spZwr']],
+            ['Księga ma, w Saferpayu nie ma',    ['plBrak']],
+            ['Do sprawdzenia',                   ['rozne', 'zlyTerm', 'zlaData', 'wTickecie']],
+            ['Dlaczego czegoś tu nie ma',        ['vat', 'poza', 'wglad']]
+        ];
+        // HTML tniemy po komentarzu-znaczniku, tekst do schowka po linii-znaczniku.
+        // Co przed pierwszym znacznikiem — naglowek protokolu — zostaje na gorze.
+        const tnijH = function (s){
+            const cz = s.split('<!--' + SEKZ), mapa = {};
+            for (let i = 1; i < cz.length; i++){
+                const p = cz[i].indexOf('-->');
+                mapa[cz[i].slice(0, p)] = cz[i].slice(p + 3);
+            }
+            return { pre: cz[0], mapa: mapa };
+        };
+        const tnijL = function (lista){
+            const pre = [], mapa = {};
+            let cel = null;
+            lista.forEach(function (w){
+                if (String(w).indexOf(SEKZ) === 0){ cel = String(w).slice(SEKZ.length); mapa[cel] = []; return; }
+                (cel === null ? pre : mapa[cel]).push(w);
+            });
+            return { pre: pre, mapa: mapa };
+        };
+        const H = tnijH(h), LL = tnijL(L);
+        // Sekcja, ktorej w ukladzie nie wymieniono, NIE moze przepasc po cichu —
+        // dopisujemy ja na koncu. Inaczej dolozenie sekcji w przyszlosci znikaloby
+        // z raportu bez sladu i nikt by nie wiedzial dlaczego.
+        const uzyte = {};
+        UKLAD.forEach(function (p){ p[1].forEach(function (k){ uzyte[k] = 1; }); });
+        const reszta = Object.keys(H.mapa).filter(function (k){ return !uzyte[k]; });
+        if (reszta.length) UKLAD.push(['Pozostałe', reszta]);
+
+        let hh = H.pre;
+        const LO = LL.pre.slice();
+        UKLAD.forEach(function (para){
+            const tytul = para[0], klucze = para[1].filter(function (k){ return H.mapa[k] != null; });
+            if (!klucze.length) return;
+            if (tytul){
+                hh += '<div style="margin:18px 0 0;padding:6px 8px;background:#F6E7E6;'
+                    + 'border-left:3px solid #750000;border-radius:4px;font-size:12px;'
+                    + 'font-weight:700;color:#750000">' + salEsc(tytul) + '</div>';
+                LO.push(''); LO.push('=== ' + tytul.toUpperCase() + ' ===');
+            }
+            klucze.forEach(function (k){
+                hh += H.mapa[k];
+                (LL.mapa[k] || []).forEach(function (w){ LO.push(w); });
+            });
+        });
+        h = hh;
+
         h += '</div>';
         d.innerHTML = h;
-        SAL_SPWYNIK = L.join('\n');
+        SAL_SPWYNIK = LO.join('\n');
         const kop = document.getElementById('sal-spkop');
         if (kop) kop.style.display = '';
     }
