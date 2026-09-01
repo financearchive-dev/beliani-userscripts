@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.18
+// @version      5.19
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -31329,9 +31329,22 @@
         const t = Date.parse(String(v || ''));
         return isNaN(t) ? null : t;
     }
+    // KIEDY TEN CYKL TRAFIL DO BANKU. Najpierw data PRZELEWU, gdy panel ja podaje —
+    // to ona odpowiada dacie z wyciagu. Data zamkniecia cyklu jest tylko przyblizeniem
+    // i przy Vente rozjezdza sie z przelewem o OSIEM DNI: cykl 9f0c3716 zamknal sie
+    // 2026-08-20 (UTC), a pieniadze poszly 2026-08-28 i weszly na konto 31.08.
+    // Liczone od zamkniecia dawalo to jedenascie dni i wypadalo poza najszersze okno
+    // dopasowania (dziesiec) — cykl byl niewidoczny mimo zgodnej co do grosza kwoty.
+    // Uwaga na strefe: panel pokazuje „21 Aug 00:01", bo dolicza CEST do 22:01 UTC.
+    // Modul czyta UTC, wiec z ekranu wychodzi dzien wczesniej niz z danych.
+    //
+    // Data zamkniecia zostaje droga zapasowa: nie kazdy operator podaje date przelewu,
+    // a cykl jeszcze nierozliczony nie ma jej z definicji.
     function mkCycDay(c){
-        return mkDay(c && (c.dateCreated || c.creationDate || c.endDate || c.dateEnd ||
-                           (c.period && (c.period.endDate || c.period.end))));
+        const p = c && c.payOut;
+        const wyplata = p && (p.transactionDate || p.paymentDate || p.date);
+        return mkDay(wyplata || (c && (c.dateCreated || c.creationDate || c.endDate || c.dateEnd ||
+                                       (c.period && (c.period.endDate || c.period.end)))));
     }
     function mkNear(list, dateStr, days){
         const d = mkDay(dateStr);
@@ -31464,11 +31477,27 @@
             'na które jesteś teraz zalogowany — zaloguj się na kolejne i kliknij ' +
             '„⬇ Pobierz zestawienia" jeszcze raz. Zlecenie czeka, nie trzeba go zakładać od nowa.'
     };
+    // Rozliczenia POMINIETE, bo raz juz zostaly sprawdzone i odrzucone. Pomijanie jest
+    // sluszne — bez niego przelot po kilkunastu sklepach wracalby w kolko do tego samego
+    // blednego kandydata — ale bylo NIEWIDOCZNE. „Nie znalazlem" brzmialo tak samo
+    // wtedy, gdy w panelu naprawde nic nie ma, i wtedy, gdy wlasciwy cykl lezy na liscie
+    // odrzuconych. To sa dwie rozne sytuacje i prowadza do dwoch roznych ruchow.
+    function mkPominiete(j){
+        const t = (j && j.tried) || [];
+        if (!t.length) return '';
+        return ' Pominąłem ' + t.length + ' rozliczen' + (t.length === 1 ? 'ie' : 'ia')
+             + ' sprawdzone wcześniej i odrzucone, bo kwota się nie zgadzała: '
+             + t.slice(0, 5).map(function (x){ return String(x).slice(0, 8); }).join(', ')
+             + (t.length > 5 ? ' …' : '')
+             + '. Jeśli właściwe jest wśród nich, wskaż je ręcznie z listy rozliczeń —'
+             + ' wtedy ta lista czyści się sama.';
+    }
     function mkCoWPanelu(list, j){
         const kand = mkKandydaci(list, j);
         if (!kand.length)
             return 'w panelu nie ma żadnego rozliczenia zamkniętego w okolicy ' + j.date
                  + ' (±10 dni). Sprawdź, czy wypłata jest już widoczna w panelu.'
+                 + mkPominiete(j)
                  + (MK_LOGIN_NA_KRAJ[String((j && j.host) || '')]
                     ? (' ' + MK_LOGIN_NA_KRAJ[String(j.host)]) : '');
         // Zdanie o osobnych loginach doklejamy do KAZDEJ odpowiedzi dla takiego panelu —
@@ -31505,12 +31534,6 @@
             // wyplaty jest wystarczajaco jednoznaczna, o ile pasuje DOKLADNIE JEDNA.
             const byAmt = mkMatchAmt(near, amount);
             if (byAmt) return byAmt;
-            // Home24 zostawia payOut.reference puste i nie podaje kwoty wyplaty w wykazie
-            // cykli. Cykle sa jednak co ~10 dni, wiec w oknie +-3 dni od daty przelewu
-            // zostaje zwykle DOKLADNIE JEDEN — i to on. Nie jest to dowod, tylko poszlaka,
-            // dlatego pozycja dostaje o tym adnotacje, a kontrola netto i tak porownuje
-            // pozniej wyplate z kwota z wyciagu i zablokuje import, gdyby sie nie zgadzalo.
-            if (near.length === 1) return near[0];
         }
         // Okno +-3 dni wystarcza, dopoki cykl zamyka sie tuz przed przelewem. BRW lamie
         // to zalozenie: cykl konczy sie w czwartek o 22:00 UTC, Mirakl zleca wyplate tej
@@ -31535,6 +31558,19 @@
             const poKwocie = mkMatchAmt(szerzej, amount);
             if (poKwocie) return poKwocie;
         }
+        // NA KONCU, a nie przed dopasowaniem po kwocie. Home24 zostawia payOut.reference
+        // puste i nie podaje kwoty wyplaty w wykazie cykli. Cykle sa jednak co ~10 dni,
+        // wiec w oknie +-3 dni od daty przelewu zostaje zwykle DOKLADNIE JEDEN — i to on.
+        // Nie jest to dowod, tylko poszlaka, dlatego pozycja dostaje o tym adnotacje,
+        // a kontrola netto i tak porownuje pozniej wyplate z kwota z wyciagu.
+        //
+        // DLACZEGO NA KONCU. Dopoki ten krok stal PRZED dopasowaniem po kwocie w oknie
+        // szerokim, zjadal mu kandydatow: przy przelocie po trzynastu sklepach Vente
+        // na kazdym z nich lapal cudzy cykl, ktory akurat byl jedyny w okolicy daty
+        // przelewu, odrzucal go na kwocie i dopisywal do `tried` — a wlasciwy cykl,
+        // zamkniety dziesiec dni wczesniej i zgodny CO DO GROSZA, nie mial jak dojsc
+        // do glosu. Poszlaka nie moze wyprzedzac dowodu.
+        if (near && near.length === 1) return near[0];
         return mkMatchIn(list || [], ref);
     }
 
@@ -38189,6 +38225,23 @@
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
             let ok = 0, seen = 0; const problem = [];
+            // NOWY PRZELOT ZACZYNA OD ZERA. `tried` chroni przed zapetleniem w obrebie
+            // JEDNEGO przebiegu — modul obchodzi kilkanascie sklepow panelu i bez niej
+            // wracalby w kolko do tego samego, blednego kandydata. Ale przezywala takze
+            // MIEDZY przebiegami, a czyscila sie wylacznie przy recznym wskazaniu cyklu.
+            // Cykl raz odrzucony znikal wiec dla zlecenia na zawsze i zadna pozniejsza
+            // poprawka dobierania nie miala na czym zadzialac. Czyscimy ja tutaj: w trakcie
+            // przelotu dziala jak dotad, a nastepny zaczyna z pelnym wyborem.
+            (function (){
+                const jj = jobsLoad();
+                let n = 0;
+                Object.keys(jj).forEach(function (k){
+                    const j = jj[k];
+                    if (!mkTodo(j) || !(j.tried || []).length) return;
+                    j.tried = []; n++;
+                });
+                if (n) jobsSave(jj);
+            })();
             if (galx){
                 seen++;
                 try { ok += await mkPrzelot('Galaxus', 'galx', MK_GALX_HOST, 'Galaxus', galxPass); }
@@ -38295,8 +38348,11 @@
                     // Bez tego lista odwiedzonych sklepow nie trafiala nigdzie, a przy
                     // kilkunastu sklepach to wlasnie ona rozstrzyga, czy modul w ogole
                     // wszedl tam, gdzie trzeba.
+                    // Ta sama informacja co wyzej — bo po przelocie po wszystkich sklepach
+                    // to wlasnie ten opis zostaje przy zleceniu.
+                    const pom = mkPominiete(mkWzorHost(host));
                     mkPowodHost(host, host + ': przelot przeszedł, ale nie znalazł tego rozliczenia.'
-                        + gdzie
+                        + gdzie + pom
                         + (mdOk || (' Sprawdź, czy jesteś zalogowany na ' + mkPanelUrl(host)
                                     + ' i czy wypłata jest już widoczna w panelu.')), false, true,
                         /^Sklep .*?:/);
