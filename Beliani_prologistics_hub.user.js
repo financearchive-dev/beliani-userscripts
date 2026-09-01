@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.16
+// @version      5.17
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25458,6 +25458,15 @@
                   host: 'teractfr-prod.mirakl.net' },
         '2004': { mp: 'Mirakl (BRW)', brand: 'Black Red White', short: 'BRW', host: 'blackredwhitepl-prod.mirakl.net' },
         '3514': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' },
+        // Vente FR — sklep 2005. Panel podaje tu nazwe „Beliani", bez kraju, wiec bez
+        // wlasnej etykiety te pieniadze zapisalyby sie pod kluczem wspolnym dla
+        // wszystkich krajow Vente, a arkusz ma dla kazdego osobne konto (FR = 1360,
+        // DE = 1114, ES = 1104, IT = 1113 …). Tak samo rozwiazany jest Leroy: jeden host,
+        // kilka krajow, numer sklepu jako jedyne pewne rozroznienie.
+        // Numer wprost z prawdziwego rozliczenia (417 wierszy, wszystkie „Shop ID 2005",
+        // kanal „France channel", wyplata z referencja VEN293900).
+        '2005': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente',
+                  host: 'venteunique-prod.mirakl.net', shop: 'Vente Unique FR' },
         // Shop ID wprost z kolumny „Shop ID" trzech prawdziwych eksportow Carrefoura —
         // ta sama wartosc w kazdym wierszu kazdego z nich, tak jak przy pozostalych.
         '3052': { mp: 'Mirakl (Carrefour)', brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net' },
@@ -41345,6 +41354,91 @@
         out.push([st, linia.length]);
         return out;
     }
+    // ---------- wplata przeklikana przez ticket ----------
+    // Wiersz „CREDIT … TICKET …" bywa WPLATA, a nie zwrotem: konto banku stoi wtedy po
+    // stronie Debit. Taki dokument ma isc do SESAM-a w ukladzie WPLATY — dokladnie tym
+    // samym, co zwykly „Auction". Wychodzil w ukladzie mieszanym: kwoty na odwrotnych
+    // kontach, a linia VAT z kierunkiem i kontem przeciwstawnym jak przy zwrocie.
+    //
+    // Separator wykrywamy, bo plik z prologistics ma przecinki, a ten sam plik zapisany
+    // przez Excela ma srednik i inaczej nie dalo by sie go otworzyc.
+    function fxSep(naglowek){
+        return (naglowek.split(';').length > naglowek.split(',').length) ? ';' : ',';
+    }
+    function fxZamienTickety(tekst, konto){
+        const kt = String(konto == null ? '' : konto).trim();
+        if (!kt) return { tekst: tekst, zamienione: [], pominiete: [] };
+        const eol = tekst.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+        const lin = tekst.split(/\r?\n/);
+        if (!lin.length) return { tekst: tekst, zamienione: [], pominiete: [] };
+        const sep = fxSep(lin[0]);
+        const head = lin[0].split(sep).map(function (x){ return x.trim(); });
+        const iBlg = head.indexOf('Blg'), iKto = head.indexOf('Kto'), iSH = head.indexOf('S/H');
+        const iGK = head.indexOf('GKto'), iSId = head.indexOf('SId'), iSIx = head.indexOf('SIdx');
+        const iM = head.indexOf('Netto'), iN = head.indexOf('Steuer');
+        const iBT = head.indexOf('BTyp'), iTx = head.indexOf('Tx1');
+        if ([iBlg, iKto, iSH, iGK, iSId, iM, iN, iBT, iTx].some(function (x){ return x < 0; }))
+            return { tekst: tekst, zamienione: [], pominiete: [] };
+
+        const dok = {};
+        for (let r = 1; r < lin.length; r++){
+            if (!lin[r].trim()) continue;
+            const p = lin[r].split(sep);
+            if (p.length !== head.length) continue;
+            const b = (p[iBlg] || '').trim();
+            (dok[b] = dok[b] || []).push({ r: r, p: p });
+        }
+        const zamienione = [], pominiete = [];
+        Object.keys(dok).forEach(function (b){
+            const g = dok[b];
+            const tx1 = (g[0].p[iTx] || '').trim();
+            // Tylko noty z ticketu — i tylko te zaksiegowane jako WPLATA.
+            if (!/CREDIT[\s\S]*TICKET/i.test(tx1)) return;
+            const bank = g.filter(function (w){ return (w.p[iKto] || '').trim() === kt; })[0];
+            if (!bank) return;
+            if ((bank.p[iSH] || '').trim().toUpperCase() !== 'S') return;   // zwrot — zostawiamy
+            const vat = g.filter(function (w){ return (w.p[iBT] || '').trim() === '2'; });
+            const inne = g.filter(function (w){ return (w.p[iBT] || '').trim() !== '2'; });
+            const drugi = inne.filter(function (w){ return w !== bank; })[0];
+            const zSId = inne.filter(function (w){ return (w.p[iSId] || '').trim(); });
+            // Wzorzec musi sie zgadzac CO DO SZTUKI. Cicha przerobka dokumentu, ktorego
+            // nie rozumiemy, byla by tu najgorszym mozliwym zachowaniem.
+            if (inne.length !== 2 || !drugi || zSId.length !== 1){
+                pominiete.push({ blg: b, tx1: tx1,
+                                 powod: 'układ dokumentu inny niż znany (' + inne.length
+                                      + ' linie bez VAT, ' + zSId.length + ' z kodem podatku)' });
+                return;
+            }
+            const bezSId = inne.filter(function (w){ return w !== zSId[0]; })[0];
+            const kontoDrugie = (drugi.p[iKto] || '').trim();
+            const przenies = function (cel, zrod){
+                const nowe = cel.p.slice();
+                [iSId, iSIx, iM, iN].forEach(function (k){ if (k >= 0) nowe[k] = zrod.p[k]; });
+                return nowe;
+            };
+            // Budujemy dokument w ukladzie WPLATY — nie „zamieniamy Soll z Haben".
+            // Dzieki temu wynik jest poprawny niezaleznie od tego, jak byl ulozony,
+            // a dokument juz poprawny zostaje bez zmian.
+            const nBank = przenies(bank, bezSId);
+            nBank[iKto] = kt; nBank[iSH] = 'S'; nBank[iGK] = kontoDrugie;
+            const nDrugi = przenies(drugi, zSId[0]);
+            nDrugi[iKto] = kontoDrugie; nDrugi[iSH] = 'H'; nDrugi[iGK] = kt;
+            const zmiana = (lin[bank.r] !== nBank.join(sep)) || (lin[drugi.r] !== nDrugi.join(sep));
+            lin[bank.r] = nBank.join(sep);
+            lin[drugi.r] = nDrugi.join(sep);
+            let zmianaVat = false;
+            vat.forEach(function (w){
+                const nv = w.p.slice();
+                nv[iSH] = 'H'; nv[iGK] = kt;               // linia VAT jak przy wplacie
+                if (lin[w.r] !== nv.join(sep)) zmianaVat = true;
+                lin[w.r] = nv.join(sep);
+            });
+            if (zmiana || zmianaVat)
+                zamienione.push({ blg: b, tx1: tx1, kto: kt, gkto: kontoDrugie,
+                                  kwota: (bezSId.p[iM] || '').trim() });
+        });
+        return { tekst: lin.join(eol), zamienione: zamienione, pominiete: pominiete };
+    }
     function fxCsv(tekst, kurs, jedn){
         const eol = tekst.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
         const lin = tekst.split(/\r?\n/);
@@ -41564,7 +41658,11 @@
            // Pudelko oznaczania stoi NAD ustawieniami, a nie pod tabelka postepu —
            // ktos wraca do niego po godzinie, z programu ksiegowego, i ma je zobaczyc
            // od razu po otwarciu panelu, bez przewijania.
-           + '<div id="exp-markbox" style="margin-bottom:10px"></div>';
+           + '<div id="exp-markbox" style="margin-bottom:10px"></div>'
+           // Lista dokumentow z ticketu, ktorym poprawilem uklad kont. Stoi tuz pod
+           // pudelkiem oznaczania, bo to sie sprawdza RAZEM z plikiem, zanim wejdzie
+           // do ksiegowosci — a pasek stanu znika przy nastepnej operacji.
+           + '<div id="exp-tickrap" style="display:none;margin-bottom:10px;padding:7px 9px;border:1px solid #99f6e4;background:#f0fdfa;border-radius:6px"></div>';
 
         h += '<div style="display:flex;gap:10px;align-items:flex-start">';
 
@@ -42199,11 +42297,30 @@
                 if (f.ct.indexOf('text/html') >= 0 || !f.buf.length)
                     throw new Error('zamiast pliku przyszła strona HTML');
                 let buf = f.buf, nazwa = safeName(expAccLabel(a)) + expExt(f.cd, '.xls');
+                // WPLATY PRZEKLIKANE PRZEZ TICKET. Wiersz „CREDIT … TICKET …" bywa
+                // wplata, nie zwrotem, i wychodzil w mieszanym ukladzie kont. Poprawiamy
+                // go PRZED przewalutowaniem, bo tamto wyrownuje kwoty w obrebie dokumentu
+                // i musi widziec juz wlasciwe linie.
+                if (expFileRows(f).typ === 'tekst'){
+                    try {
+                        const zt = fxZamienTickety(
+                            new TextDecoder('utf-8', { fatal: false }).decode(buf), String(a));
+                        if (zt.zamienione.length || zt.pominiete.length){
+                            if (zt.zamienione.length) buf = new TextEncoder().encode(zt.tekst);
+                            st[i].tick = zt;
+                        }
+                    } catch (e){
+                        // Nie udalo sie — plik zostaje NIETKNIETY, a powod ma byc widoczny.
+                        st[i].tickBlad = (e && e.message) || String(e);
+                    }
+                }
                 if (p.fx && fxBy[a] && fxBy[a].cur !== 'CHF'){
                     if (expFileRows(f).typ !== 'tekst')
                         throw new Error('przewalutowanie działa tylko na formatach tekstowych, '
                                       + 'a przyszedł plik binarny — zmień format w profilu');
-                    const w = fxCsv(new TextDecoder('utf-8', { fatal: false }).decode(f.buf),
+                    // Z `buf`, nie z `f.buf` — inaczej przewalutowanie pracowaloby na
+                    // pliku SPRZED poprawki ukladu i zamiana przepadala by po cichu.
+                    const w = fxCsv(new TextDecoder('utf-8', { fatal: false }).decode(buf),
                                     fxBy[a].kurs, fxBy[a].jedn);
                     buf = new TextEncoder().encode(w.tekst);
                     nazwa = nazwa.replace(/(\.[^.]+)$/, ' CHF$1');
@@ -42218,16 +42335,22 @@
                 const fr = expFileRows(f);
                 const nx = fr.n;
                 snaps[i] = { acc: a, label: expAccLabel(a), body: body, vals: rows,
-                             file: files[i].name, xls: nx, ftyp: fr.typ, flipped: [] };
+                             file: files[i].name, xls: nx, ftyp: fr.typ, flipped: [],
+                             tick: st[i].tick || null };
                 if (nx !== null && nx < rows.length){
                     snaps[i].bad = 'w pliku ' + nx + ' ' + plural(nx, 'wiersz', 'wiersze', 'wierszy')
                                  + ', a wysłałem ' + rows.length;
                     st[i].note = 'plik krótszy!';
                     problems.push(expAccLabel(a) + ': ' + snaps[i].bad);
                 } else {
-                    st[i].note = st[i].fx
+                    const tk = st[i].tick;
+                    const opisTk = tk
+                        ? (' · ticket: zamienione ' + tk.zamienione.length
+                           + (tk.pominiete.length ? (', do sprawdzenia ' + tk.pominiete.length) : ''))
+                        : (st[i].tickBlad ? (' · ticket: NIE sprawdziłem (' + st[i].tickBlad + ')') : '');
+                    st[i].note = (st[i].fx
                         ? ('przeliczone, wyrównanych ' + st[i].fx.wyrownanych + ' z ' + st[i].fx.dokumentow + ' dok.')
-                        : 'pobrane';
+                        : 'pobrane') + opisTk;
                 }
             } catch (e){
                 st[i].note = 'błąd';
@@ -42293,6 +42416,7 @@
         });
         EXP_MARKREP = '';
         markRender();
+        expTicketRaport(snapAccs);
 
         say((expAbort ? 'Przerwane — biorę to, co zdążyło. ' : '') + what + ', ' + el + ' s'
             + (problems.length ? (' · problemy: ' + problems.join('; ')) : '')
@@ -42300,6 +42424,71 @@
             + (zapomniane ? (' UWAGA: poprzedni plik (' + zapomniane + ' wierszy) nie został oznaczony i właśnie go zastąpiłem.') : ''),
             (problems.length || expAbort || zapomniane) ? '#c47f00' : '#0a7a2f');
     }
+    // Lista dokumentow z ticketu, ktore poprawilem — do RECZNEGO sprawdzenia.
+    // Sama zamiana bez tej listy bylaby zmiana w pliku ksiegowym, ktorej nie da sie
+    // skontrolowac. Odnosnik prowadzi do TICKETU, bo to tam widac, czy kwota naprawde
+    // byla zaksiegowana z minusem — czyli czy poprawka byla sluszna.
+    function expTicketRaport(accs){
+        const box = document.getElementById('exp-tickrap');
+        if (!box) return;
+        const poz = [], zle = [];
+        (accs || []).forEach(function (a){
+            const t = a && a.tick;
+            if (!t) return;
+            (t.zamienione || []).forEach(function (x){ poz.push({ acc: a.label || a.acc, x: x }); });
+            (t.pominiete || []).forEach(function (x){ zle.push({ acc: a.label || a.acc, x: x }); });
+        });
+        if (!poz.length && !zle.length){ box.style.display = 'none'; box.innerHTML = ''; return; }
+        const esc = function (v){ return String(v == null ? '' : v)
+            .replace(/[&<>"]/g, function (c){ return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); };
+        const tkLink = function (tx1){
+            const m = String(tx1 || '').match(/TICKET\s*(\d{4,})/i);
+            if (!m) return esc(tx1);
+            return '<a href="https://www.prologistics.info/rma.php?rma_id=' + m[1]
+                 + '" target="_blank" style="color:#0f766e">' + esc(tx1) + '</a>';
+        };
+        let h = '';
+        if (poz.length){
+            h += '<div style="font-weight:700;color:#0f766e;margin-bottom:3px">'
+               + 'Wpłaty przeklikane przez ticket — poprawiony układ kont (' + poz.length + ')</div>'
+               + '<div style="font-size:11px;color:#555;margin-bottom:5px">'
+               + 'Te dokumenty mają w opisie „CREDIT … TICKET …", ale konto stoi po stronie '
+               + '<b>Debit</b>, czyli są <b>wpłatą</b>. Zbudowałem je w układzie wpłaty — tym samym, '
+               + 'co zwykły „Auction". Kwot nie przeliczałem, tylko przeniosłem między liniami, '
+               + 'więc suma dokumentu jest ta sama. <b>Sprawdź je w tickecie</b>: kwota zaksięgowana '
+               + 'z minusem potwierdza, że to wpłata.</div>'
+               + '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+               + '<tr style="color:#888"><td style="padding:2px 5px">konto</td>'
+               + '<td style="padding:2px 5px">dokument</td><td style="padding:2px 5px;text-align:right">kwota</td>'
+               + '<td style="padding:2px 5px">ticket</td></tr>';
+            poz.forEach(function (q){
+                h += '<tr style="border-top:1px solid #eee">'
+                   + '<td style="padding:2px 5px">' + esc(q.acc) + '</td>'
+                   + '<td style="padding:2px 5px">' + esc(q.x.blg) + '</td>'
+                   + '<td style="padding:2px 5px;text-align:right">' + esc(q.x.kwota) + '</td>'
+                   + '<td style="padding:2px 5px">' + tkLink(q.x.tx1) + '</td></tr>';
+            });
+            h += '</table>';
+        }
+        if (zle.length){
+            h += '<div style="font-weight:700;color:#b45309;margin:8px 0 3px">'
+               + 'Z ticketu, ale układu nie rozpoznałem — ZOSTAWIONE BEZ ZMIAN (' + zle.length + ')</div>'
+               + '<div style="font-size:11px;color:#555;margin-bottom:5px">'
+               + 'Nie ruszyłem ich, bo nie pasowały do znanego wzorca — obejrzyj je ręcznie.</div>'
+               + '<table style="border-collapse:collapse;font-size:11px;width:100%">';
+            zle.forEach(function (q){
+                h += '<tr style="border-top:1px solid #eee">'
+                   + '<td style="padding:2px 5px">' + esc(q.acc) + '</td>'
+                   + '<td style="padding:2px 5px">' + esc(q.x.blg) + '</td>'
+                   + '<td style="padding:2px 5px">' + tkLink(q.x.tx1) + '</td>'
+                   + '<td style="padding:2px 5px;color:#b45309">' + esc(q.x.powod) + '</td></tr>';
+            });
+            h += '</table>';
+        }
+        box.innerHTML = h;
+        box.style.display = 'block';
+    }
+
     // ---------- most dla modulu Salda ----------
     // Salda potrzebuje TEGO SAMEGO pliku, ktory daje „Uruchom", tylko bez panelu.
     // Zamiast powtarzac tam kontrakt formularza (19 pol, kolejnosc, zrodla sprzedawcow)
@@ -43020,6 +43209,9 @@
                           fv: String(r[K['Invoice Number']] == null ? '' : r[K['Invoice Number']]).replace(/\.0$/, ''),
                           deb: String(r[K['Debit']] == null ? '' : r[K['Debit']]).replace(/\.0$/, ''),
                           cred: String(r[K['Credit']] == null ? '' : r[K['Credit']]).replace(/\.0$/, ''),
+                          // Konto VAT rozstrzyga, czy para storno+ksiegowanie jest
+                          // PRZEKSIEGOWANIEM PODATKU, czy zwyklym odwroceniem.
+                          vat: String(r[K['VAT Account']] == null ? '' : r[K['VAT Account']]).replace(/\.0$/, ''),
                           auf: slAuftrag(r[K['Auftrag number']]),
                           // Surowy tekst kolumny. slAuftrag oddaje OBIEKT albo null —
                           // przy „CREDIT 11374974 TICKET 662028" null, bo to nie numer.
@@ -43729,8 +43921,43 @@
             cel.w.push(x);
             return cel;
         }
+        // ---------- przeksiegowania VAT ----------
+        // Klient podaje numer VAT UE, wiec faktura idzie na 0%. Cala wplate wyksiegowuje
+        // sie wtedy i ksieguje z powrotem na innym koncie VAT, a nadwyzke zwraca na karte.
+        // Obie linie maja ten sam auftrag, te sama kwote, przeciwny kierunek i TE SAMA
+        // SEKUNDE — a roznia sie kontem VAT. W pliku wygladaja jak osobna wplata i osobny
+        // zwrot, wiec ta sama kwota meldowala sie jako roznica PO OBU STRONACH naraz:
+        // konto 1411 za sierpien pokazywalo +1 233 802 przy wplatach i +1 233 802 przy
+        // zwrotach, a nie brakowalo ani grosza.
+        const vatPrzeks = [];
+        (function (){
+            const g = {};
+            pl.poz.forEach(function (y){
+                if (y.kw == null || !y.chwila || !y.auf) return;
+                const k = String(y.auf.nr) + '|' + Math.abs(Math.round(y.kw * 100)) + '|' + y.chwila;
+                (g[k] = g[k] || []).push(y);
+            });
+            Object.keys(g).forEach(function (k){
+                const w = g[k];
+                const wpl = w.filter(function (y){ return !y.zwrot; });
+                const zwr = w.filter(function (y){ return y.zwrot; });
+                const n = Math.min(wpl.length, zwr.length);
+                for (let i = 0; i < n; i++){
+                    // KONTO VAT MUSI SIE ROZNIC. Bez tego warunku ukrywalibysmy kazde
+                    // storno, takze takie, ktore jest bledem do wyjasnienia. Rozne konto
+                    // VAT jest tym, co czyni z tej pary przeksiegowanie PODATKU.
+                    if (String(wpl[i].vat || '') === String(zwr[i].vat || '')) continue;
+                    wpl[i].vatPrzeks = true; zwr[i].vatPrzeks = true;
+                    vatPrzeks.push({ auf: wpl[i].auf, aufTekst: wpl[i].aufTekst,
+                                     kw: Math.abs(wpl[i].kw), data: wpl[i].data,
+                                     vatZ: zwr[i].vat, vatNa: wpl[i].vat, konto: wpl[i].konto });
+                }
+            });
+        })();
         const L = {};
         pl.poz.forEach(function (x){
+            // Obie nogi przeksiegowania VAT wypadaja z porownania — patrz wyzej.
+            if (x.vatPrzeks) return;
             // Najpierw wlasna kolumna „Transaction ID", potem to, co udalo sie wylowic
             // z komentarza — ta druga droga jest dla zrodel, ktore kolumny nie maja.
             const klucz = x.txid || x.id;
@@ -43758,7 +43985,7 @@
             if (tk) (poTicket[tk[1]] = poTicket[tk[1]] || []).push(y);
         });
         pl.poz.forEach(function (y){
-            if (zajete[kluczW(y)]) return;
+            if (y.vatPrzeks || zajete[kluczW(y)]) return;
             const nr = (y.auf && y.auf.nr) ? String(y.auf.nr) : '';
             if (nr) (poAuf[nr] = poAuf[nr] || []).push(y);
             if (y.kw == null) return;
@@ -43789,7 +44016,7 @@
         }
         const wgNoty = {};
         pl.poz.forEach(function (y){
-            if (!y.zwrot || y.kw == null) return;
+            if (y.vatPrzeks || !y.zwrot || y.kw == null) return;
             zwrDodaj(y.kw, [y]);
             // Klucz grupy to NOTA KREDYTOWA („CREDIT 11152892 TICKET 647972"), bo to ona
             // jest jednym zwrotem, a jej wiersze to jego pozycje. Skladanie kwoty
@@ -44159,7 +44386,8 @@
                  zgodne: zgodne, rozne: rozne, tylkoSP: tylkoSP,
                  tylkoPL: tylkoPL, zlyTerm: zlyTerm, nieuzywany: nieuzywany,
                  zwrotBezPary: zwrotNieznane, zwrotSpar: zwrotSpar,
-                 wTicketach: wTicketach, jakIle: jakIle, zlaData: zlaData };
+                 wTicketach: wTicketach, jakIle: jakIle, zlaData: zlaData,
+                 vatPrzeks: vatPrzeks };
     }
 
     async function salRysujSP(){
@@ -44426,8 +44654,10 @@
         };
         const spPl = zlicz(spWsz, function (x){ return !jestZwrot(x); });
         const spZw = zlicz(spWsz, jestZwrot);
-        const plPl = zlicz(r.pl.poz || [], function (y){ return !y.zwrot; });
-        const plZw = zlicz(r.pl.poz || [], function (y){ return y.zwrot; });
+        // Obie nogi przeksiegowania VAT wypadaja z sum — znosza sie do zera, a liczone
+        // podnosily OBIE strony o te sama kwote i wygladalo to jak dwie rozne dziury.
+        const plPl = zlicz(r.pl.poz || [], function (y){ return !y.zwrot && !y.vatPrzeks; });
+        const plZw = zlicz(r.pl.poz || [], function (y){ return y.zwrot && !y.vatPrzeks; });
         const wiersz = function (co, a, b){
             const roz = Math.round((b.sum - a.sum) * 100) / 100;
             return '<tr><td style="' + TD + '">' + co + '</td>'
@@ -44458,6 +44688,46 @@
         L.push('      zwroty: Saferpay ' + spZw.n + ' na ' + kw(spZw.sum)
              + ' · prologistics ' + plZw.n + ' na ' + kw(plZw.sum)
              + ' · roznica ' + kw(Math.round((plZw.sum - spZw.sum) * 100) / 100));
+
+        // ---------- przeksiegowania VAT ----------
+        // Wyjecie czegos z rachunku bez powiedzenia o tym jest gorsze niz zostawienie:
+        // liczby zaczynaja sie zgadzac i nie wiadomo dlaczego. Sekcja stoi PRZED sekcjami
+        // brakow, bo tlumaczy, czego w nich juz nie ma.
+        const vp = r.vatPrzeks || [];
+        if (vp.length){
+            const sumaVp = vp.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
+            h += sek('Przeksięgowania VAT — poza porównaniem (' + vp.length + ')');
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+               + 'Klient podał numer VAT UE, więc faktura poszła na 0%. Wpłata przyszła już '
+               + 'z podatkiem, więc księgowo <b>wyksięgowano ją w całości i zaksięgowano z powrotem</b> '
+               + 'na innym koncie VAT, a nadwyżkę zwrócono na kartę. Obie linie znoszą się do zera, '
+               + 'ale w pliku wyglądają jak osobna wpłata i osobny zwrot — i podnosiły '
+               + '<b>obie</b> strony o tę samą kwotę, przez co ta sama liczba pokazywała się '
+               + 'jako różnica dwa razy. Poznaję je po tym, że mają ten sam auftrag, tę samą kwotę, '
+               + '<b>tę samą sekundę</b> i <b>inne konto VAT</b>. Razem <b>' + kw(sumaVp) + '</b> '
+               + '— o tyle mniejsze są obie sumy wyżej.</div>';
+            h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
+               + '<tr><td style="' + TH + '">auftrag</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<td style="' + TH + '">chwila księgowania</td>'
+               + '<td style="' + TH + '">konto VAT</td>'
+               + '<td style="' + TH + '">konto</td></tr>';
+            L.push(''); L.push('PRZEKSIEGOWANIA VAT — POZA POROWNANIEM (' + vp.length
+                 + ') na ' + kw(sumaVp));
+            vp.slice(0, 300).forEach(function (x){
+                h += '<tr><td style="' + TD + ';font-size:11px">' + slAufKom(x.auf, x.aufTekst) + '</td>'
+                   + '<td style="' + TDR + '">' + kw(Math.abs(x.kw || 0)) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(x.data || '') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(x.vatZ || '?') + ' → '
+                   + salEsc(x.vatNa || '?') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(x.konto || '') + '</td></tr>';
+                L.push('  ' + ((x.auf ? (x.auf.nr + ' / ' + x.auf.txn) : (x.aufTekst || '?')))
+                     + '  ' + kw(Math.abs(x.kw || 0)) + '  ' + (x.data || '')
+                     + '  VAT ' + (x.vatZ || '?') + ' -> ' + (x.vatNa || '?'));
+            });
+            h += '</table>';
+            if (vp.length > 300)
+                h += '<div style="font-size:11px;color:#888">…i ' + (vp.length - 300) + ' dalszych.</div>';
+        }
 
         // ---------- 0. co WYPADLO przy zawezeniu ----------
         // Ta sekcja stoi pierwsza, bo jako jedyna mowi o czyms, czego w reszcie protokolu
