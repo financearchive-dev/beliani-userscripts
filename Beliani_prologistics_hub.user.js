@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.17
+// @version      5.18
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -38058,13 +38058,18 @@
         // v3.87: to samo co mkPowod, ale dla JEDNEJ instancji Mirakla.
         // Mirakli jest kilka (Vente, Home24, Manor) i blad jednego nie ma prawa opisac
         // zlecen drugiego — mkPowod('mirakl', …) rozsmarowalby go po wszystkich.
-        function mkPowodHost(host, tekst, jakoBlad, tylkoBezOpisu){
+        // `doNadpisania` — wzorzec opisow, ktore WOLNO zamazac mimo `tylkoBezOpisu`.
+        // Potrzebne przy przelocie po sklepach: mkPass zostawia tam zdanie o OSTATNIM
+        // sklepie, wiec po petli jest ono nieaktualne z definicji i blokowalo zdanie
+        // wymieniajace wszystkie odwiedzone sklepy.
+        function mkPowodHost(host, tekst, jakoBlad, tylkoBezOpisu, doNadpisania){
             const jobs = jobsLoad();
             let n = 0;
             mkCzekajace(jobs, 'mirakl').forEach(function (k){
                 const j = jobs[k];
                 if (String(j.host || '') !== String(host || '')) return;
-                if (tylkoBezOpisu && j.msg) return;
+                const przeterminowany = !!(doNadpisania && j.msg && doNadpisania.test(String(j.msg)));
+                if (tylkoBezOpisu && j.msg && !przeterminowany) return;
                 j.msg = tekst;
                 if (jakoBlad) j.status = 'err';
                 n++;
@@ -38285,10 +38290,16 @@
                                 : ''))
                         : '';
                     const mdOk = await mkPodpowiedzMaila(host);
+                    // Opis z mkPass („Sklep <nazwa>: …") dotyczy JEDNEGO sklepu i po
+                    // przejsciu calej petli jest juz nieaktualny — pozwalamy go zamazac.
+                    // Bez tego lista odwiedzonych sklepow nie trafiala nigdzie, a przy
+                    // kilkunastu sklepach to wlasnie ona rozstrzyga, czy modul w ogole
+                    // wszedl tam, gdzie trzeba.
                     mkPowodHost(host, host + ': przelot przeszedł, ale nie znalazł tego rozliczenia.'
                         + gdzie
                         + (mdOk || (' Sprawdź, czy jesteś zalogowany na ' + mkPanelUrl(host)
-                                    + ' i czy wypłata jest już widoczna w panelu.')), false, true);
+                                    + ' i czy wypłata jest już widoczna w panelu.')), false, true,
+                        /^Sklep .*?:/);
                 } catch (e){
                     // v3.87: powod ląduje PRZY ZLECENIU i z klikalnym adresem — tak samo jak
                     // przy pozostalych platformach. Dotad szedl wylacznie do zbiorczego
