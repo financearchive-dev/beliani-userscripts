@@ -48900,7 +48900,11 @@
     // „PROSZE PRZEKSIEGOWAC COD OPEN AMOUNT", „zaksięguj". Wzorzec na konkretne formy
     // („ksieguj") gubil „wyksiegowanie". Po angielsku dochodzi „unbook" — prosba potrafi
     // mowic samym „pls unbook the cod".
-    var UC_KSIEG = /\b(?:un)?book(?:ing|ed)?\b|ksi[eę]g/i;
+    // Angielskie prosby nie musza uzywac slowa „book": „Please post the COD and reverse
+    // the entry in ticket 1088". Dolozone czlony sprawdzilem na zebranym logu 96 ticketow
+    // (184 komentarze ze slowem COD): nie dokladaja tam ANI JEDNEGO trafienia, czyli nie
+    // rozluzniaja reguly — lapia tylko style, ktorych w probce nie bylo.
+    var UC_KSIEG = /\b(?:un)?book(?:ing|ed)?\b|ksi[eę]g|\b1088\b|\bunpaid[\s-]*cod\b|\brevers(?:e|al|ed)\b|\bpost(?:ed|ing)?\s+(?:the\s+)?cod\b/i;
     // Formularz „Approval" obslugi klienta ma NARAZ „COD: YES" i „Proposed solution: book
     // open COD amount", wiec przechodzi oba warunki wyzej — a prosba to nie jest, tylko
     // zgoda na rozwiazanie. W 27 ticketach z probki byl JEDYNYM tekstem z COD i book.
@@ -49217,6 +49221,14 @@
       +   '<span style="font-size:11px;color:#16a34a;font-style:italic;white-space:nowrap">✓ konto stałe dla tego modułu</span>'
       + '</div>'
 
+      + '<div style="margin-top:8px">'
+      +   '<label style="font-size:12px;color:#333;cursor:pointer;display:inline-flex;gap:6px;align-items:center">'
+      +     '<input type="checkbox" id="uc-reczne">'
+      +     '<span>➕ Pozwól dopisać kwotę tam, gdzie <b>nie ma prośby</b> o COD '
+      +       '<span style="color:#666;font-weight:normal">(podstawię open amount, kwotę możesz zmienić; ticket nie zostanie odbity — nie ma na kogo)</span></span>'
+      +   '</label>'
+      + '</div>'
+
       + '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
       +   '<button id="uc-check" style="flex:1;min-width:180px;padding:9px;background:#332524;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🔍 Sprawdź</button>'
       +   '<button id="uc-log" title="Nic nie księguje. Wchodzi w każdy numer z wklejki, spisuje WSZYSTKIE komentarze — ticketu i auftraga — i zapisuje je do pliku." '
@@ -49262,6 +49274,8 @@
         if (r.st === 'diff') return '<span style="color:#c47f00;font-weight:700">⚠ kwota ≠ open amount</span>';
         if (r.st === 'zero') return '<span style="color:#2563eb;font-weight:700">ℹ open amount = 0</span>';
         if (r.st === 'skip') return '<span style="color:#2563eb;font-weight:700">ℹ bez prośby o COD</span>';
+        if (r.st === 'wybor') return '<span style="color:#c47f00;font-weight:700">❓ wskaż ticket</span>';
+        if (r.st === 'man')  return '<span style="color:#c47f00;font-weight:700">✎ kwota ręczna</span>';
         if (r.st === 'err')  return '<span style="color:#c00;font-weight:700">✗ błąd</span>';
         if (r.st === 'done') return '<span style="color:#0a7a2f;font-weight:700">✓ zaksięgowane</span>';
         if (r.st === 'part') return '<span style="color:#c47f00;font-weight:700">⚠ do sprawdzenia</span>';
@@ -49271,8 +49285,13 @@
     // Do zaksiegowania nadaja sie tylko wiersze z odnalezionym ticketem, auftragiem i kwota.
     // Rozjazd kwoty NIE blokuje — tylko odznacza; decyzje zostawiamy czlowiekowi.
     function bookable(r){
-        return !r.booked && !!r.rma && !!r.aufNum && r.kwota != null && (r.st === 'ok' || r.st === 'diff');
+        // 'man' to wiersz bez prosby, ktoremu czlowiek sam wpisal kwote — swiadoma decyzja,
+        // wiec ksiegowac wolno; wiersz i tak nie jest zaznaczony z automatu.
+        return !r.booked && !!r.rma && !!r.aufNum && r.kwota != null
+            && (r.st === 'ok' || r.st === 'diff' || r.st === 'man');
     }
+    // Przelacznik „dopisz kwote recznie" — bez niego wiersz bez prosby jest tylko pomijany.
+    function reczneWl(){ var c = $('#uc-reczne'); return !!(c && c.checked); }
     function tLnk(id){ return id ? ('<a href="https://www.prologistics.info/rma.php?rma_id=' + esc(id) + '" target="_blank" style="color:#750000;font-weight:bold">' + esc(id) + '</a>') : '—'; }
     function aLnk(n){ return n ? ('<a href="https://www.prologistics.info/auction.php?number=' + esc(n) + '&txnid=3" target="_blank" style="color:#750000;font-weight:bold">' + esc(n) + '</a>') : '—'; }
 
@@ -49302,10 +49321,15 @@
               +  '<td style="' + TD + ';text-align:center">' + (can ? '<input type="checkbox" class="uc-chk" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '>' : '') + '</td>'
               +  '<td style="' + TD + '">' + esc(r.line) + (r.maili > 1 ? ('<span style="color:#999" title="tyle maili dotyczy tego samego numeru"> ×' + r.maili + '</span>') : '') + '</td>'
               +  '<td style="' + TD + ';max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + att(r.temat) + '">' + esc(r.from || '—') + '</td>'
-              +  '<td style="' + TD + ';white-space:nowrap">' + tLnk(r.rma) + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">' + (r.tikOpcje && !r.rma ? wybor(r, i) : tLnk(r.rma)) + '</td>'
               +  '<td style="' + TD + ';white-space:nowrap">' + aLnk(r.aufNum) + '</td>'
-              +  '<td style="' + TD + ';text-align:right;font-weight:bold">' + f2(r.kwota)
-                 + (r.kwotaZ === 'open amount' ? '<div style="font-size:10px;color:#0a58ca;font-weight:normal" title="Prośba nie podała kwoty — wzięty open amount auftraga">z open amount</div>' : '') + '</td>'
+              +  '<td style="' + TD + ';text-align:right;font-weight:bold">'
+                 + (r.st === 'man'
+                    ? ('<input type="text" class="uc-kw" data-i="' + i + '" value="' + att(f2(r.kwota)) + '" '
+                       + 'style="width:110px;padding:3px 5px;border:1px solid #c47f00;border-radius:4px;font-size:12px;text-align:right;font-weight:bold">')
+                    : f2(r.kwota))
+                 + (r.kwotaZ === 'open amount' ? '<div style="font-size:10px;color:#0a58ca;font-weight:normal" title="Prośba nie podała kwoty — wzięty open amount auftraga">z open amount</div>' : '')
+                 + (r.kwotaZ === 'ręcznie' ? '<div style="font-size:10px;color:#c47f00;font-weight:normal" title="Wiersz bez prośby — kwotę potwierdzasz sam">wpisana ręcznie</div>' : '') + '</td>'
               +  '<td style="' + TD + ';text-align:right">' + f2(r.open) + (r.waluta ? (' <span style="color:#999">' + esc(r.waluta) + '</span>') : '') + '</td>'
               +  '<td style="' + TD + ';white-space:nowrap">' + esc(r.autor || '—')
                  + (r.prZ === 'auftrag' ? '<div style="font-size:10px;color:#0a58ca" title="Prośba stała w komentarzach auftraga, nie ticketu">z auftraga</div>' : '') + '</td>'
@@ -49316,9 +49340,53 @@
         el.querySelectorAll('.uc-chk').forEach(function(c){
             c.onchange = function(){ S.rows[parseInt(c.getAttribute('data-i'), 10)].sel = c.checked; };
         });
+        el.querySelectorAll('.uc-kw').forEach(function(inp){
+            // 'change', nie 'input' — przy kazdym znaku przerysowanie zabieraloby kursor.
+            inp.onchange = function(){
+                var r = S.rows[parseInt(inp.getAttribute('data-i'), 10)];
+                var v = money(inp.value);
+                if (v == null || !(v > 0)){ say('Kwota „' + inp.value + '” nie jest dodatnią liczbą.', '#c00'); inp.value = f2(r.kwota); return; }
+                r.kwota = v; say('');
+                render();
+                $('#uc-book').disabled = !S.rows.filter(function(x){ return x.sel && bookable(x); }).length;
+            };
+        });
+        el.querySelectorAll('.uc-tik').forEach(function(sel){
+            sel.onchange = function(){ wybierzTicket(parseInt(sel.getAttribute('data-i'), 10), sel.value); };
+        });
     }
 
     function dopisz(r, t){ r.msg = r.msg ? (r.msg + '; ' + t) : t; }
+
+    // Lista ticketow auftraga do recznego wskazania. Przy kazdym widac, czy sam mowi o COD.
+    function wybor(r, i){
+        var h = '<select class="uc-tik" data-i="' + i + '" style="padding:3px 5px;border:1px solid #c47f00;border-radius:4px;font-size:12px">'
+              + '<option value="">— wybierz ticket —</option>';
+        (r.tikOpcje || []).forEach(function(o){
+            h += '<option value="' + att(o.id) + '">' + esc(o.id) + (o.pr ? ' • ma prośbę' : '') + '</option>';
+        });
+        return h + '</select>';
+    }
+    // Po wyborze liczymy wiersz OD NOWA — z wymuszonym ticketem przechodzi ta sama sciezke
+    // co kazdy inny, wiec kwota, konto i kontrola open amount dzialaja tak samo.
+    async function wybierzTicket(i, id){
+        var r = S.rows[i];
+        if (!r || !id) return;
+        if (S.busy){ say('Poczekaj, aż skończy się bieżące przetwarzanie.', '#c00'); return; }
+        S.busy = true; $('#uc-check').disabled = true; $('#uc-log').disabled = true;
+        r.rmaWymuszony = id; r.tikOpcje = null; r.msg = ''; r.st = 'busy';
+        r.rma = ''; r.tik = null; r.kwota = null; r.kwotaZ = ''; r.autor = ''; r.autorId = '';
+        r.reczna = false; r.sel = false;
+        render();
+        say('Przeliczam wiersz ' + r.line + ' z ticketem ' + id + '…');
+        try { await sprawdzWiersz(r); }
+        catch (e){ r.st = 'err'; dopisz(r, (e && e.message) || String(e)); }
+        if (r.st === 'busy') r.st = 'err';
+        S.busy = false; $('#uc-check').disabled = false; $('#uc-log').disabled = false;
+        say('Wiersz ' + r.line + ': ticket ' + id + ' — ' + (r.msg || 'gotowe'));
+        render();
+        $('#uc-book').disabled = !S.rows.filter(function(x){ return x.sel && bookable(x); }).length;
+    }
 
     // ===== sprawdzanie =====
     // Prosba stoi w komentarzach TICKETU albo AUFTRAGA — obie strony i tak sa czytane,
@@ -49349,6 +49417,13 @@
                               : 'auftrag nie ma ticketów i nie ma w nim prośby o unpaid COD');
                 return;
             }
+            if (r.rmaWymuszony){
+                // Ticket wskazany przez czlowieka z listy — nie szukamy, bierzemy ten.
+                r.rma = r.rmaWymuszony;
+                r.tik = await ticketC(r.rma);
+                if (!r.tik.ok){ r.st = 'err'; dopisz(r, r.tik.err); return; }
+                dopisz(r, 'ticket ' + r.rma + ' wskazany ręcznie z ' + a0.tickety.length + ' ticketów auftraga');
+            } else {
             var znal = [];
             for (var i = 0; i < a0.tickety.length; i++){
                 if (S.abort) return;
@@ -49356,22 +49431,38 @@
                 if (t0.ok && t0.pr) znal.push({ id: a0.tickety[i], t: t0 });
             }
             if (znal.length === 1){ r.rma = znal[0].id; r.tik = znal[0].t; }
-            else if (znal.length > 1){
-                r.st = 'err';
-                dopisz(r, 'prośba o unpaid COD jest w kilku ticketach (' + znal.map(function(x){ return x.id; }).join(', ') + ') — rozstrzygnij ręcznie');
-                return;
-            } else if (prA && a0.tickety.length === 1){
+            else if (a0.tickety.length === 1 && (prA || znal.length)){
                 // Prosba w auftragu, a ticket jeden — wtedy on jest tym, w ktorym sie
                 // wyksieguje, choc sam o COD nie mowi.
                 r.rma = a0.tickety[0];
-                r.tik = await ticketC(r.rma);
+                r.tik = znal.length ? znal[0].t : await ticketC(r.rma);
                 if (!r.tik.ok){ r.st = 'err'; dopisz(r, r.tik.err); return; }
                 dopisz(r, 'prośba jest w komentarzach auftraga; ticket wzięty jako jedyny na tym auftragu');
-            } else {
-                r.st = 'skip';
-                dopisz(r, prA ? ('prośba jest w komentarzach auftraga, ale auftrag ma ' + a0.tickety.length + ' ticketów — wskaż ręcznie, w którym wyksięgować')
-                              : ('ani auftrag, ani jego ' + a0.tickety.length + ' ticket(y) nie mają prośby o unpaid COD'));
+            } else if (znal.length > 1 || (a0.tickety.length > 1 && (prA || znal.length))){
+                // Nie ma czym rozstrzygnac ZA czlowieka, ale jest co pokazac: cala lista
+                // ticketow auftraga z zaznaczeniem, ktore z nich same mowia o COD. Wybor
+                // wraca do wiersza i przeliczamy go od nowa.
+                var maPr = {};
+                znal.forEach(function(x){ maPr[x.id] = true; });
+                r.tikOpcje = a0.tickety.map(function(id){ return { id: id, pr: !!maPr[id] }; });
+                r.st = 'wybor';
+                dopisz(r, znal.length > 1
+                    ? ('prośba o unpaid COD jest w ' + znal.length + ' ticketach (' + znal.map(function(x){ return x.id; }).join(', ') + ') — wskaż, w którym wyksięgować')
+                    : ('prośba jest w komentarzach auftraga, ale żaden z ' + a0.tickety.length + ' ticketów jej nie ma — wskaż, w którym wyksięgować'));
                 return;
+            } else {
+                // Prosby nie ma nigdzie. Przy kilku ticketach i tak pokazujemy liste —
+                // z wlaczonym przelacznikiem kwoty recznej wiersz da sie doprowadzic do konca.
+                if (a0.tickety.length > 1){
+                    r.tikOpcje = a0.tickety.map(function(id){ return { id: id, pr: false }; });
+                    r.st = 'wybor';
+                    dopisz(r, 'ani auftrag, ani jego ' + a0.tickety.length + ' ticketów nie ma prośby o unpaid COD — wskaż ticket, jeśli mimo to ma iść');
+                    return;
+                }
+                r.st = 'skip';
+                dopisz(r, 'ani auftrag, ani jego ticket nie mają prośby o unpaid COD');
+                return;
+            }
             }
         } else {
             var t1 = await ticketC(r.rma);
@@ -49419,21 +49510,35 @@
         var aA = cache[r.aufNum];
         var pula = (r.tik.kom || []).concat((aA && aA.kom) || []);
         var pr = znajdzProsbe(pula);
-        if (!pr){
+        if (!pr && !reczneWl()){
             r.st = 'skip';
             dopisz(r, 'ani w tickecie, ani w auftragu nie ma prośby o unpaid COD (żaden komentarz nie mówi naraz o COD i o zaksięgowaniu)');
             return;
         }
-        r.autor = pr.k.autor; r.autorId = pr.k.autorId; r.dataPr = pr.k.data; r.prZ = pr.k.zrodlo;
-        if (pr.k.zrodlo === 'auftrag') dopisz(r, 'prośba z komentarzy AUFTRAGA (' + pr.k.data + ')');
-        if (pr.ile > 1) dopisz(r, 'pasujących komentarzy ' + pr.ile + ' — wzięty najnowszy z ' + pr.k.data);
-        if (!r.autor) dopisz(r, 'nie odczytałem autora prośby — ticket nie zostanie odbity');
+        if (!pr){
+            // Przelacznik wlaczony: wiersz idzie dalej, ale bez prosby nie ma ani kwoty,
+            // ani osoby do odbicia — obie rzeczy bierze na siebie czlowiek.
+            r.reczna = true;
+            dopisz(r, 'nie ma prośby o unpaid COD — kwotę wpisujesz sam, ticket nie zostanie odbity');
+        }
+        if (pr){
+            r.autor = pr.k.autor; r.autorId = pr.k.autorId; r.dataPr = pr.k.data; r.prZ = pr.k.zrodlo;
+            if (pr.k.zrodlo === 'auftrag') dopisz(r, 'prośba z komentarzy AUFTRAGA (' + pr.k.data + ')');
+            if (pr.ile > 1) dopisz(r, 'pasujących komentarzy ' + pr.ile + ' — wzięty najnowszy z ' + pr.k.data);
+            if (!r.autor) dopisz(r, 'nie odczytałem autora prośby — ticket nie zostanie odbity');
+        }
 
         // ---------- 4. kwota ----------
         if (r.open == null){ r.st = 'err'; dopisz(r, 'nie odczytałem „Auftrag value - Total of Payments"'); return; }
         if (eq(r.open, 0)){ r.st = 'zero'; dopisz(r, 'open amount = 0 — nie ma czego wyksięgowywać'); return; }
         if (!r.maKonto){ r.st = 'err'; dopisz(r, 'auftrag nie ma konta ' + UC_KONTO + ' na liście — zaksięguj ręcznie'); return; }
 
+        if (r.reczna){
+            r.kwota = r.open; r.kwotaZ = 'ręcznie'; r.st = 'man'; r.sel = false;
+            dopisz(r, 'podstawiłem open amount ' + f2(r.open) + (r.waluta ? (' ' + r.waluta) : '')
+                    + ' — popraw kwotę w tabeli, jeśli ma być inna, i zaznacz wiersz');
+            return;
+        }
         if (pr.kwota != null){
             r.kwota = pr.kwota; r.kwotaZ = 'prośba';
             if (!(r.kwota > 0)){ r.st = 'err'; dopisz(r, 'kwota z prośby nie jest dodatnia (' + f2(r.kwota) + ')'); return; }
@@ -49489,11 +49594,16 @@
             var ok = S.rows.filter(function(r){ return r.st === 'ok'; }).length;
             var df = S.rows.filter(function(r){ return r.st === 'diff'; }).length;
             var inf = S.rows.filter(function(r){ return r.st === 'zero' || r.st === 'skip'; }).length;
+            var wyb = S.rows.filter(function(r){ return r.st === 'wybor'; }).length;
+            var man = S.rows.filter(function(r){ return r.st === 'man'; }).length;
             var bd = S.rows.filter(function(r){ return r.st === 'err'; }).length;
             var n = S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
             say((S.abort ? ('Przerwane po ' + done + '/' + tot + '. ') : '')
                 + 'Sprawdzone: ' + S.rows.length + ' — zgodnych ' + ok + ', z rozjazdem kwoty ' + df
-                + ', bez księgowania (open 0 / bez prośby) ' + inf + ', błędów ' + bd
+                + ', bez księgowania (open 0 / bez prośby) ' + inf
+                + (wyb ? (', do wskazania ticketu ' + wyb) : '')
+                + (man ? (', z kwotą do wpisania ' + man) : '')
+                + ', błędów ' + bd
                 + (p.errs.length ? ('  ·  pominięte wiersze wklejki: ' + p.errs.length) : '')
                 + '. Zaznaczonych: ' + n + '.', bd ? '#c00' : (df ? '#c47f00' : '#0a7a2f'));
         } catch (e){
