@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.21
+// @version      5.22
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -44156,10 +44156,61 @@
                 }
             });
         })();
+        // ---------- PRZEKSIEGOWANIE MIEDZY AUFTRAGAMI ----------
+        // Pieniadze juz zaksiegowane zdejmuje sie z jednego zamowienia i sadza na drugim —
+        // najczesciej dlatego, ze na pierwotnym nie ma na nie faktury i robily nadplate.
+        // Przyklad z sierpnia 2026: klient placi 100 EUR za postojowe, kwota siada na
+        // auftragu 14966203 i robi tam nadplate; CS zaklada osobne zamowienie 15272119
+        // wylacznie po to, zeby to zafakturowac, i 11.08 ksiegowa przenosi kwote.
+        //
+        // Z konta nie wyszedl ani grosz, wiec Saferpay o tym nie wie i wiedziec nie moze.
+        // Obie nogi znosza sie do zera — liczone podnosza strone zwrotow o kwote, ktora
+        // nigdy nie byla zwrotem, i pompuja „roznice sum" (u nas o 100 z 179,98).
+        //
+        // Sygnatura, wszystkie warunki naraz:
+        //   * to samo konto i ta sama kwota, PRZECIWNE kierunki,
+        //   * ten sam dzien,
+        //   * RÓŻNE auftragi (przy tym samym to storno, nie przeniesienie),
+        //   * zgodne nazwisko,
+        //   * DOKLADNIE JEDNA noga ma numer transakcji. Storno dziedziczy numer platnosci
+        //     pierwotnej, a nowe ksiegowanie robi czlowiek i numeru nie ma. To wlasnie
+        //     odroznia przeniesienie od dwoch prawdziwych transakcji — te maja numery obie.
+        const przeksAuf = [];
+        (function (){
+            const wg = {};
+            pl.poz.forEach(function (y){
+                if (y.vatPrzeks || y.kw == null || !y.auf || !y.auf.nr) return;
+                const k = String(y.konto || '') + '|' + Math.abs(Math.round(y.kw * 100))
+                        + '|' + String(y.data || '').slice(0, 10);
+                (wg[k] = wg[k] || []).push(y);
+            });
+            Object.keys(wg).forEach(function (k){
+                const g = wg[k];
+                if (g.length < 2) return;
+                const wpl = g.filter(function (y){ return !y.zwrot; });
+                const zwr = g.filter(function (y){ return y.zwrot; });
+                for (let i = 0; i < wpl.length; i++){
+                    for (let j = 0; j < zwr.length; j++){
+                        const a = wpl[i], b = zwr[j];
+                        if (a.przeksAuf || b.przeksAuf) continue;
+                        if (String(a.auf.nr) === String(b.auf.nr)) continue;
+                        if (!slWspolne(a.tok || [], b.tok || [])) continue;
+                        const maA = !!(a.txid || a.id), maB = !!(b.txid || b.id);
+                        if (maA === maB) continue;            // obie maja numer albo zadna
+                        a.przeksAuf = true; b.przeksAuf = true;
+                        przeksAuf.push({ kw: Math.abs(a.kw), data: a.data,
+                                         zAuf: b.auf, zTekst: b.aufTekst,
+                                         naAuf: a.auf, naTekst: a.aufTekst,
+                                         konto: a.konto, tok: a.tok || [] });
+                    }
+                }
+            });
+        })();
+
         const L = {};
         pl.poz.forEach(function (x){
-            // Obie nogi przeksiegowania VAT wypadaja z porownania — patrz wyzej.
-            if (x.vatPrzeks) return;
+            // Obie nogi przeksiegowania — VAT i miedzy auftragami — wypadaja z porownania.
+            if (x.vatPrzeks || x.przeksAuf) return;
             // Najpierw wlasna kolumna „Transaction ID", potem to, co udalo sie wylowic
             // z komentarza — ta druga droga jest dla zrodel, ktore kolumny nie maja.
             const klucz = x.txid || x.id;
@@ -44187,7 +44238,7 @@
             if (tk) (poTicket[tk[1]] = poTicket[tk[1]] || []).push(y);
         });
         pl.poz.forEach(function (y){
-            if (y.vatPrzeks || zajete[kluczW(y)]) return;
+            if (y.vatPrzeks || y.przeksAuf || zajete[kluczW(y)]) return;
             const nr = (y.auf && y.auf.nr) ? String(y.auf.nr) : '';
             if (nr) (poAuf[nr] = poAuf[nr] || []).push(y);
             if (y.kw == null) return;
@@ -44218,7 +44269,7 @@
         }
         const wgNoty = {};
         pl.poz.forEach(function (y){
-            if (y.vatPrzeks || !y.zwrot || y.kw == null) return;
+            if (y.vatPrzeks || y.przeksAuf || !y.zwrot || y.kw == null) return;
             zwrDodaj(y.kw, [y]);
             // Klucz grupy to NOTA KREDYTOWA („CREDIT 11152892 TICKET 647972"), bo to ona
             // jest jednym zwrotem, a jej wiersze to jego pozycje. Skladanie kwoty
@@ -44249,6 +44300,20 @@
                 // o godziny.
                 if (x.chwila && g.every(function (y){
                         return y.chwila && Math.abs(y.chwila - x.chwila) > 86400000; })) return false;
+                return true;
+            });
+        }
+        // TO SAMO BEZ WARUNKU DATY. Zwrot ksieguje sie recznie i potrafi trafic do ksiegi
+        // kilka dni po tym, jak wyszedl z Saferpaya — a wtedy okno doby go odcina i pozycja
+        // laduje w brakach, chociaz po drugiej stronie WOLNY wiersz na te kwote stoi.
+        // Uzywamy tego wylacznie jako OSTATNIEJ proby, gdy zwykla droga nic nie znalazla:
+        // w sekcji brakow ma zostac to, czego naprawde nie ma, a nie to, co sie spoznilo.
+        function kandZwrotBezOkna(x){
+            if (x.kw == null) return [];
+            return (zwrIdx[Math.abs(Math.round(x.kw * 100))] || []).filter(function (g){
+                if (g.some(function (y){ return zajeteZwr[kluczW(y)]; })) return false;
+                const w = (SAL_SP_KONTA[g[0].konto] || {}).wal || '';
+                if (w && x.wal && w !== x.wal) return false;
                 return true;
             });
         }
@@ -44525,6 +44590,31 @@
         function powodZwrotu(x){
             if (x.kw == null) return 'brak kwoty w eksporcie';
             const kwk = Math.abs(Math.round(x.kw * 100));
+            // NAJPIERW pytanie, ktorego dotad nie bylo: czy wiersz o tej kwocie stal
+            // W OKNIE, tylko zajal go inny zwrot? To zupelnie co innego niz „poza oknem
+            // doby", a raport pisal to drugie takze wtedy, gdy wiersz byl z TEGO SAMEGO
+            // DNIA — bo ten rachunek celowo nie patrzy na zajetosc. Pytamy TYM SAMYM
+            // indeksem i tym samym oknem, ktorych uzywa kandZwrot; inaczej „w oknie"
+            // znaczyloby tu co innego niz tam.
+            const wOknie = (zwrIdx[kwk] || []).filter(function (g){
+                const w = (SAL_SP_KONTA[g[0].konto] || {}).wal || '';
+                if (w && x.wal && w !== x.wal) return false;
+                if (x.chwila && g.every(function (y){
+                        return y.chwila && Math.abs(y.chwila - x.chwila) > 86400000; })) return false;
+                return true;
+            });
+            const zajete = wOknie.filter(function (g){
+                return g.some(function (y){ return zajeteZwr[kluczW(y)]; });
+            });
+            // Warunek jest ostry: mowimy „zajete" tylko wtedy, gdy zajete sa WSZYSTKIE
+            // grupy w oknie. Gdyby ktoras byla wolna, kandZwrot by ja oddal i nie byloby
+            // nas tutaj — a przy nierownosci lepiej zejsc do odpowiedzi ogolnej.
+            if (wOknie.length && zajete.length === wOknie.length){
+                const kto = zajeteZwr[kluczW(zajete[0][0])];
+                return (zajete[0].length > 1 ? 'nota kredytowa' : 'wiersz zwrotu')
+                     + ' na tę kwotę jest w oknie doby, ale zajął go inny zwrot'
+                     + ((typeof kto === 'string' && kto) ? (' — ' + kto) : '');
+            }
             const wal = function (y){ return (SAL_SP_KONTA[y.konto] || {}).wal || ''; };
             const tejKwoty = pl.poz.filter(function (y){
                 if (y.kw == null || Math.abs(Math.round(y.kw * 100)) !== kwk) return false;
@@ -44550,19 +44640,80 @@
         // Sparowanie zajmuje WSZYSTKIE wiersze wybranej grupy. „para" zostaje pierwszym
         // wierszem (raport i testy siegaja po nia), a „pary" niesie calosc.
         function wezZwrot(x, g){
-            g.forEach(function (y){ zajeteZwr[kluczW(y)] = 1; });
+            // Zapisujemy NUMER zwrotu, ktory wzial ten wiersz, a nie samo „zajete".
+            // Dzieki temu przy zwrocie bez pary da sie powiedziec, kto go uprzedzil —
+            // a to zupelnie inna odpowiedz niz „poza oknem doby". Napis jest prawdziwy,
+            // wiec warunki „if (zajeteZwr[...])" dzialaja jak dotad.
+            g.forEach(function (y){ zajeteZwr[kluczW(y)] = x.tx || 1; });
             x.pary = g; x.para = g[0]; x.pozycji = g.length;
             zwrotSpar.push(x);
         }
+        // PRZEBIEG ZEROWY — NAZWISKO PRZED WSZYSTKIM. Dotad pierwszenstwo mial zwrot,
+        // ktory miał dokladnie JEDNEGO kandydata, i to on zabieral wiersz — takze wtedy,
+        // gdy nazwisko wskazywalo ten wiersz komus innemu. Tak zwrot DORSY RIAZIKERMANI
+        // wzial 20.08 wiersz „CREDIT 11093596 TICKET 646855 / LERMA PENELLA", a prawdziwy
+        // JOSEP LERMA PENELLA zostal bez pary i trafil do sekcji brakow.
+        //
+        // Zmierzone na sierpniu 2026, konto 1022 (897 par): par potwierdzonych nazwiskiem
+        // 550 -> 572, par z kloccymi sie nazwiskami 132 -> 111, sparowanych 898 -> 899,
+        // a zwrotow, ktore STRACILYBY zgodne nazwisko: ZERO. Zmiana idzie tylko w jedna
+        // strone. Zwroty bez nazwiska nie traca nic, bo ich nazwiskiem i tak nie da sie
+        // potwierdzic — biora to, co zostanie.
+        const zwrotPoZerowym = [];
         zwrotBezPary.forEach(function (x){
+            const k = kandZwrot(x);
+            const zNazw = k.filter(function (g){
+                return (x.tok || []).some(function (q){
+                    return g.some(function (y){ return (y.tok || []).indexOf(q) >= 0; });
+                });
+            });
+            // DOKLADNIE jeden — przy dwoch kandydatach z tym samym nazwiskiem nazwisko
+            // niczego nie rozstrzyga i decyzja zostaje przebiegom nizej.
+            if (zNazw.length === 1){ wezZwrot(x, zNazw[0]); x.poNazwisku = true; }
+            else zwrotPoZerowym.push(x);
+        });
+        zwrotPoZerowym.forEach(function (x){
             const k = kandZwrot(x);
             if (k.length === 1) wezZwrot(x, k[0]);
             else zwrotReszta.push(x);
         });
         zwrotReszta.sort(function (a, b){ return (a.chwila || 0) - (b.chwila || 0); });
         zwrotReszta.forEach(function (x){
-            const k = kandZwrot(x);
-            if (!k.length){ x.powod = powodZwrotu(x); zwrotNieznane.push(x); return; }
+            let k = kandZwrot(x);
+            if (!k.length){
+                // OSTATNIA PROBA: ta sama kwota i waluta, bez patrzenia na date.
+                const kb = kandZwrotBezOkna(x);
+                if (kb.length){
+                    // Nazwisko dalej ma pierwszenstwo, potem najblizszy w czasie —
+                    // przy samej kwocie nie ma mocniejszej przeslanki.
+                    kb.sort(function (p, q){
+                        const nz = function (g){
+                            return (x.tok || []).some(function (t2){
+                                return g.some(function (y){ return (y.tok || []).indexOf(t2) >= 0; });
+                            }) ? 0 : 1;
+                        };
+                        const dni = function (g){
+                            let d = 9999;
+                            g.forEach(function (y){ d = Math.min(d, slDni(x.data, y.data)); });
+                            return d;
+                        };
+                        return (nz(p) - nz(q)) || (dni(p) - dni(q));
+                    });
+                    x.pozaOknem = true;
+                    x.dniOdstepu = (function (g){
+                        let d = 9999;
+                        g.forEach(function (y){ d = Math.min(d, slDni(x.data, y.data)); });
+                        return d === 9999 ? null : d;
+                    })(kb[0]);
+                    x.poNazwisku = (x.tok || []).some(function (t2){
+                        return kb[0].some(function (y){ return (y.tok || []).indexOf(t2) >= 0; });
+                    });
+                    jakIle.zwrotPozaOknem = (jakIle.zwrotPozaOknem || 0) + 1;
+                    wezZwrot(x, kb[0]);
+                    return;
+                }
+                x.powod = powodZwrotu(x); zwrotNieznane.push(x); return;
+            }
             // Najblizszy w czasie liczymy po wierszu grupy, ktory jest najblizej —
             // przy nocie rozbitej na pozycje pierwszy wiersz nie musi byc najblizszy.
             const dyst = function (g){
@@ -44604,6 +44755,85 @@
         });
         jakIle.zwrot = zwrotSpar.length;
 
+        // ---------- OSTATNIA PROBA DLA WPLAT: PO WIERSZACH KSIEGI ----------
+        // Szukamy TU, a nie wsrod kubelkow, bo wiersz BEZ numeru transakcji do zadnego
+        // kubelka nie trafia (`const klucz = x.txid || x.id; if (!klucz) return;`) — a to
+        // wlasnie takie wiersze zostawaly w brakach. Sierpien 2026, konto 1022: wszystkie
+        // cztery nierozliczone wplaty mialy w ksiedze wiersz tej samej kwoty, bez numeru,
+        // zaksiegowany SEKUNDE albo dwie pozniej:
+        //       20,00  05.08 14:04:59  <->  14:04:57  auftrag 15392451  (2 s)
+        //      157,02  09.08 11:31:17  <->  11:31:16  auftrag 15422690  (1 s)
+        //      469,98  10.08 14:56:30  <->  14:56:28  auftrag 15434141  (2 s)
+        //    7 669,63  31.08 14:39:58  <->  14:39:57  auftrag 15610259  (1 s)
+        //
+        // DWIE DROGI, w tej kolejnosci:
+        // 1. KWOTA I CHWILA — odstep do minuty. NAZWISKO TU NIE ROZSTRZYGA i nie ma prawa
+        //    blokowac: karta czesto nalezy do kogos innego niz nabywca (15610259: karta
+        //    „Monika Schlüter", zamowienie „de Champfleury"). Dwie niezalezne wplaty tej
+        //    samej kwoty w odstepie sekund na jednym koncie to nie jest realny zbieg.
+        //    Warunek OBUSTRONNY: po jednej i po drugiej stronie dokladnie jeden kandydat.
+        // 2. JEDYNA TAKA KWOTA PO OBU STRONACH — gdy czasu nie ma albo sie rozjezdza.
+        //    Tu nazwisko juz rozstrzyga: lacze tylko, gdy sie NIE kloci (brak nazwiska
+        //    po ktorejs stronie sprzecznoscia nie jest — przy recznym linku Saferpay
+        //    nie dostaje danych klienta).
+        (function (){
+            const OKNO = 60000;
+            const cent = function (v){ return Math.abs(Math.round((v || 0) * 100)); };
+            const wolneSP = tylkoSP.filter(function (x){ return x.kw != null; });
+            if (!wolneSP.length) return;
+            // Kandydatem dla wplaty moze byc tylko WPLATA i tylko wiersz naprawde wolny.
+            const wolneW = pl.poz.filter(function (y){
+                if (y.vatPrzeks || y.przeksAuf || y.kw == null) return false;
+                if (y.zwrot || /CREDIT/i.test(String(y.aufTekst || ''))) return false;
+                return !zajete[kluczW(y)] && !zajeteZwr[kluczW(y)];
+            });
+            if (!wolneW.length) return;
+            const ileSP = {}, ileW = {};
+            wolneSP.forEach(function (x){ const k = cent(x.kw); ileSP[k] = (ileSP[k] || 0) + 1; });
+            wolneW.forEach(function (y){ const k = cent(y.kw); ileW[k] = (ileW[k] || 0) + 1; });
+            const wziete = {};
+            const blisko = function (y, x){
+                return !!(x.chwila && y.chwila && Math.abs(y.chwila - x.chwila) <= OKNO);
+            };
+            wolneSP.forEach(function (x){
+                if (x.jak === 'kwota-chwila' || x.jak === 'kwota-jedyna') return;
+                const k = cent(x.kw);
+                const same = wolneW.filter(function (y){ return !wziete[kluczW(y)] && cent(y.kw) === k; });
+                if (!same.length) return;
+                let wybor = null, jak = '';
+                const wOknie = same.filter(function (y){ return blisko(y, x); });
+                if (wOknie.length === 1){
+                    const spWOknie = wolneSP.filter(function (z){
+                        return z.kw != null && cent(z.kw) === k && blisko(wOknie[0], z)
+                            && z.jak !== 'kwota-chwila' && z.jak !== 'kwota-jedyna';
+                    });
+                    if (spWOknie.length === 1){ wybor = wOknie[0]; jak = 'kwota-chwila'; }
+                }
+                if (!wybor && ileSP[k] === 1 && ileW[k] === 1){
+                    const y = same[0];
+                    const maSP = (x.tok || []).length > 0, maPL = (y.tok || []).length > 0;
+                    if (!(maSP && maPL && !slWspolne(x.tok || [], y.tok || []))){ wybor = y; jak = 'kwota-jedyna'; }
+                }
+                if (!wybor) return;
+                // Zajmujemy wiersz TYM SAMYM znacznikiem, ktorego uzywa reszta modulu —
+                // dzieki temu kubelek zlozony z takich wierszy sam wypada z sekcji
+                // „w ksiedze, a nie ma w Saferpayu" i nic nie liczy sie dwa razy.
+                wziete[kluczW(wybor)] = 1;
+                zajete[kluczW(wybor)] = 1;
+                x.jak = jak;
+                x.doAuftraga = wybor.auf ? String(wybor.auf.nr) : '';
+                x.wiersz = wybor;
+                zgodne.push(x);
+                if (jak === 'kwota-chwila') jakIle.kwotaChwila = (jakIle.kwotaChwila || 0) + 1;
+                else jakIle.kwotaJedyna = (jakIle.kwotaJedyna || 0) + 1;
+            });
+            if (!jakIle.kwotaChwila && !jakIle.kwotaJedyna) return;
+            const zost = tylkoSP.filter(function (x){
+                return x.jak !== 'kwota-chwila' && x.jak !== 'kwota-jedyna';
+            });
+            tylkoSP.length = 0; zost.forEach(function (x){ tylkoSP.push(x); });
+        })();
+
         // „W ksiedze bez transakcji" liczymy po wierszach, ktore NAPRAWDE zostaly wolne —
         // wiersz zabrany przez droge zapasowa jest juz sparowany, tylko nie po numerze.
         Object.keys(L).forEach(function (tx){
@@ -44621,7 +44851,7 @@
                  tylkoPL: tylkoPL, zlyTerm: zlyTerm, nieuzywany: nieuzywany,
                  zwrotBezPary: zwrotNieznane, zwrotSpar: zwrotSpar,
                  wTicketach: wTicketach, jakIle: jakIle, zlaData: zlaData,
-                 vatPrzeks: vatPrzeks };
+                 vatPrzeks: vatPrzeks, przeksAuf: przeksAuf };
     }
 
     async function salRysujSP(){
@@ -44917,7 +45147,10 @@
           + ' · po Reference number: ' + ji.ref
           + ' · po kwocie i nazwisku: ' + ji.kwota
           + (ji.druga ? (' · druga wpłata na tym samym auftragu: ' + ji.druga
-                         + (ji.drugaNazw ? (' (w tym po nazwisku: ' + ji.drugaNazw + ')') : '')) : '') + '</div>'
+                         + (ji.drugaNazw ? (' (w tym po nazwisku: ' + ji.drugaNazw + ')') : '')) : '')
+          + (ji.kwotaChwila ? (' · <b>po kwocie i chwili księgowania: ' + ji.kwotaChwila + '</b>') : '')
+          + (ji.kwotaJedyna ? (' · <b>po samej kwocie, jedynej takiej po obu stronach: '
+                               + ji.kwotaJedyna + '</b>') : '') + '</div>'
           + '</td></tr>'
           + '<tr><td style="' + TD + '">z tego zgodnych co do grosza</td><td style="' + TDR + ';color:#0a7a2f">' + r.zgodne.length + '</td></tr>'
           + '</table>'
@@ -44925,9 +45158,20 @@
           // i nazwisku powstaje tylko przy jednym kandydacie i w oknie minuty — ale to
           // wciaz poszlaka, a nie numer.
           + (ji.ref || ji.kwota
-              ? ('<div style="font-size:11px;color:#666;margin-top:4px">Gdy numeru transakcji '
+              ? ('<div style="font-size:11px;color:#666;margin-top:4px">'
+                 + (ji.kwotaChwila
+                     ? ('<b>Po kwocie i chwili księgowania</b> łączę wtedy, gdy wpłatę i jej wiersz '
+                        + 'w księdze dzielą <b>sekundy</b> i po obu stronach jest tylko jeden taki '
+                        + 'kandydat. Nazwisko tu nie rozstrzyga — karta bywa cudza, a to nie znaczy, '
+                        + 'że to inna płatność. ')
+                     : '')
+                 + (ji.kwotaJedyna
+                     ? ('<b>Po samej kwocie</b> łączę na końcu i tylko wtedy, gdy taka kwota '
+                        + 'jest <b>jedyna po obu stronach</b>, a nazwiska się nie kłócą. ')
+                     : '')
+                 + 'Gdy numeru transakcji '
                  + 'nie ma po obu stronach, szukam dalej: najpierw numeru auftraga w polu '
-                 + '„Reference number", potem tej samej kwoty i nazwiska w oknie ±1 minuty '
+                 + '„Reference number", potem tej samej kwoty i nazwiska w oknie <b>trzech dób</b> '
                  + '(przy zwrotach ±1 dnia). Łączę tylko przy jednym kandydacie.</div>')
               : '');
         L.push('transakcji w Saferpayu: ' + r.sp.poz.length
@@ -44935,7 +45179,12 @@
              + ' · dopasowanych: ' + dop + ' · zgodnych: ' + r.zgodne.length);
         L.push('  po numerze transakcji: ' + ji.id + ' · po Reference number: ' + ji.ref
              + ' · po kwocie i nazwisku: ' + ji.kwota
-             + ' · zwrotow po kwocie i dacie: ' + (ji.zwrot || 0));
+             + (ji.druga ? (' · druga wplata: ' + ji.druga
+                            + (ji.drugaNazw ? (' (po nazwisku: ' + ji.drugaNazw + ')') : '')) : '')
+             + (ji.kwotaChwila ? (' · po kwocie i chwili: ' + ji.kwotaChwila) : '')
+             + (ji.kwotaJedyna ? (' · po samej kwocie: ' + ji.kwotaJedyna) : '')
+             + ' · zwrotow po kwocie i dacie: ' + (ji.zwrot || 0)
+             + (ji.zwrotPozaOknem ? (' (w tym po samej kwocie: ' + ji.zwrotPozaOknem + ')') : ''));
 
         // ---------- 0a. SUMA SUM ----------
         // Najprostsze pytanie, ktorego protokol dotad nie zadawal: ile w sumie wplynelo
@@ -44958,8 +45207,8 @@
         const spZw = zlicz(spWsz, jestZwrot);
         // Obie nogi przeksiegowania VAT wypadaja z sum — znosza sie do zera, a liczone
         // podnosily OBIE strony o te sama kwote i wygladalo to jak dwie rozne dziury.
-        const plPl = zlicz(r.pl.poz || [], function (y){ return !y.zwrot && !y.vatPrzeks; });
-        const plZw = zlicz(r.pl.poz || [], function (y){ return y.zwrot && !y.vatPrzeks; });
+        const plPl = zlicz(r.pl.poz || [], function (y){ return !y.zwrot && !y.vatPrzeks && !y.przeksAuf; });
+        const plZw = zlicz(r.pl.poz || [], function (y){ return y.zwrot && !y.vatPrzeks && !y.przeksAuf; });
         const wiersz = function (co, a, b){
             const roz = Math.round((b.sum - a.sum) * 100) / 100;
             return '<tr><td style="' + TD + '">' + co + '</td>'
@@ -45049,6 +45298,40 @@
             h += '</table>';
             if (vp.length > 300)
                 h += '<div style="font-size:11px;color:#888">…i ' + (vp.length - 300) + ' dalszych.</div>';
+        }
+
+        // ---------- przeksiegowania miedzy auftragami ----------
+        const pa = r.przeksAuf || [];
+        if (pa.length){
+            const sumaPa = pa.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
+            h += sek('Przeksięgowania między auftragami — poza porównaniem (' + pa.length + ')', 'przeksAuf');
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+               + 'Pieniądze już zaksięgowane zdjęto z jednego zamówienia i posadzono na drugim — '
+               + 'najczęściej dlatego, że na pierwotnym nie było na nie faktury i robiły nadpłatę. '
+               + '<b>Z konta nie wyszedł ani grosz</b>, więc Saferpay o tym nie wie i wiedzieć nie może. '
+               + 'Obie nogi znoszą się do zera, ale w pliku wyglądają jak osobny zwrot i osobna wpłata — '
+               + 'liczone podnosiłyby stronę zwrotów o kwotę, która zwrotem nigdy nie była. '
+               + 'Poznaję je po tym, że mają tę samą kwotę i dzień, przeciwne kierunki, to samo nazwisko, '
+               + '<b>różne auftragi</b>, a numer transakcji niesie <b>tylko jedna</b> z nich. '
+               + 'Razem <b>' + kw(sumaPa) + '</b> — o tyle mniejsza jest strona zwrotów wyżej.</div>';
+            h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
+               + '<tr><td style="' + TH + '">data</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<td style="' + TH + '">zdjęte z</td><td style="' + TH + '">posadzone na</td>'
+               + '<td style="' + TH + '">nazwisko</td></tr>';
+            L.push(''); L.push('PRZEKSIEGOWANIA MIEDZY AUFTRAGAMI (' + pa.length + ') na ' + kw(sumaPa));
+            pa.slice(0, 200).forEach(function (x){
+                h += '<tr><td style="' + TD + ';font-size:11px">' + salEsc(String(x.data || '').slice(0, 16)) + '</td>'
+                   + '<td style="' + TDR + '">' + kw(Math.abs(x.kw || 0)) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + slAufKom(x.zAuf, x.zTekst) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + slAufKom(x.naAuf, x.naTekst) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc((x.tok || []).join(' ')) + '</td></tr>';
+                L.push('  ' + String(x.data || '').slice(0, 16) + '  ' + kw(Math.abs(x.kw || 0))
+                     + '  z ' + (x.zAuf ? (x.zAuf.nr + ' / ' + x.zAuf.txn) : (x.zTekst || '?'))
+                     + '  na ' + (x.naAuf ? (x.naAuf.nr + ' / ' + x.naAuf.txn) : (x.naTekst || '?')));
+            });
+            h += '</table>';
+            if (pa.length > 200)
+                h += '<div style="font-size:11px;color:#888">…i ' + (pa.length - 200) + ' dalszych.</div>';
         }
 
         // ---------- 0. co WYPADLO przy zawezeniu ----------
@@ -45415,8 +45698,20 @@
                ? ('<tr><td style="' + TD + ';color:#666;padding-left:16px">w tym rozbitych na pozycje '
                   + 'zamówienia</td><td style="' + TDR + ';color:#666">' + rozbite.length + '</td></tr>')
                : '')
+           + ((r.jakIle && r.jakIle.zwrotPozaOknem)
+               ? ('<tr><td style="' + TD + ';color:#666;padding-left:16px">w tym po samej kwocie, '
+                  + 'poza oknem doby</td><td style="' + TDR + ';color:#b45309">'
+                  + r.jakIle.zwrotPozaOknem + '</td></tr>')
+               : '')
            + '<tr><td style="' + TD + '">bez pary</td><td style="' + TDR
            + (zbp.length ? ';color:#b45309' : ';color:#0a7a2f') + '">' + zbp.length + '</td></tr></table>';
+        if (r.jakIle && r.jakIle.zwrotPozaOknem)
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px"><b>'
+               + r.jakIle.zwrotPozaOknem + '</b> zwrotów sparowałem <b>po samej kwocie</b>, bo w oknie '
+               + 'doby nie było już wolnego wiersza, a dalej — poza oknem — stał. Zwrot księguje się '
+               + 'ręcznie i bywa zaksięgowany kilka dni później. To para <b>słabsza</b> niż pozostałe: '
+               + 'opiera się na kwocie i walucie, a nie na dacie. Dzięki niej w brakach zostaje tylko '
+               + 'to, czego po drugiej stronie naprawdę nie ma.</div>';
         if (rozbite.length)
             h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Zwrot bywa zaksięgowany '
                + '<b>pozycja po pozycji</b> — 3 000 w Saferpayu to 1 500 + 1 500 w księdze, bo artykuły '
@@ -45479,7 +45774,7 @@
             // tutaj pokazywala sie jako wiersz „bez pary" i ta sama kwota stala w raporcie
             // DWA RAZY: raz jako wyjasniona, raz jako niewyjasniona. Na koncie 1022 za
             // sierpien 2026 bylo to 13 z 22 wierszy i 8 749,70 z 9 349,64 EUR.
-            const wierszeZw = r.pl.poz.filter(function (x){ return x.zwrot && !x.vatPrzeks; });
+            const wierszeZw = r.pl.poz.filter(function (x){ return x.zwrot && !x.vatPrzeks && !x.przeksAuf; });
             const wKsiedze = wierszeZw.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
             h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
                + '<tr><td style="' + TD + '">zwrotów w eksporcie</td><td style="' + TDR + '">'
@@ -45513,22 +45808,64 @@
             const wolneZw = wierszeZw.filter(function (y){
                 return !wzieteZw[String(y.konto || '') + '#' + y.w];
             });
-            h += '<div style="font-weight:700;margin-top:8px;margin-bottom:3px">Wiersze zwrotu w księdze '
-               + 'bez pary (' + wolneZw.length + ')</div>';
-            L.push('  wierszy zwrotu w ksiedze bez pary: ' + wolneZw.length);
-            if (!wolneZw.length){
-                h += '<div style="color:#0a7a2f;font-size:12px">Nie ma — każdy wiersz zwrotu '
-                   + 'ma swoją transakcję w eksporcie.</div>';
+            // Wiersz, ktory ma swoj kubelek w polowie „Ksiega ma, w Saferpayu nie ma",
+            // jest tam JUZ WYPISANY — z numerem transakcji, data i auftragiem. Powtarzanie
+            // go tutaj golym wierszem sprawialo, ze ta sama kwota stala w raporcie dwa razy
+            // i wygladala jak dwie rozne sprawy (1022, sierpien 2026: 8 wierszy na 599,94
+            // z dziewieciu). Zostawiamy tu tylko te, ktorych NIGDZIE INDZIEJ nie widac.
+            const wKubelkach = {};
+            (r.tylkoPL || []).forEach(function (x){
+                ((x.y && x.y.w) || []).forEach(function (y){
+                    wKubelkach[String(y.konto || '') + '#' + y.w] = x.tx;
+                });
+            });
+            const wolneTylkoTu = wolneZw.filter(function (y){
+                return !wKubelkach[String(y.konto || '') + '#' + y.w];
+            });
+            // RACHUNEK ROZNICY. Roznica sum to SALDO OBU STRON, a nie sama strona ksiegi —
+            // zdanie „te wiersze skladaja sie na roznice" bylo nieprawdziwe. Pokazujemy
+            // dzialanie, zeby liczbe dalo sie sprawdzic olowkiem.
+            const sumWolne = wolneZw.reduce(function (a, y){ return a + Math.abs(y.kw || 0); }, 0);
+            const sumZbp = zbp.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
+            h += '<div style="font-weight:700;margin-top:8px;margin-bottom:3px">Skąd bierze się '
+               + 'różnica sum</div>';
+            h += '<table style="border-collapse:collapse;font-size:12px;width:100%;margin-bottom:4px">'
+               + '<tr><td style="' + TD + '">wiersze zwrotu w księdze bez pary</td>'
+               + '<td style="' + TDR + ';color:#888">' + wolneZw.length + '</td>'
+               + '<td style="' + TDR + '">' + kw(sumWolne) + '</td></tr>'
+               + '<tr><td style="' + TD + '">minus zwroty w Saferpayu bez pary</td>'
+               + '<td style="' + TDR + ';color:#888">' + zbp.length + '</td>'
+               + '<td style="' + TDR + '">−' + kw(sumZbp) + '</td></tr>'
+               + '<tr><td style="' + TD + ';font-weight:700">różnica sum</td><td style="' + TDR + '"></td>'
+               + '<td style="' + TDR + ';font-weight:700">' + kw(Math.round((sumWolne - sumZbp) * 100) / 100)
+               + '</td></tr></table>';
+            L.push('  ROZNICA SUM: wiersze ksiegi bez pary ' + wolneZw.length + ' na ' + kw(sumWolne)
+                 + ' minus zwroty Saferpaya bez pary ' + zbp.length + ' na ' + kw(sumZbp)
+                 + ' = ' + kw(Math.round((sumWolne - sumZbp) * 100) / 100));
+            const wKubelku = wolneZw.length - wolneTylkoTu.length;
+            if (wKubelku)
+                h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+                   + (wKubelku === wolneZw.length
+                       ? ('<b>Wszystkie ' + wolneZw.length + '</b> są już wypisane wyżej, ')
+                       : ('Z tych ' + wolneZw.length + ' wierszy <b>' + wKubelku + '</b> jest już wypisanych wyżej, '))
+                   + 'w połowie „Księga ma, w Saferpayu nie ma" — z numerem transakcji i auftragiem. '
+                   + 'Nie powtarzam ich tutaj. Nóg storna z przeksięgowań VAT też tu nie ma, '
+                   + 'są w swojej sekcji.</div>';
+            if (!wolneTylkoTu.length){
+                h += '<div style="color:#0a7a2f;font-size:12px">Poza nimi nie ma ani jednego '
+                   + 'wiersza zwrotu bez pary.</div>';
+                L.push('  poza kubelkami: brak');
             } else {
-                h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Te wiersze składają się '
-                   + 'na różnicę sum powyżej. Data sprzed okresu eksportu zamyka sprawę bez '
-                   + 'dochodzenia — zwrot dotyczy wtedy płatności, której w tym pliku po prostu nie ma. '
-                   + 'Nóg storna z przeksięgowań VAT tu nie ma — są opisane w swojej sekcji '
-                   + 'i nie liczę ich dwa razy.</div>';
+                h += '<div style="font-weight:700;margin-top:6px;margin-bottom:3px">Wiersze, których '
+                   + 'nie widać nigdzie indziej (' + wolneTylkoTu.length + ')</div>';
+                h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Data sprzed okresu '
+                   + 'eksportu zamyka sprawę bez dochodzenia — zwrot dotyczy wtedy płatności, '
+                   + 'której w tym pliku po prostu nie ma.</div>';
+                L.push('  wierszy widocznych tylko tutaj: ' + wolneTylkoTu.length);
                 h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
                    + '<tr><td style="' + TH + '">data</td><td style="' + TH + ';text-align:right">kwota</td>'
                    + '<td style="' + TH + '">auftrag</td><td style="' + TH + '">konto</td></tr>';
-                wolneZw.slice(0, 300).forEach(function (y){
+                wolneTylkoTu.slice(0, 300).forEach(function (y){
                     const a = slAufKom(y.auf, y.aufTekst);
                     h += '<tr><td style="' + TD + ';font-size:11px">' + salEsc(y.data || '') + '</td>'
                        + '<td style="' + TDR + '">' + kw(Math.abs(y.kw || 0)) + '</td>'
@@ -45538,8 +45875,8 @@
                          + (y.auf ? (y.auf.nr + ' / ' + y.auf.txn) : (y.aufTekst || '—')));
                 });
                 h += '</table>';
-                if (wolneZw.length > 300)
-                    h += '<div style="font-size:11px;color:#888">…i ' + (wolneZw.length - 300) + ' dalszych.</div>';
+                if (wolneTylkoTu.length > 300)
+                    h += '<div style="font-size:11px;color:#888">…i ' + (wolneTylkoTu.length - 300) + ' dalszych.</div>';
             }
         }
 
@@ -45650,12 +45987,23 @@
         // na te kwote" to luka, a „tylko jako platnosc" to przypadkowa zbieznosc kwot,
         // przy ktorej nie ma czego szukac. Do podsumowania idzie sama luka.
         const zbpLuka = zbp.filter(function (x){ return /nie ma wiersza/.test(String(x.powod || '')); });
+        // Trzeci stan, ktory dotad wpadal do szarego worka „zbieznosc kwot": wiersz o tej
+        // kwocie stal w oknie, ale wzial go inny zwrot. To NIE jest zbieznosc i nie wolno
+        // tego uciszac — znaczy, ze po stronie ksiegi jest o jeden wiersz tej kwoty mniej,
+        // niz zwrotow w Saferpayu. Idzie do roboty, nie do tla.
+        const zbpZajete = zbp.filter(function (x){ return /zajął go inny zwrot/.test(String(x.powod || '')); });
+        const zbpReszta = zbp.filter(function (x){
+            const p = String(x.powod || '');
+            return !/nie ma wiersza/.test(p) && !/zajął go inny zwrot/.test(p);
+        });
         const POZ = [
             ['glowa', 'Saferpay ma, w księdze nie ma', null, null],
             ['brak',  'wpłaty', r.tylkoSP.length, sumaKw(r.tylkoSP, function (x){ return x.kw; })],
             ['brak',  'zwroty — realna luka', zbpLuka.length, sumaKw(zbpLuka, function (x){ return x.kw; })],
+            ['brak',  'zwroty — wiersz w oknie zajął inny zwrot',
+                      zbpZajete.length, sumaKw(zbpZajete, function (x){ return x.kw; })],
             ['cicho', 'zwroty — zbieżność kwot, nie ma czego szukać',
-                      zbp.length - zbpLuka.length, sumaKw(zbp.filter(function (x){ return !/nie ma wiersza/.test(String(x.powod || '')); }), function (x){ return x.kw; })],
+                      zbpReszta.length, sumaKw(zbpReszta, function (x){ return x.kw; })],
             ['glowa', 'Księga ma, w Saferpayu nie ma', null, null],
             ['brak',  'wpłaty', plBezTx.length, sumaKw(plBezTx, function (x){ return x.y.suma; })],
             ['brak',  'zwroty i noty — numer powinien być w eksporcie',
@@ -45708,7 +46056,7 @@
             ['Saferpay ma, w księdze nie ma',    ['spWpl', 'spZwr']],
             ['Księga ma, w Saferpayu nie ma',    ['plBrak']],
             ['Do sprawdzenia',                   ['rozne', 'zlyTerm', 'zlaData', 'wTickecie']],
-            ['Dlaczego czegoś tu nie ma',        ['vat', 'poza', 'wglad']]
+            ['Dlaczego czegoś tu nie ma',        ['vat', 'przeksAuf', 'poza', 'wglad']]
         ];
         // HTML tniemy po komentarzu-znaczniku, tekst do schowka po linii-znaczniku.
         // Co przed pierwszym znacznikiem — naglowek protokolu — zostaje na gorze.
