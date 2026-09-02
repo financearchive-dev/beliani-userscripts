@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.22
+// @version      5.23
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -5132,6 +5132,168 @@
         } finally {
             destroyFrameCtx(ctx);
         }
+    };
+
+    // ===== Most dla modulu „Unpaid COD" =====
+    // Modul UCOD czyta wszystko fetch-em (komentarze ticketu, open amount auftraga) i sam
+    // ksieguje na auftragu POST-em. Do ticketu potrzebuje jednak RAMKI: formularz pozycji
+    // (Solution + kwota + data + konto), „Add comment" i „Reassign" to zapisy, a te musza
+    // isc przez zywy dokument. Cala ta mechanika stoi TUTAJ i jest wychodzona — drugiej
+    // kopii nie ma po co pisac (patrz `getFrameWin`, ktore celowo rzuca przy zapisie do
+    // strony pobranej fetch-em).
+    //
+    // Dwie roznice wobec zwyklego ksiegowania zwrotu:
+    //   * przy braku Solution / credit note NIE eskalujemy „Please add solution" —
+    //     przy odmowie pobrania zwrot nie wymaga solution, wiec taki komentarz bylby
+    //     falszywym poleceniem dla obslugi klienta;
+    //   * komentarz i przepiecie ida ZAWSZE po udanym ksiegowaniu, a nie tylko w awarii.
+    async function ucodTicketRaz(o) {
+        const rmaId = String((o && o.rmaId) || '').trim();
+        if (!rmaId) return { ok: false, error: 'brak numeru ticketu' };
+        const kwota = String((o && o.amount) != null ? o.amount : '').trim();
+        const data  = String((o && o.bookingDate) || '').trim();
+        const konto = String((o && o.accountNum) || '').trim();
+        const tekst = String((o && o.komentarz) || '').trim();
+        const osoba = String((o && o.osoba) || '').trim();
+        if (!kwota) return { ok: false, error: 'brak kwoty do zaksięgowania w tickecie' };
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) return { ok: false, error: 'zła data księgowania: ' + data };
+        if (!konto) return { ok: false, error: 'brak konta' };
+
+        const href = `${BASE}/rma.php?rma_id=${encodeURIComponent(rmaId)}`;
+        const ctx = createFrameCtx();
+        const w = { ok: false, href: href, ksieg: null, komentarz: null, reassign: null,
+                    status: '', bylZamkniety: false, error: null };
+        try {
+            let ostatniBlad = '';
+            let kliknietoUpdate = false;
+            for (let proba = 1; proba <= 2; proba++) {
+                await loadInFrame(href, 20000, ctx);
+                await sleep(800);
+
+                // Ten sam wpis juz na tickecie stoi — drugiego nie robimy. Gdy powstal
+                // w POPRZEDNIEJ probie tego przebiegu, jest NASZ (nie „already booked").
+                const juz = findBookedRefundEntry(getFrameDoc(ctx), kwota, data, false);
+                if (juz) {
+                    w.ksieg = { ok: true, alreadyBooked: !kliknietoUpdate,
+                                opis: juz.text || juz.amount || '' };
+                    break;
+                }
+
+                const st = getTicketStatus(getFrameDoc(ctx));
+                if (proba === 1) w.bylZamkniety = (st === 'Closed');
+                if (st === 'Closed') {
+                    await setTicketStatus('Open', ctx);
+                    await sleep(800);
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(700);
+                }
+                if (!isTicketPageHealthy(getFrameDoc(ctx))) {
+                    ostatniBlad = 'strona ticketu nie wyrenderowała się poprawnie';
+                    await sleep(900);
+                    continue;
+                }
+
+                let fill;
+                try {
+                    fill = await fillTicket(kwota, data, konto, ctx);
+                } catch (e) {
+                    ostatniBlad = (e && e.message) || String(e);
+                    await sleep(900);
+                    continue;
+                }
+                if (fill.alreadyBooked) {
+                    w.ksieg = { ok: true, alreadyBooked: !kliknietoUpdate,
+                                opis: (fill.existingRefund && (fill.existingRefund.text || fill.existingRefund.amount)) || '' };
+                    break;
+                }
+                if (fill.noSolution) {
+                    // Bez eskalacji „Please add solution" — patrz komentarz nad funkcja.
+                    w.ksieg = { ok: false, error: fill.reasonText || 'w tickecie nie ma na czym zaksięgować' };
+                    break;
+                }
+                kliknietoUpdate = true;
+
+                // ODCZYT, wiec szybka droga; sleep zostaje, bo dotyczy zwloki SERWERA
+                // w utrwaleniu zapisu, a nie renderowania strony.
+                await loadForRead(href, 20000, ctx);
+                await sleep(900);
+                let ver = verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId);
+                const backoff = [3000, 6000, 10000];
+                for (let i = 0; i < backoff.length && !ver.ok; i++) {
+                    await sleep(backoff[i]);
+                    try { await loadForRead(href, 25000, ctx); await sleep(1500); } catch (e) { /* verify i tak cos powie */ }
+                    ver = verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId);
+                }
+                if (ver.ok) {
+                    w.ksieg = { ok: true, metoda: ver.method || 'after-update', fallback: !!fill.fallbackUsed };
+                    break;
+                }
+                ostatniBlad = ver.error || 'nie potwierdziło się księgowanie w tickecie';
+                await sleep(900);
+            }
+            if (!w.ksieg) w.ksieg = { ok: false, error: ostatniBlad || 'nie udało się zaksięgować w tickecie' };
+
+            // Komentarz i przepiecie tylko po NASZYM ksiegowaniu. Gdy wpis byl tam juz
+            // wczesniej, drugi komentarz „Booked" i powtorne odbicie sa smieciem — a przy
+            // tak krotkiej tresci nie da sie odroznic naszego wpisu od cudzego po tekscie.
+            if (w.ksieg.ok && !w.ksieg.alreadyBooked) {
+                // POWROT NA RAMKE: kontrola wyzej szla fetch-em, a teraz PISZEMY.
+                await loadInFrame(href, 20000, ctx);
+                await sleep(600);
+                if (getTicketStatus(getFrameDoc(ctx)) === 'Closed') {
+                    await setTicketStatus('Open', ctx);
+                    await sleep(700);
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(500);
+                }
+                if (tekst) {
+                    try { w.komentarz = await addEscalationComment(ctx, tekst); }
+                    catch (e) { w.komentarz = { ok: false, error: (e && e.message) || String(e) }; }
+                }
+                if (osoba) {
+                    try { w.reassign = await reassignTicketToUser(ctx, href, osoba); }
+                    catch (e) { w.reassign = { ok: false, error: (e && e.message) || String(e) }; }
+                }
+            }
+
+            // Stan ticketu przywracamy ZAWSZE, takze po nieudanym ksiegowaniu — inaczej
+            // nieudany zapis zostawialby otwarty ticket, ktory byl zamkniety.
+            if (w.bylZamkniety) {
+                try {
+                    await loadInFrame(href, 20000, ctx);
+                    await sleep(600);
+                    if (getTicketStatus(getFrameDoc(ctx)) !== 'Closed') await setTicketStatus('Closed', ctx);
+                    w.status = 'przywrócony Closed';
+                } catch (e) { w.status = 'NIE udało się zamknąć z powrotem — sprawdź ticket'; }
+            }
+            w.ok = !!(w.ksieg && w.ksieg.ok);
+            return w;
+        } catch (e) {
+            w.error = (e && e.message) || String(e);
+            return w;
+        } finally {
+            destroyFrameCtx(ctx);
+        }
+    }
+    // Jedno powtorzenie, tak jak przy komentarzach: najczestsze porazki sa przejsciowe
+    // (ticket nie zdazyl sie wyrenderowac, serwer oddal 500, ramka padla na przeladowaniu).
+    // Powtorzenie nie grozi drugim ksiegowaniem — ucodTicketRaz zaczyna od sprawdzenia,
+    // czy wpisu przypadkiem juz tam nie ma.
+    window.__TM_UCOD_TICKET = async function (o) {
+        let r1;
+        try { r1 = await ucodTicketRaz(o); }
+        catch (e) { r1 = { ok: false, error: (e && e.message) || String(e) }; }
+        if (r1 && r1.ok) return r1;
+        if (r1 && /brak numeru ticketu|zła data|brak konta|brak kwoty/i.test(r1.error || '')) return r1;
+        // Powodu „nie ma na czym zaksiegowac" druga proba nie naprawi — to stan ticketu,
+        // nie awaria przejsciowa.
+        if (r1 && r1.ksieg && /nie ma na czym zaksięgować/i.test(r1.ksieg.error || '')) return r1;
+        await sleep(1500);
+        let r2;
+        try { r2 = await ucodTicketRaz(o); }
+        catch (e) { r2 = { ok: false, error: (e && e.message) || String(e) }; }
+        if (r2 && r2.ok) return Object.assign({}, r2, { poPowtorzeniu: true });
+        return r2 || r1;
     };
 
     async function reassignTicketToUser(ctx, ticketHref, openedByName) {
@@ -14595,25 +14757,94 @@
         // Numer konta ma pierwszenstwo z tej sciezki, ktora ERP juz potwierdzil
         // (pi.acc — porownane z kontami w systemie przy kontroli P/I). Blok bankowy
         // z P/I sluzy do nazwy, adresu i BIC; jego slot "konto" bywa przesuniety.
-        function painBankOfG(G){
-            var list = [], seen = {}, why = '';
-            function add(b, vacc){
+        // SWIFT z komentarza albo z karty dostawcy. Wzorzec MUSI byc zakotwiczony przy
+        // slowie „SWIFT"/„BIC": sam ksztalt BIC-u (6 liter + 2 znaki) lapie zwykle wyrazy
+        // pisane wersalikami — „BENEFICIARY" pasuje do niego co do znaku.
+        var PC_BIC_TXT = /\b(?:swift|bic)(?:\s*(?:code|no\.?|number))?\s*[:\-]?\s*([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/i;
+        function painBicZTekstu(t){
+            var m = String(t == null ? '' : t).match(PC_BIC_TXT);
+            var v = m ? painNorm(m[1]) : '';
+            return painBicOk(v) ? v : '';
+        }
+        // Skladanie danych z blokow NIEPELNYCH. Laczymy tylko te, ktore mowia o TYM SAMYM
+        // koncie (albo konta nie maja) — inaczej doklejalibysmy SWIFT jednego banku do
+        // numeru drugiego, czyli robili przelew, ktorego nikt nie zlecil.
+        function painScalBloki(bl){
+            var baza = null;
+            (bl || []).forEach(function(b){
                 if (!b) return;
-                // Blok odrzucony i tak nie moze pojsc do przelewu, ale zapamietujemy,
-                // CZEGO w nim brakuje — inaczej dalej wychodzi „brak bloku bankowego”.
-                if (!b.ok){ if (!why) why = piBankWhy(b); return; }
+                if (!baza){ baza = {}; for (var k0 in b) if (Object.prototype.hasOwnProperty.call(b, k0)) baza[k0] = b[k0]; return; }
+                var a1 = painNorm(baza.acc || ''), a2 = painNorm(b.acc || '');
+                if (a1 && a2 && a1 !== a2) return;
+                ['name', 'addr', 'bankName', 'bankAddr', 'acc', 'swift'].forEach(function(k){
+                    if (!baza[k] && b[k]) baza[k] = b[k];
+                });
+                if (baza.swiftBad && b.swift && !b.swiftBad){ baza.swift = b.swift; baza.swiftBad = false; }
+            });
+            return baza;
+        }
+        function painBankOfG(G){
+            var list = [], czesc = [], seen = {}, why = '';
+            function zKontem(b, vacc){
                 var cur = String(b.acc || ''), ver = normAcc(vacc || ''), o = b;
                 if (ver.length >= 8 && normAcc(cur) !== ver && (!piAccShape(cur) || b.accFix)){
                     o = {}; for (var kk in b) if (Object.prototype.hasOwnProperty.call(b, kk)) o[kk] = b[kk];
                     o.acc = ver; o.accWasWrong = cur || '(puste)'; o.accFix = false;
                 }
+                return o;
+            }
+            function add(b, vacc){
+                if (!b) return;
+                // Blok NIEPELNY nie jest bezuzyteczny. Nazwa, adres, bank i konto sa w nim
+                // tak samo dobre jak w pelnym; brakuje zwykle JEDNEGO pola — najczesciej
+                // SWIFT-u, ktorego dostawca nie wpisal (order 21806: „SWIFT NO. :" puste,
+                // a konto 419571486287 i nazwa beneficjenta na miejscu). Do 5.22 leciala
+                // przez to cala reszta, razem z powodem: painBankOfG dostawalo null, wiec
+                // nie zapisywalo nawet „brakuje SWIFT-u" i w UI zostawalo nieprawdziwe
+                // „brak danych bankowych w P/I".
+                if (!b.ok){
+                    if (!why) why = piBankWhy(b);
+                    czesc.push(zKontem(b, vacc));
+                    return;
+                }
+                var o = zKontem(b, vacc);
                 var k = painNorm(o.acc) + '|' + painNorm(o.swift);
                 if (seen[k]) return;
                 seen[k] = 1; list.push(o);
             }
-            (G.dep || []).forEach(function(r){ add(r.pi && r.pi.piBank, r.pi && r.pi.piAcc); });
-            (G.bal || []).forEach(function(r){ add(r.bpi && r.bpi.bank, r.bpi && r.bpi.piAcc); });
-            return { bank: list[0] || null, n: list.length, conflict: list.length > 1, why: list.length ? '' : why };
+            (G.dep || []).forEach(function(r){ add(r.pi && (r.pi.piBank || r.pi.piBankRaw), r.pi && r.pi.piAcc); });
+            (G.bal || []).forEach(function(r){ add(r.bpi && (r.bpi.bank || r.bpi.bankRaw), r.bpi && r.bpi.piAcc); });
+            var bank = list[0] || null, czesciowy = false, bicSrc = '';
+            if (!bank && czesc.length){
+                // Najpierw sklejamy to, co przyszlo z P/I tego samego dostawcy — inne
+                // zamowienie tej samej grupy potrafi miec SWIFT, ktorego brakuje tutaj.
+                bank = painScalBloki(czesc);
+                czesciowy = !!bank;
+                if (bank && czesc.length > 1 && bank.swift && !czesc[0].swift) bicSrc = 'z P/I innego zamówienia tego dostawcy';
+            }
+            // Dalej: komentarze bankowe zamowien i karta dostawcy. Obie strony sa juz
+            // pobrane wczesniej, wiec to zero dodatkowych zapytan.
+            if (bank && !painBicOk(bank.swift || '')){
+                var zrodla = [];
+                (G.dep || []).concat(G.bal || []).forEach(function(r){
+                    var oc = _ordConf[String(r && r.order)];
+                    if (!oc) return;
+                    ['conf', 'chg', 'hint'].forEach(function(k){
+                        if (oc[k] && oc[k].text) zrodla.push({ t: oc[k].text, skad: 'z komentarza w zamówieniu ' + r.order + ' (' + (oc[k].date || '?') + ')' });
+                    });
+                });
+                var cf = G.cid ? _conf[G.cid] : null;
+                if (cf) ['conf', 'chg', 'hint'].forEach(function(k){
+                    if (cf[k] && cf[k].text) zrodla.push({ t: cf[k].text, skad: 'z komentarza na karcie dostawcy (' + (cf[k].date || '?') + ')' });
+                });
+                if (G.cid && _info[G.cid]) zrodla.push({ t: _info[G.cid], skad: 'z pola „document information” na karcie dostawcy' });
+                for (var z = 0; z < zrodla.length; z++){
+                    var v = painBicZTekstu(zrodla[z].t);
+                    if (v){ bank.swift = v; bank.swiftBad = false; bicSrc = zrodla[z].skad; break; }
+                }
+            }
+            return { bank: bank, n: list.length, conflict: list.length > 1,
+                     why: list.length ? '' : why, czesciowy: czesciowy, bicSrc: bicSrc };
         }
         // "Zielony" = wszystko sprawdzone. Ostrzezenie (zolte) tez NIE jest zielone.
         function painGroupOk(G){
@@ -14706,7 +14937,11 @@
                     // Kraj z karty dostawcy jest pewny — „slaby" dotyczy tylko wyprowadzania.
                     geoSrc: karta && karta.ctry ? 'karta' : (geo.src || ''),
                     geoWeak: !!(geo.weak && geo.ctry && !(karta && karta.ctry)),
+                    // hasBank znaczy dalej „w P/I byl KOMPLETNY blok bankowy" — pola nizej
+                    // moga byc wypelnione takze z bloku niepelnego i wtedy czescBank mowi,
+                    // ze dane sa, ale dokument ich nie mial w komplecie.
                     hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
+                    czescBank: !!bk.czesciowy, bicSrc: bk.bicSrc || '',
                     verified: st.ok && !hintBad, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
                     sumDep: ds || 0, sumBal: bs || 0, zrodlo: W.zr,
@@ -14734,9 +14969,14 @@
                 var recznie = !!painNorm(r.acc) && painBicOk(r.bic)
                               && !!painTxt(r.name, 140, strict);
                 if (recznie) warns.push((r.bankWhy || 'nie znalazłem bloku bankowego w P/I')
-                    + ' — dane wpisane ręcznie, sprawdź je przed wysłaniem.');
+                    + (r.czescBank ? ' — resztę wziąłem z tego samego bloku' : ' — dane wpisane ręcznie')
+                    + ', sprawdź je przed wysłaniem.');
                 else errs.push((r.bankWhy || 'brak bloku bankowego w P/I') + ' — uzupełnij dane ręcznie.');
             }
+            // SWIFT spoza P/I. To jedyne pole, ktore modul potrafi dobrac skadinad, wiec
+            // ma byc widoczne ZAWSZE — takze gdy wiersz poza tym nie ma zadnej uwagi.
+            if (r.bicSrc) warns.push('SWIFT/BIC „' + r.bic + '” nie pochodzi z tego P/I, tylko '
+                + r.bicSrc + ' — potwierdź go przed wysłaniem.');
             if (!painTxt(r.name, 140, strict)) errs.push('brak nazwy beneficjenta.');
             if (!painNorm(r.acc)) errs.push('brak numeru konta beneficjenta.');
             // .slice(0, 34) w budowie pliku ucinalby numer PO CICHU. Lepiej zatrzymac
@@ -17672,7 +17912,16 @@
                     : '<span style="color:' + (uw.errs.length ? '#c00' : '#c47f00') + ';font-weight:700" title="'
                       + pcAttr(uw.errs.concat(uw.warns).join('\n')) + '">⚠ ' + ileUw + ' uwag'
                       + (uw.errs.length ? (' (' + uw.errs.length + ' blokuje plik)') : '') + '</span>';
-                if (!r.hasBank) st = '<span style="color:#c00;font-weight:700">✗ brak danych bankowych w P/I</span>';
+                // „Brak danych bankowych" wolno napisac tylko wtedy, gdy naprawde ich nie ma.
+                // Gdy blok jest, a brakuje w nim pola, mowimy KTOREGO — inaczej komunikat
+                // wysyla czlowieka szukac czegos, co lezy na wierzchu.
+                if (!r.hasBank && r.czescBank)
+                    st = '<span style="color:#c47f00;font-weight:700" title="' + pcAttr(r.bankWhy || '')
+                       + '">⚠ blok bankowy niepełny — wziąłem, co było</span>'
+                       + (uw.errs.length ? ('<br>' + st) : '');
+                else if (!r.hasBank) st = '<span style="color:#c00;font-weight:700"'
+                       + (r.bankWhy ? (' title="' + pcAttr(r.bankWhy) + '"') : '')
+                       + '>✗ brak danych bankowych w P/I</span>';
                 else if (r.conflict) st += ' <span style="color:#c00;font-weight:700" title="P/I wskazują różne konta">✗ konflikt kont</span>';
                 // Rozjazd z komentarzem stoi NAD reszta statusu — to jedyna uwaga, ktora moze
                 // skonczyc sie wyslaniem pieniedzy pod zly numer.
@@ -18307,9 +18556,16 @@
             return out;
         }
         // Komentarz z prosba o depozyt — procent bywa pominiety ("please pay deposit 2886.40 USD").
+        // Slowo klucz to nie samo „deposit". W komentarzach stoi takze skrot „depo"
+        // („Please, pay depo 15%: 1245.05 USD" — order 21797), „advance payment"
+        // i „prepayment". Sprawdzanie partii znalo te warianty od dawna (bcJestDepo),
+        // Wprowadzanie nie — i przez to nie gubilo samej kwoty, tylko CALY P/I: bez
+        // rozpoznanego komentarza checkOnePI wychodzilo przed pobraniem pliku, wiec
+        // razem z kwota przepadaly dane bankowe, ktore w P/I byly kompletne.
+        var PC_DEPO_RE = /\bdepo(?:sit|zyt)?\b|\badvance\s+payment\b|\bpre-?payment\b/i;
         function pcIsDepoText(t){
             var s = String(t == null ? '' : t);
-            if (!/deposit/i.test(s)) return false;
+            if (!PC_DEPO_RE.test(s)) return false;
             return /%/.test(s) || /\b(?:pay|payment|paid|prepay|prepayment)\b/i.test(s);
         }
         // Komentarze SYSTEM o roszczeniach (penalty/claim) — to nie sa kwoty balance, tylko korekta.
@@ -18635,10 +18891,13 @@
                 // procent bywa pominiety — wtedy pct = null, a sprawdzamy tylko kwote i konto
                 var pm = t.match(/(\d+(?:[.,]\d+)?)\s*%/);
                 var pct = pm ? parseFloat(String(pm[1]).replace(',', '.')) : null;
-                var di = t.toLowerCase().indexOf('deposit');
-                var amount = pcDepoAmt(t.slice(di + 7));
-                // np. "please pay 2886.40 USD deposit" — kwota przed slowem "deposit"
-                if (amount == null) amount = pcDepoAmt(t.slice(0, di));
+                // Kwoty szukamy wokol TEGO slowa, ktore trafilo — dotad stalo tu sztywne
+                // indexOf('deposit') i przy komentarzu z „depo" wychodzilo -1, czyli
+                // czytanie od konca tekstu.
+                var mk = t.match(PC_DEPO_RE), di = mk ? mk.index : -1;
+                var amount = (di >= 0) ? pcDepoAmt(t.slice(di + mk[0].length)) : null;
+                // np. "please pay 2886.40 USD deposit" — kwota przed slowem kluczem
+                if (amount == null && di >= 0) amount = pcDepoAmt(t.slice(0, di));
                 if (amount != null) return { pct: pct, amount: amount, idx: spans.length ? i : -1 };
             }
             return null;
@@ -20374,7 +20633,16 @@
             // bezDepo: sciezka sprawdzania z wklejki. Przy zamowieniach „Deposit: 0%"
             // komentarza depozytowego NIE MA, a blok bankowy z P/I jest tam potrzebny tak
             // samo — bez niego znika porownanie konta, SWIFT-u i beneficjenta.
-            if (!com && !bezDepo) { dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ')'); return ret({ ok: false, msg: 'brak komentarza deposit' }); }
+            // Brak komentarza NIE konczy sprawdzania. Plik P/I trzeba pobrac tak czy owak,
+            // bo to z niego biora sie dane bankowe (nazwa, konto, SWIFT) — a te sa potrzebne
+            // niezaleznie od tego, czy kwote depozytu udalo sie odczytac. Do 5.22 wychodzilo
+            // sie stad PRZED pobraniem i zamowienie bez rozpoznanego komentarza trafialo do
+            // przelewow zupelnie puste: kwota 0.00 i „brak danych bankowych w P/I", chociaz
+            // w pliku byl komplet z SWIFT-em (order 21797). Werdykt i tak konczy sie nizej
+            // ostrzezeniem „brak komentarza depozytowego — z P/I wziąłem dane bankowe",
+            // wiec nic nie udaje, ze kwota jest znana. Parametr bezDepo przestal cokolwiek
+            // rozstrzygac; zostaje w sygnaturze, bo wolaja go dwie sciezki.
+            if (!com) dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ') — czytam P/I dla danych bankowych');
             if (!piUrl) { dlog('DEPO ' + order + ': brak pliku P/I'); return ret({ ok: false, msg: 'brak P/I' }); }
             var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
             if (!buf) { dlog('DEPO ' + order + ': nie pobrano P/I (' + piUrl + ')'); return ret({ ok: false, msg: 'nie pobrano P/I' }); }
@@ -20452,7 +20720,11 @@
             // Dane bankowe z P/I doklejamy do kazdego wyniku — sa potrzebne do pain.001
             // niezaleznie od tego, czy kontrola konta wypadla OK.
             var pbank = (pi && pi.bank && pi.bank.ok) ? pi.bank : null;
-            function R(p){ p.bank = pbank; p.piAcc = (pi && pi.acc) ? pi.acc : ''; return { cands: cands, pens: pens, pi: p }; }
+            // bankRaw: blok TAKI, JAKI JEST — takze niepelny. pbank zostaje „komplet albo
+            // nic", bo na tym stoja kontrole konta, ale wiersz przelewu ma z czego wziac
+            // nazwe, konto i bank, gdy w dokumencie brakuje jednego pola (patrz painBankOfG).
+            var pbankRaw = (pi && pi.bank) ? pi.bank : null;
+            function R(p){ p.bank = pbank; p.bankRaw = pbankRaw; p.piAcc = (pi && pi.acc) ? pi.acc : ''; return { cands: cands, pens: pens, pi: p }; }
             if (pi && pi.manual) return R({ ok: false, warn: true, msg: pi.err || 'P/I – sprawdź ręcznie', title: title });
             if (pi && pi.err) return R({ ok: false, msg: pi.err, title: title });
             if (!pi || !pi.acc) return R({ ok: false, msg: 'brak konta w P/I', title: title });
@@ -40542,7 +40814,12 @@
     function money(s){
         var t = String(s == null ? '' : s).replace(/[\s'’ ]/g, '').replace(/[^\d.,+-]/g, '');
         if (!t || !/\d/.test(t)) return null;
-        if (t.indexOf('.') === -1 && /,\d{1,2}$/.test(t)) t = t.replace(',', '.'); else t = t.replace(/,/g, '');
+        // Przecinek jako OSTATNI separator z jedna-dwiema cyframi po sobie to zapis
+        // niemiecki („1.149,97”) - kropki sa wtedy tysiacami i musza zniknac. W kazdym
+        // innym ukladzie przecinek jest separatorem tysiecy i to on znika.
+        var lc = t.lastIndexOf(','), ld = t.lastIndexOf('.');
+        if (lc > ld && /,\d{1,2}$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');
+        else t = t.replace(/,/g, '');
         var v = parseFloat(t);
         return isFinite(v) ? v : null;
     }
@@ -40645,7 +40922,11 @@
         if (!node) return null;
         var box = (node.closest && node.closest('td')) || node.parentNode;
         var t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
-        var m = t.match(/-?\s*\d[\d'’\s]*(?:[.,]\d{1,2})?/);
+        // Separator tysiecy MUSI wejsc do wzorca. Prologistics pisze te kwote po angielsku,
+        // z przecinkiem - „€ 1,149.97” - a wzorzec bez przecinka lapal z tego samo „1,14”
+        // i open amount 1149.97 czytal jako 1.14. Rozdzielenie kropki od przecinka zostaje
+        // przy `money` nizej. To samo poprawiono w crOpen (Marketplace's) w 4.67.
+        var m = t.match(/-?\s*\d[\d'’\s,.]*/);
         return m ? money(m[0]) : null;
     }
     function accOptions(d){
@@ -48216,6 +48497,622 @@
 })();
     }
 
+    // ===================== Unpaid COD =====================
+    // Wklejka to lista maili ze skrzynki (From / Subject / Received / Size). W temacie stoi
+    // numer ticketu („Please answer Ticket: 677012") albo auftraga („New responsible for
+    // auftrag: 15496323/3") — z jednego i drugiego dochodzimy do TICKETU, bo to w jego
+    // komentarzach obsluga klienta prosi o wyksiegowanie nieoplaconego pobrania:
+    //
+    //     Refund request: Refused COD: Please book the open COD amount to 1088
+    //     Amount: 21231
+    //     Currency: HUF
+    //
+    // Zasada: kwota z prosby musi zgadzac sie z open amount auftraga. Wtedy z dzisiejsza
+    // data ksiegujemy ja na 1088 („Unpaid COD") w AUFTRAGU i te sama kwote, to samo konto
+    // i te sama date w TICKECIE (Solution = Money back). Obie nogi znosza sie na 1088 do
+    // zera — stad „puste ksiegowanie": pieniedzy nigdy nie bylo, wiec nic z konta nie
+    // wychodzi, a auftrag i ticket przestaja wisiec otwarte.
+    //
+    // Podzial pracy: czytanie idzie fetch-em, ksiegowanie na auftragu POST-em — obie rzeczy
+    // modul robi sam. Ticket to zapis w ZYWYM dokumencie, wiec te czesc wola most
+    // window.__TM_UCOD_TICKET z modulu „Ksiegowanie w tickecie". Tamta mechanika (otwarcie
+    // zamknietego ticketu, Solution, Update, potwierdzenie, komentarz, Reassign, powrot do
+    // Closed) jest wychodzona i drugiej kopii nie ma po co pisac.
+    //
+    // Czego modul NIE robi: nie dopisuje „Please add solution". Przy odmowie pobrania zwrot
+    // nie wymaga solution, wiec taki komentarz bylby falszywym poleceniem dla CS.
+    function init_ucod() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+    // Modul „Ksiegowanie w tickecie" pracuje w ukrytych ramkach na tym samym hoscie —
+    // bez tej bramki panel montowalby sie w kazdej z nich.
+    if (window.top !== window.self) return;
+    if (document.getElementById('ucod-btn')) return;
+
+    var UC_VER   = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
+    var UC_KONTO = '1088';    // „Unpaid COD" — ustalone, nie czytamy go z tresci prosby
+    var UC_TOL   = 0.005;     // grosz
+    var UC_KOM   = 'Booked';  // komentarz dopisywany po zaksiegowaniu
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function att(s){ return esc(s).replace(/\n/g, '&#10;'); }
+    function dom(html){ return new DOMParser().parseFromString(String(html || ''), 'text/html'); }
+    function flat(s){ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
+    function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
+    function eq(a, b){ return a != null && b != null && isFinite(a) && isFinite(b) && Math.abs(a - b) < UC_TOL; }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function today(){ var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+    // Separator dziesietny to ten, ktory stoi JAKO OSTATNI — reszta to separatory tysiecy.
+    // Sam przecinek rozstrzygamy po liczbie cyfr za nim: „21,231" to tysiace (angielski
+    // zapis prologistics), „21,23" to grosze. Bez tego open amount „€ 1,149.97" czytalby
+    // sie jako 1,14 — dokladnie ta pomylka siedziala kiedys w crOpen.
+    function money(v){
+        if (v == null) return null;
+        var s = String(v).replace(/ /g, '').replace(/[\s'’]/g, '').replace(/[€£$]/g, '');
+        s = s.replace(/[^0-9.,-]/g, '');
+        if (!s || s === '-' || !/\d/.test(s)) return null;
+        var neg = s.charAt(0) === '-';
+        s = s.replace(/-/g, '');
+        var lc = s.lastIndexOf(','), ld = s.lastIndexOf('.');
+        if (lc > -1 && ld > -1){
+            s = (lc > ld) ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+        } else if (lc > -1){
+            var cn = (s.match(/,/g) || []).length, af = s.length - lc - 1;
+            s = (cn > 1 || af === 3) ? s.replace(/,/g, '') : s.replace(',', '.');
+        } else if (ld > -1){
+            var cd = (s.match(/\./g) || []).length, ad = s.length - ld - 1;
+            if (cd > 1 || ad === 3) s = s.replace(/\./g, '');
+        }
+        var n = parseFloat(s);
+        if (!isFinite(n)) return null;
+        return neg ? -n : n;
+    }
+
+    // Pula robocza — tylko do SPRAWDZANIA. Ksiegowanie idzie po kolei (patrz „Ksieguj").
+    async function pool(items, workers, worker){
+        var idx = 0, N = items.length;
+        async function one(){
+            while (idx < N){
+                if (S.abort) return;
+                var i = idx++;
+                try { await worker(items[i], i); } catch (e){ /* worker sam opisuje blad w wierszu */ }
+            }
+        }
+        var ps = [];
+        for (var w = 0; w < Math.max(1, Math.min(workers, N)); w++) ps.push(one());
+        await Promise.all(ps);
+    }
+    function parN(){ var v = parseInt(($('#uc-par') || {}).value, 10); return (isFinite(v) && v >= 1 && v <= 6) ? v : 3; }
+
+    // ===== wklejka =====
+    // Kolumn bywa mniej niz cztery (kopiowanie bez naglowka, wklejka przez schowek tekstowy),
+    // wiec numeru szukamy w CALYM wierszu, a nadawce bierzemy z pierwszej kolumny tylko
+    // wtedy, gdy tabulatory naprawde sa. Ten sam ticket w kilku mailach to jedna robota —
+    // dlatego wiersze scalamy po numerze i pokazujemy, ile maili go dotyczylo.
+    function parsePaste(raw){
+        var lines = String(raw || '').split(/\r?\n/), out = [], errs = [], widziane = {};
+        lines.forEach(function(line, i){
+            var s = String(line == null ? '' : line).trim();
+            if (!s) return;
+            var low = s.toLowerCase();
+            if (/^from\b/.test(low) && low.indexOf('subject') >= 0) return;   // naglowek skrzynki
+            var f = String(line).split('\t');
+            var mT = s.match(/ticket\s*[:#]?\s*(\d{3,})/i);
+            var mA = s.match(/auftrag\s*[:#]?\s*(\d{3,})(?:\s*\/\s*(\d+))?/i);
+            if (!mT && !mA){ errs.push('wiersz ' + (i + 1) + ': nie ma w nim ani „Ticket: NNN", ani „auftrag: NNN".'); return; }
+            var typ = mT ? 'ticket' : 'auftrag';
+            var id  = mT ? mT[1] : mA[1];
+            var kl  = typ + ':' + id;
+            if (widziane[kl]){ widziane[kl].maili++; return; }
+            var r = {
+                line: i + 1, typ: typ, id: id, maili: 1,
+                // Sufiks „/3" z tematu tylko odnotowujemy. Caly HUB czyta i ksieguje
+                // auftrag z txnid=3 — mieszanie tego w jednym module skonczyloby sie
+                // odczytem jednej transakcji, a ksiegowaniem w drugiej.
+                txn: (!mT && mA && mA[2]) ? mA[2] : '',
+                from: (f.length > 1 ? flat(f[0]) : ''),
+                temat: (f.length > 1 ? flat(f[1]) : s),
+                rma: (typ === 'ticket' ? id : ''), aufNum: (typ === 'auftrag' ? id : ''),
+                kwota: null, open: null, waluta: '', nPay: 0, maKonto: false,
+                autor: '', autorId: '', dataPr: '',
+                st: 'new', msg: '', sel: false, booked: false
+            };
+            widziane[kl] = r;
+            out.push(r);
+        });
+        return { rows: out, errs: errs };
+    }
+
+    // ===== ticket =====
+    // Tresc komentarza trzyma <span class="commentText"> z <br> zamiast zlaman wiersza —
+    // wiersz „Amount:" bez tej zamiany skleilby sie z sasiednim i kwota wyszlaby inna.
+    function tekstKomentarza(span){
+        try {
+            var h = String(span.innerHTML || '').replace(/<br\s*\/?>/gi, '\n');
+            var d = span.ownerDocument.createElement('div');
+            d.innerHTML = h;
+            return String(d.textContent || '');
+        } catch (e){ return String((span && span.textContent) || ''); }
+    }
+    // Prosbe poznajemy po TRZECH rzeczach naraz: slowie COD, prosbie o zaksiegowanie
+    // i numerze konta. W tickecie stoja obok siebie takze komentarze CS, maile przewoznika
+    // i tlumaczenia — pomylka oznaczalaby zaksiegowanie kwoty z cudzej prosby.
+    function czyProsba(t){
+        return /\bCOD\b/i.test(t) && /\bbook/i.test(t) && String(t).indexOf(UC_KONTO) >= 0;
+    }
+    function czytajKomentarze(d){
+        var out = [];
+        d.querySelectorAll('tr.comment-row').forEach(function(tr){
+            var span = tr.querySelector('span.commentText');
+            if (!span) return;
+            var tds = tr.querySelectorAll('td');
+            var aut = tr.querySelector('td.comment-author');
+            var a   = tr.querySelector('a.comment-author-name');
+            out.push({
+                data: tds[0] ? flat(tds[0].textContent) : '',
+                autor: a ? flat(a.textContent) : (aut ? flat(aut.textContent) : ''),
+                autorId: (aut && aut.getAttribute('data-user')) || '',
+                src: tr.getAttribute('data-src') || '',
+                tekst: tekstKomentarza(span)
+            });
+        });
+        return out;
+    }
+    function znajdzProsbe(kom){
+        var kand = kom.filter(function(k){ return czyProsba(k.tekst); });
+        if (!kand.length) return null;
+        var k = kand[kand.length - 1];                       // najswiezsza prosba
+        var mk = k.tekst.match(/Amount\s*[:=]\s*(-?[\d][\d'’\s.,]*)/i);
+        var mw = k.tekst.match(/Currency\s*[:=]\s*([A-Za-z]{2,4})/i);
+        return { k: k, kwota: mk ? money(mk[1]) : null, waluta: mw ? mw[1].toUpperCase() : '', ile: kand.length };
+    }
+    function aufyZeStrony(d){
+        var out = [];
+        d.querySelectorAll('a[href*="auction.php?number="]').forEach(function(a){
+            var h = a.getAttribute('href') || '';
+            if (h.indexOf('shipping_auction.php') >= 0) return;
+            var m = h.match(/number=(\d+)/);
+            if (m && out.indexOf(m[1]) === -1) out.push(m[1]);
+        });
+        return out;
+    }
+    function ticketyZeStrony(d){
+        var out = [];
+        d.querySelectorAll('a[href*="rma.php"][href*="rma_id="]').forEach(function(a){
+            var m = (a.getAttribute('href') || '').match(/[?&]rma_id=(\d+)/i);
+            if (m && out.indexOf(m[1]) === -1) out.push(m[1]);
+        });
+        return out;
+    }
+    // Strona ticketu odpowiada ~30 s i to czas SERWERA — fetch nie jest tu szybszy od
+    // ramki, ale nie renderuje i nie zajmuje ramki ksiegujacej. Kazde wejscie liczy sie
+    // podwojnie, dlatego czytamy ticket RAZ i niesiemy z niego wszystko naraz.
+    async function czytajTicket(rma){
+        var html = '';
+        try {
+            var res = await fetch('/rma.php?rma_id=' + encodeURIComponent(rma), { credentials: 'same-origin' });
+            if (!res || !res.ok) return { ok: false, err: 'ticket ' + rma + ': HTTP ' + (res ? res.status : '?') };
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarto ticketu ' + rma }; }
+        var d = dom(html);
+        if (!d.querySelector('tr.comment-row') && !d.getElementById('auftrag_details'))
+            return { ok: false, err: 'ticket ' + rma + ': strona nie wygląda na ticket (brak komentarzy i Auftrag Details)' };
+        return { ok: true, pr: znajdzProsbe(czytajKomentarze(d)), aufy: aufyZeStrony(d) };
+    }
+
+    // ===== auftrag =====
+    // Trzy sposoby na „skasowany", bo jeden nie wystarcza: rozstrzyga status WLASNY
+    // z naglowka, a nie caly kod strony — ta wymienia takze pozostale transakcje tego
+    // numeru i wystarczyla jedna skasowana, zeby zywy auftrag wyszedl na skasowany.
+    function usuniety(d, html){
+        try {
+            var nag = d && d.querySelector('h1.header-title, .header-title');
+            var st = nag ? nag.querySelector('[class*="auftrag-status--"]') : null;
+            if (st) return /auftrag-status--deleted/i.test(String(st.className || ''));
+            var bl = String(html || '').match(/<h1[^>]*class="[^"]*header-title[^"]*"[\s\S]{0,600}?<\/h1>/i);
+            if (bl){
+                if (/auftrag-status--deleted/i.test(bl[0])) return true;
+                if (/auftrag-status--active/i.test(bl[0])) return false;
+            }
+            if (d && d.querySelector('.auftrag-status--deleted')) return true;
+        } catch (e){}
+        return /auftrag-status--deleted/i.test(String(html || ''));
+    }
+    // Napis stoi na stronie DWA razy: w podsumowaniu tabeli Payments (w <b>) i jako zwykly
+    // tekst w kolumnie Comment wczesniejszego ksiegowania. Bierzemy wylacznie ten z <b>,
+    // i to ostatni. Separator tysiecy MUSI byc we wzorcu — patrz `money` wyzej.
+    function aufOpen(d){
+        var bs = d.querySelectorAll('b'), node = null;
+        for (var i = 0; i < bs.length; i++){ if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i]; }
+        if (!node) return { open: null, waluta: '' };
+        var box = (node.closest && node.closest('td')) || node.parentNode;
+        var t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+        var m = t.match(/-?\s*\d[\d'’\s,.]*/);
+        if (!m) return { open: null, waluta: '' };
+        var przed = t.slice(0, m.index).replace(/[\s:]+/g, ' ').trim();
+        var w = przed.match(/([A-Z]{3}|[€£$])\s*$/);
+        return { open: money(m[0]), waluta: w ? w[1] : '' };
+    }
+    async function czytajAuftrag(num){
+        var html = '';
+        try {
+            var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3', { credentials: 'same-origin' });
+            if (!res || !res.ok) return { ok: false, err: 'auftrag ' + num + ': HTTP ' + (res ? res.status : '?') };
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarto auftraga ' + num }; }
+        var d = dom(html), usun = usuniety(d, html);
+        var tick = ticketyZeStrony(d);
+        if (!d.querySelector('form#book'))
+            return { ok: false, deleted: usun, tickety: tick,
+                     err: usun ? ('auftrag ' + num + ' jest SKASOWANY (bez formularza płatności)')
+                               : ('na stronie auftraga ' + num + ' nie ma formularza płatności') };
+        var o = aufOpen(d);
+        // Konto sprawdzamy na liscie TEGO auftraga: POST z kontem, ktorego w wyborze nie ma,
+        // konczy sie HTTP 200 i niczym wiecej — awaria bylaby cicha.
+        var maKonto = false;
+        var os = d.querySelectorAll('select[name="account"] option');
+        for (var i = 0; i < os.length; i++){ if (String(os[i].getAttribute('value') || '') === UC_KONTO) { maKonto = true; break; } }
+        return { ok: true, open: o.open, waluta: o.waluta, deleted: usun, tickety: tick,
+                 nPay: d.querySelectorAll('a[href*="delpay="]').length, maKonto: maKonto };
+    }
+    // Formularz #book nie ma tokenu CSRF ani onsubmit, wiec POST z osmioma polami odtwarza
+    // dokladnie to, co wysyla przegladarka po kliknieciu „Make payment". Przyciskow „safer"
+    // i „paypal" NIE wolno dosylac — oznaczaja platnosc karta.
+    async function ksiegujAuftrag(num, dateISO, kwota, opis){
+        var m = String(dateISO || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return { ok: false, err: 'zła data księgowania' };
+        var b = [];
+        function add(k, v){ b.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); }
+        add('number', String(num));
+        add('txnid', '3');
+        add('Date_Month', m[2]);
+        add('Date_Day', String(parseInt(m[3], 10)));   // select ma 1..31, bez zera wiodacego
+        add('Date_Year', m[1]);
+        add('account', UC_KONTO);
+        add('amount', Number(kwota).toFixed(2));
+        add('paycomment', flat(opis));
+        try {
+            var res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: b.join('&') });
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            return { ok: true };
+        } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
+    }
+
+    // ===== stan + UI =====
+    var S = { rows: [], busy: false, abort: false };
+
+    var btn = document.createElement('button');
+    btn.id = 'ucod-btn';
+    btn.textContent = '📮 Unpaid COD';
+    btn.style.cssText = 'position:fixed;top:294px;right:12px;z-index:2147483000;padding:9px 14px;border:none;border-radius:8px;background:#5b2d82;color:#fff;font:bold 13px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)';
+
+    var panel = document.createElement('div');
+    panel.id = 'ucod-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:2147483001;width:min(1280px,96vw);max-height:88vh;overflow:auto;background:#fff;border:1px solid #d8cbe6;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.28);font:13px Arial,sans-serif;flex-direction:column';
+    panel.innerHTML =
+        '<div style="display:flex;justify-content:space-between;align-items:center;background:#F1EAF8;padding:12px 16px;border-bottom:1px solid #d8cbe6">'
+      +   '<div style="font-weight:700;color:#5b2d82">Unpaid COD <span style="font-weight:400;font-size:11px;opacity:.6">v' + UC_VER + '</span></div>'
+      +   '<button id="uc-close" style="padding:4px 12px;border:1px solid #d8cbe6;border-radius:6px;background:#fff;cursor:pointer">✕</button>'
+      + '</div>'
+      + '<div style="padding:12px 16px">'
+      +   '<div style="font-size:11px;color:#666;margin-bottom:4px">Wklej wiersze ze skrzynki (From / Subject / Received / Size). Z tematu brany jest numer po <b>Ticket:</b> albo po <b>auftrag:</b>; kwota i osoba — z komentarza z prośbą o wyksięgowanie COD.</div>'
+      +   '<textarea id="uc-paste" spellcheck="false" style="width:100%;height:130px;font:11px monospace;border:1px solid #d8cbe6;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>'
+      +   '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Data księgowania (cała paczka)'
+      +       '<input type="date" id="uc-date" value="' + today() + '" style="font-size:12px;padding:3px 5px;border:1px solid #d8cbe6;border-radius:5px"></label>'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666">Konto'
+      +       '<input type="text" value="' + UC_KONTO + ' — Unpaid COD" readonly style="font-size:12px;padding:3px 5px;border:1px solid #d8cbe6;border-radius:5px;background:#f6f2fa;color:#555;min-width:170px"></label>'
+      +     '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#666" title="Ile ticketów sprawdzać naraz. Dotyczy TYLKO sprawdzania — księgowanie idzie po kolei.">Równolegle (sprawdzanie)'
+      +       '<input type="number" id="uc-par" min="1" max="6" value="3" style="font-size:12px;padding:3px 5px;border:1px solid #d8cbe6;border-radius:5px;width:60px"></label>'
+      +   '</div>'
+      +   '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">'
+      +     '<button id="uc-check" style="padding:7px 14px;border:none;border-radius:7px;background:#5b2d82;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+      +     '<button id="uc-book" disabled style="padding:7px 14px;border:none;border-radius:7px;background:#5b2d82;color:#fff;font-weight:700;cursor:pointer">💾 Księguj zaznaczone</button>'
+      +     '<button id="uc-stop" disabled style="padding:7px 14px;border:1px solid #d8cbe6;border-radius:7px;background:#fff;cursor:pointer">⛔ Przerwij</button>'
+      +     '<button id="uc-all" style="padding:7px 12px;border:1px solid #d8cbe6;border-radius:7px;background:#fff;cursor:pointer">☑ Zaznacz / odznacz</button>'
+      +     '<span id="uc-status" style="font-size:11px;color:#666"></span>'
+      +   '</div>'
+      +   '<div id="uc-out" style="margin-top:12px;overflow-x:auto"></div>'
+      + '</div>';
+
+    function $(s){ return panel.querySelector(s); }
+    function say(t, c){ var e = $('#uc-status'); if (e){ e.textContent = t; e.style.color = c || '#666'; } }
+    // Launcher chowa ten guzik i „klika" go za nas (data-sel -> b.click()), wiec przelacznik
+    // musi dzialac tak samo z ukrytego guzika jak z widocznego.
+    btn.onclick = function(){ panel.style.display = (panel.style.display === 'none' ? 'flex' : 'none'); };
+    (document.body || document.documentElement).appendChild(btn);
+    (document.body || document.documentElement).appendChild(panel);
+    $('#uc-close').onclick = function(){ panel.style.display = 'none'; };
+
+    function stTxt(r){
+        if (r.st === 'ok')   return '<span style="color:#0a7a2f;font-weight:700">✓ zgodne</span>';
+        if (r.st === 'diff') return '<span style="color:#c47f00;font-weight:700">⚠ kwota ≠ open amount</span>';
+        if (r.st === 'zero') return '<span style="color:#2563eb;font-weight:700">ℹ open amount = 0</span>';
+        if (r.st === 'skip') return '<span style="color:#2563eb;font-weight:700">ℹ bez prośby o COD</span>';
+        if (r.st === 'err')  return '<span style="color:#c00;font-weight:700">✗ błąd</span>';
+        if (r.st === 'done') return '<span style="color:#0a7a2f;font-weight:700">✓ zaksięgowane</span>';
+        if (r.st === 'part') return '<span style="color:#c47f00;font-weight:700">⚠ do sprawdzenia</span>';
+        if (r.st === 'fail') return '<span style="color:#c00;font-weight:700">✗ nie zaksięgowano</span>';
+        return '<span style="color:#888">—</span>';
+    }
+    // Do zaksiegowania nadaja sie tylko wiersze z odnalezionym ticketem, auftragiem i kwota.
+    // Rozjazd kwoty NIE blokuje — tylko odznacza; decyzje zostawiamy czlowiekowi.
+    function bookable(r){
+        return !r.booked && !!r.rma && !!r.aufNum && r.kwota != null && (r.st === 'ok' || r.st === 'diff');
+    }
+    function tLnk(id){ return id ? ('<a href="https://www.prologistics.info/rma.php?rma_id=' + esc(id) + '" target="_blank" style="color:#5b2d82;font-weight:600">' + esc(id) + '</a>') : '—'; }
+    function aLnk(n){ return n ? ('<a href="https://www.prologistics.info/auction.php?number=' + esc(n) + '&txnid=3" target="_blank" style="color:#5b2d82;font-weight:600">' + esc(n) + '</a>') : '—'; }
+
+    function render(){
+        var el = $('#uc-out');
+        if (!S.rows.length){ el.innerHTML = '<div style="color:#888;padding:8px">Wklej wiersze ze skrzynki i kliknij „Sprawdź”.</div>'; return; }
+        var h = '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+              + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px"></td><td style="padding:2px 5px">Wiersz</td>'
+              + '<td style="padding:2px 5px">Z maila</td><td style="padding:2px 5px">Ticket</td><td style="padding:2px 5px">Auftrag</td>'
+              + '<td style="padding:2px 5px;text-align:right">Kwota z prośby</td><td style="padding:2px 5px;text-align:right">Open amount</td>'
+              + '<td style="padding:2px 5px">Prosił</td><td style="padding:2px 5px">Status</td><td style="padding:2px 5px">Uwagi</td></tr>';
+        S.rows.forEach(function(r, i){
+            var zle = (r.st === 'err' || r.st === 'fail');
+            var bg = r.booked ? (r.st === 'done' ? '#EAF7EA' : '#FFF6E0') : (zle ? '#FDECEC' : (r.st === 'diff' ? '#FFF6E0' : '#fff'));
+            var can = bookable(r);
+            h += '<tr style="background:' + bg + '">'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + (can ? '<input type="checkbox" class="uc-chk" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '>' : '') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee">' + esc(r.line) + (r.maili > 1 ? ('<span style="color:#999" title="tyle maili dotyczy tego samego numeru"> ×' + r.maili + '</span>') : '') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + att(r.temat) + '">' + esc(r.from || '—') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + tLnk(r.rma) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + aLnk(r.aufNum) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right;font-weight:600">' + f2(r.kwota) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;text-align:right">' + f2(r.open) + (r.waluta ? (' <span style="color:#999">' + esc(r.waluta) + '</span>') : '') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + esc(r.autor || '—') + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;white-space:nowrap">' + stTxt(r) + '</td>'
+              +  '<td style="padding:2px 5px;border-top:1px solid #eee;color:#666">' + esc(r.msg || '') + '</td></tr>';
+        });
+        el.innerHTML = h + '</table>';
+        el.querySelectorAll('.uc-chk').forEach(function(c){
+            c.onchange = function(){ S.rows[parseInt(c.getAttribute('data-i'), 10)].sel = c.checked; };
+        });
+    }
+
+    function dopisz(r, t){ r.msg = r.msg ? (r.msg + '; ' + t) : t; }
+
+    // ===== sprawdzanie =====
+    async function sprawdzWiersz(r){
+        // Z numeru auftraga dochodzimy do ticketu: prosba stoi w komentarzach TICKETU.
+        // Auftrag czytamy przy okazji — i tak bedzie potrzebny.
+        if (r.typ === 'auftrag'){
+            if (r.txn && r.txn !== '3') dopisz(r, 'temat mówił o transakcji /' + r.txn + ', czytam i księguję /3 jak reszta HUB-a');
+            var a0 = await czytajAuftrag(r.id);
+            if (!a0.ok){ r.st = 'err'; dopisz(r, a0.err); return; }
+            r.aufNum = r.id; r.open = a0.open; r.waluta = a0.waluta; r.nPay = a0.nPay; r.maKonto = a0.maKonto;
+            if (a0.deleted){ r.st = 'err'; dopisz(r, 'auftrag skasowany'); return; }
+            if (!a0.tickety.length){ r.st = 'skip'; dopisz(r, 'auftrag nie ma ticketów — nie ma gdzie szukać prośby'); return; }
+            var znal = [];
+            for (var i = 0; i < a0.tickety.length; i++){
+                if (S.abort) return;
+                var t0 = await czytajTicket(a0.tickety[i]);
+                if (t0.ok && t0.pr) znal.push({ id: a0.tickety[i], t: t0 });
+            }
+            if (!znal.length){
+                r.st = 'skip';
+                dopisz(r, 'w ' + a0.tickety.length + ' tickecie(-ach) tego auftraga nie ma prośby o unpaid COD');
+                return;
+            }
+            if (znal.length > 1){
+                r.st = 'err';
+                dopisz(r, 'prośba o unpaid COD jest w kilku ticketach (' + znal.map(function(x){ return x.id; }).join(', ') + ') — rozstrzygnij ręcznie');
+                return;
+            }
+            r.rma = znal[0].id;
+            r.tik = znal[0].t;
+        } else {
+            var t1 = await czytajTicket(r.rma);
+            if (!t1.ok){ r.st = 'err'; dopisz(r, t1.err); return; }
+            if (!t1.pr){
+                r.st = 'skip';
+                dopisz(r, 'w tickecie nie ma prośby o unpaid COD (żaden komentarz nie ma naraz „COD", „book" i konta ' + UC_KONTO + ')');
+                return;
+            }
+            r.tik = t1;
+        }
+
+        var pr = r.tik.pr;
+        r.autor = pr.k.autor; r.autorId = pr.k.autorId; r.dataPr = pr.k.data; r.kwota = pr.kwota;
+        if (pr.ile > 1) dopisz(r, 'w tickecie jest ' + pr.ile + ' takich próśb — wzięta najnowsza z ' + pr.k.data);
+        if (r.kwota == null){ r.st = 'err'; dopisz(r, 'nie odczytałem kwoty z wiersza „Amount:" w prośbie'); return; }
+        if (!(r.kwota > 0)){ r.st = 'err'; dopisz(r, 'kwota z prośby nie jest dodatnia (' + f2(r.kwota) + ')'); return; }
+        if (!r.autor) dopisz(r, 'nie odczytałem autora prośby — ticket nie zostanie odbity');
+
+        // Auftrag: z ticketu, chyba ze wklejka podala go wprost.
+        if (!r.aufNum){
+            var nums = r.tik.aufy || [];
+            if (!nums.length){ r.st = 'err'; dopisz(r, 'ticket nie wskazuje żadnego auftraga'); return; }
+            if (nums.length === 1) r.aufNum = nums[0];
+            else {
+                // Kilka auftragow pod jednym ticketem. Zwykle tylko jeden ma open amount
+                // rowny kwocie z prosby i wtedy wybor jest jednoznaczny; gdy pasuje zero
+                // albo wiecej niz jeden — decyduje czlowiek.
+                var kand = [];
+                for (var j = 0; j < nums.length; j++){
+                    if (S.abort) return;
+                    var ax = await czytajAuftrag(nums[j]);
+                    kand.push({ num: nums[j], ok: ax.ok, open: ax.ok ? ax.open : null, waluta: ax.ok ? ax.waluta : '',
+                                nPay: ax.ok ? ax.nPay : 0, maKonto: !!ax.maKonto, deleted: !!ax.deleted, err: ax.ok ? '' : ax.err });
+                }
+                var hit = kand.filter(function(c){ return c.ok && !c.deleted && eq(c.open, r.kwota); });
+                function opis(c){ return c.num + ' → ' + (c.ok ? f2(c.open) : c.err) + (c.deleted ? ' [skasowany]' : ''); }
+                if (hit.length === 1){
+                    r.aufNum = hit[0].num; r.open = hit[0].open; r.waluta = hit[0].waluta;
+                    r.nPay = hit[0].nPay; r.maKonto = hit[0].maKonto;
+                    dopisz(r, 'ticket wskazywał ' + kand.length + ' auftragi — wybrany ' + hit[0].num + ', bo jego open amount zgadza się z prośbą');
+                } else {
+                    r.st = 'err';
+                    dopisz(r, (hit.length > 1 ? 'kilka auftragów ma open amount = ' + f2(r.kwota) : 'żaden z ' + kand.length + ' auftragów nie ma open amount = ' + f2(r.kwota))
+                            + ' — rozstrzygnij ręcznie: ' + kand.map(opis).join(', '));
+                    return;
+                }
+            }
+        }
+        if (r.open == null){
+            var a1 = await czytajAuftrag(r.aufNum);
+            if (!a1.ok){ r.st = 'err'; dopisz(r, a1.err); return; }
+            if (a1.deleted){ r.st = 'err'; dopisz(r, 'auftrag skasowany'); return; }
+            r.open = a1.open; r.waluta = a1.waluta; r.nPay = a1.nPay; r.maKonto = a1.maKonto;
+        }
+        if (r.open == null){ r.st = 'err'; dopisz(r, 'nie odczytałem „Auftrag value - Total of Payments"'); return; }
+        if (eq(r.open, 0)){ r.st = 'zero'; dopisz(r, 'open amount = 0 — nie ma czego wyksięgowywać'); return; }
+        if (!r.maKonto){ r.st = 'err'; dopisz(r, 'auftrag nie ma konta ' + UC_KONTO + ' na liście — zaksięguj ręcznie'); return; }
+        if (eq(r.open, r.kwota)){ r.st = 'ok'; r.sel = true; }
+        else {
+            r.st = 'diff'; r.sel = false;
+            dopisz(r, 'różnica ' + f2(r.kwota - r.open) + ' — prośba ' + f2(r.kwota) + ', open amount ' + f2(r.open) + '. Zaznacz ręcznie, jeśli mimo to ma iść');
+        }
+    }
+
+    $('#uc-check').onclick = async function(){
+        try {
+            if (S.busy) return;
+            var p = parsePaste($('#uc-paste').value);
+            if (!p.rows.length){
+                S.rows = []; render();
+                say(p.errs.length ? p.errs[0] : 'Nie znalazłem ani jednego wiersza z numerem ticketu albo auftraga.', '#c00');
+                return;
+            }
+            S.rows = p.rows; S.busy = true; S.abort = false;
+            $('#uc-check').disabled = true; $('#uc-book').disabled = true; $('#uc-stop').disabled = false;
+            render();
+            var done = 0, tot = S.rows.length, par = parN();
+            say('Sprawdzam ' + tot + ' pozycji, po ' + par + ' naraz… (strona ticketu odpowiada ok. 30 s)');
+            await pool(S.rows, par, async function(r){
+                try { await sprawdzWiersz(r); }
+                catch (e){ r.st = 'err'; dopisz(r, (e && e.message) || String(e)); }
+                done++; say('Sprawdzone ' + done + '/' + tot + '…'); render();
+            });
+            var ok = S.rows.filter(function(r){ return r.st === 'ok'; }).length;
+            var df = S.rows.filter(function(r){ return r.st === 'diff'; }).length;
+            var inf = S.rows.filter(function(r){ return r.st === 'zero' || r.st === 'skip'; }).length;
+            var bd = S.rows.filter(function(r){ return r.st === 'err'; }).length;
+            var n = S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
+            say((S.abort ? ('Przerwane po ' + done + '/' + tot + '. ') : '')
+                + 'Sprawdzone: ' + S.rows.length + ' — zgodnych ' + ok + ', z rozjazdem kwoty ' + df
+                + ', bez księgowania (open 0 / bez prośby) ' + inf + ', błędów ' + bd
+                + (p.errs.length ? ('  ·  pominięte wiersze wklejki: ' + p.errs.length) : '')
+                + '. Zaznaczonych: ' + n + '.', bd ? '#c00' : (df ? '#c47f00' : '#0a7a2f'));
+        } catch (e){
+            say('Błąd sprawdzania: ' + ((e && e.message) || e), '#c00');
+        } finally {
+            S.busy = false; $('#uc-check').disabled = false; $('#uc-stop').disabled = true;
+            $('#uc-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
+            render();
+        }
+    };
+
+    $('#uc-all').onclick = function(){
+        var any = S.rows.some(function(r){ return bookable(r) && !r.sel; });
+        S.rows.forEach(function(r){ if (bookable(r)) r.sel = any; });
+        render();
+        $('#uc-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
+    };
+    $('#uc-stop').onclick = function(){ S.abort = true; say('Przerywam po bieżącej pozycji…', '#c47f00'); };
+
+    // ===== ksiegowanie =====
+    // Kolejnosc: najpierw auftrag (POST, szybki i sprawdzalny), potem ticket (ramka).
+    // Gdy auftrag przejdzie, a ticket nie — pozycja konczy jako „do sprawdzenia" z tresci,
+    // ktora mowi wprost, co zostalo do zrobienia recznie. Zielono nie moze wyjsc nigdy.
+    async function ksiegujWiersz(r, data){
+        var b = await ksiegujAuftrag(r.aufNum, data, r.kwota, 'Unpaid COD ticket ' + r.rma);
+        if (!b.ok){ r.st = 'fail'; r.msg = 'auftrag: ' + (b.err || 'nie wysłano'); return; }
+        r.booked = true; r.sel = false;
+        await sleep(300);
+        var a = await czytajAuftrag(r.aufNum);
+        if (!a.ok){ r.msg = 'auftrag: wysłane, ale nie udało się odczytać do weryfikacji (' + a.err + ')'; r.st = 'part'; }
+        else if (!(a.nPay > r.nPay)){
+            r.st = 'fail'; r.msg = 'auftrag: w tabeli Payments nie przybyło księgowania — sprawdź ręcznie';
+            return;
+        } else {
+            r.open = a.open; r.nPay = a.nPay;
+            r.msg = 'auftrag: zaksięgowane ' + f2(r.kwota) + ' na ' + UC_KONTO;
+            if (!eq(a.open, 0)) r.msg += ' (uwaga: open amount = ' + f2(a.open) + ', nie 0)';
+        }
+
+        if (typeof window.__TM_UCOD_TICKET !== 'function'){
+            r.st = 'part';
+            dopisz(r, 'ticket POMINIĘTY — włącz moduł „Ksiegowanie w tickecie" (⚙ Moduły), bo to on obsługuje zapis w tickecie');
+            return;
+        }
+        var t = await window.__TM_UCOD_TICKET({
+            rmaId: r.rma, amount: Number(r.kwota).toFixed(2), bookingDate: data,
+            accountNum: UC_KONTO, komentarz: UC_KOM, osoba: r.autor
+        });
+        if (!t || !t.ok){
+            r.st = 'part';
+            dopisz(r, 'ticket NIE zaksięgowany: ' + ((t && ((t.ksieg && t.ksieg.error) || t.error)) || 'nieznany błąd') + ' — dokończ ręcznie');
+            if (t && t.status) dopisz(r, 'status ticketu: ' + t.status);
+            return;
+        }
+        if (t.ksieg && t.ksieg.alreadyBooked){
+            dopisz(r, 'ticket: takie księgowanie już tam było — komentarza i odbicia nie powtarzam');
+        } else {
+            dopisz(r, 'ticket: zaksięgowane');
+            if (t.komentarz && t.komentarz.ok) dopisz(r, 'komentarz „' + UC_KOM + '" dopisany');
+            else if (t.komentarz) dopisz(r, 'komentarz NIE dopisany: ' + (t.komentarz.error || '?'));
+            if (t.reassign && t.reassign.ok) dopisz(r, 'odbity na ' + (t.reassign.currentResponsible || t.reassign.targetUser || r.autor) + (t.reassign.verified ? '' : ' (niepotwierdzone)'));
+            else if (t.reassign) dopisz(r, 'NIE odbity na ' + r.autor + ': ' + (t.reassign.error || '?'));
+        }
+        if (t.status) dopisz(r, t.status);
+        var zleT = (t.komentarz && !t.komentarz.ok) || (t.reassign && !t.reassign.ok)
+                || /nie 0|NIE dopisany|NIE odbity|NIE udało/i.test(r.msg || '');
+        r.st = zleT ? 'part' : 'done';
+    }
+
+    $('#uc-book').onclick = async function(){
+        try {
+            if (S.busy) return;
+            var data = $('#uc-date').value;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(data)){ say('Ustaw datę księgowania.', '#c00'); return; }
+            var todo = S.rows.filter(function(r){ return r.sel && bookable(r); });
+            if (!todo.length){ say('Nie ma zaznaczonych pozycji.', '#c00'); return; }
+            var df = todo.filter(function(r){ return r.st === 'diff'; }).length;
+            if (!confirm('Zaksięgować ' + todo.length + ' pozycji?\n\nData: ' + data + '\nKonto: ' + UC_KONTO + ' (Unpaid COD)\n'
+                + 'Dla każdej: księgowanie w auftragu + księgowanie w tickecie + komentarz „' + UC_KOM + '" + odbicie na osobę, która prosiła.'
+                + (df ? ('\n\nUWAGA: ' + df + ' z nich ma kwotę różną od open amount.') : '')
+                + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            S.busy = true; S.abort = false;
+            $('#uc-check').disabled = true; $('#uc-book').disabled = true; $('#uc-stop').disabled = false;
+            var ok = 0, part = 0, fail = 0, done = 0;
+            // Po kolei, nie rownolegle: jedna pozycja to kilkanascie wejsc na rma.php,
+            // a dwa rownolegle zapisy do tego samego ticketu albo auftraga daly by odczyt
+            // w polowie cudzej zmiany.
+            say('Księguję ' + todo.length + ' pozycji po kolei… (jedna to kilka minut)');
+            for (var i = 0; i < todo.length; i++){
+                if (S.abort) break;
+                var r = todo[i];
+                try { await ksiegujWiersz(r, data); }
+                catch (e){ r.st = 'fail'; dopisz(r, (e && e.message) || String(e)); }
+                done++;
+                if (r.st === 'done') ok++; else if (r.st === 'part') part++; else fail++;
+                say('Zaksięgowane ' + done + '/' + todo.length + '…');
+                render();
+            }
+            say((S.abort ? ('Przerwane po ' + done + '/' + todo.length + '. ') : '')
+                + 'Gotowe: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
+                fail ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
+        } catch (e){
+            say('Błąd księgowania: ' + ((e && e.message) || e), '#c00');
+        } finally {
+            S.busy = false; $('#uc-check').disabled = false; $('#uc-stop').disabled = true;
+            $('#uc-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
+            render();
+        }
+    };
+
+    render();
+})();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
@@ -48224,6 +49121,7 @@
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
+        { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'vatcalc',  name: 'Kalkulator VAT',            test: onProlo,   init: init_vatcalc },
         { id: 'sepa',     name: 'SEPA Walidator IBAN',       test: onProlo,   init: init_sepa },
@@ -48443,6 +49341,7 @@
         function svgIco(p){ return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FF2F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + p + '</svg>'; }
         const LAUNCH_TOOLS = [
             { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
+            { id:'ucod',     icon:svgIco('<path d="M3 8l7.89 5.26a2 2 0 0 0 2.22 0l7.89 -5.26"/><rect x="3" y="5" width="18" height="14" rx="2"/>'), label:'Unpaid COD', sel:'#ucod-btn' },
             { id:'auftrag',  icon:svgIco('<path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie w auftragu', sel:'#auftrag-btn' },
             { id:'mkt',      icon:svgIco('<path d="M3 21h18"/><path d="M5 21v-10l7 -5l7 5v10"/><path d="M9 21v-6h6v6"/>'), label:"Ksiegowanie Marketplace's", sel:'#mkt-btn' },
             { id:'ins',      icon:svgIco('<path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 14.85a12 12 0 0 1 -8.5 -14.85a12 12 0 0 0 8.5 -3"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie INS', sel:'#ins-btn' },
