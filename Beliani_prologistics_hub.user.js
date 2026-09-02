@@ -48894,7 +48894,13 @@
     // book the open cod amount", „PROSZE PRZEKSIEGOWAC COD OPEN AMOUNT ZA AUFTR <link>").
     // Warunek z 1088 lapal 47 z 71; ten lapie 69 — a dwa pominiete to wlasnie te, ktore
     // pominac trzeba: „Payment Method: IBAN" i „partner shippment", bez slowa COD.
-    var UC_COD   = /\bcod\b/i;
+    // Prosba nie musi wymowic slowa COD ani razu: „prosze zaksiegowac na 1088" nazywa
+    // sprawe numerem konta i to wystarczy, bo 1088 sluzy w firmie tylko do tego. Dlatego
+    // 1088 stoi TUTAJ, po stronie tematu, a nie przy czasowniku — inaczej komentarz
+    // zlozony z samego „1088" spelnialby oba warunki naraz i przechodzil jako prosba.
+    // Sprawdzone na logu 96 ticketow: wariant (cod|1088) nie wciaga tam ani jednego
+    // komentarza wiecej niz sam „cod".
+    var UC_TEMAT = /\bcod\b|\b1088\b/i;
     // Rdzen „ksi[eę]g" bez koncowki, bo prosby po polsku odmieniaja to slowo na wszystkie
     // strony i pisza raz z diakrytykami, raz bez: „prosze o wyksiegowanie cod",
     // „PROSZE PRZEKSIEGOWAC COD OPEN AMOUNT", „zaksięguj". Wzorzec na konkretne formy
@@ -48904,7 +48910,7 @@
     // the entry in ticket 1088". Dolozone czlony sprawdzilem na zebranym logu 96 ticketow
     // (184 komentarze ze slowem COD): nie dokladaja tam ANI JEDNEGO trafienia, czyli nie
     // rozluzniaja reguly — lapia tylko style, ktorych w probce nie bylo.
-    var UC_KSIEG = /\b(?:un)?book(?:ing|ed)?\b|ksi[eę]g|\b1088\b|\bunpaid[\s-]*cod\b|\brevers(?:e|al|ed)\b|\bpost(?:ed|ing)?\s+(?:the\s+)?cod\b/i;
+    var UC_KSIEG = /\b(?:un)?book(?:ing|ed)?\b|ksi[eę]g|\bunpaid[\s-]*cod\b|\brevers(?:e|al|ed)\b|\bpost(?:ed|ing)?\s+(?:the\s+)?cod\b/i;
     // Formularz „Approval" obslugi klienta ma NARAZ „COD: YES" i „Proposed solution: book
     // open COD amount", wiec przechodzi oba warunki wyzej — a prosba to nie jest, tylko
     // zgoda na rozwiazanie. W 27 ticketach z probki byl JEDYNYM tekstem z COD i book.
@@ -48933,7 +48939,7 @@
     }
     function czyProsba(t){
         var s = String(t == null ? '' : t);
-        if (!UC_COD.test(s) || !UC_KSIEG.test(s)) return false;
+        if (!UC_TEMAT.test(s) || !UC_KSIEG.test(s)) return false;
         return !jestApproval(s);
     }
     // zrodlo: 'ticket' albo 'auftrag' — prosba potrafi stac w komentarzach jednego
@@ -49512,7 +49518,7 @@
         var pr = znajdzProsbe(pula);
         if (!pr && !reczneWl()){
             r.st = 'skip';
-            dopisz(r, 'ani w tickecie, ani w auftragu nie ma prośby o unpaid COD (żaden komentarz nie mówi naraz o COD i o zaksięgowaniu)');
+            dopisz(r, 'ani w tickecie, ani w auftragu nie ma prośby o unpaid COD (żaden komentarz nie mówi naraz o COD albo koncie ' + UC_KONTO + ' i o zaksięgowaniu)');
             return;
         }
         if (!pr){
@@ -49685,7 +49691,7 @@
         L.push('LEGENDA');
         L.push("  src=''          zwykły komentarz; finance / CS / WMS / liquidator — oznaczone przez system");
         L.push('  @auftrag NNN    komentarz stoi na stronie AUFTRAGA, nie ticketu');
-        L.push('  <<< REGUŁA      komentarz uznany za prośbę: mówi o COD i prosi o zaksięgowanie');
+        L.push('  <<< REGUŁA      komentarz uznany za prośbę: mówi o COD albo o koncie ' + UC_KONTO + ', i prosi o zaksięgowanie');
         L.push('                  (numeru ' + UC_KONTO + ' NIE wymagamy — 24 z 71 próśb go nie podaje)');
         L.push('  [formularz Approval]  zgoda obsługi klienta — ma „COD" i „book", ale prośbą nie jest');
         L.push('');
@@ -49729,7 +49735,7 @@
                         + (pr.liczby && pr.liczby.length ? ', ale w treści są liczby: ' + pr.liczby.slice(0, 4).join(', ') : ''))
                         : f2(pr.kwota))
                    + ', waluta ' + (pr.waluta || '—') + ', pasujących komentarzy ' + pr.ile)
-                : 'NIE TRAFIŁA — żaden komentarz nie mówi naraz o COD i o zaksięgowaniu'));
+                : 'NIE TRAFIŁA — żaden komentarz nie mówi naraz o COD (albo o koncie ' + UC_KONTO + ') i o zaksięgowaniu'));
             if (pr) nProsb++;
             // to samo, co w logu, ale w wierszu tabeli — zeby bylo widac bez otwierania pliku
             if (r){
