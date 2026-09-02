@@ -44448,16 +44448,43 @@
                         return !uzyte[x.tx] && Math.abs(Math.round(x.kw * 100)) === brak;
                     });
                     if (!kand.length) break;
-                    // Pierwszenstwo: „Reference number" wskazuje TEN auftrag.
+                    // Pierwszenstwo: „Reference number" wskazuje TEN auftrag. Numer
+                    // rozbieramy slAuftrag-iem, bo w polu bywa postac „15507208 / 3",
+                    // a samo wyrzucenie nie-cyfr sklejalo z niej „155072083" — numer,
+                    // ktorego nie ma. W sierpniowym eksporcie 7 takich wierszy. Stara
+                    // droga zostaje jako druga proba, zeby nic, co dotad parowalo,
+                    // nie przestalo.
                     const zAuf = kand.filter(function (x){
+                        const a = slAuftrag(x.ref);
+                        if (a && a.nr && aufy[String(a.nr)]) return true;
                         const rf = String(x.ref == null ? '' : x.ref).replace(/[^0-9]/g, '');
-                        return rf && aufy[rf];
+                        return !!(rf && aufy[rf]);
                     });
                     let wybor = null;
                     if (zAuf.length === 1) wybor = zAuf[0];
-                    // Bez potwierdzenia auftragiem laczymy tylko wtedy, gdy w calym
-                    // przebiegu jest DOKLADNIE JEDNA wolna platnosc o tej kwocie.
-                    else if (!zAuf.length && kand.length === 1 && ile[brak] === 1) wybor = kand[0];
+                    else if (!zAuf.length){
+                        // DRUGIE POTWIERDZENIE: NAZWISKO. Przy platnosci z terminala
+                        // recznego „Reference number" bywa wewnetrznym numerem linku
+                        // (29556), a nie numerem auftraga — wtedy pierwsza droga milczy.
+                        // Dotad zostawal warunek „w calym przebiegu jest jedna wolna
+                        // platnosc o tej kwocie", a ten przy popularnych kwotach nie ma
+                        // szans: 79,99 wystepuje w sierpniu piec razy i pozycja przepadala,
+                        // chociaz FLECHER byl tylko jeden — i to on domykal auftrag 15364561.
+                        // Nazwisko rozstrzyga to, czego liczba kandydatow nie rozstrzygnie.
+                        const nazwKub = [];
+                        z.y.w.forEach(function (w){
+                            (w.tok || []).forEach(function (q){
+                                if (nazwKub.indexOf(q) < 0) nazwKub.push(q);
+                            });
+                        });
+                        const zNazw = nazwKub.length
+                            ? kand.filter(function (x){ return slWspolne(x.tok || [], nazwKub); })
+                            : [];
+                        if (zNazw.length === 1){ wybor = zNazw[0]; wybor.poNazwisku = true; }
+                        // Bez potwierdzenia auftragiem ANI nazwiskiem laczymy tylko wtedy,
+                        // gdy w calym przebiegu jest DOKLADNIE JEDNA wolna platnosc o tej kwocie.
+                        else if (!zNazw.length && kand.length === 1 && ile[brak] === 1) wybor = kand[0];
+                    }
                     if (!wybor) break;
                     uzyte[wybor.tx] = 1;
                     wybor.jak = 'druga';
@@ -44469,7 +44496,12 @@
                     // Strona Saferpaya zgadza sie teraz z ksiega — to juz nie jest roznica.
                     z.x.druga = dobrane;
                     zgodne.push(z.x);
-                    dobrane.forEach(function (w){ zgodne.push(w); jakIle.druga++; });
+                    dobrane.forEach(function (w){
+                        zgodne.push(w); jakIle.druga++;
+                        // Para po nazwisku jest slabsza niz po numerze auftraga i raport
+                        // ma o tym powiedziec, a nie chowac tego w jednej liczbie.
+                        if (w.poNazwisku) jakIle.drugaNazw = (jakIle.drugaNazw || 0) + 1;
+                    });
                 } else {
                     // Nie domkneliśmy — cofamy, zeby nic nie zniknelo z niedopasowanych.
                     dobrane.forEach(function (w){ delete uzyte[w.tx]; w.jak = ''; delete w.doAuftraga; });
@@ -44748,7 +44780,55 @@
         salSpInfo();
         b.disabled = false;
     }
-    function salPorownajSP(b){
+    // „Auftrag value - Total of Payments" ze strony auftragu. Ujemna wartosc to NADWYZKA:
+    // klient zaplacil wiecej, niz wynosi wartosc zamowienia, i te roznice trzeba mu oddac.
+    // Skladamy to tak samo jak crOpen w module marketplace'ow: bierzemy OSTATNI <b> z tym
+    // napisem, bo ten sam tekst stoi rowniez w komentarzu wczesniejszego ksiegowania.
+    function salOpenAmount(html){
+        try {
+            const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+            const bs = d.querySelectorAll('b');
+            let node = null;
+            for (let i = 0; i < bs.length; i++)
+                if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i];
+            if (!node) return null;
+            const box = (node.closest && node.closest('td')) || node.parentNode;
+            const txt = String(box.textContent || '').replace(/Auftrag value[\s\S]*?Payments\s*:?/i, '');
+            // Separator tysiecy MUSI wejsc do wzorca. Prologistics pisze te kwote po
+            // angielsku — „€ 1,149.97" — a wzorzec bez przecinka lapal z tego samo „1,14".
+            const m = txt.match(/-?\s*\d[\d'’\s,.]*/);
+            if (!m) return null;
+            let s = m[0].replace(/[\s'’]/g, '');
+            if (s.indexOf('.') === -1 && /,\d{1,2}$/.test(s)) s = s.replace(',', '.');
+            else s = s.replace(/,/g, '');
+            const v = parseFloat(s);
+            return isFinite(v) ? v : null;
+        } catch (e){ return null; }
+    }
+    // TRZECIA NOGA PRZEKSIEGOWANIA VAT. Dwie pierwsze — storno i ksiegowanie z powrotem —
+    // znosza sie do zera, wiec z samego pliku NIE WIDAC, czy klient dostal zwrot nadwyzki.
+    // Widac to dopiero na stronie auftragu. Sierpien 2026, konto 1022: 13 przeksiegowan,
+    // z tego 10 ma zwrot nadwyzki zaksiegowany, a auftrag 15573794 nie ma — i wisi na nim
+    // 163,32 EUR nalezne klientowi. Bez tego odczytu nikt sie o tym nie dowiadywal.
+    // Pobran jest tyle, ile przeksiegowan — kilkanascie na miesiac. Po trzy naraz,
+    // zeby nie czekac ich dlugosci po kolei.
+    async function salVatOpen(r){
+        const lista = (r.vatPrzeks || []).filter(function (p){ return p.auf; });
+        if (!lista.length) return;
+        let i = 0;
+        async function robotnik(){
+            while (i < lista.length){
+                const p = lista[i++];
+                try {
+                    const res = await fetch(slAufUrl(p.auf), { credentials: 'same-origin' });
+                    if (!res || !res.ok){ p.openErr = 'HTTP ' + (res ? res.status : '?'); continue; }
+                    p.open = salOpenAmount(await res.text());
+                } catch (e){ p.openErr = (e && e.message) || String(e); }
+            }
+        }
+        await Promise.all([robotnik(), robotnik(), robotnik()]);
+    }
+    async function salPorownajSP(b){
         if (!SAL_SP){ salSay('Wskaż eksport z Saferpaya.', '#c47f00'); return; }
         if (!SAL_SPEXP){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
         b.disabled = true;
@@ -44762,11 +44842,18 @@
                      + ' (' + f.opis + '). Sprawdź, czy eksport obejmuje ten terminal.', '#c47f00');
                 b.disabled = false; return;
             }
-            salRaportSP(slUzgodnijSP({ poz: f.poz, wybor: SAL_SP.wybor, zawezenie: f.opis,
-                                       wszystkich: SAL_SP.poz.length,
-                                       // Odrzucone przy zawezeniu ida dalej: protokol ma
-                                       // o nich powiedziec, a nie udawac, ze ich nie bylo.
-                                       poza: f.poza || [] }, SAL_SPEXP));
+            const wynik = slUzgodnijSP({ poz: f.poz, wybor: SAL_SP.wybor, zawezenie: f.opis,
+                                        wszystkich: SAL_SP.poz.length,
+                                        // Odrzucone przy zawezeniu ida dalej: protokol ma
+                                        // o nich powiedziec, a nie udawac, ze ich nie bylo.
+                                        poza: f.poza || [] }, SAL_SPEXP);
+            // Nadwyzki doczytujemy PRZED zbudowaniem raportu — maja wejsc takze do tekstu
+            // do schowka, a ten powstaje razem z HTML-em.
+            if ((wynik.vatPrzeks || []).length){
+                salSay('Sprawdzam nadwyżki po przeksięgowaniach VAT (' + wynik.vatPrzeks.length + ')…', '#666');
+                await salVatOpen(wynik);
+            }
+            salRaportSP(wynik);
             salSay('Gotowe.', '#0a7a2f');
         } catch (e){
             salSay('Nie policzyłem: ' + ((e && e.message) || e), '#c00');
@@ -44829,7 +44916,8 @@
           + '<div style="font-size:10px;color:#888">po numerze transakcji: ' + ji.id
           + ' · po Reference number: ' + ji.ref
           + ' · po kwocie i nazwisku: ' + ji.kwota
-          + (ji.druga ? (' · druga wpłata na tym samym auftragu: ' + ji.druga) : '') + '</div>'
+          + (ji.druga ? (' · druga wpłata na tym samym auftragu: ' + ji.druga
+                         + (ji.drugaNazw ? (' (w tym po nazwisku: ' + ji.drugaNazw + ')') : '')) : '') + '</div>'
           + '</td></tr>'
           + '<tr><td style="' + TD + '">z tego zgodnych co do grosza</td><td style="' + TDR + ';color:#0a7a2f">' + r.zgodne.length + '</td></tr>'
           + '</table>'
@@ -44920,11 +45008,23 @@
                + 'jako różnica dwa razy. Poznaję je po tym, że mają ten sam auftrag, tę samą kwotę, '
                + '<b>tę samą sekundę</b> i <b>inne konto VAT</b>. Razem <b>' + kw(sumaVp) + '</b> '
                + '— o tyle mniejsze są obie sumy wyżej.</div>';
+            // Trzecia noga: nadwyzka do oddania klientowi. Czytana ze strony auftragu,
+            // bo w pliku jej nie widac — obie ksiegowe nogi znosza sie do zera.
+            const vatOtw = vp.filter(function (x){ return x.open != null && x.open < -0.005; });
+            h += '<div style="font-size:11px;margin-bottom:4px;color:'
+               + (vatOtw.length ? '#b45309' : '#0a7a2f') + '">'
+               + (vatOtw.length
+                   ? ('Po przeksięgowaniu zostaje <b>nadwyżka do zwrotu na kartę</b>. Sprawdziłem '
+                      + 'każdy auftrag: <b>' + vatOtw.length + '</b> z ' + vp.length + ' ma ją '
+                      + '<b>nierozliczoną</b> — pieniądze wciąż należą się klientowi.')
+                   : 'Sprawdziłem każdy auftrag — nadwyżki po przeksięgowaniu są rozliczone.')
+               + '</div>';
             h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
                + '<tr><td style="' + TH + '">auftrag</td><td style="' + TH + ';text-align:right">kwota</td>'
                + '<td style="' + TH + '">chwila księgowania</td>'
                + '<td style="' + TH + '">konto VAT</td>'
-               + '<td style="' + TH + '">konto</td></tr>';
+               + '<td style="' + TH + '">konto</td>'
+               + '<td style="' + TH + ';text-align:right">nadwyżka</td></tr>';
             L.push(''); L.push('PRZEKSIEGOWANIA VAT — POZA POROWNANIEM (' + vp.length
                  + ') na ' + kw(sumaVp));
             vp.slice(0, 300).forEach(function (x){
@@ -44933,10 +45033,18 @@
                    + '<td style="' + TD + ';font-size:11px">' + salEsc(x.data || '') + '</td>'
                    + '<td style="' + TD + ';font-size:11px">' + salEsc(x.vatZ || '?') + ' → '
                    + salEsc(x.vatNa || '?') + '</td>'
-                   + '<td style="' + TD + ';font-size:11px">' + salEsc(x.konto || '') + '</td></tr>';
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(x.konto || '') + '</td>'
+                   + '<td style="' + TDR + ';color:'
+                   + (x.open != null && x.open < -0.005 ? '#b45309;font-weight:700' : '#888') + '">'
+                   + (x.open != null
+                       ? (x.open < -0.005 ? kw(Math.abs(x.open)) : '<span style="color:#0a7a2f">rozliczona</span>')
+                       : ('<span title="' + salEsc(x.openErr || 'nie odczytałem strony auftragu')
+                          + '">?</span>'))
+                   + '</td></tr>';
                 L.push('  ' + ((x.auf ? (x.auf.nr + ' / ' + x.auf.txn) : (x.aufTekst || '?')))
                      + '  ' + kw(Math.abs(x.kw || 0)) + '  ' + (x.data || '')
-                     + '  VAT ' + (x.vatZ || '?') + ' -> ' + (x.vatNa || '?'));
+                     + '  VAT ' + (x.vatZ || '?') + ' -> ' + (x.vatNa || '?')
+                     + (x.open != null && x.open < -0.005 ? ('  NADWYZKA ' + kw(Math.abs(x.open))) : ''));
             });
             h += '</table>';
             if (vp.length > 300)
@@ -45366,7 +45474,12 @@
             // Obie strony w CALOSCI. Sumowanie samych resztek i zestawianie ich ze
             // wszystkimi wierszami ksiegi dawalo roznice zawsze — i nic nie znaczyla.
             const suma = zsp.concat(zbp).reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
-            const wierszeZw = r.pl.poz.filter(function (x){ return x.zwrot; });
+            // Noga storna przeksiegowania VAT NIE jest zwrotem do klienta — to druga
+            // polowa operacji ksiegowej, wylaczonej z porownania w sekcji wyzej. Liczona
+            // tutaj pokazywala sie jako wiersz „bez pary" i ta sama kwota stala w raporcie
+            // DWA RAZY: raz jako wyjasniona, raz jako niewyjasniona. Na koncie 1022 za
+            // sierpien 2026 bylo to 13 z 22 wierszy i 8 749,70 z 9 349,64 EUR.
+            const wierszeZw = r.pl.poz.filter(function (x){ return x.zwrot && !x.vatPrzeks; });
             const wKsiedze = wierszeZw.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
             h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
                + '<tr><td style="' + TD + '">zwrotów w eksporcie</td><td style="' + TDR + '">'
@@ -45409,7 +45522,9 @@
             } else {
                 h += '<div style="font-size:11px;color:#666;margin-bottom:4px">Te wiersze składają się '
                    + 'na różnicę sum powyżej. Data sprzed okresu eksportu zamyka sprawę bez '
-                   + 'dochodzenia — zwrot dotyczy wtedy płatności, której w tym pliku po prostu nie ma.</div>';
+                   + 'dochodzenia — zwrot dotyczy wtedy płatności, której w tym pliku po prostu nie ma. '
+                   + 'Nóg storna z przeksięgowań VAT tu nie ma — są opisane w swojej sekcji '
+                   + 'i nie liczę ich dwa razy.</div>';
                 h += '<table style="border-collapse:collapse;font-size:12px;width:100%">'
                    + '<tr><td style="' + TH + '">data</td><td style="' + TH + ';text-align:right">kwota</td>'
                    + '<td style="' + TH + '">auftrag</td><td style="' + TH + '">konto</td></tr>';
@@ -45551,7 +45666,14 @@
             ['brak',  'różnice kwot', r.rozne.length, sumaKw(r.rozne, function (x){ return x.roz; })],
             ['brak',  'zły terminal', r.zlyTerm.length, sumaKw(r.zlyTerm, function (x){ return x.x && x.x.kw; })],
             ['brak',  'data poza zwykłym oknem', zd.length, sumaKw(zd, function (x){ return x.x && x.x.kw; })],
-            ['brak',  'wpłaty zaksięgowane w tickecie', zTicketu.length, sumaKw(zTicketu, function (y){ return y.kw; })]
+            ['brak',  'wpłaty zaksięgowane w tickecie', zTicketu.length, sumaKw(zTicketu, function (y){ return y.kw; })],
+            // Nadwyzka po przeksiegowaniu VAT to pieniadze NALEZNE KLIENTOWI, ktore
+            // wciaz siedza na auftragu. Sekcja VAT stoi w pasie „dlaczego czegos tu nie
+            // ma", wiec bez tej linijki nikt by tam nie zajrzal.
+            ['brak',  'nadwyżka po przeksięgowaniu VAT — do zwrotu klientowi',
+                      (vp || []).filter(function (x){ return x.open != null && x.open < -0.005; }).length,
+                      sumaKw((vp || []).filter(function (x){ return x.open != null && x.open < -0.005; }),
+                             function (x){ return x.open; })]
         ];
         let doZrobienia = 0;
         POZ.forEach(function (p){ if (p[0] === 'brak') doZrobienia += (p[2] || 0); });
