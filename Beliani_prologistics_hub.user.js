@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.25
+// @version      5.26
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -34242,7 +34242,7 @@
         sek('BRAK PŁATNOŚCI w prologistics', k.brakuje, function (x){
             return x.id + '  ' + f2(x.kwota) + (x.typ ? ('  ' + x.typ) : '') + (x.maZwrot ? '  (ma zwrot)' : ''); }, 'brakuje');
         sek('ZŁE KONTO SPRZEDAŻY', k.zleKonto, function (x){
-            return x.id + '  jest ' + x.konto + ', powinno ' + x.ocz + '  (' + x.typ + ', ' + f2(x.kwota) + ')'; });
+            return x.id + '  jest ' + x.konto + ', powinno ' + x.ocz + '  (' + x.typ + ', ' + f2(x.kwota) + ')'; }, 'zleKonto');
         sek('KWOTA SIĘ NIE ZGADZA', k.zlaKwota, function (x){
             return x.id + '  w prologistics ' + f2(x.wExporcie) + ', w rozliczeniu ' + f2(x.wRaporcie)
                  + '  (różnica ' + f2(x.roznica) + ')'; });
@@ -34254,7 +34254,7 @@
                  + '  (' + (x.nSprz + x.nKor) + ' wiersze w prologistics: ' + x.nSprz + ' sprzedaż, '
                  + x.nKor + ' korekt' + (x.nKor === 1 ? 'a' : 'y') + ')'
                  + (x.pelny ? '  — zwrócone w całości, dlatego typ klienta jest nie do ustalenia'
-                            : (x.zwrot != null ? ('  — zwrócono ' + f2(x.zwrot)) : '')); });
+                            : (x.zwrot != null ? ('  — zwrócono ' + f2(x.zwrot)) : '')); }, 'bezTypu');
         sek('WIERSZ NIE DOTYCZY TEGO KONTA', k.obce, function (x){
             return (x.id || '?') + '  ' + (x.auf || '') + '  ' + x.deb + '/' + x.cre + '  ' + f2(x.kwota); });
         sek('W PROLOGISTICS, A NIE MA W ROZLICZENIU', k.wolne, function (x){
@@ -34293,7 +34293,7 @@
                  + (x.typ ? (' · ' + mmEsc(x.typ)) : '') + (x.maZwrot ? ' · <b>ma zwrot</b>' : '') + '</div>'; }, 'brakuje');
         sek('Złe konto sprzedaży', k.zleKonto, '#c00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · jest <b>' + mmEsc(x.konto)
-                 + '</b>, powinno <b>' + mmEsc(x.ocz) + '</b> · ' + mmEsc(x.typ) + ' · ' + f2(x.kwota) + '</div>'; });
+                 + '</b>, powinno <b>' + mmEsc(x.ocz) + '</b> · ' + mmEsc(x.typ) + ' · ' + f2(x.kwota) + '</div>'; }, 'zleKonto');
         sek('Kwota się nie zgadza', k.zlaKwota, '#c00', function (x){
             return '<div><code>' + mmEsc(x.id) + '</code> · prologistics ' + f2(x.wExporcie)
                  + ' vs rozliczenie ' + f2(x.wRaporcie) + ' · różnica <b>' + f2(x.roznica) + '</b></div>'; });
@@ -34306,7 +34306,7 @@
                  + x.nSprz + ' sprzedaż, ' + x.nKor + ' korekt' + (x.nKor === 1 ? 'a' : 'y') + ')'
                  + (x.pelny ? ' · <span style="color:#666">zwrócone w całości — dlatego typu klienta nie da się ustalić</span>'
                             : (x.zwrot != null ? (' · zwrócono ' + f2(x.zwrot)) : ''))
-                 + '</div>'; });
+                 + '</div>'; }, 'bezTypu');
         sek('Wiersz nie dotyczy tego konta', k.obce, '#c47f00', function (x){
             return '<div><code>' + mmEsc(x.id || '?') + '</code> · ' + mmEsc(x.auf || '')
                  + ' · ' + mmEsc(x.deb) + '/' + mmEsc(x.cre) + ' · ' + f2(x.kwota) + '</div>'; });
@@ -34322,6 +34322,9 @@
     // ManoMano do Amazona. Rozni sie tu jedna rzecz: konto sprzedazy bierzemy z tabeli
     // MK_ALLE_VAT (B2B 3209 / B2C 3292), a nie z tabeli krajow.
     function mkKontrolaAlle(p, ex){
+        // Nowe porownanie to nowy wsad — odczyty auftragow z poprzedniego przebiegu
+        // opisywalyby inne pozycje, wiec ida do kosza razem z podrecznym zapisem stron.
+        alleZapomnijKonta();
         const poFf = Object.create(null);
         (ex || []).forEach(function (r){ if (r.ff){ const kl = mkFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
 
@@ -34350,6 +34353,10 @@
                 const zwrocone = (p.ref[id] != null) ? Math.abs(r2(p.ref[id])) : null;
                 bezTypu.push({ id: id, typ: typ || '', kwota: brutto,
                                konta: kt.join(', '),
+                               // Wiersze SPRZEDAZY z zestawienia — po nich drugi przebieg
+                               // trafia w auftrag i w konkretny wiersz platnosci.
+                               sprzW: w.filter(function (r){ return r.sprzedaz; }).map(function (r){
+                                          return { auf: r.auf, kwota: r.kwota, data: r.data, konto: r.konto }; }),
                                nSprz: w.filter(function (r){ return r.sprzedaz; }).length,
                                nKor:  w.filter(function (r){ return r.zwrot; }).length,
                                zwrot: zwrocone,
@@ -34360,7 +34367,8 @@
                 if (ocz && r.sprzedaz && r.konto !== ocz && r.konto !== alt)
                     zleKonto.push({ id: id, typ: typ, konto: r.konto,
                                     ocz: ocz + (alt ? (' albo ' + alt) : ''),
-                                    auf: r.auf, kwota: r.kwota, paid: r.paid });
+                                    auf: r.auf, kwota: r.kwota, paid: r.paid,
+                                    data: r.data });
             });
             // Kwote porownujemy tylko po wierszach SPRZEDAZY — zamowienie widoczne
             // w zestawieniu wylacznie jako korekta sprzedano w innym okresie.
@@ -34416,6 +34424,9 @@
         brakZwrot.forEach(function (x){ if (!znoszaSie.some(function (y){ return y.id === x.id; })) zwrBezPary.push(x); });
 
         return { konto: p.konto || '', brakuje: bezPary, zleKonto: zleKonto, zlaKwota: zlaKwota,
+                 // Pozycje, ktorym auftrag zaprzeczyl: w eksporcie zle konto, na auftragu
+                 // dobre. Kubelek zaczyna sie pusty i wypelnia go dopiero drugi przebieg.
+                 zleKontoOk: [],
                  brakZwrot: zwrBezPary, obce: obce, bezTypu: bezTypu, wolne: wolne,
                  znoszaSie: znoszaSie,
                  // Do licznika usterek ida tylko te pary, ktorych roznicy nie umiemy nazwac.
@@ -34458,6 +34469,294 @@
                  + (c.ok ? '' : ' <span style="color:#c00">[' + mmEsc(c.err) + ']</span>');
         }).join(', ');
     }
+    // ---------- konto sprzedazy CZYTANE Z AUFTRAGU ----------
+    // Numer konta w „Export payments" bywa nieaktualny: zestawienie pokazuje jedno,
+    // a na auftragu przy tej samej platnosci stoi drugie. Dopoki kontrola porownywala
+    // sam eksport, kazda taka rozbieznosc wychodzila jako „zle konto sprzedazy" — choc
+    // ksiegowanie bylo dobre, a nieaktualny byl wlasnie eksport. Dlatego drugi przebieg:
+    // wchodzimy na auftrag i czytamy konto WPROST Z WIERSZA PLATNOSCI (kolumna
+    // „Selling account" w tabeli Payments), bo to ono opisuje ksiegowanie, ktore JUZ STOI.
+    //
+    // Napis „Selling Account: NNNN" spod formularza pokazujemy obok, ale NIE rozstrzyga:
+    // mowi, co dostalaby NOWA platnosc, czyli idzie za dzisiejszym customer_type auftragu,
+    // a nie za tym, co zaksiegowano. Gdyby decydowal on, przypadek „typ poprawiono,
+    // ksiegowanie zostalo stare" wychodzilby na zielono. Decyzja uzytkownika, 03.09.2026.
+    //
+    // Droga jest ta sama, ktora sprawdza typ klienta PRZED ksiegowaniem (amzTypCheck):
+    // fetch w tle, po piec auftragow naraz przez amzPula. Auftrag czytamy RAZ — kilka
+    // pozycji potrafi wskazywac ten sam numer.
+    const alleKontoState = {};        // id zamowienia -> { stan, err, num, konto, ... }
+    const alleAufCache = {};          // numer auftragu -> odczyt strony
+    function alleZapomnijKonta(){
+        Object.keys(alleKontoState).forEach(function (k){ delete alleKontoState[k]; });
+        Object.keys(alleAufCache).forEach(function (k){ delete alleAufCache[k]; });
+    }
+    // Konta, ktore dla danego typu klienta sa POPRAWNE. Alternatywne jest rowne glownemu
+    // — patrz komentarz przy MK_ALLE_VAT i przy kontroli w mkKontrolaAlle.
+    function alleDozwolone(typ){
+        const kv = typ ? MK_ALLE_VAT[typ] : null;
+        return kv ? [kv.vat, kv.alt].filter(Boolean) : [];
+    }
+    // Tabela „Payments" ze strony auftragu. Kolumny bierzemy PO NAGLOWKU, nie po numerze:
+    // prologistics dokladal do niej kolumny („Exported by", „Clearing account") i stala
+    // lista numerow rozjechalaby sie po cichu, a czytalibysmy wtedy nie to pole.
+    function allePlatnosci(d){
+        const kot = d.querySelector('td#payments');
+        const tab = (kot && kot.closest) ? kot.closest('table') : null;
+        if (!tab) return [];
+        const trs = tab.querySelectorAll('tr');
+        const out = [];
+        let ix = null;
+        for (let i = 0; i < trs.length; i++){
+            const tds = trs[i].querySelectorAll('td');
+            if (!tds.length) continue;
+            const txt = [];
+            for (let j = 0; j < tds.length; j++)
+                txt.push(String(tds[j].textContent || '').replace(/\s+/g, ' ').trim());
+            if (!ix){
+                // Naglowek poznajemy po tym, ze ma i „Date", i „Amount". Wiersz z samym
+                // <h3>Payments</h3> ma jedna komorke i nie pasuje.
+                const male = txt.map(function (t){ return t.toLowerCase(); });
+                if (male.indexOf('amount') >= 0 && male.indexOf('date') >= 0){
+                    ix = {};
+                    male.forEach(function (t, j){ if (t && ix[t] == null) ix[t] = j; });
+                }
+                continue;
+            }
+            if (tds.length < 6) continue;          // „Total of Payments" i reszta podsumowania
+            const pole = function (n){ const j = ix[n]; return (j == null) ? '' : (txt[j] || ''); };
+            const kw = mkNum(pole('amount'));
+            out.push({ data: pole('date').slice(0, 10),
+                       konto: pole('account'),
+                       kwota: (kw == null ? null : r2(kw)),
+                       selling: pole('selling account'),
+                       vat: pole('vat account'),
+                       eksport: pole('exported'),
+                       kom: pole('comment').slice(0, 140) });
+        }
+        return out;
+    }
+    // Kolumna „Auftrag number" w Export payments niesie numer RAZEM Z TRANSAKCJA:
+    // „15504280 / 3". Wlozona w adres bez rozbioru dawala
+    // `number=15504280%20%2F%203` — prologistics oddawal na to raz HTTP 500, a raz
+    // strone bez tabeli platnosci, wiec kontrola meldowala „auftrag bez płatności"
+    // przy auftragach, ktore platnosc mialy. Numer i transakcje rozbieramy tutaj,
+    // w jednym miejscu, zamiast ufac, ze kolumna zawiera same cyfry.
+    function alleAufNr(auf){
+        const m = String(auf == null ? '' : auf).match(/(\d+)\s*(?:\/\s*(\d+))?/);
+        // Brak transakcji w zapisie znaczy 3 — tak samo jak wszedzie indziej w HUB-ie.
+        return m ? { num: m[1], txn: m[2] || '3' } : null;
+    }
+    // Jedno ponowienie. Przy 140 stronach auftragu pojedyncze 5xx zdarza sie samo,
+    // a bez powtorki zostawiaja po sobie pozycje „nie odczytałem", ktorych nikt juz
+    // nie sprawdzi. Bledu 4xx nie powtarzamy — to nie jest chwilowa awaria.
+    async function alleGet(url){
+        for (let pr = 0; pr < 2; pr++){
+            try {
+                const res = await fetch(url, { credentials: 'same-origin' });
+                if (res && res.ok) return { html: await res.text() };
+                const kod = res ? res.status : 0;
+                if (kod && kod < 500) return { err: 'HTTP ' + kod };
+                if (pr) return { err: 'HTTP ' + (kod || '?') + ' (po ponowieniu)' };
+            } catch (e){
+                if (pr) return { err: (e && e.message) || 'brak połączenia z prologistics' };
+            }
+            await new Promise(function (r){ setTimeout(r, 700); });
+        }
+        return { err: 'nie odczytałem' };
+    }
+    // Zapamietujemy OBIETNICE, nie gotowy odczyt. Pula puszcza piec zapytan naraz
+    // i przy zapisie dopiero po odczycie ten sam auftrag byl pobierany tyle razy,
+    // ile pozycji na niego wskazywalo. Strona auftragu jest ciezka, wiec liczy sie
+    // liczba WEJSC, nie to, ze wynik i tak byl ten sam.
+    function alleCzytajAuf(num, txn){
+        const klucz = num + '/' + txn;
+        if (alleAufCache[klucz]) return alleAufCache[klucz];
+        return (alleAufCache[klucz] = (async function (){
+            const url = '/auction.php?number=' + encodeURIComponent(num) + '&txnid=' + encodeURIComponent(txn);
+            const r = await alleGet(url);
+            if (r.err){
+                // Nieudanego odczytu NIE zapamietujemy — inaczej „Ponów odczyt"
+                // oddawalby ten sam blad, nie ruszajac sieci.
+                delete alleAufCache[klucz];
+                return { num: num, txn: txn, err: 'auftrag ' + num + ' / ' + txn + ': ' + r.err };
+            }
+            const html = r.html;
+            const d = new DOMParser().parseFromString(html, 'text/html');
+            const sel = d.querySelector('select[name="customer_type"]');
+            const mS = html.match(/Selling Account:\s*(\d+)/i);
+            const mV = html.match(/VAT Account:\s*(\d+)/i);
+            return {
+                num: num, txn: txn, err: '',
+                deleted: auftUsuniety(d, html),
+                typ: (sel && sel.options[sel.selectedIndex]) ? String(sel.options[sel.selectedIndex].value || '').trim() : '',
+                selling: mS ? mS[1] : '',          // konto dla NOWEJ platnosci — nie rozstrzyga
+                vat: mV ? mV[1] : '',
+                plat: allePlatnosci(d)
+            };
+        })());
+    }
+    // Wiersz platnosci odpowiadajacy TEJ pozycji z zestawienia. Rozstrzyga kwota; przy
+    // kilku wierszach o tej samej kwocie pomaga konto rozliczeniowe, a potem data.
+    // Gdy i to nie rozstrzyga, oddajemy pierwszy i MOWIMY, ze bylo ich kilka — zamiast
+    // wybierac po cichu.
+    function alleDopasujPlat(plat, kwota, data, kontoRozl){
+        const lista = plat || [];
+        const konta = [];
+        lista.forEach(function (r){ if (r.selling && konta.indexOf(r.selling) < 0) konta.push(r.selling); });
+        const a = Math.abs(r2(kwota || 0));
+        let kand = lista.filter(function (r){
+            return r.kwota != null && Math.abs(Math.abs(r.kwota) - a) < 0.02; });
+        if (kand.length > 1 && kontoRozl){
+            const z = kand.filter(function (r){ return r.konto === kontoRozl; });
+            if (z.length) kand = z;
+        }
+        if (kand.length > 1 && data){
+            const z = kand.filter(function (r){ return r.data === String(data).slice(0, 10); });
+            if (z.length) kand = z;
+        }
+        if (kand.length) return { wiersz: kand[0], ilu: kand.length, skad: 'kwota', konta: konta };
+        // Kwota nie trafila — bo platnosc zaksiegowano na inna sume (rabat, dwie wplaty
+        // na jeden auftrag) albo bo wiersz stoi na innej transakcji. Gdy WSZYSTKIE
+        // platnosci tego auftragu siedza na jednym koncie sprzedazy, konto jest i tak
+        // jednoznaczne — bierzemy je, ale mowimy, skad.
+        if (konta.length === 1)
+            return { wiersz: lista.filter(function (r){ return r.selling === konta[0]; })[0],
+                     ilu: 0, skad: 'wszystkie', konta: konta };
+        return { wiersz: null, ilu: 0, skad: '', konta: konta };
+    }
+    // Ile pozycji czeka jeszcze na odczyt z auftragu. Zerowy wynik chowa guzik.
+    function alleDoKont(k){
+        const id = {};
+        ((k && k.zleKonto) || []).forEach(function (x){ id[x.id] = 1; });
+        ((k && k.bezTypu) || []).forEach(function (x){ id[x.id] = 1; });
+        return Object.keys(id).filter(function (i){
+            const st = alleKontoState[i];
+            return !st || st.stan !== 'sprawdzone';
+        }).length;
+    }
+    async function alleSprawdzKonta(p, k, postep){
+        const poz = [];
+        const dopisz = function (x, auf, kwota, data){
+            const st = alleKontoState[x.id];
+            if (st && st.stan === 'sprawdzone') return;      // ten juz czytany
+            poz.push({ id: x.id, auf: String(auf || '').trim(), kwota: kwota, data: data || '' });
+        };
+        ((k && k.zleKonto) || []).forEach(function (x){ dopisz(x, x.auf, x.kwota, x.data); });
+        ((k && k.bezTypu) || []).forEach(function (x){
+            const w = (x.sprzW || [])[0] || null;
+            dopisz(x, w ? w.auf : '', w ? w.kwota : x.kwota, w ? w.data : '');
+        });
+        const kontoRozl = String((p && p.konto) || '');
+        let zrobione = 0;
+        const krok = function (id){ zrobione++; if (postep) postep(zrobione, poz.length, id); };
+        // Po piec naraz — ta sama pula, ktorej uzywa sprawdzanie typu klienta przed
+        // ksiegowaniem. Wiecej nie dokladamy: strona auftragu jest ciezka.
+        await amzPula(poz, async function (q){
+            let nr = alleAufNr(q.auf);
+            if (!nr){
+                // Zestawienie nie podalo numeru auftragu — szukamy go tak samo, jak guzik
+                // „Szukaj auftragów po fulfilmencie": search.php?what=ff_number.
+                const f = await crFind(q.id);
+                nr = alleAufNr((f.nums || [])[0] || '');
+                if (!nr){
+                    alleKontoState[q.id] = { stan: 'brak', err: f.err || 'nie znajduję auftragu' };
+                    krok(q.id); return;
+                }
+            }
+            const a = await alleCzytajAuf(nr.num, nr.txn);
+            if (a.err){
+                alleKontoState[q.id] = { stan: 'blad', num: nr.num, txn: nr.txn, err: a.err };
+                krok(q.id); return;
+            }
+            const dp = alleDopasujPlat(a.plat, q.kwota, q.data, kontoRozl);
+            alleKontoState[q.id] = {
+                stan: 'sprawdzone', num: nr.num, txn: nr.txn, deleted: a.deleted, typAuf: a.typ,
+                formSelling: a.selling, formVat: a.vat,
+                wiersz: dp.wiersz, ilu: dp.ilu, skad: dp.skad, konta: dp.konta || [],
+                nPlat: (a.plat || []).length,
+                konto: dp.wiersz ? String(dp.wiersz.selling || '') : ''
+            };
+            krok(q.id);
+        }, 5);
+        // Rozdzial „zlych kont": co auftrag POTWIERDZA, zostaje bledem; co prostuje,
+        // schodzi na osobna, zielona liste i przestaje sie liczyc do usterek. Pozycja,
+        // ktorej nie udalo sie odczytac, zostaje na czerwonej liscie — „nie wiem" nie
+        // jest powodem, zeby usterke wygasic.
+        k.zleKontoOk = k.zleKontoOk || [];
+        const zostaje = [];
+        ((k && k.zleKonto) || []).forEach(function (x){
+            const st = alleKontoState[x.id];
+            const dozw = alleDozwolone(x.typ);
+            if (st && st.stan === 'sprawdzone' && st.konto && dozw.indexOf(st.konto) >= 0){
+                x.wAuftragu = st.konto;
+                x.skad = st.skad;
+                k.zleKontoOk.push(x);
+                return;
+            }
+            zostaje.push(x);
+        });
+        k.zleKonto = zostaje;
+        return k;
+    }
+    // Numer auftragu tak, jak stoi w naglowku strony: „15504280 / 3".
+    function alleAufEtyk(st){ return st.num + (st.txn ? (' / ' + st.txn) : ''); }
+    // Opis tego, co stoi na auftragu. „wEksporcie" — konto z zestawienia; gdy podane
+    // i rozne od tego z wiersza platnosci, mowimy o rozjezdzie wprost.
+    function alleKontoOpis(id, wEksporcie){
+        const st = alleKontoState[id];
+        if (!st) return '';
+        if (st.stan === 'brak') return 'nie znajduję auftragu';
+        if (st.stan === 'blad') return st.err || 'nie odczytałem auftragu';
+        const cz = [];
+        if (st.konto){
+            cz.push('w auftragu ' + st.konto
+                  + (st.skad === 'wszystkie' ? ' (nie po kwocie — wszystkie płatności tego auftragu stoją na tym koncie)' : ''));
+        } else if (st.nPlat){
+            cz.push('żadna z ' + st.nPlat + ' płatności auftragu nie ma tej kwoty'
+                  + (st.konta && st.konta.length ? (' — konta sprzedaży na auftragu: ' + st.konta.join(', ')) : ''));
+        } else {
+            cz.push('na auftragu nie ma ani jednej płatności');
+        }
+        if (st.konto && wEksporcie && st.konto !== String(wEksporcie)) cz.push('ROZJAZD z eksportem');
+        if (st.ilu > 1) cz.push(st.ilu + ' wiersze o tej kwocie — wybrałem pierwszy');
+        if (st.formSelling && st.formSelling !== st.konto) cz.push('pod formularzem ' + st.formSelling);
+        if (st.typAuf) cz.push('customer_type ' + st.typAuf);
+        if (st.deleted) cz.push('AUFTRAG SKASOWANY');
+        return cz.join(', ');
+    }
+    function alleKontoHtml(id, wEksporcie, typ){
+        const st = alleKontoState[id];
+        if (!st) return '<span style="color:#888">—</span>';
+        if (st.stan === 'brak') return '<span style="color:#c47f00">nie znajduję auftragu</span>';
+        if (st.stan === 'blad') return '<span style="color:#c00">' + mmEsc(st.err || 'nie odczytałem') + '</span>';
+        const cz = ['<a href="/auction.php?number=' + mmEsc(st.num) + '&txnid=' + mmEsc(st.txn || '3')
+                  + '" target="_blank">' + mmEsc(alleAufEtyk(st)) + '</a>'];
+        if (st.konto){
+            // Kolor idzie za POPRAWNOSCIA konta, nie za tym, ze rozni sie od eksportu.
+            // Przy nierozstrzygnietym typie klienta nie ma z czym porownac — wtedy
+            // konto zostaje czarne, a rozjazd nazywamy osobnym napisem.
+            const dozw = alleDozwolone(typ);
+            const kolor = dozw.length ? (dozw.indexOf(st.konto) >= 0 ? '#0a7a2f' : '#c00') : '#333';
+            cz.push('<b style="color:' + kolor + '">' + mmEsc(st.konto) + '</b>');
+            if (st.skad === 'wszystkie')
+                cz.push('<span style="color:#888" title="Żadna płatność nie ma kwoty z zestawienia, ale wszystkie stoją na tym koncie">nie po kwocie</span>');
+            if (wEksporcie && st.konto !== String(wEksporcie))
+                cz.push('<span style="color:#c47f00">≠ eksport</span>');
+        } else if (st.nPlat){
+            cz.push('<span style="color:#c47f00">żadna z ' + st.nPlat + ' płatności nie ma tej kwoty</span>');
+            if (st.konta && st.konta.length)
+                cz.push('<span style="color:#888">na auftragu: ' + mmEsc(st.konta.join(', ')) + '</span>');
+        } else {
+            cz.push('<span style="color:#c47f00">auftrag bez płatności</span>');
+        }
+        if (st.ilu > 1) cz.push('<span style="color:#c47f00">' + st.ilu + ' wiersze o tej kwocie</span>');
+        if (st.formSelling && st.formSelling !== st.konto)
+            cz.push('<span style="color:#888">formularz ' + mmEsc(st.formSelling) + '</span>');
+        if (st.typAuf) cz.push('<span style="color:#888">' + mmEsc(st.typAuf) + '</span>');
+        if (st.deleted) cz.push('<b style="color:#c47f00">DELETED</b>');
+        return cz.join(' · ');
+    }
     // Numery operacji Allegro dla numeru zamowienia — po nich szuka sie w panelu sprzedawcy,
     // gdy auftragu nie ma. To ten sam slownik, ktory od 4.52 zasila liste NOT FOUND.
     function alleNrOp(p, id){
@@ -34476,7 +34775,7 @@
     // Allegro wypisuje dwie sekcje SAMO — bogaciej niz wspolny render: z numerem operacji
     // w Allegro i z wynikiem szukania auftragu. Reszte rysuje wspolny kod, a liczniki
     // i tak licza sie z pelnego zestawu.
-    const ALLE_POMIN = { brakuje: 1, brakZwrot: 1 };
+    const ALLE_POMIN = { brakuje: 1, brakZwrot: 1, zleKonto: 1, zleKontoOk: 1, bezTypu: 1 };
     function alleKnTekst(p, k, zle){
         const L = [];
         const podst = mmKnTekst(p, k, zle, alleKnOpis(p), ALLE_POMIN).split('\n');
@@ -34507,6 +34806,45 @@
             k.brakZwrot.forEach(function (x){
                 wl.push('   ' + x.id + '  ' + f2(x.kwota)
                       + '   nr operacji: ' + (((p.zrodlo || {})[x.id] || []).join(', ') || '—'));
+            });
+        }
+        // Trzy sekcje o kontach wypisujemy SAMI, bo wspolny wypis nie zna odczytu
+        // z auftragu. Dopoki drugiego przebiegu nie bylo, wygladaja jak dotad.
+        if ((k.zleKonto || []).length){
+            wl.push('');
+            wl.push('ZŁE KONTO SPRZEDAŻY (' + k.zleKonto.length + ')');
+            k.zleKonto.forEach(function (x){
+                const a = alleKontoOpis(x.id, x.konto);
+                wl.push('   ' + x.id + '  jest ' + x.konto + ', powinno ' + x.ocz
+                      + '  (' + x.typ + ', ' + f2(x.kwota) + ')'
+                      + (x.auf ? ('  auftrag ' + x.auf) : '')
+                      + (a ? ('   — ' + a) : '   — auftragu nie czytałem'));
+            });
+        }
+        if ((k.zleKontoOk || []).length){
+            wl.push('');
+            wl.push('KONTO W EKSPORCIE NIEAKTUALNE — NA AUFTRAGU JEST WŁAŚCIWE ('
+                  + k.zleKontoOk.length + ')');
+            k.zleKontoOk.forEach(function (x){
+                wl.push('   ' + x.id + '  w eksporcie ' + x.konto + ', na auftragu ' + x.wAuftragu
+                      + '  (' + x.typ + ', ' + f2(x.kwota) + ')'
+                      + (x.auf ? ('  auftrag ' + x.auf) : ''));
+            });
+        }
+        if ((k.bezTypu || []).length){
+            wl.push('');
+            wl.push('TYP KLIENTA NIEROZSTRZYGNIĘTY — billing nic o nich nie wie ('
+                  + k.bezTypu.length + ')');
+            k.bezTypu.forEach(function (x){
+                const wEks = (x.sprzW && x.sprzW[0]) ? x.sprzW[0].konto : '';
+                const a = alleKontoOpis(x.id, wEks);
+                wl.push('   ' + x.id + '  ' + f2(x.kwota)
+                      + '  konto ' + (x.konta || '—')
+                      + '  (' + (x.nSprz + x.nKor) + ' wiersze w prologistics: ' + x.nSprz + ' sprzedaż, '
+                      + x.nKor + ' korekt' + (x.nKor === 1 ? 'a' : 'y') + ')'
+                      + (x.pelny ? '  — zwrócone w całości, dlatego typ klienta jest nie do ustalenia'
+                                 : (x.zwrot != null ? ('  — zwrócono ' + f2(x.zwrot)) : ''))
+                      + (a ? ('   — ' + a) : ''));
             });
         }
         // naglowek to pierwsze trzy linie wspolnego wypisu
@@ -34555,6 +34893,48 @@
                          + kom('<code>' + mmEsc(x.id) + '</code>')
                          + '<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + alleNrOp(p, x.id) + '</td>'
                          + kwo(f2(x.kwota)) + kom(alleAufKom(x.id)) + '</tr>';
+                }));
+        }
+        // Konta rysujemy sami — wspolny render nie ma kolumny „co stoi na auftragu".
+        if ((k.zleKonto || []).length){
+            tab('Złe konto sprzedaży (' + k.zleKonto.length + ')', '#c00',
+                ['Zamówienie', 'W eksporcie', 'Powinno być', 'Typ', 'Kwota', 'Co stoi na auftragu'],
+                k.zleKonto.map(function (x){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + kom('<b>' + mmEsc(x.konto) + '</b>')
+                         + kom(mmEsc(x.ocz))
+                         + kom(mmEsc(x.typ || '—'))
+                         + kwo(f2(x.kwota))
+                         + kom(alleKontoHtml(x.id, x.konto, x.typ)) + '</tr>';
+                }));
+        }
+        if ((k.zleKontoOk || []).length){
+            tab('Konto w eksporcie nieaktualne — na auftragu jest właściwe (' + k.zleKontoOk.length + ')', '#0a7a2f',
+                ['Zamówienie', 'W eksporcie', 'Na auftragu', 'Typ', 'Kwota', 'Auftrag'],
+                k.zleKontoOk.map(function (x){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + kom('<span style="color:#888;text-decoration:line-through">' + mmEsc(x.konto) + '</span>')
+                         + kom('<b style="color:#0a7a2f">' + mmEsc(x.wAuftragu || '') + '</b>')
+                         + kom(mmEsc(x.typ || '—'))
+                         + kwo(f2(x.kwota))
+                         + kom(alleKontoHtml(x.id, x.konto, x.typ)) + '</tr>';
+                }));
+        }
+        if ((k.bezTypu || []).length){
+            tab('Typ klienta nierozstrzygnięty — billing nic o nich nie wie (' + k.bezTypu.length + ')', '#c47f00',
+                ['Zamówienie', 'Kwota', 'Konto w eksporcie', 'Wiersze w prologistics', 'Co stoi na auftragu'],
+                k.bezTypu.map(function (x){
+                    const wEks = (x.sprzW && x.sprzW[0]) ? x.sprzW[0].konto : '';
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + kwo(f2(x.kwota))
+                         + kom(mmEsc(x.konta || '—'))
+                         + kom((x.nSprz + x.nKor) + ' (' + x.nSprz + ' sprzedaż, ' + x.nKor + ' korekt'
+                               + (x.nKor === 1 ? 'a' : 'y') + ')'
+                               + (x.pelny ? ' <span style="color:#666">· zwrot w całości</span>' : ''))
+                         + kom(alleKontoHtml(x.id, wEks)) + '</tr>';
                 }));
         }
         return mmKnRender(p, k, zle, alleKnOpis(p), ALLE_POMIN) + H.join('');
@@ -34638,6 +35018,9 @@
         tekst: alleKnTekst,
         auftragi: alleSprawdzAuftragi,
         doSprawdzenia: alleDoSprawdzenia,
+        // Drugi przebieg kontroli kont: czyta auftragi i bierze konto z wiersza platnosci.
+        kontaAuf: alleSprawdzKonta,
+        doKontAuf: alleDoKont,
         // Konta rozliczeniowe Allegro. 1069 nie ma jeszcze znanego loginu, wiec w Saldach
         // wybiera sie je recznie — tak samo jak przy imporcie.
         konta: function (){
@@ -47115,7 +47498,9 @@
             + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
             + '<button id="sal-alporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
             + '<button id="sal-alauf" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
-            + 'title="Dla zamówień, których prologistics nie znalazł, szuka auftragu po numerze fulfilmentu — tą samą drogą co moduł „Księgowanie w auftragu". Auftrag bywa skasowany i wtedy import go nie widzi.">🔍 Szukaj auftragów po fulfilmencie</button>'
+            + 'title="Dla zamówień, których prologistics nie znalazł, szuka auftragu po numerze fulfilmentu — tą samą drogą co moduł „Księgowanie w auftragu". Auftrag bywa skasowany i wtedy import go nie widzi.">🔍 Szukaj auftragów po fulfilmencie</button> '
+            + '<button id="sal-alkonta" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Numer konta w Export payments bywa nieaktualny. Ten guzik wchodzi na auftragi z listy złych kont i z nierozstrzygniętym typem klienta i czyta konto sprzedaży wprost z wiersza płatności. Po pięć auftragów naraz.">🔎 Sprawdź konta w auftragach</button>'
             + '<button id="sal-alkopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
             + '</div>'
             + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
@@ -47127,6 +47512,7 @@
         p.querySelector('#sal-falle').onchange = function (){ salWczytajAlle(this.files); };
         p.querySelector('#sal-alporownaj').onclick = function (){ salPorownajAlle(this); };
         p.querySelector('#sal-alauf').onclick = function (){ salAlleAuftragi(this); };
+        p.querySelector('#sal-alkonta').onclick = function (){ salAlleKonta(this); };
         p.querySelector('#sal-akonto').onchange = function (){ salZlozAlle(); };
         p.querySelector('#sal-alkopiuj').onclick = function (){
             try { GM_setClipboard(SAL_ALLE_WYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
@@ -47191,7 +47577,66 @@
             salSay('Błąd szukania auftragów: ' + ((e && e.message) || e), '#c00');
         } finally { b.disabled = false; }
     }
-    function salPorownajAlle(b){
+    // Podsumowanie ekranu — jedno miejsce, bo pisza je dwa kroki: porownanie
+    // i odczyt kont z auftragow, ktory po nim nastepuje.
+    function salAlleStat(k, dodatek){
+        const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                    + (k.znoszaZle || 0);
+        const znosi = (k.znoszaSie || []).length;
+        salSay((blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.')
+             + (znosi ? (' Wpłata i zwrot znoszą się w ' + znosi + ' zamówieni' + (znosi === 1 ? 'u' : 'ach') + '.') : '')
+             + (dodatek ? (' ' + dodatek) : ''),
+               blady ? '#c47f00' : '#0a7a2f');
+    }
+    // Drugi przebieg kontroli kont: numer konta z „Export payments" bywa nieaktualny,
+    // wiec dla pozycji, ktore po samym zestawieniu wyszly na zle konto — i dla tych bez
+    // rozstrzygnietego typu klienta — wchodzimy na auftrag i czytamy konto z wiersza
+    // platnosci. Po piec naraz, ta sama droga co sprawdzanie typu klienta przed
+    // ksiegowaniem w module „Ksiegowanie Marketplace's".
+    //
+    // Leci SAM, zaraz po porownaniu: pierwszy wynik bez tego pokazywalby numery kont
+    // z eksportu, o ktorych wiadomo, ze bywaja nieaktualne. Guzik zostaje do powtorki
+    // tych pozycji, ktorych nie udalo sie odczytac.
+    async function salAlleKonta(b, auto){
+        const most = salAlleMost();
+        if (!most || typeof most.kontaAuf !== 'function'){
+            salSay('Ta wersja modułu marketplace\'ów nie umie czytać kont z auftragów.', '#c00'); return;
+        }
+        if (!SAL_ALLE_K || !SAL_ALLE_P){ salSay('Najpierw „Sprawdź".', '#c47f00'); return; }
+        const ile = most.doKontAuf(SAL_ALLE_K);
+        if (!ile){
+            if (!auto) salSay('Nie ma czego czytać — żadna pozycja nie czeka na konto z auftragu.', '#0a7a2f');
+            return;
+        }
+        if (b) b.disabled = true;
+        const t0 = Date.now();
+        try {
+            await most.kontaAuf(SAL_ALLE_P, SAL_ALLE_K, function (i, n){
+                if (i === n || i % 5 === 0)
+                    salSay('Czytam auftragi: ' + i + ' z ' + n + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            });
+            const p = salPanel();
+            p.querySelector('#sal-alwynik').innerHTML = most.render(SAL_ALLE_P, SAL_ALLE_K, SAL_AEXP.zle);
+            SAL_ALLE_WYNIK = most.tekst(SAL_ALLE_P, SAL_ALLE_K, SAL_AEXP.zle);
+            // Zostaja tylko te, ktorych NIE udalo sie odczytac — guzik jest wtedy
+            // powtorka, a nie pierwszym uruchomieniem.
+            const zostalo = most.doKontAuf(SAL_ALLE_K);
+            const kn = p.querySelector('#sal-alkonta');
+            if (kn){
+                kn.style.display = zostalo ? '' : 'none';
+                kn.textContent = '🔎 Ponów odczyt auftragów (' + zostalo + ')';
+            }
+            const ok = (SAL_ALLE_K.zleKontoOk || []).length;
+            salAlleStat(SAL_ALLE_K,
+                'Auftragów przeczytanych: ' + (ile - zostalo) + ' z ' + ile
+                + ' w ' + Math.round((Date.now() - t0) / 1000) + ' s.'
+                + (ok ? (' ' + ok + ' z nich ma na auftragu właściwe konto — tam numer w eksporcie jest nieaktualny.') : '')
+                + (zostalo ? (' ' + zostalo + ' nie odczytałem — powtórz guzikiem.') : ''));
+        } catch (e){
+            salSay('Błąd czytania auftragów: ' + ((e && e.message) || e), '#c00');
+        } finally { if (b) b.disabled = false; }
+    }
+    async function salPorownajAlle(b){
         const p = salPanel(), most = salAlleMost();
         const out = p.querySelector('#sal-alwynik'), kop = p.querySelector('#sal-alkopiuj');
         if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
@@ -47217,12 +47662,15 @@
             const doSpr = most.doSprawdzenia(k);
             const auf = p.querySelector('#sal-alauf');
             if (auf) auf.style.display = doSpr.length ? '' : 'none';
-            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
-                        + (k.znoszaZle || 0);
-            const znosi = (k.znoszaSie || []).length;
-            salSay((blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.')
-                 + (znosi ? (' Wpłata i zwrot znoszą się w ' + znosi + ' zamówieni' + (znosi === 1 ? 'u' : 'ach') + '.') : ''),
-                   blady ? '#c47f00' : '#0a7a2f');
+            // Konta czytamy z auftragow tylko wtedy, gdy jest co czytac.
+            const kn = p.querySelector('#sal-alkonta');
+            const doKont = (typeof most.doKontAuf === 'function') ? most.doKontAuf(k) : 0;
+            if (kn) kn.style.display = doKont ? '' : 'none';
+            salAlleStat(k);
+            // Konta z auftragow czytamy OD RAZU. Bez tego pierwszy wynik pokazuje
+            // numery z eksportu, o ktorych wiadomo, ze bywaja nieaktualne, i trzeba
+            // byloby patrzec na liste, ktorej i tak nie wolno wierzyc.
+            if (doKont) await salAlleKonta(kn, true);
         } catch (e){
             salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
         } finally { b.disabled = false; }
