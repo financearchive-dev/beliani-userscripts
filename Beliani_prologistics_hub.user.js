@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.24
+// @version      5.25
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -48969,12 +48969,32 @@
     // Kwota ma trzy zapisy: „Amount: 21231" z osobnym „Currency: HUF", rumunski
     // „Amount & Currency: 179.00 RON" w jednej linii (8 ticketow w probce — stary wzorzec
     // wymagal dwukropka TUZ po „Amount" i nie czytal ich wcale) oraz „Amount & Currency:15,595 HUF".
+    // Prologistics zapisuje KAZDE ksiegowanie w auftragu takze jako komentarz:
+    //   „249.00 (Date: 2026-09-02 08:20:00; Account: 1088; Auftrag value - Total of Payments: 0.00)"
+    // To jedyny slad, po ktorym da sie PRZED zapisem sprawdzic, czy takie ksiegowanie juz
+    // bylo — POST na /auction.php niczego nie sprawdza i przyjmie drugi raz to samo.
+    var UC_ZAPIS = /^\s*([-+]?[\d\s.,'’]+?)\s*\(\s*Date:\s*(\d{4}-\d{2}-\d{2})[^;)]*;\s*Account:\s*(\d+)/i;
     var UC_KWOTA = /\bamount\b\s*(?:&\s*currency)?\s*[:=]\s*([-+]?\d[\d\s .,'’]*)/i;
     var UC_WAL1  = /\bcurrency\b\s*[:=]?\s*([A-Za-z]{3})\b/i;
     var UC_WAL2  = /\bamount\s*&\s*currency\s*[:=]\s*[-+]?\d[\d\s .,'’]*\s*([A-Za-z]{3})\b/i;
     // Liczby, ktore w tresci moglyby udawac kwote, gdy prosba nie ma etykiety „Amount".
     // Numeru konta i cyfr z adresow NIE liczymy — inaczej „…to 1088" i link do auction.php
     // wygladalyby jak podana kwota.
+    // Czy w komentarzach auftraga stoi juz ksiegowanie tej samej kwoty, na to samo konto
+    // i z ta sama data. Zwraca opis znaleziska albo '' — pusty napis znaczy „nie ma".
+    function dubletZKomentarzy(kom, dateISO, kwota){
+        var out = '';
+        (kom || []).forEach(function(k){
+            if (out) return;
+            var m = UC_ZAPIS.exec(flat(k.tekst));
+            if (!m || String(m[3]) !== UC_KONTO || m[2] !== dateISO) return;
+            var kw = money(m[1]);
+            if (kw == null || !eq(kw, kwota)) return;
+            out = f2(kw) + ' na ' + UC_KONTO + ' z ' + (k.data || m[2]);
+        });
+        return out;
+    }
+
     function inneLiczby(t){
         var s = String(t == null ? '' : t).replace(/https?:\/\/\S+/gi, ' ');
         var out = [], re = /(?:^|[^\w.,])(\d{1,3}(?:[ '’, ]\d{3})+(?:[.,]\d{1,2})?|\d{3,}(?:[.,]\d{1,2})?)(?![\d])/g, m;
@@ -49162,7 +49182,7 @@
     }
 
     // ===== stan + UI =====
-    var S = { rows: [], busy: false, abort: false, cache: {}, t0: 0 };
+    var S = { rows: [], busy: false, abort: false, cache: {}, t0: 0, co: '' };
 
     // Pamiec na czas JEDNEGO przelotu, trzymana na OBIETNICACH. Ten sam ticket bywa
     // w kilku mailach, a ten sam auftrag pod kilkoma ticketami — bez tego strona, ktora
@@ -49253,8 +49273,24 @@
       +   '<span style="font-size:10px;color:#750000;font-style:italic;width:100%">Każda pozycja to zapis w auftragu i w tickecie. Zacznij od 2–3, jeśli serwer zacznie odrzucać zapytania.</span>'
       + '</div>'
 
+      + '<div id="uc-warn" style="display:none;margin-top:8px;padding:8px;background:#fff4e5;border:1px solid #f0b429;'
+      +   'border-radius:6px;font-size:12px;color:#8a5a00;font-weight:bold">'
+      +   '⚠ Księgowanie w toku — nie zamykaj tej karty ani jej nie odświeżaj. '
+      +   'Auftrag i ticket zapisują się osobno; przerwanie w połowie zostawia jedno bez drugiego.'
+      + '</div>'
       + '<div id="uc-status" style="margin-top:8px;color:#333;min-height:16px;font-size:12px;font-weight:bold"></div>'
       + '<div id="uc-out" style="margin-top:10px;overflow-x:auto"></div>';
+
+    // Zapis w auftragu i zapis w tickecie to DWA osobne zadania do serwera. Zamkniecie
+    // albo odswiezenie karty miedzy nimi zostawia auftrag zaksiegowany, a ticket nie —
+    // i nikt sie o tym nie dowie. Dlatego przegladarka ma zapytac, dopoki cos leci.
+    window.addEventListener('beforeunload', function(e){
+        if (!S.busy) return;
+        var t = 'Unpaid COD: trwa ' + (S.co || 'przetwarzanie') + '. Zamknięcie karty przerwie je w połowie.';
+        e.preventDefault();
+        e.returnValue = t;      // starsze przegladarki czytaja to pole
+        return t;
+    });
 
     function $(s){ return panel.querySelector(s); }
     function say(t, c){ var e = $('#uc-status'); if (e){ e.textContent = t; e.style.color = c || '#333'; } }
@@ -49293,8 +49329,10 @@
     function bookable(r){
         // 'man' to wiersz bez prosby, ktoremu czlowiek sam wpisal kwote — swiadoma decyzja,
         // wiec ksiegowac wolno; wiersz i tak nie jest zaznaczony z automatu.
-        return !r.booked && !!r.rma && !!r.aufNum && r.kwota != null
-            && (r.st === 'ok' || r.st === 'diff' || r.st === 'man');
+        // 'fail' i 'part' zostaja do ponowienia: przy 'part' auftrag jest juz zapisany
+        // (r.aufDone), wiec powtorka dotyka samego ticketu i dubletu nie zrobi.
+        return !!r.rma && !!r.aufNum && r.kwota != null
+            && (r.st === 'ok' || r.st === 'diff' || r.st === 'man' || r.st === 'fail' || r.st === 'part');
     }
     // Przelacznik „dopisz kwote recznie" — bez niego wiersz bez prosby jest tylko pomijany.
     function reczneWl(){ var c = $('#uc-reczne'); return !!(c && c.checked); }
@@ -49548,7 +49586,14 @@
         if (pr.kwota != null){
             r.kwota = pr.kwota; r.kwotaZ = 'prośba';
             if (!(r.kwota > 0)){ r.st = 'err'; dopisz(r, 'kwota z prośby nie jest dodatnia (' + f2(r.kwota) + ')'); return; }
-            if (eq(r.open, r.kwota)){ r.st = 'ok'; r.sel = true; }
+            if (eq(r.open, r.kwota)){
+                r.st = 'ok'; r.sel = true;
+                // Wiersz bez ANI JEDNEJ uwagi wyglada tak samo jak wiersz, w ktorym nic
+                // nie znaleziono — a to sa dwie zupelnie rozne rzeczy. Skoro nic nie
+                // odstaje, powiedzmy to wprost, zamiast zostawiac pusto.
+                if (!r.msg) dopisz(r, 'prośba w komentarzach ticketu (' + (r.dataPr || '?')
+                                    + '), kwota z prośby zgodna z open amount');
+            }
             else {
                 r.st = 'diff'; r.sel = false;
                 dopisz(r, 'różnica ' + f2(r.kwota - r.open) + ' — prośba ' + f2(r.kwota) + ', open amount ' + f2(r.open) + '. Zaznacz ręcznie, jeśli mimo to ma iść');
@@ -49583,7 +49628,7 @@
                 say(p.errs.length ? p.errs[0] : 'Nie znalazłem ani jednego wiersza z numerem ticketu albo auftraga.', '#c00');
                 return;
             }
-            S.rows = p.rows; S.busy = true; S.abort = false; S.cache = {}; S.t0 = Date.now();
+            S.rows = p.rows; S.busy = true; S.abort = false; S.cache = {}; S.t0 = Date.now(); S.co = 'sprawdzanie';
             $('#uc-check').disabled = true; $('#uc-book').disabled = true; $('#uc-log').disabled = true; $('#uc-stop').disabled = false;
             render();
             var done = 0, tot = S.rows.length, par = parN();
@@ -49648,7 +49693,9 @@
              + (jestApproval(k.tekst) ? '   [formularz Approval — pomijany]' : ''));
         String(k.tekst == null ? '' : k.tekst).split(/\r?\n/).forEach(function(w){ L.push('      ' + w); });
     }
-    function logAuf(L, num, a){
+    // F (opcjonalne) — lista „materialu do reguly". Komentarze finance AUFTRAGA musza
+    // do niej trafiac tak samo jak ticketowe: prosba rownie czesto stoi po tej stronie.
+    function logAuf(L, num, a, F){
         if (!a || !a.ok){
             // czytajAuftrag wpisuje numer w treść błędu — nie dublujemy go w prefiksie.
             var e = (a && a.err) || ('auftrag ' + num + ': nie odczytany');
@@ -49662,7 +49709,17 @@
         // Komentarze AUFTRAGA — prosba potrafi stac tutaj, a nie w tickecie.
         var ka = a.kom || [];
         L.push('  komentarzy auftraga: ' + ka.length);
-        ka.forEach(function(k, i){ logKom(L, k, i, 'auftrag ' + num); });
+        ka.forEach(function(k, i){
+            logKom(L, k, i, 'auftrag ' + num);
+            if (F && String(k.src || '').toLowerCase() === 'finance'){
+                // Ten sam auftrag bywa logowany dwa razy (raz jako pozycja wklejki, raz
+                // przez ticket, ktory go wskazuje) — w materiale do reguly ma byc raz.
+                var glowa = 'auftrag ' + num + '  ' + (k.data || '?') + '  ' + (k.autor || '?');
+                if (!F.some(function(x){ return x.indexOf(glowa) === 0; }))
+                    F.push(glowa + (czyProsba(k.tekst) ? '  [reguła: TAK]' : '  [reguła: nie]')
+                         + '\n    ' + flat(k.tekst).slice(0, 500));
+            }
+        });
     }
     async function zbierzLog(){
         var p = parsePaste($('#uc-paste').value);
@@ -49672,7 +49729,7 @@
         }
         // Wiersze idą do S.rows, żeby tabela pokazywała zbiórkę tak samo jak sprawdzanie —
         // widać, co jest w robocie, co już spisane i czego nie udało się otworzyć.
-        S.rows = p.rows; S.busy = true; S.abort = false; S.cache = {}; S.t0 = Date.now();
+        S.rows = p.rows; S.busy = true; S.abort = false; S.cache = {}; S.t0 = Date.now(); S.co = 'zbiórka komentarzy';
         $('#uc-check').disabled = true; $('#uc-book').disabled = true; $('#uc-log').disabled = true; $('#uc-stop').disabled = false;
         render();
         var L = [], fin = [], t0 = Date.now(), nT = 0, nK = 0, nProsb = 0;
@@ -49744,7 +49801,7 @@
                 dopisz(r, 'komentarzy ' + kom.length + ' · ' + (pr ? ('prośba z ' + pr.k.zrodlo
                         + (pr.kwota == null ? ', bez kwoty' : ', kwota ' + f2(pr.kwota))) : 'bez prośby'));
             }
-            aufy.forEach(function(x){ logAuf(B, x.num, x.a); });
+            aufy.forEach(function(x){ logAuf(B, x.num, x.a, F); });
             B.push('  --- komentarze ticketu ' + rma + ' ---');
             kom.forEach(function(k, i){
                 logKom(B, k, i, '');
@@ -49767,7 +49824,7 @@
                         B.push('===== AUFTRAG ' + r.id + ' =====');
                         B.push('  z maila     : ' + (r.from || '—') + ' — ' + r.temat);
                         var a = await auftragC(r.id);
-                        logAuf(B, r.id, a);
+                        logAuf(B, r.id, a, F);
                         r.aufNum = r.id;
                         if (a && a.ok){ r.open = a.open; r.waluta = a.waluta; }
                         var tick = (a && a.tickety) || [];
@@ -49794,7 +49851,8 @@
             finB.forEach(function(f){ fin = fin.concat(f); });
             L.push('');
             L.push('===== KOMENTARZE data-src="finance" — sam materiał do reguły =====');
-            L.push(fin.length ? fin.join('\n') : '(żaden ticket nie miał komentarza finance)');
+            L.push('      (z ticketów ORAZ z auftragów — prośba stoi raz po jednej, raz po drugiej stronie)');
+            L.push(fin.length ? fin.join('\n') : '(ani ticket, ani auftrag nie miał komentarza finance)');
             L.push('');
             L.push('===== PODSUMOWANIE =====');
             L.push('Ticketów przeczytanych : ' + nT);
@@ -49831,19 +49889,47 @@
     // Gdy auftrag przejdzie, a ticket nie — pozycja konczy jako „do sprawdzenia" z tresci,
     // ktora mowi wprost, co zostalo do zrobienia recznie. Zielono nie moze wyjsc nigdy.
     async function ksiegujWiersz(r, data){
-        var b = await ksiegujAuftrag(r.aufNum, data, r.kwota, 'Unpaid COD ticket ' + r.rma);
-        if (!b.ok){ r.st = 'fail'; r.msg = 'auftrag: ' + (b.err || 'nie wysłano'); return; }
-        r.booked = true; r.sel = false;
-        await sleep(300);
-        var a = await czytajAuftrag(r.aufNum);
-        if (!a.ok){ r.msg = 'auftrag: wysłane, ale nie udało się odczytać do weryfikacji (' + a.err + ')'; r.st = 'part'; }
-        else if (!(a.nPay > r.nPay)){
-            r.st = 'fail'; r.msg = 'auftrag: w tabeli Payments nie przybyło księgowania — sprawdź ręcznie';
-            return;
+        // Kazde podejscie pisze raport od nowa — inaczej przy ponowieniu mieszalyby sie
+        // wyniki dwoch przebiegow i nie byloby wiadomo, co jest z ktorego.
+        r.msg = '';
+        if (!r.aufDone){
+            // Odczyt PRZED zapisem: swiezy stan Payments do pozniejszej kontroli, a przy
+            // okazji jedyna mozliwa ochrona przed dubletem.
+            var a0 = await czytajAuftrag(r.aufNum);
+            if (a0.ok){
+                r.nPay = a0.nPay; r.open = a0.open;
+                var dub = dubletZKomentarzy(a0.kom, data, r.kwota);
+                if (dub){
+                    r.aufDone = true; r.booked = true;
+                    dopisz(r, 'auftrag: takie księgowanie już tam stało (' + dub + ') — nie powtarzam');
+                }
+            } else {
+                dopisz(r, 'auftrag: nie odczytałem przed zapisem (' + a0.err + ') — kontrola dubletu pominięta');
+            }
         } else {
-            r.open = a.open; r.nPay = a.nPay;
-            r.msg = 'auftrag: zaksięgowane ' + f2(r.kwota) + ' na ' + UC_KONTO;
-            if (!eq(a.open, 0)) r.msg += ' (uwaga: open amount = ' + f2(a.open) + ', nie 0)';
+            dopisz(r, 'auftrag: zaksięgowany wcześniej — powtarzam tylko ticket');
+        }
+
+        if (!r.aufDone){
+            var b = await ksiegujAuftrag(r.aufNum, data, r.kwota, 'Unpaid COD ticket ' + r.rma);
+            if (!b.ok){ r.st = 'fail'; dopisz(r, 'auftrag: ' + (b.err || 'nie wysłano')); return; }
+            r.aufDone = true; r.booked = true; r.sel = false;
+            await sleep(300);
+            var a = await czytajAuftrag(r.aufNum);
+            if (!a.ok){ dopisz(r, 'auftrag: wysłane, ale nie udało się odczytać do weryfikacji (' + a.err + ')'); r.st = 'part'; }
+            else if (!(a.nPay > r.nPay)){
+                // POST wrocil 200, ale platnosci nie przybylo. Nie wiemy, czy zapis
+                // przepadl, czy odczyt byl za wczesny — wiec NIE uznajemy auftragu za
+                // zaksiegowany. Ponowienie zacznie od kontroli dubletu i to ona rozstrzygnie:
+                // jak zapis jednak jest, znajdzie go w komentarzach i nie powtorzy.
+                r.aufDone = false; r.booked = false;
+                r.st = 'fail'; dopisz(r, 'auftrag: w tabeli Payments nie przybyło księgowania — sprawdź ręcznie');
+                return;
+            } else {
+                r.open = a.open; r.nPay = a.nPay;
+                dopisz(r, 'auftrag: zaksięgowane ' + f2(r.kwota) + ' na ' + UC_KONTO);
+                if (!eq(a.open, 0)) dopisz(r, 'uwaga: open amount = ' + f2(a.open) + ', nie 0');
+            }
         }
 
         if (typeof window.__TM_UCOD_TICKET !== 'function'){
@@ -49896,8 +49982,9 @@
                 + 'Dla każdej: księgowanie w auftragu + księgowanie w tickecie + komentarz „' + UC_KOM + '" + odbicie na osobę, która prosiła.'
                 + (df ? ('\n\nUWAGA: ' + df + ' z nich ma kwotę różną od open amount.') : '')
                 + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-            S.busy = true; S.abort = false; S.t0 = Date.now();
+            S.busy = true; S.abort = false; S.t0 = Date.now(); S.co = 'księgowanie';
             $('#uc-check').disabled = true; $('#uc-book').disabled = true; $('#uc-log').disabled = true; $('#uc-stop').disabled = false;
+            $('#uc-warn').style.display = 'block';
             var ok = 0, part = 0, fail = 0, done = 0, par = parN();
             // Rownolegle — ale wiersze celujace w TEN SAM auftrag ida PO KOLEI. Ksiegowanie
             // czyta stan auftragu zaraz po zapisie („czy przybyla platnosc", „czy open = 0"),
@@ -49925,13 +50012,28 @@
                     postep(done, todo.length, 'Zaksięgowane'); render();
                 }
             });
-            say((S.abort ? ('Przerwane po ' + done + '/' + todo.length + '. ') : '')
-                + 'Gotowe: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
+            // Do ponowienia zostaja te, ktore nie doszly do konca. Zaznaczamy WYLACZNIE je,
+            // zeby kolejne „Księguj zaznaczone" wzielo tylko niedokonczone.
+            S.rows.forEach(function(x){ if (x.st === 'done' || x.st === 'busy') x.sel = false; });
+            var znowu = S.rows.filter(function(x){ return (x.st === 'fail' || x.st === 'part') && bookable(x); });
+            znowu.forEach(function(x){ x.sel = true; });
+            var nietkniete = todo.length - done;
+            say((S.abort ? ('PRZERWANE. ') : '')
+                + 'Zaksięgowane w komplecie: ' + ok + ' z ' + todo.length
+                + (part ? ('  ·  ⚠ niedokończone ' + part) : '')
+                + (fail ? ('  ·  ✗ nieudane ' + fail) : '')
+                + (nietkniete > 0 ? ('  ·  nietknięte ' + nietkniete) : '')
+                + (znowu.length
+                   ? ('  ·  zaznaczyłem ' + znowu.length + ' do ponowienia — „Księguj zaznaczone" weźmie tylko je'
+                      + ' (auftrag, który już się zapisał, nie zostanie zaksięgowany drugi raz)')
+                   : '  ·  nic nie zostało do poprawki'),
                 fail ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
         } catch (e){
             say('Błąd księgowania: ' + ((e && e.message) || e), '#c00');
         } finally {
-            S.busy = false; $('#uc-check').disabled = false; $('#uc-log').disabled = false; $('#uc-stop').disabled = true;
+            S.busy = false; S.co = '';
+            $('#uc-check').disabled = false; $('#uc-log').disabled = false; $('#uc-stop').disabled = true;
+            $('#uc-warn').style.display = 'none';
             $('#uc-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
             render();
         }
