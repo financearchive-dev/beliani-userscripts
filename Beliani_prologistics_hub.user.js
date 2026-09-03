@@ -49296,10 +49296,29 @@
     function say(t, c){ var e = $('#uc-status'); if (e){ e.textContent = t; e.style.color = c || '#333'; } }
     // Launcher chowa ten guzik i „klika" go za nas (data-sel -> b.click()), wiec przelacznik
     // musi dzialac tak samo z ukrytego guzika jak z widocznego.
-    btn.onclick = function(){ panel.style.display = (panel.style.display === 'none' ? 'block' : 'none'); };
+    // Schowanie panelu NIE zatrzymuje pracy — leci ona dalej w tej karcie. Ale czlowiek,
+    // ktory zamyka panel w polowie ksiegowania, zwykle sadzi, ze wlasnie je przerywa.
+    // Wiec pytamy i przy okazji mowimy, jak jest naprawde i co przerywa NA PEWNO.
+    function schowajPanel(){
+        if (S.busy){
+            var wRobocie = S.rows.filter(function(r){ return r.st === 'busy'; }).length;
+            if (!confirm('Trwa ' + (S.co || 'przetwarzanie')
+                + (wRobocie ? (' — w robocie ' + wRobocie + ' pozycji.') : '.')
+                + '\n\nSchowanie panelu NIE przerywa pracy: idzie dalej w tle tej karty, a wynik'
+                + '\nzobaczysz po ponownym otwarciu panelu.'
+                + '\n\nPrzerwać można tylko guzikiem „⛔ Przerwij”. Zamknięcie albo odświeżenie'
+                + '\nCAŁEJ KARTY zostawi zapis w połowie — auftrag zaksięgowany, ticket nie.'
+                + '\n\nSchować panel?')) return;
+        }
+        panel.style.display = 'none';
+    }
+    btn.onclick = function(){
+        if (panel.style.display === 'none') panel.style.display = 'block';
+        else schowajPanel();
+    };
     (document.body || document.documentElement).appendChild(btn);
     (document.body || document.documentElement).appendChild(panel);
-    $('#uc-close').onclick = function(){ panel.style.display = 'none'; };
+    $('#uc-close').onclick = schowajPanel;
     $('#uc-clear').onclick = function(){
         if (S.busy){ say('Najpierw przerwij przetwarzanie.', '#c00'); return; }
         S.rows = []; S.cache = {};
