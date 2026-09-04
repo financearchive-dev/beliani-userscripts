@@ -47529,7 +47529,10 @@
             SAL_AWYNIK = most.tekst(SAL_AMZ, k, SAL_AEXP.zle);
             out.innerHTML = most.render(SAL_AMZ, k, SAL_AEXP.zle);
             kop.style.display = '';
-            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+            // Podwojne ksiegowania licza sie do paska tak samo jak reszta — inaczej pasek
+            // mowilby „wszystko sie zgadza", a raport pod nim pokazywalby noty na 2x kwote.
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                        + (k.podwojne || []).length;
             salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
                    blady ? '#c47f00' : '#0a7a2f');
         } catch (e){
