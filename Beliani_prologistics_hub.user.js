@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.29
+// @version      5.30
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -37184,6 +37184,63 @@
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
                 errs.length ? '#c47f00' : '#0a7a2f');
         }
+        // Most z Bank Importu. Ten sam wyciag, ktory poszedl do importu bankowego, moze
+        // zalozyc tu zlecenia — na konto PostFinance wpadaja tez wyplaty marketplace.
+        // Plik przychodzi BAJTAMI (base64), zeby kodowanie rozstrzygal ten, kto je zna,
+        // i wchodzi ta sama droga co guzik „wgraj wyciąg".
+        const MKB_Z = 'bank_imp_do_mkt', MKB_O = 'bank_imp_do_mkt_odp';
+        let mkbOstatnie = '';
+        setInterval(async function (){
+            let z = null;
+            try { z = JSON.parse(GM_getValue(MKB_Z, '') || 'null'); } catch (e){ z = null; }
+            if (!z || !z.id || z.id === mkbOstatnie) return;
+            if (Date.now() - (z.kiedy || 0) > 180000) return;    // przeterminowanego nie ruszamy
+            mkbOstatnie = z.id;
+            try { GM_setValue(MKB_Z, ''); } catch (e){}
+            try {
+                const bin = atob(String(z.b64 || ''));
+                const u8 = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+                const przed = jobsLoad();
+                await mkWczytajWyciagi([new File([u8], z.nazwa || 'wyciag.csv', { type: 'text/csv' })]);
+                const poJobs = jobsLoad();
+                const nowe = Object.keys(poJobs).filter(function (k){ return !przed[k]; });
+                // ---- arkusz ----
+                // Zlecenia z mostu dopisujemy OD RAZU jako pozycje „do zrobienia".
+                // Bez konta nie dopisujemy: klucz duplikatu w arkuszu to data + konto
+                // + kwota, wiec wiersz bez konta nie zszedlby sie z tym, ktory powstanie
+                // przy ksiegowaniu — zrobilby drugi wiersz zamiast sie z nim zejsc.
+                let arkDodane = 0, arkBezKonta = 0, arkBlad = '';
+                const cfgA = shCfg();
+                if (cfgA.on && cfgA.url && cfgA.secret){
+                    const wiersze = [];
+                    nowe.forEach(function (k){
+                        const j2 = poJobs[k];
+                        if (!j2 || !j2.mp) return;                       // tylko rozpoznane markety
+                        const c2 = setLoad()[setKey(j2.mp, (j2.data && j2.data.shop) || j2.shop)] || {};
+                        if (!c2.acct){ arkBezKonta++; return; }
+                        let w = null;
+                        try { w = shRow(j2, c2); } catch (e){ w = null; }
+                        if (!w) return;
+                        w.booked = 'Nie';                                // pozycja DO ZROBIENIA
+                        wiersze.push(w);
+                    });
+                    if (wiersze.length){
+                        try { const r2 = await shPost(wiersze); arkDodane = (r2 && r2.added) || 0; }
+                        catch (e){ arkBlad = (e && e.message) || String(e); }
+                    }
+                } else if (nowe.length){
+                    arkBlad = shWhy(cfgA);
+                }
+                GM_setValue(MKB_O, JSON.stringify({ id: z.id, ok: true,
+                    nowych: nowe.length, razem: Object.keys(poJobs).length,
+                    arkusz: { dodane: arkDodane, bezKonta: arkBezKonta, blad: arkBlad },
+                    kiedy: Date.now() }));
+            } catch (e){
+                GM_setValue(MKB_O, JSON.stringify({ id: z.id, ok: false,
+                    blad: (e && e.message) || String(e), kiedy: Date.now() }));
+            }
+        }, 500);
         $('#mk-file').onchange = function(){
             const fs = Array.prototype.slice.call(this.files || []);
             try { this.value = ''; } catch (e){}
@@ -52143,6 +52200,16 @@
 
     var BK_BS_URL  = '/api/bankSettings/index/';
     var BK_BK_URL  = '/api/bookingSettings/index/';
+    // Ile groszy roznicy w „open amount" wolno wyrownac. Zaokraglenia rzedu 0.01–0.04 to
+    // normalny szum; wieksza roznica to juz realny rozjazd i zostaje CHECK-iem.
+    var BK_TOL_KEY = 'bank_imp_tolerancja';
+    function tolGet(){
+        var v = Number(gmGet(BK_TOL_KEY, 0.05));
+        return (isFinite(v) && v >= 0) ? v : 0.05;
+    }
+    // = przycisk „Book & Assign on sub-account".
+    var BK_BLOCK_SUB = 'booking_sub';
+    var BK_BLOCK_SUB_OPIS = 'Book & Assign on sub-account';
     // = przycisk „Book & Assign on main account". Import SAM NIE KSIEGUJE — tworzy tylko
     // paczke. Nazwy akcji sa odczytane wprost z handlerow przyciskow strony Import payments
     // (onClick -> save("<block>")), a nie zgadniete:
@@ -52220,9 +52287,26 @@
         // „numer -> data", potrzebna przy ksiegowaniu wierszy NOT FOUND wprost na auftragu.
         kolKlucz: 8,
         kolData: 9,
-        konto: '1232',                 // EUPAGO PT Beliani DE — informacyjnie, do kontroli wzrokowej
+        konto: '1232',                 // EUPAGO PT Beliani DE — konto ksiegowania na auftragu
         waluta: 'EUR',                 // do szukania po otwartej kwocie
         szukaj: /eupago|eu\s*pago/i    // po tym podpowiadamy ustawienie importu
+    }, {
+        id: 'postfinance',
+        nazwa: 'PostFinance CH',
+        opis: 'export_transactions z e-finance — wyciąg konta CH; do importu idzie bez żadnych zmian',
+        // Plik wysylamy TAKI, JAKI JEST: z blokiem naglowkowym (Date from / Account /
+        // Currency) i stopka „Disclaimer". Import prologistics przyjmuje go w tej postaci,
+        // wiec nie ma czego poprawiac — a sklejanie CSV od nowa by to zepsulo.
+        surowy: true,
+        // Na to konto wpadaja takze wyplaty marketplace (Manor, OBI CH i inne). Modul
+        // „Ksiegowanie Marketplace's" ma wlasny parser PostFinance i rozpoznaje w nim
+        // marketplace'y po nadawcy i tytule — przekazujemy mu wiec ten sam plik zamiast
+        // przepisywac to rozpoznawanie tutaj.
+        mostMkt: true,
+        minKol: 0, kwoty: [], daty: [],
+        konto: '',                     // konto w planie kont — wpisz w ustawieniach
+        waluta: 'CHF',
+        szukaj: /post\s*finance/i
     }];
     function fmt(id){ return BK_FORMATY.filter(function (x){ return x.id === id; })[0] || BK_FORMATY[0]; }
 
@@ -52263,6 +52347,7 @@
             rd.onload = function (){
                 try {
                     var buf = rd.result;
+                    S.buf = buf;          // oryginalne bajty — formaty „surowe" wysylaja wlasnie je
                     if (/\.xlsx?$/i.test(file.name)){
                         if (typeof XLSX === 'undefined'){ zle(new Error('brak biblioteki XLSX — odśwież stronę')); return; }
                         var wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
@@ -52285,6 +52370,9 @@
     // zmieniaja sie tylko komorki danych we wskazanych kolumnach.
     function bkPrzerob(aoa, F){
         if (!aoa || !aoa.length) return { err: 'plik jest pusty' };
+        // Format „surowy" idzie do importu nietkniety — niczego nie liczymy i nie zmieniamy,
+        // wiersze sluza wylacznie do podgladu.
+        if (F.surowy) return { rows: aoa, zmKwot: 0, zmDat: 0, surowy: true };
         var hdr = (aoa[0] || []).map(function (c){ return String(c == null ? '' : c); });
         if (hdr.length < F.minKol)
             return { err: 'Plik musi mieć co najmniej ' + F.minKol + ' kolumn — ten ma ' + hdr.length + '.' };
@@ -52314,7 +52402,12 @@
         };
         return rows.map(function (r){ return r.map(q).join(';'); }).join('\r\n') + '\r\n';
     }
-    function bkBlob(rows){ return new Blob(['\ufeff' + bkCsvText(rows)], { type: 'text/csv;charset=utf-8' }); }
+    function bkBlob(rows){
+        // Format „surowy": wysylamy ORYGINALNE bajty pliku. Sklejenie CSV od nowa
+        // zgubiloby blok naglowkowy i stopke, a import PostFinance ich oczekuje.
+        if (fmt(S.format).surowy && S.buf) return new Blob([S.buf], { type: 'text/csv' });
+        return new Blob(['\ufeff' + bkCsvText(rows)], { type: 'text/csv;charset=utf-8' });
+    }
     // Nazwa jak w starej aplikacji: „04.09.2026 08.14 eupago.csv".
     function bkNazwa(F){
         var d = new Date();
@@ -52382,12 +52475,56 @@
         return hit;
     }
     function ustaw(id){
-        var o = jGet(BK_SET_KEY);
-        return o[id] || { bank: '', bankNm: '', booking: '', bookingNm: '' };
+        var o = jGet(BK_SET_KEY), v = o[id] || { bank: '', bankNm: '', booking: '', bookingNm: '' };
+        // Konto ksiegowania na auftragu. Dla eupago znane z gory, dla pozostalych do
+        // wpisania — zgadywanie numeru konta to zle zaksiegowana wplata.
+        if (!v.konto) v.konto = fmt(id).konto || '';
+        return v;
     }
     function ustawZapisz(id, v){
         var o = jGet(BK_SET_KEY);
         o[id] = v; jSet(BK_SET_KEY, o);
+    }
+
+    // ---------- most do „Księgowanie Marketplace's" ----------
+    // Na konto PostFinance wpadaja takze wyplaty marketplace. Modul Marketplace's ma
+    // WLASNY parser PostFinance i rozpoznaje w nim marketplace'y po nadawcy i tytule,
+    // wiec nie przepisujemy tego tutaj — podajemy mu ten sam plik ta sama droga, ktora
+    // chodzi jego guzik „wgraj wyciąg". Plik idzie bajtami (base64), zeby kodowanie
+    // rozstrzygal ten, kto je zna.
+    var MKT_MOST_Z = 'bank_imp_do_mkt';
+    var MKT_MOST_O = 'bank_imp_do_mkt_odp';
+    function bkB64(buf){
+        var b = new Uint8Array(buf), s2 = '';
+        for (var i = 0; i < b.length; i += 0x8000)
+            s2 += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+        return btoa(s2);
+    }
+    async function bkDoMarketplace(nazwa){
+        if (!S.buf) throw new Error('nie mam pliku w pamięci — wgraj go jeszcze raz');
+        if (S.buf.byteLength > 4 * 1024 * 1024)
+            throw new Error('plik ma ponad 4 MB — przekaż go wprost w module Marketplace’s');
+        var id = 'm' + Date.now().toString(36);
+        gmSet(MKT_MOST_O, '');
+        gmSet(MKT_MOST_Z, JSON.stringify({ id: id, nazwa: nazwa, b64: bkB64(S.buf), kiedy: Date.now() }));
+        return await new Promise(function (ok, zle){
+            var start = Date.now();
+            var zegar = setInterval(function (){
+                var o = null;
+                try { o = JSON.parse(gmGet(MKT_MOST_O, '') || 'null'); } catch (e){ o = null; }
+                if (o && o.id === id){
+                    clearInterval(zegar);
+                    try { gmSet(MKT_MOST_O, ''); } catch (e){}
+                    if (o.ok) ok(o); else zle(new Error(o.blad || 'moduł Marketplace’s nie przyjął pliku'));
+                    return;
+                }
+                if (Date.now() - start > 60000){
+                    clearInterval(zegar);
+                    zle(new Error('moduł „Księgowanie Marketplace’s" nie odpowiedział w minutę — '
+                                + 'sprawdź, czy jest włączony w ⚙ Moduły'));
+                }
+            }, 400);
+        });
     }
 
     // ---------- paczka importu ----------
@@ -52452,6 +52589,44 @@
             headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
             body: body });
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy ustawianiu statusu wiersza ' + rowId);
+        return r.text();
+    }
+    // Przypisanie auftragu do wiersza paczki.
+    async function bkPrzypisz(id, rowId, numer){
+        var body = 'id=' + encodeURIComponent(rowId)
+                 + '&auction_number=' + encodeURIComponent(numer)
+                 + '&block=auction_number&file_id=' + encodeURIComponent(id);
+        var r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy przypisywaniu auftragu');
+        return r.text();
+    }
+    // Numer auftragu z tresci wiersza. Tylko postaci JEDNOZNACZNE — sama osmiocyfrowka
+    // w wyciagu bywa numerem referencyjnym banku, a nie zamowienia. To podpowiedz do
+    // pola, nie decyzja: wysyla ja dopiero klikniecie.
+    function bkAufZTekstu(t){
+        var x = String(t || '').replace(/\s+/g, ' ');
+        var m = x.match(/\bAUFTRAG\s+(\d{6,9})\s*\/\s*(\d+)/i);
+        if (m) return m[1] + '/' + m[2];
+        m = x.match(/\b(\d{8})\s*\/\s*(\d+)\b/);                     // „15307370 / 3"
+        if (m) return m[1] + '/' + m[2];
+        // Numer po slowie zamowienia — w kilku jezykach, bo wyciag CH miesza niemiecki,
+        // francuski i wloski. txnid dopisujemy jako 3, bo caly HUB czyta i ksieguje
+        // auftrag wlasnie w tej transakcji — ale numer i tak widac w polu przed wyslaniem.
+        m = x.match(/\b(?:AUFTRAG|BESTELLUNG|COMMANDE|COMANDA|REFERENZ|REFERENCE|ORDER|ORDINE|PEDIDO)\s+(?:NR\.?\s*)?(\d{8})\b/i);
+        if (m) return m[1] + '/3';
+        return '';
+    }
+    async function bkKsiegujSub(id, ids){
+        var body = 'file_id=' + encodeURIComponent(id) + '&block=' + BK_BLOCK_SUB
+                 + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
+        var r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu na subkoncie');
         return r.text();
     }
     // Open amount przychodzi raz jako „0.00", a raz jako „CHF 0.01" — z waluta w srodku
@@ -53369,6 +53544,8 @@
               +  '<select id="bk-bank" style="font-size:11px;padding:4px;max-width:320px">' + opcje(S.banki, c.bank) + '</select>'
               +  '<label style="font-size:11px;color:#750000;font-weight:700">booking_setting</label>'
               +  '<select id="bk-book" style="font-size:11px;padding:4px;max-width:280px">' + opcje(S.ksieg, c.booking) + '</select>'
+              +  '<label style="font-size:11px;color:#750000;font-weight:700" title="Konto z planu kont, na które księgują się wpłaty przy księgowaniu wprost na auftragu.">konto</label>'
+              +  '<input id="bk-konto" value="' + esc(c.konto || '') + '" style="width:60px;font-size:11px;text-align:right">'
               +  '<button id="bk-zapisz" style="padding:5px 12px;border:none;border-radius:6px;background:#0a7a2f;color:#fff;font-weight:700;cursor:pointer;font-size:11px">💾 Zapisz</button>'
               +  '<button id="bk-listy" style="padding:5px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px">↻ Odśwież listy</button>'
               +  '</div>'
@@ -53391,12 +53568,28 @@
             var d = S.rows;
             h += '<div style="padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:8px">'
               +  '<div style="font-size:12px;color:#0a7a2f;font-weight:700">✓ ' + esc(S.plik) + ' → ' + esc(S.nazwa) + '</div>'
-              +  '<div style="font-size:11px;color:#166534;margin-top:2px">wierszy danych: <b>' + (d.length - 1) + '</b>'
-              +  ' · poprawionych kwot: <b>' + S.zmKwot + '</b> (kolumna ' + F.kwoty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')'
-              +  ' · poprawionych dat: <b>' + S.zmDat + '</b> (kolumna ' + F.daty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')</div>'
+              +  '<div style="font-size:11px;color:#166534;margin-top:2px">'
+              +  (F.surowy
+                    ? ('wierszy w pliku: <b>' + d.length + '</b> · <b>wysyłam bez żadnych zmian</b> '
+                       + '— razem z blokiem nagłówkowym i stopką, dokładnie tak, jak wyszedł z banku')
+                    : ('wierszy danych: <b>' + (d.length - 1) + '</b>'
+                       + ' · poprawionych kwot: <b>' + S.zmKwot + '</b> (kolumna '
+                       + F.kwoty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')'
+                       + ' · poprawionych dat: <b>' + S.zmDat + '</b> (kolumna '
+                       + F.daty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')'))
+              +  '</div>'
               +  '<details style="margin-top:5px"><summary style="font-size:11px;color:#166534;cursor:pointer;font-weight:700">Podgląd pierwszych wierszy</summary>'
               +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:10px;margin-top:4px;font-family:monospace">';
-            d.slice(0, 6).forEach(function (r, i){
+            // Przy pliku surowym poczatek to blok naglowkowy banku (Date from, Account,
+            // Currency) — podglad zaczynamy od WIERSZA NAGLOWKA tabeli, czyli pierwszego
+            // o najwiekszej liczbie kolumn. Inaczej widac same metadane, a nie wplaty.
+            var od = 0;
+            if (F.surowy){
+                var maxK = 0;
+                d.forEach(function (r){ if (r.length > maxK) maxK = r.length; });
+                for (var q = 0; q < d.length; q++) if (d[q].length === maxK){ od = q; break; }
+            }
+            d.slice(od, od + (F.surowy ? 10 : 6)).forEach(function (r, i){
                 h += '<tr style="' + (i ? 'border-top:1px solid #dcfce7' : 'font-weight:700;color:#666') + '">';
                 r.forEach(function (v, k){
                     var pod = (F.kwoty.indexOf(k) >= 0 || F.daty.indexOf(k) >= 0) && i > 0;
@@ -53408,7 +53601,18 @@
               +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
               +  '<button id="bk-wyslij" style="padding:8px 16px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">📤 Wyślij do importu</button>'
               +  '<button id="bk-pobierz" style="padding:8px 14px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz plik</button>'
-              +  '</div>';
+              +  (F.mostMkt
+                    ? ('<button id="bk-mkt" style="padding:8px 14px;border:none;border-radius:6px;'
+                       + 'background:#DD7E6B;color:#fff;font-weight:700;cursor:pointer;font-size:12px" '
+                       + 'title="Podaje ten sam plik modułowi „Księgowanie Marketplace’s”. To on rozpoznaje '
+                       + 'wypłaty marketplace po nadawcy i tytule — tutaj niczego nie zgaduję.">'
+                       + '↪ Przekaż do Marketplace’s</button>') : '')
+              +  '</div>'
+              +  (F.mostMkt
+                    ? ('<div style="font-size:10px;color:#c47f00;margin:-4px 0 10px">Na to konto wpadają także '
+                       + 'wypłaty marketplace (Manor, OBI CH…). Przekazanie <b>nie wyjmuje</b> ich z pliku '
+                       + 'wysyłanego do importu — pilnuj, żeby nie zaksięgować tej samej wpłaty dwa razy.</div>')
+                    : '');
         }
 
         h += '<div id="bk-status" style="margin-top:4px;min-height:16px;font-size:12px;font-weight:bold"></div>';
@@ -53444,8 +53648,11 @@
         if (zp) zp.onclick = function (){
             var b = $('#bk-bank').value, k = $('#bk-book').value;
             if (!b || !k){ say('Wskaż oba ustawienia — bez nich nie wyślę pliku.', '#c47f00'); return; }
+            var kn = String(($('#bk-konto') || {}).value || '').trim();
+            if (kn && !/^\d{3,6}$/.test(kn)){ say('Konto to sam numer z planu kont, np. 1232.', '#c47f00'); return; }
             ustawZapisz(S.format, { bank: b, bankNm: (S.banki[b] || {}).nm || '',
-                                    booking: k, bookingNm: (S.ksieg[k] || {}).nm || '' });
+                                    booking: k, bookingNm: (S.ksieg[k] || {}).nm || '',
+                                    konto: kn });
             say('Zapisane: ' + esc((S.banki[b] || {}).nm || b) + ' (' + esc(b) + ') · '
                 + esc((S.ksieg[k] || {}).nm || k) + ' (' + esc(k) + ').', '#0a7a2f');
         };
@@ -53471,6 +53678,24 @@
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
             say('Zapisane: ' + esc(S.nazwa), '#0a7a2f');
+        };
+        var mk = $('#bk-mkt');
+        if (mk) mk.onclick = async function (){
+            mk.disabled = true;
+            say('przekazuję plik do Księgowania Marketplace’s…', '#666');
+            try {
+                var o = await bkDoMarketplace(S.plik || S.nazwa);
+                var ar = o.arkusz || {};
+                var opisArk = ar.dodane
+                        ? (' · do arkusza dopisane: <b>' + ar.dodane + '</b> (jako „do zrobienia")')
+                        : (ar.blad ? (' · <span style="color:#c00">ARKUSZ: ' + esc(ar.blad) + '</span>') : '');
+                if (ar.bezKonta) opisArk += ' · <span style="color:#c47f00">bez znanego konta pominięte: '
+                                          + ar.bezKonta + ' — uzupełnij konto sklepu w ⚙ Konta</span>';
+                say('Marketplace’s przyjął plik — nowych zleceń: <b>' + (o.nowych || 0) + '</b>'
+                    + ' (razem na liście: ' + (o.razem || 0) + ')' + opisArk
+                    + '. Otwórz moduł Księgowanie Marketplace’s, żeby je zobaczyć.', '#0a7a2f');
+            } catch (e){ say('Nie przekazałem: ' + esc((e && e.message) || e), '#c00'); }
+            finally { if ($('#bk-mkt')) $('#bk-mkt').disabled = false; }
         };
         var wb = $('#bk-wyslij');
         if (wb) wb.onclick = async function (){
@@ -53595,7 +53820,18 @@
         // kwota zgadza sie co do grosza. Rozdzielamy wiec oba przypadki, zeby naglowek
         // nie mowil czegos, czego w tabeli nie widac.
         var zNumerem = chk.filter(bkToNumerZamowienia);
-        var doWyj = chk.filter(function (x){ return zNumerem.indexOf(x) < 0; });
+        // Koncowki groszowe: na auftragu zostaje tyle, ile mozna wyrownac na subkoncie.
+        // Musi byc numer auftragu — bez niego nie ma czego przypisac.
+        var tol = tolGet();
+        var koncowki = chk.filter(function (x){
+            if (zNumerem.indexOf(x) >= 0) return false;
+            var o = bkNum(x.open_amount);
+            return o != null && Math.abs(o) > 0.0001 && Math.abs(o) <= tol
+                && String(x.auction_number || '').trim();
+        });
+        var doWyj = chk.filter(function (x){
+            return zNumerem.indexOf(x) < 0 && koncowki.indexOf(x) < 0;
+        });
         var ao = j.autoOkOpis;
         if (ao && (ao.ile || (ao.bledy && ao.bledy.length))){
             h += '<div style="margin:6px 0;padding:5px 7px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px">'
@@ -53612,6 +53848,20 @@
             h += tab('Numer zamówienia zamiast transakcji — status się NIE zapisał', '#c47f00', zNumerem,
                      'Kwota zgadza się z open amount, więc nie ma tu czego wyjaśniać — nie udało się tylko '
                      + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.');
+        if (koncowki.length){
+            h += tab('Końcówki groszowe — do wyksięgowania na subkoncie', '#0a7a2f', koncowki,
+                     'Na auftragu zostaje mniej niż ' + f2(tol) + ' — to zaokrąglenie, nie rozjazd. '
+                     + 'Guzik niżej ustawia im status OK i księguje na subkoncie, czyli odpowiada '
+                     + 'przyciskowi „' + esc(BK_BLOCK_SUB_OPIS) + '".')
+              +  '<div style="margin:-4px 0 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+              +  '<span style="font-size:10px;color:#666">grosze do wyrównania: do</span>'
+              +  '<input id="bk-tol" value="' + tol.toFixed(2) + '" style="width:46px;font-size:10px;text-align:right">'
+              +  '<button id="bk-tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
+              +  '<button id="bk-sub" style="padding:4px 10px;border:none;border-radius:6px;background:#0a7a2f;'
+              +  'color:#fff;font-weight:700;cursor:pointer;font-size:11px">✔ Ustaw OK i wyksięguj na subkoncie ('
+              +  koncowki.length + ')</button>'
+              +  '<span id="bk-sub-msg" style="font-size:11px;color:#666"></span></div>';
+        }
         if (doWyj.length)
             h += tab('CHECK — do wyjaśnienia', '#c47f00', doWyj,
                      'Prologistics oznaczyło te wiersze do sprawdzenia. Różnica 0.00 znaczy, że powodem '
@@ -53631,6 +53881,7 @@
               +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer transakcji</td>'
               +  '<td style="padding:1px 6px">Data płatności</td>'
               +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px">Przypisz auftrag</td>'
               +  '<td style="padding:1px 6px">Auftrag po numerze transakcji</td></tr>';
             nf.forEach(function (x){
                 var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
@@ -53641,8 +53892,21 @@
                 h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
                   +  (nr ? esc(nr) : '<span style="color:#c00">brak numeru w paczce</span>') + '</td>'
                   +  '<td style="padding:2px 6px;white-space:nowrap">'
-                  +  (iso ? esc(iso) : '<span style="color:#c47f00">— (wgraj plik jeszcze raz)</span>') + '</td>'
+                  +  (iso ? esc(iso)
+                          : (fmt(j.format || S.format).kolKlucz == null
+                                ? '<span style="color:#888" title="Ten format nie niesie pary numer→data, więc daty płatności nie znam.">—</span>'
+                                : '<span style="color:#c47f00">— (wgraj plik jeszcze raz)</span>'))
+                  +  '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+                  // Przypisanie auftragu wprost do wiersza paczki — to samo, co ołówek
+                  // przy wierszu w prologistics. Numer podpowiadany z treści, nigdy
+                  // wysyłany bez kliknięcia.
+                  +  '<td style="padding:2px 6px;white-space:nowrap">'
+                  +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="' + esc(bkAufZTekstu(nr)) + '" '
+                  +  'placeholder="15629079/3" style="width:96px;font-size:10px">'
+                  +  ' <button class="bk-auf-set" data-row="' + esc(x.id) + '" style="padding:2px 7px;border:none;'
+                  +  'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">przypisz</button>'
+                  +  '</td>'
                   +  '<td style="padding:2px 6px">' + bkNfKom(j, nr, a) + '</td></tr>';
             });
             h += '</table></div>'
@@ -53671,6 +53935,36 @@
         box.innerHTML = h;
 
         $('#bk-imp-re').onclick = function (){ sprawdz(); };
+        var ts = $('#bk-tol-set');
+        if (ts) ts.onclick = function (){
+            var v = Number(String(($('#bk-tol') || {}).value || '').replace(',', '.'));
+            if (!isFinite(v) || v < 0){ say('Podaj liczbę, np. 0.05.', '#c47f00'); return; }
+            gmSet(BK_TOL_KEY, v); rysujPaczke(j, d);
+        };
+        var sb = $('#bk-sub');
+        if (sb) sb.onclick = async function (){
+            var m = $('#bk-sub-msg');
+            if (!confirm('Ustawić status OK i zaksięgować ' + koncowki.length + ' pozycji na subkoncie?\n\n'
+                + koncowki.map(function (x){
+                      return '  • ' + String(x.payment_descr || '').slice(0, 40)
+                           + '  open ' + f2(bkNum(x.open_amount)); }).join('\n')
+                + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „'
+                + BK_BLOCK_SUB_OPIS + '".\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            sb.disabled = true; m.style.color = '#666';
+            try {
+                for (var i = 0; i < koncowki.length; i++){
+                    m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + koncowki.length;
+                    await bkStan(j.impId, koncowki[i].id, 'OK');
+                }
+                m.textContent = 'księguję na subkoncie…';
+                await bkKsiegujSub(j.impId, koncowki.map(function (x){ return x.id; }));
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
+                await sprawdz();
+            } catch (e){
+                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
+                sb.disabled = false;
+            }
+        };
         var nfb = $('#bk-nf');
         if (nfb) nfb.onclick = function (){
             var lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
@@ -53694,6 +53988,29 @@
                 bkSzukajPoKwocieIDacie(nr, kw, iso, fmt(j.format || S.format), b, function (){ rysujPaczke(j, d); });
             };
         });
+        box.querySelectorAll('.bk-auf-set').forEach(function (b){
+            b.onclick = async function (){
+                var rid = b.getAttribute('data-row');
+                var inp = box.querySelector('.bk-auf[data-row="' + rid + '"]');
+                var nrA = String((inp || {}).value || '').trim();
+                if (!/^\d{6,9}(\/\d+)?$/.test(nrA)){
+                    say('Numer auftragu wpisz jako „15629079/3" albo sam numer.', '#c47f00'); return;
+                }
+                if (nrA.indexOf('/') < 0) nrA += '/3';
+                if (!confirm('Przypisać auftrag ' + nrA + ' do tego wiersza paczki ' + j.impId + '?\n\n'
+                    + 'Odpowiada to ołówkowi przy wierszu w prologistics. Status wiersza przeliczy '
+                    + 'się po stronie systemu.')) return;
+                b.disabled = true; b.textContent = 'przypisuję…';
+                try {
+                    await bkPrzypisz(j.impId, rid, nrA);
+                    say('Przypisane: ' + esc(nrA) + '. Odczytuję paczkę jeszcze raz…', '#0a7a2f');
+                    await sprawdz();
+                } catch (e){
+                    say('Nie przypisałem: ' + esc((e && e.message) || e), '#c00');
+                    b.disabled = false; b.textContent = 'przypisz';
+                }
+            };
+        });
         box.querySelectorAll('.bk-eu-st').forEach(function (b){
             b.onclick = function (){
                 bkEuStatusy(b.getAttribute('data-nr'), b, function (){ rysujPaczke(j, d); });
@@ -53713,10 +54030,15 @@
                 var kw = Number(b.getAttribute('data-amt')), iso = b.getAttribute('data-iso');
                 var skasowany = b.getAttribute('data-del') === '1';
                 var F = fmt(j.format || S.format);
+                var konto = ustaw(j.format || S.format).konto || F.konto;
+                if (!konto){
+                    say('Nie wiem, na które konto księgować — wpisz numer konta w ustawieniach (krok 2).', '#c47f00');
+                    return;
+                }
                 if (!confirm('Zaksięgować wpłatę na auftragu ' + num + '?\n\n'
                     + 'Numer transakcji: ' + nr + '\n'
                     + 'Kwota: ' + f2(kw) + '\n'
-                    + 'Konto: ' + F.konto + '\n'
+                    + 'Konto: ' + konto + '\n'
                     + 'Data: ' + iso + ' (z pliku)\n'
                     + 'Komentarz płatności: pusty\n'
                     + (skasowany
@@ -53727,7 +54049,7 @@
                     + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
                     + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
                 b.disabled = true; b.textContent = 'księguję…';
-                var r = await bkKsiegujAuftrag(num, iso, F.konto, kw);
+                var r = await bkKsiegujAuftrag(num, iso, konto, kw);
                 if (r.ok){
                     var st2 = BK_NF[nr] || (BK_NF[nr] = {});
                     st2.zaks = num;
@@ -53743,7 +54065,7 @@
                                     : (' UWAGA: komentarza nie odbiłem — ' + po.err);
                     }
                     say('Zaksięgowane na auftragu ' + esc(num) + ' — ' + f2(kw) + ' na koncie '
-                        + esc(F.konto) + '.' + esc(dop), po_kolor(st2));
+                        + esc(konto) + '.' + esc(dop), po_kolor(st2));
                 } else {
                     say('Nie zaksięgowałem na auftragu ' + esc(num) + ': ' + esc(r.err || '?'), '#c00');
                     b.disabled = false;
