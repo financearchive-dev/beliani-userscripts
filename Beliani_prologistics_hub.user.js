@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.28
+// @version      5.29
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11934,9 +11934,6 @@
     // z tresci: normalizujemy CALA tresc i szukamy w niej znormalizowanego poczatku naszej
     // nazwy. Plik czyta FileReader w przegladarce — nigdzie nie jest wysylany ani zapisywany.
     let bankFile = null;   // ostatnio wczytany plik: { rows, currency, error, name, sum, debits }
-    // Zaznaczenie firm w panelu zlecenia zbiorczego. Trzymane POZA renderem, bo ramka
-    // przerysowuje sie przy kazdej zmianie wklejki, a wybor czlowieka ma to przezyc.
-    let epoSel = null, epoSig = '', epoDom = {};
 
     function bankNameNorm(s) {
         return String(s == null ? '' : s)
@@ -12153,16 +12150,6 @@
         // Dalej juz przeszukanie — dla zlecenia, ktore pokrywa tylko CZESC pozycji.
         // Malejaco, bo duza kwota szybciej wprowadza `zostalo < 0` i przycina galaz.
         const p = poz.slice().sort(function (a, b){ return b.gr - a.gr; });
-        // SUMA OGONA — ile najwyzej da sie jeszcze dolozyc od pozycji i w gore. Bez tego
-        // odciecia galaz, ktora pominela duza kwote, schodzi do samego dna, chociaz dobic
-        // do celu juz nie moze. Zmierzone na wyciagu z 03.09.2026 (trzydziesci firm, jedno
-        // zlecenie na 438 224,76): bez odciecia pelne przeszukanie kosztuje ponad
-        // 200 000 000 krokow i budzet konczy sie ZANIM padnie odpowiedz — z odcieciem
-        // 23 833 kroki, czyli dwa rzedy PONIZEJ budzetu. Roznica nie jest w szybkosci,
-        // tylko w tym, czy odpowiedz w ogole pada: „nie sprawdzilem wszystkich kombinacji”
-        // zamienia sie na pewne „zaden zestaw nie daje tej kwoty”.
-        const ogon = new Array(n + 1); ogon[n] = 0;
-        for (let i = n - 1; i >= 0; i--) ogon[i] = ogon[i + 1] + p[i].gr;
         const wybor = [];
         (function idz(i, zostalo){
             if (przerwane || out.length >= limit) return;
@@ -12170,7 +12157,7 @@
             // wobec czasu, ktory mial chronic.
             if (++krokow > 2000000){ przerwane = true; return; }
             if (zostalo === 0 && wybor.length){ out.push(wybor.slice()); return; }
-            if (i >= n || zostalo < 0 || ogon[i] < zostalo) return;
+            if (i >= n || zostalo < 0) return;
             wybor.push(p[i]);
             idz(i + 1, zostalo - p[i].gr);
             wybor.pop();
@@ -12178,112 +12165,6 @@
         })(0, celGr);
         return { zestawy: out, przerwane: przerwane };
     }
-    // ===== Zlecenie zbiorcze EPO — skladanie kwoty recznie =====
-    // Automat wyzej (epoZestawy) odpowiada tylko wtedy, gdy pasuje DOKLADNIE jeden zestaw.
-    // 03.09.2026 nie pasowal zaden: jedno zlecenie na 438 224,76 i trzydziesci firm bez
-    // przelewu, ktore sumuja sie do 460 314,43 — w paczce bylo cos, czego we wklejce nie ma.
-    // Raport pokazywal wtedy trzydziesci czerwonych wierszy „w pliku nie ma przelewu”
-    // i ani slowem, ile brakuje. Ten panel liczy wprost: suma zaznaczonych firm kontra
-    // kwota zlecenia i roznica miedzy nimi. Odznaczenie firmy odejmuje ja od sumy — kwote
-    // sklada czlowiek, modul tylko dodaje. Zadnego zgadywania.
-    // Po stronie banku wchodza WYLACZNIE wiersze „COLLECTIVE ORDER”: przelewy do
-    // developerow i wplywy nie maja z ta paczka nic wspolnego i do porownania nie ida.
-    function epoTx(rows) {
-        const out = [];
-        (rows || []).forEach(function (t) {
-            if (!(t.amt > 0)) return;   // wplyw ma kwote ujemna — tu nie wchodzi
-            if (String(t.txt || '').toUpperCase().indexOf('COLLECTIVE ORDER') < 0) return;
-            out.push(t);
-        });
-        return out;
-    }
-    // MESSAGE-ID w wyciagu to stempel, ktory sami wpisalismy do pliku: MsgId = 'BEL'
-    // + RRRRMMDD + GGMMSS (painBuild). Czyta sie z niego, ktory to plik pain.001 —
-    // z ktorego dnia i z ktorej godziny — wiec czlowiek wie, czego szukac w e-finance.
-    function epoStempel(txt) {
-        const m = String(txt == null ? '' : txt).match(/\bBEL(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\b/);
-        return m ? (m[3] + '.' + m[2] + '.' + m[1] + ' ' + m[4] + ':' + m[5] + ':' + m[6]) : '';
-    }
-    // Startowo zaznaczone sa te firmy, ktore wlasnego przelewu NIE maja — czyli kandydaci
-    // do paczki. Firma z wlasnym przelewem startuje odznaczona, ale zostaje na liscie:
-    // bywa, ze dopasowala sie po kwocie przypadkiem i trzeba ja przerzucic do paczki.
-    function epoDomyslne(list) {
-        const s = {};
-        (list || []).forEach(function (e) {
-            if (e.state === 'missing' || e.state === 'nokey' || e.state === 'epo') s[e.key] = 1;
-        });
-        return s;
-    }
-    function epoPodsumowanie(cel, suma, ile) {
-        const roznica = bal2(suma - cel), zgoda = Math.abs(roznica) < 0.005;
-        return '<span style="color:' + (zgoda ? '#166534' : '#991b1b') + '">' + (zgoda ? '\u2713 ' : '\u26a0 ') +
-            'zaznaczone ' + ile + ' na <strong>' + balFix(suma) + '</strong> &nbsp;\u00b7&nbsp; zlecenie ' +
-            balFix(cel) + ' &nbsp;\u00b7&nbsp; ' +
-            (zgoda ? 'zgadza si\u0119 co do grosza'
-                   : ('r\u00f3\u017cnica <strong>' + (roznica > 0 ? '+' : '') + balFix(roznica) + '</strong> \u2014 ' +
-                      (roznica > 0 ? 'zaznaczono za du\u017co' : 'brakuje pozycji do zaznaczenia'))) + '</span>';
-    }
-    // Przeliczenie BEZ przerysowania ramki: gdyby panel szedl przez innerHTML, kazde
-    // klikniecie gubiloby pozycje przewijania przy trzydziestu wierszach.
-    function epoPrzelicz() {
-        const box = document.getElementById('tm-bank-box');
-        const sumEl = box && box.querySelector('#tm-epo-sum');
-        if (!sumEl) return;
-        let cel = 0;
-        epoTx(bankFile && bankFile.rows).forEach(function (t) { cel = bal2(cel + t.amt); });
-        let suma = 0, ile = 0;
-        Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
-            if (!c.checked) return;
-            suma = bal2(suma + (parseFloat(c.getAttribute('data-amt')) || 0));
-            ile++;
-        });
-        sumEl.innerHTML = epoPodsumowanie(cel, suma, ile);
-    }
-    function epoPanelHtml(m, rows) {
-        const zb = epoTx(rows);
-        if (!zb.length) return '';
-        let cel = 0;
-        zb.forEach(function (t) { cel = bal2(cel + t.amt); });
-        // Zmiana skladu wklejki uniewaznia zaznaczenie — klucze sa inne i przeniesienie
-        // starego wyboru dawaloby sume z firm, ktorych juz na liscie nie ma.
-        const sig = m.list.map(function (e) { return e.key; }).join('|');
-        if (!epoSel || sig !== epoSig) { epoDom = epoDomyslne(m.list); epoSel = epoDomyslne(m.list); epoSig = sig; }
-        let suma = 0, ile = 0;
-        const li = m.list.map(function (e) {
-            const on = !!epoSel[e.key];
-            if (on) { suma = bal2(suma + e.total); ile++; }
-            const ids = e.ids.length
-                ? ' <span style="color:#9ca3af">' + balEsc(e.ids.slice(0, 6).join(', ')) +
-                  (e.ids.length > 6 ? '\u2026' : '') + '</span>'
-                : '';
-            const wl = (e.state === 'ok' || e.state === 'amt' || e.state === 'diff')
-                ? ' <span style="color:#6b7280">(ma w\u0142asny przelew)</span>' : '';
-            const nm = String(e.name || '');
-            return '<label style="display:block;padding:1px 0;cursor:pointer;">' +
-                '<input type="checkbox" class="tm-epo-c" data-key="' + balEsc(e.key) +
-                '" data-amt="' + balFix(e.total) + '"' + (on ? ' checked' : '') +
-                ' style="vertical-align:-2px;margin-right:6px;">' +
-                '<span style="font-family:monospace;">' + balFix(e.total) + '</span> ' +
-                balEsc(nm.length > 72 ? nm.slice(0, 72) + '\u2026' : nm) + wl + ids + '</label>';
-        }).join('');
-        const gl = zb.map(function (t) {
-            const st = epoStempel(t.txt);
-            return balFix(t.amt) + (st ? (' \u2014 plik pain.001 z ' + st) : '');
-        }).join(' &nbsp;\u00b7&nbsp; ');
-        const btn = 'style="font:inherit;font-size:11px;padding:0 5px;margin-left:4px;border:1px solid #d1d5db;' +
-            'border-radius:4px;background:#fff;cursor:pointer;color:#374151;"';
-        return '<div style="background:#fff;border:1px solid #fde68a;border-radius:6px;padding:6px 8px;margin-top:6px;">' +
-            '<div style="font-weight:700;color:#92400e;">Zlecenie zbiorcze EPO: ' + gl + '</div>' +
-            '<div id="tm-epo-sum" style="margin:2px 0 4px;">' + epoPodsumowanie(cel, suma, ile) + '</div>' +
-            '<div style="color:#6b7280;margin-bottom:2px;">Zaznacz firmy, kt\u00f3re posz\u0142y t\u0105 paczk\u0105 \u2014 suma liczy si\u0119 na bie\u017c\u0105co.' +
-            '<button type="button" class="tm-epo-b" data-v="dom" ' + btn + '>domy\u015blne</button>' +
-            '<button type="button" class="tm-epo-b" data-v="all" ' + btn + '>wszystkie</button>' +
-            '<button type="button" class="tm-epo-b" data-v="none" ' + btn + '>\u017cadna</button></div>' +
-            '<div style="' + (m.list.length > 14 ? 'max-height:260px;overflow:auto;' : '') + '">' + li + '</div>' +
-            '<div style="color:#6b7280;margin-top:3px;">Po stronie banku liczy si\u0119 tylko zlecenie zbiorcze \u2014 ' +
-            'przelewy do developer\u00f3w i wp\u0142ywy do tego por\u00f3wnania nie wchodz\u0105.</div></div>';
-    }
-
     // Dopasowanie: znormalizowany klucz nazwy musi wystapic w znormalizowanej tresci przelewu.
     // Kilka przelewow do jednej firmy sumuje sie — bank czasem dzieli platnosc na dwa zlecenia.
     function bankMatch(expected, tx) {
@@ -12407,12 +12288,7 @@
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
                 (e.hits.length > 1 ? ' w ' + e.hits.length + ' przelewach' : '') + '</span>';
         } else if (e.state === 'missing') {
-            // Gdy w pliku jest zlecenie zbiorcze, zdanie „nie ma przelewu" jest nieprawdziwe
-            // w tonie: pieniadze najpewniej zeszly, tylko w paczce, ktorej nie rozlozylismy.
-            // Kierujemy wiec do panelu wyzej, zamiast sugerowac brak platnosci.
-            tail = epoTx(bankFile && bankFile.rows).length
-                ? '<span style="color:#991b1b">nie ma osobnego przelewu — składaj kwotę w panelu zlecenia zbiorczego wyżej</span>'
-                : '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
+            tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
         } else if (e.state === 'epo') {
             const inne = (e.epoRazem || []).filter(function (n) { return n !== e.name; });
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
@@ -12507,10 +12383,6 @@
             '<div style="color:#6b7280;">' + head + '</div>' +
             '<strong>' + title + '</strong>' + warn;
 
-        // Panel zlecenia zbiorczego stoi NAD lista firm, bo gdy w pliku jest paczka EPO,
-        // to on tlumaczy czerwone wiersze pod spodem, a nie odwrotnie.
-        html += epoPanelHtml(m, bankFile.rows);
-
         if (bad.length) {
             html += '<div style="margin-top:4px;">' + bad.map(bankRowHtml).join('') + '</div>';
         }
@@ -12533,32 +12405,6 @@
         }
         html += '<div style="color:#6b7280;margin-top:3px;">Ta kontrola tylko informuje — księgowania nie blokuje.</div>';
         box.innerHTML = html + '</div>';
-        // Listener na KONTENERZE i tylko raz: innerHTML wymieniamy przy kazdej zmianie
-        // wklejki, wiec podpiecie sie do samych checkboxow gubiloby obsluge po pierwszym
-        // przerysowaniu. Zaznaczenie trzyma epoSel, nie DOM.
-        if (!box.__epoBound) {
-            box.__epoBound = 1;
-            box.addEventListener('change', function (ev) {
-                const t = ev.target;
-                if (!t || !t.classList || !t.classList.contains('tm-epo-c')) return;
-                if (!epoSel) epoSel = {};
-                epoSel[t.getAttribute('data-key')] = t.checked ? 1 : 0;
-                epoPrzelicz();
-            });
-            box.addEventListener('click', function (ev) {
-                const t = ev.target;
-                if (!t || !t.classList || !t.classList.contains('tm-epo-b')) return;
-                const v = t.getAttribute('data-v');
-                if (!epoSel) epoSel = {};
-                Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
-                    const k = c.getAttribute('data-key');
-                    const on = (v === 'all') ? true : (v === 'none') ? false : !!epoDom[k];
-                    c.checked = on;
-                    epoSel[k] = on ? 1 : 0;
-                });
-                epoPrzelicz();
-            });
-        }
     }
 
     // ===== Kontrola PO zaksiegowaniu: Export orders payments =====
@@ -14445,17 +14291,9 @@
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
-        // Slowo kluczowe bywa PRZELAMANE w polowie — wydruk z EPO lamie tytul co 35 znakow
-        // („pe nalty 1376"), a Excel potrafi zawinac komorke. O tym, czy numer jest
-        // roszczeniem czy zamowieniem, nie moze decydowac miejsce zlamania wiersza,
-        // wiec miedzy literami dopuszczamy odstep. Nazwa rodzaju i tak idzie dalej
-        // bez odstepow (replace nizej), wiec wynik jest ten sam, co przy calym slowie.
-        function pcPenSlowo(w){ return w.split('').join('\\s*'); }
-        var PC_PEN_RE = new RegExp('(' + ['overpayment', 'underpayment', 'penalty', 'discount']
-            .map(pcPenSlowo).join('|') + '|other\\s*[+-])\\s*(?:no\\.?\\s*)?(\\d+)', 'gi');
         function pcParsePenalties(text){
             var s0 = String(text || ''), out = [];
-            var re = new RegExp(PC_PEN_RE.source, 'gi'), m;
+            var re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:no\.?\s*)?(\d+)/gi, m;
             while ((m = re.exec(s0)) !== null){
                 var ty = m[1].toLowerCase().replace(/\s+/g, '');
                 if (ty === 'other+') ty = 'other +'; else if (ty === 'other-') ty = 'other -';
@@ -14464,12 +14302,9 @@
                 // Po jednym slowie kluczowym stoi czasem CALA LISTA numerow:
                 // „overpayment 1078, 1084, 1137, 1184". Kazdy z nich to roszczenie, a nie
                 // zamowienie — bez tego szly do sprawdzania jako cudze zamowienia.
-                // Ciagniemy liste dopoki numery maja najwyzej cztery cyfry: „penalty 1270,
-                // 15395" nie moze polknac zamowienia. Warunku „nie dluzsze od pierwszego"
-                // tu nie ma i byc nie moze — „penalty 979,1297" to DWA roszczenia, a przy
-                // tamtym warunku 1297 (cztery cyfry po trzycyfrowym 979) wypadalo z listy
-                // i szlo dalej jako zamowienie. 04.09.2026, HK JIANHUI, zamowienie 20249.
-                var ogon = s0.slice(m.index + m[0].length), maks = 4;
+                // Ciagniemy liste tylko dopoki numery nie sa DLUZSZE od pierwszego i maja
+                // najwyzej cztery cyfry: „penalty 1270, 15395" nie moze polknac zamowienia.
+                var ogon = s0.slice(m.index + m[0].length), maks = Math.min(4, m[2].length);
                 // ZAKRES: „other - 1115-1117" to trzy roszczenia, nie jedno. Warunki te same,
                 // co w bcExpandRange, ktory rozwija zakresy w tytule: koniec wiekszy od
                 // poczatku, ta sama liczba cyfr, rozpietosc najwyzej 60. Bez nich
@@ -16217,32 +16052,8 @@
 
         // --- PDF: automat na etykietach. Dziala na obu ukladach e-finance
         //     (zlecenie recznie wklepane i zlecenie z wgranego pliku pain.001).
-        // Tresc przelewu skladana Z LINII, a nie przez join(' '). PostFinance lamie pole
-        // Message co PC_EPO_LINIA (35) znakow — tyle ma jedna linia Ustrd w pain.001 —
-        // i lamie TWARDO, w polowie slowa: „Order 15907, 20462, CMAU9949332, pe" + „nalty 1376".
-        // Sklejenie spacja robilo z tego „pe nalty 1376", a wtedy pcParsePenalties nie
-        // widzialo slowa kluczowego i numer ROSZCZENIA 1376 szedl dalej jako numer
-        // ZAMOWIENIA. Modul ciagnal wtedy cudze zamowienie (1376 istnieje — Business Control
-        // Establishment), jego konto, SWIFT i beneficjenta, i pokazywal trzy czerwone
-        // rozjazdy, ktorych nie bylo. 04.09.2026: A-LIFE 20462/15907 i HK JIANHUI 20249/17770.
-        // Regula ta sama, co w pcEpoMsgZLinii przy Wprowadzaniu: linia o dlugosci 35 to
-        // lamanie twarde i nastepna dokleja sie BEZ odstepu; krotsza konczy mysl albo miala
-        // na koncu spacje, ktora wydruk uciął — wtedy odstep dokladamy.
-        function bcMsgZLinii(czesci, dlug){
-            if (!czesci || !czesci.length) return '';
-            var out = String(czesci[0]);
-            for (var i = 1; i < czesci.length; i++){
-                var poprz = (dlug && dlug[i - 1] != null) ? dlug[i - 1] : String(czesci[i - 1]).length;
-                out += (poprz >= PC_EPO_LINIA ? '' : ' ') + czesci[i];
-            }
-            return out.trim();
-        }
         function bcParsePdfText(txt, fname){
             var lines = String(txt || '').split('\n'), fields = {}, cur = null;
-            // Dlugosci ORYGINALNYCH linii tresci. Po sklejeniu lacznikiem czesc jest
-            // dluzsza niz linia, z ktorej powstala, a o kolejnym odstepie decyduje
-            // wlasnie ta linia — nie dlugosc sklejki.
-            var msgDl = [];
             for (var i = 0; i < lines.length; i++){
                 // PDF-y z e-finance przychodza raz z apostrofem prostym ('), raz
                 // z typograficznym (’). BC_LBL trzyma prosty, wiec zamieniamy w locie —
@@ -16261,17 +16072,15 @@
                 if (hit){
                     cur = hit.lb;
                     if (!fields[cur]) fields[cur] = [];
-                    if (hit.v){ fields[cur].push(hit.v); if (cur === 'Message') msgDl.push(hit.v.length); }
+                    if (hit.v) fields[cur].push(hit.v);
                 } else if (cur !== null && /^\s{6,}\S/.test(raw)){
                     var arr = fields[cur], prev = arr.length ? arr[arr.length - 1] : '';
                     // Slowo przeniesione do nastepnej linii: bank urywa je lacznikiem
                     // ("PEN-" + "ALTY" = PENALTY). Sklejamy z powrotem, ale tylko w tresci
                     // przelewu i tylko litera-lacznik-litera — nazw i adresow nie ruszamy.
-                    if (cur === 'Message' && arr.length && /[A-Za-z]-$/.test(prev) && /^[A-Za-z]/.test(ln)){
+                    if (cur === 'Message' && arr.length && /[A-Za-z]-$/.test(prev) && /^[A-Za-z]/.test(ln))
                         arr[arr.length - 1] = prev.slice(0, -1) + ln;
-                        if (msgDl.length) msgDl[msgDl.length - 1] = ln.length;
-                    }
-                    else { arr.push(ln); if (cur === 'Message') msgDl.push(ln.length); }
+                    else arr.push(ln);
                 }
             }
             if (!fields["Recipient's account"]) return null;
@@ -16291,7 +16100,7 @@
                 debit: (fields['Debit account'] || []).slice(1).join(' '),
                 exec: g('Execution date'),
                 status: g('Status'),
-                msg: bcMsgZLinii(fields['Message'] || [], msgDl),
+                msg: (fields['Message'] || []).join(' '),
                 e2e: g('End To End ID'),
                 opt: g('Transfer option')
             };
@@ -45294,9 +45103,70 @@
         document.body.appendChild(el);
         return el;
     }
+    // Jeden wiersz stanu, kilka robot naraz. Kazda pisze do swojego kanalu, a wiersz
+    // pokazuje wszystkie — wczesniej wczytanie pliku i pobieranie z prologistics
+    // kasowaly sobie komunikaty i wygladalo, jakby jedno wylaczalo drugie.
+    const SAL_KANAL = {};
+    const SAL_ETY = { pl: 'prologistics', eu: 'eupago', plik: 'plik' };
+    let SAL_STAT_EL = null;
+    // Kazdy ekran rysuje swoj wiersz od nowa, wiec zakonczone komunikaty poprzedniego
+    // nie sa juz jego. Trwajaca robote zostawiamy — nadal chodzi i trzeba o niej wiedziec.
+    // Wolane PRZED zapisem nowego komunikatu: gdyby siedzialo w rysowaniu, kasowaloby
+    // ten, ktory wlasnie zapisalismy, i ekran zostawalby pusty.
+    function salStanEkran(){
+        const el = document.getElementById('sal-status');
+        if (!el || el === SAL_STAT_EL) return;
+        SAL_STAT_EL = el;
+        Object.keys(SAL_KANAL).forEach(function (k){
+            if (!SAL_KANAL[k].t0){ salStanStop(k); delete SAL_KANAL[k]; } });
+    }
+    function salStanRysuj(){
+        const el = document.getElementById('sal-status');
+        if (!el) return;
+        const cz = [];
+        Object.keys(SAL_KANAL).forEach(function (k){
+            const x = SAL_KANAL[k];
+            if (!x || !x.tekst) return;
+            cz.push('<span style="color:' + (x.kolor || '#666') + '">'
+                  + (SAL_ETY[k] ? ('<b>' + salEsc(SAL_ETY[k]) + ':</b> ') : '')
+                  + salEsc(x.tekst)
+                  + (x.t0 ? (' · ' + Math.round((Date.now() - x.t0) / 1000) + ' s') : '')
+                  + '</span>');
+        });
+        el.innerHTML = cz.join('<br>');
+    }
+    function salStanStop(k){
+        const x = SAL_KANAL[k];
+        if (x && x.zegar){ clearInterval(x.zegar); x.zegar = null; }
+    }
+    // Sekundy dolicza ZEGAR, a nie wywolanie postepu: pobranie zestawienia potrafi
+    // milczec pol minuty i licznik stalby na zerze, a potem skakal od razu na koniec.
+    function salPraca(k, tekst){
+        salStanEkran();
+        const x = SAL_KANAL[k];
+        if (x && x.t0){ x.tekst = tekst; salStanRysuj(); return; }
+        salStanStop(k);
+        SAL_KANAL[k] = { tekst: tekst, kolor: '#666', t0: Date.now(),
+                         zegar: setInterval(salStanRysuj, 250) };
+        salStanRysuj();
+    }
+    function salKoniec(k, tekst, kolor){
+        salStanEkran();
+        const x = SAL_KANAL[k];
+        const ile = (x && x.t0) ? Math.round((Date.now() - x.t0) / 1000) : 0;
+        salStanStop(k);
+        SAL_KANAL[k] = { tekst: (tekst || '') + (ile ? (' · ' + ile + ' s') : ''),
+                         kolor: kolor || '#0a7a2f', t0: 0 };
+        salStanRysuj();
+    }
     function salSay(t, c){
-        const s = document.getElementById('sal-status');
-        if (s){ s.textContent = t || ''; s.style.color = c || '#666'; }
+        salStanEkran();
+        // Skonczone kanaly sprzatamy dopiero przy nastepnym poleceniu — do tego czasu
+        // maja byc widoczne. Trwajace zostawiamy, bo wlasnie o to chodzi.
+        Object.keys(SAL_KANAL).forEach(function (k){
+            if (k && !SAL_KANAL[k].t0){ salStanStop(k); delete SAL_KANAL[k]; } });
+        SAL_KANAL[''] = { tekst: t || '', kolor: c || '#666', t0: 0 };
+        salStanRysuj();
     }
 
     function salRysujListe(){
@@ -46319,15 +46189,15 @@
     async function salWczytajSP(files){
         const f = files && files[0];
         if (!f) return;
-        salSay('Czytam „' + f.name + '"… przy kilkudziesięciu tysiącach wierszy to kilkanaście sekund.', '#666');
+        salPraca('plik', 'czytam „' + f.name + '"… przy kilkudziesięciu tysiącach wierszy to kilkanaście sekund.', '#666');
         try {
             const b = new Uint8Array(await f.arrayBuffer());
             SAL_SP = slCzytajSP(await slXlsx(b));
             SAL_SP.nazwa = f.name;
-            salSay('Wczytane: ' + SAL_SP.poz.length + ' transakcji.', '#0a7a2f');
+            salKoniec('plik', 'Wczytane: ' + SAL_SP.poz.length + ' transakcji.', '#0a7a2f');
         } catch (e){
             SAL_SP = null;
-            salSay('„' + f.name + '": ' + ((e && e.message) || e), '#c00');
+            salKoniec('plik', '„' + f.name + '": ' + ((e && e.message) || e), '#c00');
         }
         salSpInfo();
     }
@@ -46335,19 +46205,20 @@
         const p = salPanel();
         const wyb = salSpKonto(p);
         const konta = (wyb === '*') ? SAL_SP_LISTA.slice() : [wyb];
-        if (!konta.length){ salSay('Wybierz konto Saferpaya.', '#c47f00'); return; }
+        if (!konta.length){ salKoniec('pl', 'Wybierz konto Saferpaya.', '#c47f00'); return; }
         const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
-        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
-        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (!od || !doo){ salKoniec('pl', 'Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salKoniec('pl', 'Data „od" jest późniejsza niż „do".', '#c00'); return; }
         if (typeof window.__TM_EXPORT_FETCH !== 'function'){
-            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawień.', '#c00');
+            salKoniec('pl', 'Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawień.', '#c00');
             return;
         }
         b.disabled = true;
         const t0 = Date.now();
+        salPraca('pl', 'zaczynam…');
         let ostatni = 'Pobieram…';
         const zegar = setInterval(function (){
-            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            salPraca('pl', ostatni);
         }, 1000);
         try {
             // Przy WYBRANYM koncie zawezamy pobieranie do jego spolki — platnosc innej
@@ -46376,12 +46247,12 @@
             });
             SAL_SPEXP = { poz: poz, zrodla: zrodla };
             clearInterval(zegar);
-            salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + poz.length
+            salKoniec('pl', 'Pobrane: ' + poz.length
                  + ' wierszy z ' + zrodla.length + ' kont.'
                  + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
                  problemy.length ? '#c00' : '#0a7a2f');
         } catch (e){
-            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+            salKoniec('pl', 'Nie pobrałem: ' + ((e && e.message) || e), '#c00');
         } finally {
             clearInterval(zegar);
         }
@@ -47613,7 +47484,7 @@
     }
     async function salWczytajAmz(files){
         const most = salAmzMost();
-        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!most){ salKoniec('plik', 'Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
         if (!files || !files.length) return;
         try {
             const buf = await files[0].arrayBuffer();
@@ -47625,7 +47496,7 @@
             else if (u8.length > 1 && u8[0] === 0xFE && u8[1] === 0xFF) txt = new TextDecoder('utf-16be').decode(u8);
             else txt = new TextDecoder('utf-8').decode(u8);
             const p = most.raport(txt);
-            if (p.err){ SAL_AMZ = null; salSay(p.err, '#c00'); salAmzInfo(); return; }
+            if (p.err){ SAL_AMZ = null; salKoniec('plik', p.err, '#c00'); salAmzInfo(); return; }
             SAL_AMZ = p;
             // v3.96: rynek ustawiamy SAMI, wprost z raportu — pomylka „raport PL, konto DE"
             // dawalaby wynik, ktory wyglada wiarygodnie i jest w calosci bez sensu.
@@ -47638,11 +47509,11 @@
                 if (opt){ sel.value = opt.value; dopasowane = ' · rynek ustawiony na ' + opt.textContent.split(' — ')[0]; }
                 else dopasowane = ' · UWAGA: nie mam konta rozliczeniowego dla ' + p.kraj.toUpperCase();
             }
-            salSay('Wczytane: ' + p.shop + ', rozliczenie ' + p.setId + ', wypłata ' + (p.payDate || '—')
+            salKoniec('plik', 'Wczytane: ' + p.shop + ', rozliczenie ' + p.setId + ', wypłata ' + (p.payDate || '—')
                  + ' ' + (p.cur || '') + dopasowane, dopasowane.indexOf('UWAGA') >= 0 ? '#c47f00' : '#0a7a2f');
         } catch (e){
             SAL_AMZ = null;
-            salSay('„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
+            salKoniec('plik', '„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
         }
         salAmzInfo();
     }
@@ -47650,25 +47521,26 @@
         const p = salPanel();
         const konto = String(p.querySelector('#sal-akonto').value || '').trim();
         const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
-        if (!konto){ salSay('Podaj numer konta rozliczeniowego.', '#c47f00'); return; }
-        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
-        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (!konto){ salKoniec('pl', 'Podaj numer konta rozliczeniowego.', '#c47f00'); return; }
+        if (!od || !doo){ salKoniec('pl', 'Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salKoniec('pl', 'Data „od" jest późniejsza niż „do".', '#c00'); return; }
         if (typeof window.__TM_EXPORT_FETCH !== 'function'){
-            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
+            salKoniec('pl', 'Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
             return;
         }
         const most = salAmzMost();
-        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!most){ salKoniec('pl', 'Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
         b.disabled = true;
         const t0 = Date.now();
+        salPraca('pl', 'zaczynam…');
         let ostatni = 'Pobieram…';
         const zegar = setInterval(function (){
-            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            salPraca('pl', ostatni);
         }, 1000);
         try {
             const wynik = await window.__TM_EXPORT_FETCH([konto], od, doo, 'excel', function (i, n, nazwa, etap){
                 ostatni = 'Pobieram ' + nazwa + (etap ? (' · ' + etap) : '');
-                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+                salPraca('pl', ostatni);
             });
             const rows = [], zrodla = [], zle = [];
             wynik.forEach(function (x){
@@ -47684,13 +47556,13 @@
             SAL_AEXP = { rows: rows, zrodla: zrodla, zle: zle };
             clearInterval(zegar);
             salAmzInfo();
-            salSay(rows.length
-                ? ('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + rows.length + ' wierszy.'
+            salKoniec('pl', rows.length
+                ? ('Pobrane: ' + rows.length + ' wierszy.'
                    + (zle.length ? (' Problemy: ' + zle.join('; ')) : ''))
                 : ('Nie wczytałem ani jednego wiersza. ' + zle.join('; ')),
                 rows.length ? (zle.length ? '#c47f00' : '#0a7a2f') : '#c00');
         } catch (e){
-            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+            salKoniec('pl', 'Nie pobrałem: ' + ((e && e.message) || e), '#c00');
         } finally { clearInterval(zegar); b.disabled = false; }
     }
     function salPorownajAmz(b){
@@ -47720,10 +47592,7 @@
             SAL_AWYNIK = most.tekst(SAL_AMZ, k, SAL_AEXP.zle);
             out.innerHTML = most.render(SAL_AMZ, k, SAL_AEXP.zle);
             kop.style.display = '';
-            // Podwojne ksiegowania licza sie do paska tak samo jak reszta — inaczej pasek
-            // mowilby „wszystko sie zgadza", a raport pod nim pokazywalby noty na 2x kwote.
-            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
-                        + (k.podwojne || []).length;
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
             salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
                    blady ? '#c47f00' : '#0a7a2f');
         } catch (e){
@@ -47825,7 +47694,7 @@
     }
     async function salWczytajMM(files){
         const most = salMmMost();
-        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!most){ salKoniec('plik', 'Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
         if (!files || !files.length) return;
         try {
             const buf = await files[0].arrayBuffer();
@@ -47838,7 +47707,7 @@
             else if (u8.length > 1 && u8[0] === 0xFE && u8[1] === 0xFF) txt = new TextDecoder('utf-16be').decode(u8);
             else txt = new TextDecoder('utf-8').decode(u8);
             const p = most.raport(txt);
-            if (p.err){ SAL_MM = null; salSay(p.err, '#c00'); salMmInfo(); return; }
+            if (p.err){ SAL_MM = null; salKoniec('plik', p.err, '#c00'); salMmInfo(); return; }
             SAL_MM = p;
             // Rynek ustawiamy SAMI, wprost z rozliczenia — pomylka „raport FR, konto DE"
             // dalaby wynik, ktory wyglada wiarygodnie i jest w calosci bez sensu.
@@ -47853,10 +47722,10 @@
                 else dop = ' · UWAGA: nie mam w tabeli kont rynku ' + String(p.kraj).toUpperCase();
             }
             salMmInfo();
-            salSay('Wczytano rozliczenie ' + (p.payRef || '?') + dop, '#0a7a2f');
+            salKoniec('plik', 'Wczytano rozliczenie ' + (p.payRef || '?') + dop, '#0a7a2f');
         } catch (e){
             SAL_MM = null; salMmInfo();
-            salSay('Nie mogę odczytać pliku: ' + ((e && e.message) || e), '#c00');
+            salKoniec('plik', 'Nie mogę odczytać pliku: ' + ((e && e.message) || e), '#c00');
         }
     }
     function salPorownajMM(b){
@@ -48013,15 +47882,15 @@
     }
     async function salWczytajAlle(files){
         const most = salAlleMost();
-        if (!most){ salSay('Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
+        if (!most){ salKoniec('plik', 'Moduł „Księgowanie Marketplace\'s" jest wyłączony.', '#c00'); return; }
         if (!files || !files.length) return;
-        salSay('Czytam ' + files.length + ' plik' + (files.length === 1 ? '' : 'ów') + '…');
+        salPraca('plik', 'czytam ' + files.length + ' plik' + (files.length === 1 ? '' : 'ów') + '…');
         try {
             SAL_ALLE = await most.zbierz(files);
             salZlozAlle();
         } catch (e){
             SAL_ALLE = null; SAL_ALLE_P = null; salAlleInfo();
-            salSay('Nie mogę odczytać plików: ' + ((e && e.message) || e), '#c00');
+            salKoniec('plik', 'Nie mogę odczytać plików: ' + ((e && e.message) || e), '#c00');
         }
     }
     // Wynik ostatniego porownania — zeby po sprawdzeniu auftragow narysowac go od nowa,
@@ -48988,9 +48857,8 @@
             + '<button id="sal-eupobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
             + '<button id="sal-eueu" style="padding:5px 14px;border:1px solid #750000;background:#fff;color:#750000;border-radius:6px;font-weight:700;cursor:pointer">⬇ Pobierz z eupago</button>'
             + '</div>'
-            + '<div id="sal-euinfo" style="font-size:11px;color:#888;margin-bottom:4px">Nic jeszcze nie pobrane.</div>'
-            + '<div id="sal-stan-eu" style="font-size:11px;margin-bottom:2px;display:none"></div>'
-            + '<div id="sal-stan-pl" style="font-size:11px;margin-bottom:8px;display:none"></div>'
+            + '<div id="sal-euinfo" style="font-size:11px;color:#888;margin-bottom:8px">Nic jeszcze nie pobrane.</div>'
+
             + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
             + '<button id="sal-euporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
             + '<button id="sal-euxlsx" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
@@ -49018,44 +48886,11 @@
         p.querySelector('#sal-do').onchange = zapisz;
         salEuInfo();
     }
-    // Osobny wiersz stanu dla kazdego zrodla: eupago i prologistics chodza rownolegle
-    // i jeden komunikat nie ma szans obsluzyc obu. Sekundy dopisuje zegar, a nie
-    // wywolanie postepu — dlugie zapytanie nie daje znaku zycia i licznik stalby na zerze.
-    const EU_STAN = {}, EU_ETY = { eu: 'eupago', pl: 'prologistics' };
-    function euStanRysuj(ktore){
-        const p = salPanel();
-        const el = p ? p.querySelector('#sal-stan-' + ktore) : null;
-        if (!el) return;
-        const st = EU_STAN[ktore];
-        if (!st){ el.style.display = 'none'; el.textContent = ''; return; }
-        el.style.display = '';
-        el.style.color = st.kolor || '#666';
-        el.textContent = EU_ETY[ktore] + ': ' + st.tekst
-            + (st.t0 ? (' · ' + Math.round((Date.now() - st.t0) / 1000) + ' s') : '');
-    }
-    function euStanStop(ktore){
-        const st = EU_STAN[ktore];
-        if (st && st.zegar) clearInterval(st.zegar);
-    }
-    function euStanStart(ktore, tekst){
-        euStanStop(ktore);
-        EU_STAN[ktore] = { tekst: tekst, t0: Date.now(), kolor: '#666',
-                           zegar: setInterval(function (){ euStanRysuj(ktore); }, 250) };
-        euStanRysuj(ktore);
-    }
-    function euStanTekst(ktore, tekst){
-        if (!EU_STAN[ktore] || !EU_STAN[ktore].t0) return euStanStart(ktore, tekst);
-        EU_STAN[ktore].tekst = tekst;
-        euStanRysuj(ktore);
-    }
-    function euStanKoniec(ktore, tekst, kolor){
-        const st = EU_STAN[ktore];
-        const ile = st && st.t0 ? Math.round((Date.now() - st.t0) / 1000) : 0;
-        euStanStop(ktore);
-        EU_STAN[ktore] = { tekst: tekst + (ile ? (' · ' + ile + ' s') : ''), t0: 0,
-                           kolor: kolor || '#0a7a2f' };
-        euStanRysuj(ktore);
-    }
+    // EuPago dostal ten uklad pierwszy; teraz jest wspolny dla wszystkich ekranow,
+    // wiec zostaja same nazwy.
+    function euStanStart(ktore, tekst){ salPraca(ktore, tekst); }
+    function euStanTekst(ktore, tekst){ salPraca(ktore, tekst); }
+    function euStanKoniec(ktore, tekst, kolor){ salKoniec(ktore, tekst, kolor); }
     function salEuInfo(){
         const e = salPanel().querySelector('#sal-euinfo');
         if (!e) return;
@@ -49303,18 +49138,29 @@
     }
 
     async function salWczytaj(files, gdzie){
+        // Odrzucony plik jest wazniejszy niz podsumowanie — wczesniej liczba wczytanych
+        // nadpisywala komunikat o bledzie i po wrzuceniu czegos nie tego widac bylo
+        // tylko „wczytane: 0 plikow".
+        let dodane = 0, odrzucone = 0, ostatni = '';
         for (let i = 0; i < files.length; i++){
             // Ten sam plik dwa razy to prawie zawsze pomylka, nie zamiar.
             if (SAL_PLIKI[gdzie].some(function (x){ return x.nazwa === files[i].name; })) continue;
+            salPraca('plik', 'czytam „' + files[i].name + '”…');
             try {
                 const b = new Uint8Array(await files[i].arrayBuffer());
                 const r = slCzytajPP(await slXlsx(b));
                 SAL_PLIKI[gdzie].push({ nazwa: files[i].name, okres: r.okres, poz: r.poz,
                                         waluta: r.waluta, skrzynka: r.skrzynka });
+                dodane++;
             } catch (e){
-                salSay('„' + files[i].name + '": ' + ((e && e.message) || e), '#c00');
+                odrzucone++;
+                ostatni = '„' + files[i].name + '”: ' + ((e && e.message) || e);
             }
         }
+        salKoniec('plik',
+            odrzucone ? (ostatni + (dodane ? (' · wczytane: ' + dodane) : ''))
+                      : ('wczytane: ' + dodane + ' plik' + (dodane === 1 ? '' : 'ów')),
+            odrzucone ? '#c00' : '#0a7a2f');
         salPlikInfo();
     }
 
@@ -49323,26 +49169,27 @@
     async function salPobierz(b){
         const p = salPanel();
         const konta = salWybrane(p);
-        if (!konta.length){ salSay('Nie wybrałeś żadnego konta.', '#c47f00'); return; }
+        if (!konta.length){ salKoniec('pl', 'Nie wybrałeś żadnego konta.', '#c47f00'); return; }
         const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
-        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
-        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (!od || !doo){ salKoniec('pl', 'Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salKoniec('pl', 'Data „od" jest późniejsza niż „do".', '#c00'); return; }
         if (typeof window.__TM_EXPORT_FETCH !== 'function'){
-            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawień.', '#c00');
+            salKoniec('pl', 'Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawień.', '#c00');
             return;
         }
         b.disabled = true;
         // Zegar tyka co sekunde nawet wtedy, gdy serwer milczy. Bez tego dlugie
         // pobranie (4792 wiersze to kilka MB) wyglada dokladnie tak samo jak zwiecha.
         const t0 = Date.now();
+        salPraca('pl', 'zaczynam…');
         let ostatni = 'Pobieram…';
         const zegar = setInterval(function (){
-            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            salPraca('pl', ostatni);
         }, 1000);
         try {
             const wynik = await window.__TM_EXPORT_FETCH(konta, od, doo, 'excel', function (i, n, nazwa, etap){
                 ostatni = 'Pobieram ' + (i + 1) + '/' + n + ' — ' + nazwa + (etap ? (' · ' + etap) : '');
-                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+                salPraca('pl', ostatni);
             });
             const we = [], wy = [], zrodla = [];
             const problemy = [];
@@ -49387,7 +49234,7 @@
             clearInterval(zegar);
             const czasy = wynik.filter(function (x){ return !x.blad && x.sekSzukanie != null; })
                 .map(function (x){ return 'szukanie ' + x.sekSzukanie + ' s, plik ' + x.sekPlik + ' s'; });
-            salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+            salKoniec('pl', 'Pobrane: '
                 + we.length + ' wpływów, ' + wy.length + ' wypływów z ' + konta.length + ' kont'
                 + (czasy.length ? (' · ' + czasy.join(' | ')) : '')
                 + (zapow ? (' (serwer zapowiedział ' + zapow + ' wierszy' 
@@ -49395,7 +49242,7 @@
                 + (problemy.length ? (' Problemy: ' + problemy.join('; ')) : ''),
                 problemy.length ? '#c00' : '#0a7a2f');
         } catch (e){
-            salSay('Nie pobrałem po ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+            salKoniec('pl', 'Nie pobrałem: '
                  + ((e && e.message) || e), '#c00');
         } finally {
             clearInterval(zegar);
@@ -49769,10 +49616,10 @@
             const t = await files[0].text();
             const r = slCzytajBank(t);
             SAL_BANK = { nazwa: files[0].name, konto: r.konto, waluta: r.waluta, poz: r.poz };
-            salSay('Wczytane: ' + r.poz.length + ' pozycji z ' + (r.konto || 'konta') + '.', '#0a7a2f');
+            salKoniec('plik', 'Wczytane: ' + r.poz.length + ' pozycji z ' + (r.konto || 'konta') + '.', '#0a7a2f');
         } catch (e){
             SAL_BANK = null;
-            salSay('„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
+            salKoniec('plik', '„' + files[0].name + '": ' + ((e && e.message) || e), '#c00');
         }
         salBankInfo();
     }
@@ -49781,37 +49628,38 @@
         const p = salPanel();
         const konto = p.querySelector('#sal-konta').value;
         const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
-        if (!od || !doo){ salSay('Uzupełnij zakres dat.', '#c47f00'); return; }
-        if (od > doo){ salSay('Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        if (!od || !doo){ salKoniec('pl', 'Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salKoniec('pl', 'Data „od" jest późniejsza niż „do".', '#c00'); return; }
         if (typeof window.__TM_EXPORT_FETCH !== 'function'){
-            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
+            salKoniec('pl', 'Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę zestawienia.', '#c00');
             return;
         }
         b.disabled = true;
         const t0 = Date.now();
+        salPraca('pl', 'zaczynam…');
         let ostatni = 'Pobieram…';
         const zegar = setInterval(function (){
-            salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+            salPraca('pl', ostatni);
         }, 1000);
         try {
             const wynik = await window.__TM_EXPORT_FETCH([konto], od, doo, 'excel', function (i, n, nazwa, etap){
                 ostatni = 'Pobieram ' + nazwa + (etap ? (' · ' + etap) : '');
-                salSay(ostatni + ' · ' + Math.round((Date.now() - t0) / 1000) + ' s', '#666');
+                salPraca('pl', ostatni);
             });
             const x = wynik[0];
             if (x.blad) throw new Error(x.blad);
             if (!x.buf){ SAL_BEXP = { we: [], wy: [] }; salBankInfo();
-                salSay('To konto nie ma ruchu w tym zakresie.', '#c47f00');
+                salKoniec('pl', 'To konto nie ma ruchu w tym zakresie.', '#c47f00');
                 clearInterval(zegar); b.disabled = false; return; }
             SAL_BEXP = slCzytajPL(slXls(x.buf), konto);
             clearInterval(zegar);
             salBankInfo();
-            salSay('Pobrane w ' + Math.round((Date.now() - t0) / 1000) + ' s: '
+            salKoniec('pl', 'Pobrane: '
                 + SAL_BEXP.we.length + ' wpływów, ' + SAL_BEXP.wy.length + ' wypływów'
                 + (x.sekSzukanie != null ? (' · szukanie ' + x.sekSzukanie + ' s, plik ' + x.sekPlik + ' s') : '')
                 + '.', '#0a7a2f');
         } catch (e){
-            salSay('Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+            salKoniec('pl', 'Nie pobrałem: ' + ((e && e.message) || e), '#c00');
         } finally { clearInterval(zegar); }
         b.disabled = false;
     }
@@ -50131,6 +49979,17 @@
     function init_eutok(){
         const KLUCZ = 'tm_eu_token_v1';
         let mam = false;
+        const XKLUCZ = 'tm_eu_xauth_v1';
+        let mamX = false;
+        function zapiszX(v){
+            const t = String(v == null ? '' : v).trim();
+            if (!t || t.length > 4096) return;
+            try { GM_setValue(XKLUCZ, JSON.stringify({ tok: t, kiedy: Date.now() })); } catch (e){ return; }
+            if (mamX) return;
+            mamX = true;
+            chmurka('✓ HUB ma także nagłówek do listy transakcji eupago.', '#0a7a2f', 8000);
+        }
+
         function chmurka(tekst, kolor, ile){
             const d = document.createElement('div');
             d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;background:'
@@ -50162,7 +50021,22 @@
         // 1) Droga glowna — token lezy w sessionStorage. Po zalogowaniu pojawia sie
         //    od razu, ale skrypt startuje w document-idle i bywa szybszy niz logowanie,
         //    wiec zagladamy cyklicznie przez pierwsze pol godziny.
+        // Naglowek /api/intern moze siedziec w globalnych ustawieniach jQuery panelu.
+        // To jedyna droga, ktora nie wymaga zlapania zapytania w locie — a zlapac go
+        // w locie zwykle sie NIE DA, bo Consult przeladowuje strone i tabela odpytuje
+        // serwer, zanim skrypt zdazy sie uruchomic.
+        const czytajX = function (){
+            try {
+                const J = W.jQuery || W.$;
+                const h = J && J.ajaxSettings && J.ajaxSettings.headers;
+                if (!h) return;
+                Object.keys(h).forEach(function (k){
+                    if (String(k).toLowerCase() === 'x-auth-token') zapiszX(h[k]);
+                });
+            } catch (e){}
+        };
         const czytaj = function (){
+            czytajX();
             try { zapisz(W.sessionStorage && W.sessionStorage.getItem('access_token')); } catch (e){}
         };
         czytaj();
@@ -50178,7 +50052,14 @@
             const stary = proto && proto.setRequestHeader;
             if (typeof stary === 'function'){
                 proto.setRequestHeader = function (n, v){
-                    try { if (String(n).toLowerCase() === 'authorization') zapisz(v); } catch (e){}
+                    try {
+                        const nn = String(n).toLowerCase();
+                        if (nn === 'authorization') zapisz(v);
+                        // API /api/intern/v1.02 (uzywa go Bank Import) autoryzuje sie
+                        // WLASNYM naglowkiem, nie Authorization. Podgladamy go w ruchu
+                        // panelu — wartosci nie ma nigdzie w kodzie.
+                        if (nn === 'x-auth-token') zapiszX(v);
+                    } catch (e){}
                     return stary.apply(this, arguments);
                 };
             }
@@ -50201,14 +50082,116 @@
         function wykonaj(z){
             const q = Object.keys(z.params || {}).map(function (k){
                 return encodeURIComponent(k) + '=' + encodeURIComponent(z.params[k]); }).join('&');
-            const url = 'https://clientes.eupago.pt/clientes' + z.sciezka + (q ? ('?' + q) : '');
-            return fetch(url, { method: 'GET', credentials: 'include', cache: 'no-store',
+            // Zlecenie moze podac ADRES WPROST — tak robi Bank Import, bo jego API stoi
+            // pod innym prefiksem niz /clientes i chce POST-a. Bez „url" zachowujemy sie
+            // dokladnie jak dotad: /clientes + sciezka, metoda GET.
+            const url = z.url ? String(z.url)
+                              : ('https://clientes.eupago.pt/clientes' + z.sciezka + (q ? ('?' + q) : ''));
+            if (!/^https:\/\/clientes\.eupago\.pt\//.test(url))
+                return Promise.reject(new Error('adres spoza panelu eupago — nie wykonuję'));
+            const met = String(z.metoda || 'GET').toUpperCase();
+            // Naglowka autoryzacji /api/intern nie widac nigdzie wprost, a Consult
+            // przeladowuje strone, wiec nie da sie go zlapac w locie. Robimy wiec dwie
+            // rzeczy PO KOLEI, obie w tej karcie: najpierw zapytanie jej wlasnym jQuery
+            // (jesli panel doklada naglowek globalnie, dolozy go i nam), a potem proba
+            // po kandydatach z jej pamieci. Wartosci kandydatow nigdzie stad nie wychodza —
+            // zapamietujemy tylko ten, ktory serwer przyjal.
+            const jqProba = function (){
+                const J = W.jQuery || W.$;
+                if (!z.przezJq || !J || !J.ajax) return Promise.reject({ dalej: true });
+                return new Promise(function (ok, zle){
+                    J.ajax({ url: url, type: met, data: (z.body || ''), dataType: 'json', cache: false,
+                             contentType: (z.naglowki && z.naglowki['content-type']) || undefined })
+                     .done(function (d){ ok(d); })
+                     .fail(function (x){
+                         const st = (x && x.status) || 0;
+                         if (st === 401 || st === 403 || st === 0) zle({ dalej: true });
+                         else zle(new Error('HTTP ' + st + ' na ' + (z.sciezka || url) + ' (jQuery panelu)'));
+                     });
+                });
+            };
+            const kandydaci = function (){
+                const k = [];
+                const dodaj = function (skad, v){
+                    const t = String(v == null ? '' : v).trim();
+                    if (!t || t.length < 8 || t.length > 4096) return;
+                    if (k.some(function (x){ return x.v === t; })) return;
+                    k.push({ skad: skad, v: t });
+                };
+                try { dodaj('nagłówek złapany w ruchu',
+                            (JSON.parse(GM_getValue(XKLUCZ, '') || '{}') || {}).tok); } catch (e){}
+                ['access_token', 'refresh_token'].forEach(function (n){
+                    try { dodaj('sessionStorage.' + n, W.sessionStorage.getItem(n)); } catch (e){}
+                });
+                try {
+                    const sur = W.localStorage.getItem('__eu');
+                    dodaj('localStorage.__eu', sur);
+                    let o = null; try { o = JSON.parse(sur); } catch (e){}
+                    if (o && typeof o === 'object')
+                        Object.keys(o).forEach(function (n){
+                            if (typeof o[n] === 'string') dodaj('localStorage.__eu.' + n, o[n]);
+                        });
+                } catch (e){}
+                return k;
+            };
+            const poKandydatach = async function (){
+                if (!z.probujNaglowek) throw new Error('HTTP 401 na ' + (z.sciezka || url));
+                const k = kandydaci();
+                if (!k.length) throw new Error('w karcie panelu nie ma żadnego kandydata na nagłówek „'
+                                             + z.probujNaglowek + '"');
+                let ost = '';
+                for (let i = 0; i < k.length; i++){
+                    const h = {};
+                    Object.keys(opcje.headers).forEach(function (n){ h[n] = opcje.headers[n]; });
+                    h[z.probujNaglowek] = k[i].v;
+                    const o2 = { method: opcje.method, credentials: opcje.credentials,
+                                 cache: opcje.cache, headers: h };
+                    if (opcje.body !== undefined) o2.body = opcje.body;
+                    let r;
+                    try { r = await fetch(url, o2); } catch (e){ ost = (e && e.message) || 'brak połączenia'; continue; }
+                    const tresc = await r.text();
+                    if (r.status === 401 || r.status === 403){ ost = 'HTTP ' + r.status; continue; }
+                    if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + (z.sciezka || url));
+                    let d;
+                    try { d = JSON.parse(tresc); }
+                    catch (e){ throw new Error('panel oddał nie-JSON: ' + tresc.replace(/\s+/g, ' ').slice(0, 160)); }
+                    try { GM_setValue(XKLUCZ, JSON.stringify({ tok: k[i].v, skad: k[i].skad, kiedy: Date.now() })); } catch (e){}
+                    chmurka('\u2713 HUB znalazł nagłówek do listy transakcji: ' + k[i].skad, '#0a7a2f', 10000);
+                    return d;
+                }
+                throw new Error('żaden kandydat na nagłówek „' + z.probujNaglowek + '" nie został przyjęty '
+                              + '(próbowałem: ' + k.map(function (x){ return x.skad; }).join(', ') + ')'
+                              + (ost ? (', ostatnio ' + ost) : ''));
+            };
+            if (z.przezJq || z.probujNaglowek){
+                return jqProba().catch(function (e){
+                    if (e && e.dalej) return poKandydatach();
+                    throw e;
+                });
+            }
+            const opcje = { method: met, credentials: 'include', cache: 'no-store',
                     headers: { 'Authorization': tokTeraz(),
                                'Accept': 'application/json, text/plain, */*',
-                               'X-Requested-With': 'XMLHttpRequest' } })
+                               'X-Requested-With': 'XMLHttpRequest' } };
+            // Zlecenie moze narzucic wlasna postac naglowka: „auth" to gotowa wartosc,
+            // a pusty napis znaczy „nie wysylaj Authorization w ogole" — wtedy zostaje
+            // samo ciasteczko sesji. Bez tego pola zachowujemy sie jak dotad.
+            if (z.auth !== undefined && z.auth !== null){
+                if (String(z.auth) === '') delete opcje.headers['Authorization'];
+                else opcje.headers['Authorization'] = String(z.auth);
+            }
+            // Komplet wlasnych naglowkow. Pusta wartosc znaczy „usun ten naglowek".
+            if (z.naglowki && typeof z.naglowki === 'object'){
+                Object.keys(z.naglowki).forEach(function (k){
+                    if (String(z.naglowki[k]) === '') delete opcje.headers[k];
+                    else opcje.headers[k] = String(z.naglowki[k]);
+                });
+            }
+            if (met !== 'GET' && met !== 'HEAD') opcje.body = (z.body == null ? '' : String(z.body));
+            return fetch(url, opcje)
                 .then(function (r){
                     return r.text().then(function (tresc){
-                        if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + z.sciezka);
+                        if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + (z.sciezka || url));
                         try { return JSON.parse(tresc); }
                         catch (e){ throw new Error('panel oddał ' + (r.headers.get('content-type') || '?')
                             + ' zamiast JSON-a: ' + tresc.replace(/\s+/g, ' ').slice(0, 160)); }
@@ -52131,6 +52114,1678 @@
 })();
     }
 
+    // ===== Bank Import =====
+    // Wgrywasz plik z banku albo od operatora platnosci, modul przerabia go DOKLADNIE
+    // tak, jak robila to stara aplikacja desktopowa (klasa BankProcessor), i oddaje go
+    // prosto do „Import payments" w prologistics — ta sama droga, ktora chodzi
+    // Ksiegowanie Marketplace's: POST /api/importPayments/ z plikiem i ustawieniami,
+    // potem odczyt paczki (OK / CHECK / NOT FOUND) i „Book on main account".
+    //
+    // Na razie jest tu JEDEN format — EuPago. Kazdy nastepny dopisuje sie do BK_FORMATY
+    // i nie dotyka reszty modulu.
+    function init_bank() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+    // Modul „Ksiegowanie w tickecie" pracuje w ukrytych ramkach na tym samym hoscie —
+    // bez tej bramki panel montowalby sie w kazdej z nich.
+    if (window.top !== window.self) return;
+    if (document.getElementById('bank-btn')) return;
+
+    var BK_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
+
+    // Pamiec modulu. Klucze wlasne — ustawien Ksiegowania Marketplace's nie ruszamy,
+    // zeby dwa moduly nie deptaly sobie po tych samych wpisach.
+    var BK_SET_KEY = 'bank_imp_ustawienia';   // { <format>: {bank, bankNm, booking, bookingNm} }
+    var BK_JOB_KEY = 'bank_imp_zlecenie';     // ostatnia paczka — przezywa odswiezenie strony
+    var BK_BS_KEY  = 'bank_imp_banki';        // cache listy bank_setting
+    var BK_BK_KEY  = 'bank_imp_ksiegowania';  // cache listy booking_setting
+
+    var BK_BS_URL  = '/api/bankSettings/index/';
+    var BK_BK_URL  = '/api/bookingSettings/index/';
+    // = przycisk „Book & Assign on main account". Import SAM NIE KSIEGUJE — tworzy tylko
+    // paczke. Nazwy akcji sa odczytane wprost z handlerow przyciskow strony Import payments
+    // (onClick -> save("<block>")), a nie zgadniete:
+    //   booking                     Book & Assign on main account      <- ten
+    //   booking_sub                 Book & Assign on sub-account
+    //   booking_alt                 Book & Assign on alternative account
+    //   booking_without_assign      Book on main account
+    //   booking_sub_without_assign  Book on sub-account
+    //   booking_alt_without_assign  Book on alternative account
+    var BK_BLOCK   = 'booking';
+    var BK_BLOCK_OPIS = 'Book & Assign on main account';
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
+    function r2(n){ return Math.round(Number(n) * 100) / 100; }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function gmGet(k, d){ try { return GM_getValue(k, d); } catch (e){ return d; } }
+    function gmSet(k, v){ try { GM_setValue(k, v); } catch (e){} }
+    function jGet(k){ try { return JSON.parse(gmGet(k, '{}')) || {}; } catch (e){ return {}; } }
+    function jSet(k, o){ gmSet(k, JSON.stringify(o || {})); }
+
+    // ---------- przerobka pliku ----------
+    // Wszystko ponizej jest przepisane 1:1 z BankProcessor.clean_euro_amount
+    // i BankProcessor.convert_date_format. Zadnych ulepszen: plik ma wyjsc taki sam,
+    // jaki wychodzil ze starej aplikacji, bo to jego przyjmuje import w prologistics.
+
+    // Kwota: zdejmujemy € z konca, potem WSZYSTKIE rodzaje spacji (separatory tysiecy),
+    // a na koncu ustawiamy przecinek jako separator dziesietny.
+    function bkKwota(v){
+        if (v == null || v === '') return v;
+        var s = String(v).trim();
+        s = s.replace(/€+$/, '').trim();
+        // Dokladnie ta lista znakow, ktora usuwa stara aplikacja: zwykla spacja,
+        // U+00A0, U+202F, U+2009, U+2007, U+205F, U+3000. Zapisane escape'ami: w klasie
+        // znakow bylby to ciag niewidzialnych bajtow i pierwsza edycja pliku w cudzym
+        // edytorze mogla by go po cichu zepsuc.
+        s = s.replace(/[ \u00a0\u202f\u2009\u2007\u205f\u3000]/g, '');
+        if (s.indexOf(',') >= 0 && s.indexOf('.') >= 0){
+            // 1.234,56 — kropki przed przecinkiem to tysiace.
+            var parts = s.split(',');
+            if (parts.length === 2) s = parts[0].replace(/\./g, '') + ',' + parts[1];
+        } else if (s.indexOf('.') >= 0 && s.indexOf(',') < 0){
+            // UWAGA: stara aplikacja zamienia TU KAZDA kropke na przecinek, wiec „1234.56"
+            // wychodzi jako „1234,56" (dobrze), ale „1.234" jako „1,234" (zle). Zostawiam
+            // to tak, jak jest — plik ma byc taki sam, jaki dotad przyjmowal import.
+            // W plikach eupago ten przypadek nie wystepuje: kwoty sa z przecinkiem.
+            s = s.replace(/\./g, ',');
+        }
+        return s;
+    }
+    // Data: MM/DD/YYYY -> DD.MM.YYYY. DD.MM.YYYY zostaje bez zmian, reszty nie ruszamy.
+    function bkData(v){
+        if (v == null || v === '') return v;
+        var s = String(v).trim(), p;
+        if (/^\d{2}\.\d{2}\.\d{4}$/.test(s)) return s;
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)){ p = s.split('/'); return p[1] + '.' + p[0] + '.' + p[2]; }
+        if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)){
+            p = s.split('/');
+            return ('0' + p[1]).slice(-2) + '.' + ('0' + p[0]).slice(-2) + '.' + p[2];
+        }
+        return s;
+    }
+
+    // Formaty. „kwoty" i „daty" to numery kolumn liczone OD ZERA, tak jak w starej
+    // aplikacji. EuPago: E (4) = Value(€), J (9) = Payment Date.
+    var BK_FORMATY = [{
+        id: 'eupago',
+        nazwa: 'EuPago',
+        opis: 'Consultation of Eupago Paid or Transferred References — plik z panelu eupago',
+        minKol: 10,
+        kwoty: [4],
+        daty: [9],
+        // Kolumny liczone od zera: I (8) to „Identifier" — numer, ktory trafia do paczki
+        // jako „payment_descr" — a J (9) to „Payment Date". Z tej pary powstaje mapa
+        // „numer -> data", potrzebna przy ksiegowaniu wierszy NOT FOUND wprost na auftragu.
+        kolKlucz: 8,
+        kolData: 9,
+        konto: '1232',                 // EUPAGO PT Beliani DE — informacyjnie, do kontroli wzrokowej
+        waluta: 'EUR',                 // do szukania po otwartej kwocie
+        szukaj: /eupago|eu\s*pago/i    // po tym podpowiadamy ustawienie importu
+    }];
+    function fmt(id){ return BK_FORMATY.filter(function (x){ return x.id === id; })[0] || BK_FORMATY[0]; }
+
+    // ---------- czytanie pliku ----------
+    // Stara aplikacja czyta CSV przez pandas z encoding='utf-8-sig' — czyli UTF-8
+    // ze zdjetym BOM-em. Robimy to samo; gdyby plik przyszedl w innym kodowaniu,
+    // mowimy o tym wprost zamiast po cichu wstawiac znaki zastepcze.
+    function bkDekoduj(buf){
+        return new TextDecoder('utf-8').decode(buf).replace(/^\ufeff/, '');
+    }
+    // Sredniki wewnatrz pol w cudzyslowach sa normalne (surowy plik z eupago ma
+    // KAZDE pole w cudzyslowie), wiec parsujemy znak po znaku, nie splitem.
+    function bkCsvRows(text){
+        var s = String(text || '');
+        var rows = [], f = '', row = [], q = false;
+        for (var i = 0; i < s.length; i++){
+            var c = s.charAt(i);
+            if (q){
+                if (c !== '"'){ f += c; continue; }
+                if (s.charAt(i + 1) === '"'){ f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"'){ q = true; continue; }
+            if (c === ';'){ row.push(f); f = ''; continue; }
+            if (c === '\r') continue;
+            if (c === '\n'){ row.push(f); rows.push(row); row = []; f = ''; continue; }
+            f += c;
+        }
+        if (f !== '' || row.length){ row.push(f); rows.push(row); }
+        // pandas pomija PUSTE linie (skip_blank_lines), ale nie pomija wiersza „;;;",
+        // ktory jest wierszem pustych pol. Odsiewamy wiec tylko te pierwsze.
+        return rows.filter(function (r){ return !(r.length === 1 && r[0] === ''); });
+    }
+    function bkCzytaj(file){
+        return new Promise(function (ok, zle){
+            var rd = new FileReader();
+            rd.onerror = function (){ zle(new Error('nie udało się odczytać pliku')); };
+            rd.onload = function (){
+                try {
+                    var buf = rd.result;
+                    if (/\.xlsx?$/i.test(file.name)){
+                        if (typeof XLSX === 'undefined'){ zle(new Error('brak biblioteki XLSX — odśwież stronę')); return; }
+                        var wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
+                        var ws = wb.Sheets[wb.SheetNames[0]];
+                        // raw:false + defval:'' odpowiada pandasowemu dtype=str i fillna('').
+                        ok(XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' }));
+                        return;
+                    }
+                    var txt = bkDekoduj(buf);
+                    if (txt.indexOf('\ufffd') >= 0)
+                        zle(new Error('plik nie jest w UTF-8 (są w nim znaki zastępcze) — zapisz go z panelu jeszcze raz'));
+                    else ok(bkCsvRows(txt));
+                } catch (e){ zle(e); }
+            };
+            rd.readAsArrayBuffer(file);
+        });
+    }
+
+    // Przerobka: naglowek zostaje nietkniety (w pandasie to etykiety kolumn),
+    // zmieniaja sie tylko komorki danych we wskazanych kolumnach.
+    function bkPrzerob(aoa, F){
+        if (!aoa || !aoa.length) return { err: 'plik jest pusty' };
+        var hdr = (aoa[0] || []).map(function (c){ return String(c == null ? '' : c); });
+        if (hdr.length < F.minKol)
+            return { err: 'Plik musi mieć co najmniej ' + F.minKol + ' kolumn — ten ma ' + hdr.length + '.' };
+        var out = [hdr.slice()], zK = 0, zD = 0;
+        for (var i = 1; i < aoa.length; i++){
+            var src = aoa[i] || [], r = [];
+            // Wiersz DLUZSZY od naglowka znaczy, ze w ktoryms polu siedzi nieosloniety
+            // srednik. Dopasowanie go do naglowka urwaloby kolumne po cichu, a plik
+            // idzie do ksiegowania — wiec zamiast przycinac, odmawiamy.
+            if (src.length > hdr.length)
+                return { err: 'wiersz ' + (i + 1) + ' ma ' + src.length + ' pól, a nagłówek '
+                            + hdr.length + ' — w którymś polu jest średnik bez cudzysłowu. '
+                            + 'Nie tnę pliku na siłę.' };
+            for (var c = 0; c < hdr.length; c++) r.push(src[c] == null ? '' : String(src[c]));
+            F.kwoty.forEach(function (k){ if (k < r.length){ var n = bkKwota(r[k]); if (n !== r[k]) zK++; r[k] = n; } });
+            F.daty.forEach(function (k){ if (k < r.length){ var n2 = bkData(r[k]); if (n2 !== r[k]) zD++; r[k] = n2; } });
+            out.push(r);
+        }
+        return { rows: out, zmKwot: zK, zmDat: zD };
+    }
+    // Zapis jak pandasowe to_csv(sep=';', index=False, encoding='utf-8-sig'):
+    // cudzyslow tylko tam, gdzie jest naprawde potrzebny, konce linii CRLF, BOM z przodu.
+    function bkCsvText(rows){
+        var q = function (v){
+            var s = String(v == null ? '' : v);
+            return /[;"\r\n]/.test(s) ? ('"' + s.replace(/"/g, '""') + '"') : s;
+        };
+        return rows.map(function (r){ return r.map(q).join(';'); }).join('\r\n') + '\r\n';
+    }
+    function bkBlob(rows){ return new Blob(['\ufeff' + bkCsvText(rows)], { type: 'text/csv;charset=utf-8' }); }
+    // Nazwa jak w starej aplikacji: „04.09.2026 08.14 eupago.csv".
+    function bkNazwa(F){
+        var d = new Date();
+        return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear()
+             + ' ' + pad2(d.getHours()) + '.' + pad2(d.getMinutes()) + ' ' + F.id + '.csv';
+    }
+
+    // Data platnosci per numer transakcji, prosto z przerobionego pliku. Zapisujemy ja
+    // przy zleceniu, bo paczka importu daty nie oddaje, a przy ksiegowaniu wiersza
+    // NOT FOUND wprost na auftragu trzeba wiedziec, na ktory dzien.
+    function bkMapaDat(rows, F){
+        var m = {};
+        if (F.kolKlucz == null || F.kolData == null) return m;
+        for (var i = 1; i < rows.length; i++){
+            var k = String(rows[i][F.kolKlucz] == null ? '' : rows[i][F.kolKlucz]).trim();
+            var d = bkDataIso(rows[i][F.kolData]);
+            if (k && d && !m[k]) m[k] = d;
+        }
+        return m;
+    }
+    // „04.09.2026" -> „2026-09-04". Plik jest juz po przerobce, wiec data stoi po polsku.
+    function bkDataIso(v){
+        var m = String(v == null ? '' : v).trim().match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        return m ? (m[3] + '-' + m[2] + '-' + m[1]) : '';
+    }
+
+    // ---------- ustawienia importu ----------
+    // bank_setting to INNA numeracja niz plan kont, a zle wskazany ksiegowalby wplaty
+    // na cudzym koncie — dlatego nic tu nie zgadujemy. Liste bierzemy z prologistics,
+    // podpowiadamy po nazwie i czekamy na wybor.
+    async function bkLista(url, pole){
+        var r = await fetch(url, { credentials: 'same-origin',
+            headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' z ' + url);
+        var t = await r.text(), j = null;
+        try { j = JSON.parse(t); }
+        catch (e){ throw new Error('z ' + url + ' przyszedł nie-JSON — najpewniej strona logowania'); }
+        var src = j && j[pole];
+        if (!src || typeof src !== 'object') throw new Error('w odpowiedzi nie ma listy „' + pole + '"');
+        var out = {};
+        Object.keys(src).forEach(function (id){
+            if (!/^\d{1,6}$/.test(String(id))) return;
+            var v = src[id] || {};
+            var nm = String(v.name == null ? '' : v.name).replace(/\s+/g, ' ').trim();
+            if (!nm) return;
+            out[id] = { nm: nm, off: String(v.inactive) === '1' };
+        });
+        if (!Object.keys(out).length) throw new Error('lista „' + pole + '" przyszła pusta');
+        return out;
+    }
+    // Kotwice: 157 to „Vente Unique DE", 9 to „Fulfillment No". Znamy je na pewno,
+    // wiec jesli ich nie ma, to nie jest ta lista, na ktora liczymy — mowimy o tym,
+    // ale wyboru nie blokujemy, bo prologistics moze te wpisy kiedys wygasic.
+    function bkKotwicaBank(m){ var v = m && m['157']; return !!(v && /vente\s*unique\s*de|\b1114\b/i.test(v.nm || '')); }
+    function bkKotwicaKsieg(m){ var v = m && m['9']; return !!(v && /fulfil?l?ment\s*no/i.test(v.nm || '')); }
+
+    function bkNorm(t){ return String(t == null ? '' : t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+    function bkPodpowiedz(map, F){
+        var hit = [];
+        Object.keys(map || {}).forEach(function (id){
+            var e = map[id];
+            if (!e || e.off) return;
+            if (F.szukaj.test(e.nm) || F.szukaj.test(bkNorm(e.nm))) hit.push({ id: id, nm: e.nm });
+        });
+        return hit;
+    }
+    function ustaw(id){
+        var o = jGet(BK_SET_KEY);
+        return o[id] || { bank: '', bankNm: '', booking: '', bookingNm: '' };
+    }
+    function ustawZapisz(id, v){
+        var o = jGet(BK_SET_KEY);
+        o[id] = v; jSet(BK_SET_KEY, o);
+    }
+
+    // ---------- paczka importu ----------
+    async function bkWyslij(blob, nazwa, cfg){
+        var fd = new FormData();
+        fd.append('imgs[]', blob, nazwa);
+        // date_overwrite_to zostaje PUSTE: kazdy wiersz eupago ma wlasna date platnosci
+        // (kolumna J), wiec jedna data nadpisalaby cala paczke na jeden dzien — dokladnie
+        // ten sam powod, dla ktorego pole zostaje puste przy Allegro.
+        fd.append('data', JSON.stringify({
+            booking_setting: cfg.booking, date_overwrite_to: '',
+            bank_setting: cfg.bank, import_type: 'manual'
+        }));
+        var r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
+        var txt = await r.text();
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy wysyłce do importu');
+        // Endpoint oddaje STRONE paczki, nie JSON. Numer bierzemy z adresu po
+        // przekierowaniu, zapasowo z tresci, a na koncu z listy importow po nazwie pliku.
+        var imp = '';
+        var mu = String(r.url || '').match(/import_payments\/(\d+)/);
+        if (mu) imp = mu[1];
+        if (!imp){ var mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
+        if (!imp){ try { imp = await bkZnajdz(nazwa, cfg.bank); } catch (e){} }
+        return imp;
+    }
+    async function bkZnajdz(nazwa, bank){
+        var r = await fetch('/api/importPayments/index/?', { credentials: 'same-origin',
+            headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) return '';
+        var j = await r.json();
+        var list = (Array.isArray(j.parsing_list) ? j.parsing_list : []).slice()
+            .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
+        var hit = list.filter(function (x){ return nazwa && String(x.filename || '').indexOf(nazwa) >= 0; });
+        if (hit.length) return String(hit[0].file_id || '');
+        var alt = list.filter(function (x){ return bank && String(x.bank_id || '') === String(bank); });
+        return alt.length ? String(alt[0].file_id || '') : '';
+    }
+    async function bkPaczka(id){
+        var r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
+            credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy odczycie paczki ' + id);
+        var j = await r.json();
+        return { rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
+    }
+    async function bkKsieguj(id, ids){
+        var body = 'file_id=' + encodeURIComponent(id) + '&block=' + BK_BLOCK
+                 + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
+        var r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu');
+        return r.text();
+    }
+    // Ustawienie statusu pojedynczego wiersza — odpowiednik recznej zmiany na „OK"
+    // w prologistics. To ZAPIS, nie odczyt.
+    async function bkStan(id, rowId, state){
+        var body = 'id=' + encodeURIComponent(rowId) + '&state=' + encodeURIComponent(state)
+                 + '&block=state&file_id=' + encodeURIComponent(id);
+        var r = await fetch('/api/importPayments/save/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy ustawianiu statusu wiersza ' + rowId);
+        return r.text();
+    }
+    // Open amount przychodzi raz jako „0.00", a raz jako „CHF 0.01" — z waluta w srodku
+    // Number() zwraca NaN. Odsiewamy wiec wszystko poza cyframi, znakiem i separatorem.
+    function bkNum(v){
+        var s = String(v == null ? '' : v).replace(/[^\d.,+-]/g, '');
+        if (!s || !/\d/.test(s)) return null;
+        var dot = s.lastIndexOf('.'), com = s.lastIndexOf(',');
+        var t = (com > dot) ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+        var n = Number(t);
+        return isFinite(n) ? n : null;
+    }
+    // Link do auftragu: prologistics pokazuje go jako „15254075/3", a strona chce
+    // number i txnid osobno.
+    function bkAukcja(x){
+        var raw = String(x.auction_number == null ? '' : x.auction_number).trim();
+        if (!raw) return null;
+        var p = raw.split('/'), num = p[0].trim(), txn = (p[1] || '').trim();
+        if (!txn) ['txnid','txn_id','txnId','auction_txnid','transaction_id','txn'].forEach(function (k){
+            if (!txn && x[k] != null && String(x[k]).trim()) txn = String(x[k]).trim();
+        });
+        return { num: num, txn: txn, label: num + (txn ? ('/' + txn) : ''),
+                 url: '/auction.php?number=' + encodeURIComponent(num) + (txn ? ('&txnid=' + encodeURIComponent(txn)) : '') };
+    }
+
+    // Numer zamowienia zamiast identyfikatora transakcji. Kolumna „Identifier" w pliku
+    // eupago niesie raz 32-znakowy hash (MBWay), a raz numer zamowienia (Multibanco).
+    // W tym drugim przypadku prologistics oznacza wiersz jako CHECK, mimo ze auftrag
+    // znalazlo — poznajemy to po tym, ze numer z pliku jest DOKLADNIE numerem auftragu.
+    // Kwota musi sie zgadzac co do grosza: wiersz z innym numerem albo z inna kwota
+    // zostaje CHECK-iem do wyjasnienia i nikt go za czlowieka nie przestawia.
+    function bkToNumerZamowienia(x){
+        var au = bkAukcja(x);
+        if (!au || !au.num) return false;
+        var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+        if (!nr || nr !== au.num) return false;
+        var a = bkNum(x.amount), o = bkNum(x.open_amount);
+        return a != null && o != null && Math.abs(a - o) < 0.005;
+    }
+
+    // ---------- NOT FOUND: auftrag po numerze transakcji ----------
+    // Wyszukiwarka prologistics ma osobne kryterium „payment comment" — w formularzu
+    // to <input name="payment_comment"> wlaczany przez select_radio('radio_88').
+    // Identyfikator eupago siedzi wlasnie w komentarzu platnosci, wiec po nim auftrag
+    // sie znajduje takze wtedy, gdy import go nie dopasowal.
+    // Ile dni wokol daty wplaty przegladac przy szukaniu po kwocie. Auftrag konczy sie
+    // (End date) w chwili pierwszej proby zaplaty, a wplata, ktorej szukamy, jest proba
+    // KOLEJNA — wiec zwykle jest pozniejsza. Okno jest jednak obustronne i do zmiany
+    // w panelu, bo nie ma powodu zgadywac za czlowieka, ile mu tych dni potrzeba.
+    var BK_OKNO_KEY = 'bank_imp_okno_dni';
+    function oknoDni(){
+        var v = Number(gmGet(BK_OKNO_KEY, 2));
+        return (isFinite(v) && v >= 0 && v <= 30) ? v : 2;
+    }
+    // Ile auftragow czytac naraz. To wylacznie odczyty, wiec rownoleglosc niczego nie
+    // psuje — ale za duzo naraz potrafi dostac po prostu odmowe, wiec sufit stoi na 8.
+    var BK_ROWN_KEY = 'bank_imp_rownolegle';
+    function rownolegle(){
+        var v = parseInt(gmGet(BK_ROWN_KEY, 5), 10);
+        return (isFinite(v) && v >= 1 && v <= 8) ? v : 5;
+    }
+    var BK_POLE  = 'payment_comment';
+    var BK_RADIO = 'radio_88';
+    // Najpierw adresem — jeden fetch, tanio. Gdyby wyszukiwarka nie znala tego
+    // kryterium w adresie, schodzimy do formularza w ukrytej ramce.
+    async function bkSzukajAdresem(nr){
+        var tries = ['/search.php?what=' + BK_POLE + '&' + BK_POLE + '=' + encodeURIComponent(nr),
+                     '/search.php?express&what=' + BK_POLE + '&' + BK_POLE + '=' + encodeURIComponent(nr)];
+        for (var i = 0; i < tries.length; i++){
+            var res = null, html = '';
+            try { res = await fetch(tries[i], { credentials: 'same-origin' }); html = await res.text(); }
+            catch (e){ continue; }
+            var nums = [], m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+            if (m) nums.push(m[1]);                      // jedno trafienie: serwer przekierowal
+            if (!nums.length){
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                doc.querySelectorAll('a[href*="auction.php?number="]').forEach(function (a){
+                    var h = a.getAttribute('href') || '';
+                    if (h.indexOf('shipping_auction.php') >= 0) return;
+                    var mm = h.match(/number=(\d+)/);
+                    if (mm && nums.indexOf(mm[1]) < 0) nums.push(mm[1]);
+                });
+            }
+            if (nums.length) return nums;
+        }
+        return [];
+    }
+    // Ta sama droga, ktora przechodzi czlowiek: otwarcie wyszukiwarki, zaznaczenie
+    // kryterium, wpisanie numeru, wyslanie formularza. Ramka jest ukryta.
+    function bkSzukajFormularzem(nr){
+        return new Promise(function (koniec){
+            var fin = false, tried = 0, sent = false;
+            var urls = [location.origin + '/search.php?express', location.origin + '/search.php'];
+            var fr = document.createElement('iframe');
+            fr.style.cssText = 'position:fixed;left:-9999px;top:0;width:1200px;height:800px;opacity:0';
+            var end = function (res){
+                if (fin) return;
+                fin = true;
+                try { fr.remove(); } catch (e){}
+                koniec(res);
+            };
+            fr.onload = function (){
+                var d, w;
+                try { d = fr.contentDocument || fr.contentWindow.document; w = fr.contentWindow; }
+                catch (e){ end({ err: 'nie mam dostępu do ramki wyszukiwarki' }); return; }
+                // Swiezo wstawiona ramka zglasza „load" dla about:blank — wtedy nie ma
+                // jeszcze czego szukac.
+                var href = '';
+                try { href = String(w.location.href || ''); } catch (e){}
+                if (!href || /^about:/i.test(href)) return;
+                if (!sent){
+                    var inp = d.querySelector('input[name="' + BK_POLE + '"]');
+                    if (!inp){
+                        if (++tried < urls.length){ fr.src = urls[tried]; return; }
+                        end({ err: 'nie widzę pola „' + BK_POLE + '" na ' + href.replace(location.origin, '') });
+                        return;
+                    }
+                    // Radio wlacza wlasciwe kryterium — bez niego formularz szuka po czym innym.
+                    try { if (w.select_radio) w.select_radio(BK_RADIO); } catch (e){}
+                    var rb = d.querySelector('input[name="what"][value="' + BK_POLE + '"], #' + BK_RADIO);
+                    if (rb && !rb.checked){ rb.checked = true; rb.dispatchEvent(new Event('change', { bubbles: true })); }
+                    inp.value = String(nr);
+                    var form = inp.closest('form');
+                    if (!form){ end({ err: 'nie znalazłem formularza na search.php' }); return; }
+                    sent = true; form.submit();
+                    return;
+                }
+                var url = '';
+                try { url = String(w.location.href || ''); } catch (e){}
+                var nums = [];
+                var dodaj = function (u){
+                    var m = String(u || '').match(/number=(\d+)/);
+                    if (m && nums.indexOf(m[1]) < 0) nums.push(m[1]);
+                };
+                if (/auction\.php\?number=/i.test(url)) dodaj(url);
+                try {
+                    Array.prototype.slice.call(d.querySelectorAll('a[href*="auction.php?number="]'))
+                        .forEach(function (a){ if (String(a.href).indexOf('shipping_auction.php') < 0) dodaj(a.href); });
+                } catch (e){}
+                end({ nums: nums });
+            };
+            document.body.appendChild(fr);
+            fr.src = urls[0];
+            setTimeout(function (){ end({ err: 'wyszukiwarka nie odpowiedziała w 30 s' }); }, 30000);
+        });
+    }
+    async function bkSzukaj(nr){
+        var nums = await bkSzukajAdresem(nr);
+        if (nums.length) return { nums: nums, jak: 'adres' };
+        var r = await bkSzukajFormularzem(nr);
+        // „err" znaczy: NIE UDALO SIE zapytac. Puste trafienie to co innego — wyszukiwarka
+        // odpowiedziala i po prostu nie zna tego numeru. Oba konczyly dotad w tym samym
+        // polu i przez to gubil sie guzik drugiej drogi.
+        if (r && r.err) return { nums: [], err: r.err };
+        var n2 = (r && r.nums) || [];
+        return { nums: n2, jak: 'formularz', pusto: !n2.length };
+    }
+    // „Auftrag value - Total of Payments" stoi na stronie DWA razy: w podsumowaniu tabeli
+    // Payments (w <b>) i jako zwykly tekst w komentarzu wczesniejszego ksiegowania.
+    // Bierzemy wylacznie ten z <b>, i to ostatni. Separator tysiecy MUSI wejsc do wzorca:
+    // prologistics pisze te kwote po angielsku i bez przecinka „€ 1,149.97" czytaloby sie
+    // jako 1,14.
+    function bkOpen(d){
+        var bs = d.querySelectorAll('b'), node = null;
+        for (var i = 0; i < bs.length; i++)
+            if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i];
+        if (!node) return null;
+        var box = (node.closest && node.closest('td')) || node.parentNode;
+        var t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+        var m = t.match(/-?\s*\d[\d'’\s,.]*/);
+        return m ? bkNum(m[0]) : null;
+    }
+    // Status prosto ze ZRODLA strony: `const isDeleted = +"1";`. Zwraca true / false / null.
+    function bkUsunZeZrodla(html){
+        var m = String(html || '').match(/\bconst\s+isDeleted\s*=\s*([^;\n]{0,40});/);
+        if (!m) return null;
+        var v = m[1].replace(/[\s+"']/g, '').toLowerCase();
+        if (v === '1' || v === 'true') return true;
+        if (v === '0' || v === '' || v === 'false' || v === 'null') return false;
+        return null;
+    }
+    // Czy auftrag jest SKASOWANY. Kolejnosc ma znaczenie: naglowek opisuje TE transakcje,
+    // ktora czytamy, a reszta strony wymienia takze pozostale transakcje tego numeru —
+    // wystarczylaby jedna skasowana, zeby zywy auftrag wyszedl na skasowany. Sprawdzianu
+    // po CALYM kodzie strony nie ma celowo: lapal regule CSS obecna na kazdej stronie.
+    function bkUsuniety(d, html){
+        try {
+            var nag = d && d.querySelector('h1.header-title, .header-title');
+            var stat = nag ? nag.querySelector('[class*="auftrag-status--"]') : null;
+            if (stat) return /auftrag-status--deleted/i.test(String(stat.className || ''));
+            var bl = String(html || '').match(/<h1[^>]*class="[^"]*header-title[^"]*"[\s\S]{0,600}?<\/h1>/i);
+            if (bl){
+                if (/auftrag-status--deleted/i.test(bl[0])) return true;
+                if (/auftrag-status--active/i.test(bl[0])) return false;
+            }
+            // Plakietke w naglowku sklada dopiero skrypt strony, wiec w HTML-u pobranym
+            // fetch-em klas „auftrag-status--*" po prostu NIE MA. To jedyna pewna droga.
+            var zZr = bkUsunZeZrodla(html);
+            if (zZr !== null) return zZr;
+            var wsz = d ? d.querySelectorAll('[class*="auftrag-status--"]') : [];
+            if (wsz.length === 1) return /auftrag-status--deleted/i.test(String(wsz[0].className || ''));
+        } catch (e){}
+        return null;
+    }
+    // Tabelka „Eupago Payments" w auftragu. Jej obecnosc jest tu calym sygnalem: znaczy,
+    // ze przy tym zamowieniu byla juz proba zaplaty przez eupago. Kolumny: Date, Amount,
+    // Referencia, Token, a w ostatniej komorce guzik „Book", gdy pozycja niezaksiegowana.
+    function bkEuTabela(d){
+        var t = d.querySelector('table[data-simple-nav="Eupago Payments"]');
+        if (!t) return null;
+        var poz = [];
+        t.querySelectorAll('tr').forEach(function (tr){
+            var td = tr.querySelectorAll('td');
+            if (td.length < 4) return;
+            var dt = String(td[0].textContent || '').trim();
+            if (!/^\d{4}-\d{2}-\d{2}/.test(dt)) return;      // naglowek i wiersz „Total" odpadaja
+            poz.push({ data: dt,
+                       kwota: String(td[1].textContent || '').replace(/\s+/g, ' ').trim(),
+                       ref:   String(td[2].textContent || '').trim(),
+                       token: String(td[3].textContent || '').trim(),
+                       book:  !!(td[4] && td[4].querySelector('input[onclick*="book=1"]')) });
+        });
+        return poz;
+    }
+    async function bkCzytajAuftrag(num){
+        var html = '';
+        try {
+            // txnid=3 w adresie: bez niego prologistics pokazuje stronę bez części sekcji.
+            var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3',
+                                  { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarłem auftragu ' + num }; }
+        var d = new DOMParser().parseFromString(html, 'text/html');
+        // Skasowanie sprawdzamy PRZED formularzem: skasowany auftrag formularza platnosci
+        // zwykle nie ma, wiec inaczej wychodzilibysmy stad z komunikatem nie na temat.
+        var usun = bkUsuniety(d, html);
+        var eu = bkEuTabela(d);
+        if (!d.querySelector('form#book'))
+            return { ok: false, deleted: usun, eu: eu,
+                     err: usun ? ('auftrag ' + num + ' jest SKASOWANY (bez formularza płatności)')
+                                : ('na stronie auftragu ' + num + ' nie ma formularza płatności') };
+        return { ok: true, deleted: usun, open: bkOpen(d), eu: eu,
+                 nPay: d.querySelectorAll('a[href*="delpay="]').length };
+    }
+    // Formularz #book nie ma tokenu CSRF ani onsubmit, wiec POST z osmioma polami
+    // odtwarza dokladnie to, co wysyla przegladarka po kliknieciu „Make payment".
+    // Przyciskow „safer" i „paypal" NIE wolno dosylac — oznaczaja platnosc karta.
+    // „paycomment" idzie PUSTY: tak ustalone.
+    async function bkKsiegujAuftrag(num, iso, konto, kwota){
+        var m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return { ok: false, err: 'zła data księgowania' };
+        var b = [];
+        var add = function (k, v){ b.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); };
+        add('number', String(num));
+        add('txnid', '3');
+        add('Date_Month', m[2]);
+        add('Date_Day', String(parseInt(m[3], 10)));      // select ma 1..31, bez zera wiodacego
+        add('Date_Year', m[1]);
+        add('account', String(konto));
+        add('amount', Number(kwota).toFixed(2));
+        add('paycomment', '');
+        try {
+            var res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: b.join('&') });
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            return { ok: true };
+        } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
+    }
+    // ---------- eupago: co sie stalo z ta proba zaplaty ----------
+    // Panel odpytuje wlasne API DataTables po stronie serwera. Adres i komplet parametrow
+    // wziete z jego ustawien, nie z domyslu:
+    //   POST /api/intern/v1.02/references?status=&start_date=&end_date=&value=
+    //        &identifier=<token>&service=&channel=
+    var EU_REF_API = 'https://clientes.eupago.pt/api/intern/v1.02/references';
+    var EU_TOK_KEY = 'tm_eu_token_v1';       // ten sam token, ktory zbiera modul „EuPago — sesja panelu"
+    // API /api/intern/v1.02 autoryzuje sie WLASNYM naglowkiem — „x-auth-token", nie
+    // „Authorization". Sprawdzone na zapytaniu, ktore panel wysyla przy Consult; kazda
+    // postac Authorization dostawala 401 nawet z samej karty panelu. Wartosci tokenu nie
+    // ma w kodzie: podglada ja karta panelu we wlasnym ruchu.
+    var EU_XAUTH_KEY = 'tm_eu_xauth_v1';
+    var EU_XAUTH_NAG = 'x-auth-token';
+    // Cialo zapytania — komplet parametrow DataTables, dokladnie taki, jaki wysyla panel.
+    var EU_BODY = 'draw=1&columns%5B0%5D%5Bdata%5D=&columns%5B0%5D%5Bname%5D=&columns%5B0%5D%5Bsearchable%5D=false&columns%5B0%5D%5Borderable%5D=false&columns%5B0%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B0%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B1%5D%5Bdata%5D=&columns%5B1%5D%5Bname%5D=&columns%5B1%5D%5Bsearchable%5D=false&columns%5B1%5D%5Borderable%5D=false&columns%5B1%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B1%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B2%5D%5Bdata%5D=estado&columns%5B2%5D%5Bname%5D=&columns%5B2%5D%5Bsearchable%5D=false&columns%5B2%5D%5Borderable%5D=false&columns%5B2%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B2%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B3%5D%5Bdata%5D=entidade&columns%5B3%5D%5Bname%5D=&columns%5B3%5D%5Bsearchable%5D=false&columns%5B3%5D%5Borderable%5D=false&columns%5B3%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B3%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B4%5D%5Bdata%5D=referencia&columns%5B4%5D%5Bname%5D=&columns%5B4%5D%5Bsearchable%5D=true&columns%5B4%5D%5Borderable%5D=false&columns%5B4%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B4%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B5%5D%5Bdata%5D=nome_servico&columns%5B5%5D%5Bname%5D=&columns%5B5%5D%5Bsearchable%5D=false&columns%5B5%5D%5Borderable%5D=false&columns%5B5%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B5%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B6%5D%5Bdata%5D=valor&columns%5B6%5D%5Bname%5D=amount&columns%5B6%5D%5Bsearchable%5D=false&columns%5B6%5D%5Borderable%5D=true&columns%5B6%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B6%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B7%5D%5Bdata%5D=retencao&columns%5B7%5D%5Bname%5D=&columns%5B7%5D%5Bsearchable%5D=false&columns%5B7%5D%5Borderable%5D=false&columns%5B7%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B7%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B8%5D%5Bdata%5D=iva&columns%5B8%5D%5Bname%5D=&columns%5B8%5D%5Bsearchable%5D=false&columns%5B8%5D%5Borderable%5D=false&columns%5B8%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B8%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B9%5D%5Bdata%5D=nome_canal&columns%5B9%5D%5Bname%5D=&columns%5B9%5D%5Bsearchable%5D=false&columns%5B9%5D%5Borderable%5D=false&columns%5B9%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B9%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B10%5D%5Bdata%5D=identificador&columns%5B10%5D%5Bname%5D=&columns%5B10%5D%5Bsearchable%5D=true&columns%5B10%5D%5Borderable%5D=false&columns%5B10%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B10%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B11%5D%5Bdata%5D=data&columns%5B11%5D%5Bname%5D=date&columns%5B11%5D%5Bsearchable%5D=false&columns%5B11%5D%5Borderable%5D=true&columns%5B11%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B11%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B12%5D%5Bdata%5D=hora&columns%5B12%5D%5Bname%5D=&columns%5B12%5D%5Bsearchable%5D=true&columns%5B12%5D%5Borderable%5D=true&columns%5B12%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B12%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B13%5D%5Bdata%5D=&columns%5B13%5D%5Bname%5D=&columns%5B13%5D%5Bsearchable%5D=false&columns%5B13%5D%5Borderable%5D=false&columns%5B13%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B13%5D%5Bsearch%5D%5Bregex%5D=false&order%5B0%5D%5Bcolumn%5D=11&order%5B0%5D%5Bdir%5D=desc&order%5B1%5D%5Bcolumn%5D=12&order%5B1%5D%5Bdir%5D=desc&start=0&length=25&search%5Bvalue%5D=&search%5Bregex%5D=false';
+    var EU_MOST_Z  = 'tm_eu_most_zlec';      // i ten sam most, ktorym chodzi Salda
+    var EU_MOST_O  = 'tm_eu_most_odp';
+    // Kody statusu prosto z panelu (select „comboStatus") — nie z pamieci.
+    var EU_STATUSY = {
+        'pendente': 'Pending', 'paga': 'Paid', 'em processamento': 'Processing',
+        'transferida': 'Transferred', 'reembolsada': 'Refunded', 'cancelada': 'Canceled',
+        'expirada': 'Expired', 'erro': 'Error', 'devolvida': 'Returned',
+        'cativa': 'Captive', 'bloqueada': 'Blocked', 'chargeback': 'Chargeback'
+    };
+    // Status, ktory tlumaczy „platnosc nie doszla, klient zaplacil jeszcze raz".
+    function euNieDoszla(kod){
+        return kod === 'expirada' || kod === 'cancelada' || kod === 'erro' || kod === 'bloqueada';
+    }
+    function bkEuTok(){
+        try {
+            var o = JSON.parse(gmGet(EU_TOK_KEY, '') || '{}');
+            if (!o || !o.tok) return null;
+            if (o.exp && o.exp < Date.now() + 60000) return { przeterminowany: true, exp: o.exp };
+            return o;
+        } catch (e){ return null; }
+    }
+    function bkEuXTok(){
+        try {
+            var o = JSON.parse(gmGet(EU_XAUTH_KEY, '') || '{}');
+            return (o && o.tok) ? String(o.tok) : '';
+        } catch (e){ return ''; }
+    }
+    function bkEuBrakTokena(){
+        if (bkEuXTok()) return '';
+        return 'nie mam jeszcze nagłówka „' + EU_XAUTH_NAG + '" — otwórz '
+             + 'https://clientes.eupago.pt/backoffice/index.html, zaloguj się i kliknij tam '
+             + 'cokolwiek (np. Consult). HUB podejrzy nagłówek w ruchu panelu i zapamięta go.';
+    }
+    // Postac naglowka Authorization NIE JEST USTALONA: pod /clientes/... dziala goly token
+    // (tak chodzi Salda), a /api/intern/v1.02 oddal na goly 401 z „AUTH_INVALID". Probujemy
+    // wiec obu znanych postaci i zapamietujemy te, ktora przeszla — zgadywanie na sztywno
+    // konczyloby sie modulem, ktory milczy albo klamie.
+    // Naglowki takie, jakie wysyla panel — z „x-auth-token" i jego typem tresci.
+    function bkEuNaglowki(){
+        var n = { 'accept': 'application/json, text/javascript, */*; q=0.01',
+                  'content-type': 'application/x-www-form-urlencoded, application/json',
+                  'cache-control': 'no-cache' };
+        n[EU_XAUTH_NAG] = bkEuXTok();
+        return n;
+    }
+    function bkEuJedno(url){
+        return new Promise(function (ok, zle){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'POST', url: url, timeout: 120000, anonymous: false, data: EU_BODY,
+                headers: bkEuNaglowki(),
+                onload: function (r){
+                    var tresc = String(r.responseText || '');
+                    if (r.status === 401 || r.status === 403){
+                        var ba = new Error('eupago odrzuciło nagłówek „' + EU_XAUTH_NAG + '" (HTTP '
+                                         + r.status + ') — wejdź na kartę panelu i kliknij Consult, '
+                                         + 'żeby HUB podejrzał świeży');
+                        ba.auth = true; ba.most = true; zle(ba); return; }
+                    if (r.status < 200 || r.status >= 300){
+                        var b = new Error('eupago: HTTP ' + r.status); b.most = (r.status >= 500); zle(b); return; }
+                    try { ok(JSON.parse(tresc)); }
+                    catch (e){
+                        var b2 = new Error('eupago oddało nie-JSON (' + tresc.length + ' B): '
+                                         + tresc.replace(/\s+/g, ' ').slice(0, 160));
+                        b2.most = true; zle(b2);
+                    }
+                },
+                onerror: function (){ var b = new Error('nie połączyłem się z eupago'); b.most = true; zle(b); },
+                ontimeout: function (){ zle(new Error('eupago nie odpowiedziało w 120 s')); }
+            });
+        });
+    }
+    // Wprost z prologistics. Miedzy nim a eupago stoi Cloudflare, wiec zamiast JSON-a
+    // potrafi wrocic strona — wtedy oznaczamy blad jako „do mostu".
+    async function bkEuWprost(url){
+        var brak = bkEuBrakTokena();
+        // Bez naglowka NIE konczymy sprawy: z karty panelu zapytanie leci jego wlasnym
+        // jQuery i naglowek doklada sie sam. Dlatego zamiast bledu — droga przez most.
+        if (brak){ var b = new Error(brak); b.most = true; throw b; }
+        return await bkEuJedno(url);
+    }
+    // Most: zlecenie do wspolnej pamieci skryptu, wykonuje je otwarta karta panelu.
+    var bkNrZlec = 0;
+    function bkEuMostem(url){
+        var id = 'b' + Date.now().toString(36) + '-' + (++bkNrZlec);
+        try {
+            gmSet(EU_MOST_O, '');
+            // „Authorization: ''" znaczy dla karty: nie wysylaj tego naglowka wcale.
+            // Autoryzuje sie „x-auth-token", ktory karta podejrzala w ruchu panelu.
+            var nag = { 'Authorization': '', 'X-Requested-With': '',
+                        'accept': 'application/json, text/javascript, */*; q=0.01',
+                        'content-type': 'application/x-www-form-urlencoded, application/json' };
+            nag[EU_XAUTH_NAG] = bkEuXTok();
+            gmSet(EU_MOST_Z, JSON.stringify({ id: id, url: url, metoda: 'POST', body: EU_BODY,
+                                              naglowki: nag,
+                                              // Wykonaj to jQuery panelu: wtedy naglowek
+                                              // autoryzacji doklada sie sam i nie trzeba
+                                              // znac jego wartosci.
+                                              przezJq: true,
+                                              // Gdy jQuery panelu nie wystarczy, karta
+                                              // przechodzi po kandydatach z wlasnej pamieci.
+                                              probujNaglowek: EU_XAUTH_NAG,
+                                              sciezka: '/api/intern/v1.02/references',
+                                              params: {}, kiedy: Date.now() }));
+        } catch (e){ return Promise.reject(new Error('nie mam gdzie zostawić zlecenia dla karty eupago')); }
+        return new Promise(function (ok, zle){
+            var start = Date.now();
+            var zegar = setInterval(function (){
+                var o = null;
+                try { o = JSON.parse(gmGet(EU_MOST_O, '') || 'null'); } catch (e){ o = null; }
+                if (o && o.id === id){
+                    clearInterval(zegar);
+                    try { gmSet(EU_MOST_O, ''); gmSet(EU_MOST_Z, ''); } catch (e){}
+                    if (o.ok) ok(o.dane); else zle(new Error('karta eupago nie pobrała: ' + o.blad));
+                    return;
+                }
+                // 30 s, nie 2 min: pytamy o JEDNA referencje. Przy zamknietej karcie
+                // panelu lepiej powiedziec to szybko, niz kazac patrzec w pasek.
+                if (Date.now() - start > 30000){
+                    clearInterval(zegar);
+                    zle(new Error('karta panelu eupago nie odpowiedziała w 30 s — otwórz '
+                        + 'https://clientes.eupago.pt/backoffice/index.html, zaloguj się '
+                        + 'i zostaw tę kartę otwartą, wtedy HUB pyta przez nią.'));
+                }
+            }, 400);
+        });
+    }
+    var bkMostZapowiedziany = false;
+    async function bkEuZapytaj(url){
+        try { return await bkEuWprost(url); }
+        catch (e){
+            if (!e || !e.most) throw e;
+            // Mowimy o tym PRZED czekaniem, a nie po nim: bez otwartej karty panelu
+            // most nie ma kto wykonac i czlowiek musi wiedziec od razu, co zrobić.
+            if (!bkMostZapowiedziany){
+                bkMostZapowiedziany = true;
+                say('pytam przez kartę panelu eupago — tam zapytanie wykonuje jego własne jQuery '
+                    + 'i nagłówek autoryzacji dokłada się sam. Otwórz '
+                    + 'https://clientes.eupago.pt i zostaw ją zalogowaną.', '#c47f00');
+            }
+            return await bkEuMostem(url);
+        }
+    }
+    function bkDzienPrzesuniety(iso, o){
+        var p = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (!p) return '';
+        var d = new Date(Date.UTC(+p[1], +p[2] - 1, +p[3] + o));
+        return d.toISOString().slice(0, 10);
+    }
+    // Odpowiedz jest z DataTables po stronie serwera. Nazw pol w wierszu NIE ZNAM, wiec
+    // ich nie zgaduje: szukam wiersza, w ktorym gdziekolwiek stoi ten identyfikator,
+    // i w nim wartosci, ktora jest jednym ze znanych kodow statusu. Czego nie rozpoznam,
+    // zglaszam wprost — „nie odczytałem statusu" jest uczciwe, ciche „nie expired" nie.
+    function bkEuSzukajStatusu(j, token) {
+        var rows = (j && (j.data || j.aaData || j.entries)) || (Array.isArray(j) ? j : []);
+        if (!Array.isArray(rows)) return { err: 'odpowiedź nie ma listy wierszy' };
+        var tk = String(token || '').toLowerCase();
+        // Nazwy pol znamy z zapytania panelu (kolumny DataTables): identyfikator stoi
+        // w „identificador", a status w „estado". Gdyby kiedys sie przesunely, nizej
+        // zostaje przeglad po wszystkich wartosciach wiersza.
+        for (var p = 0; p < rows.length; p++){
+            var r = rows[p];
+            if (!r || typeof r !== 'object') continue;
+            if (String(r.identificador == null ? '' : r.identificador).toLowerCase() !== tk) continue;
+            var kod = String(r.estado == null ? '' : r.estado).trim().toLowerCase();
+            if (EU_STATUSY[kod]) return { kod: kod, opis: EU_STATUSY[kod] };
+        }
+        for (var i = 0; i < rows.length; i++){
+            var w = rows[i];
+            var wart = (w && typeof w === 'object') ? Object.keys(w).map(function (k){ return w[k]; }) : [w];
+            var ma = wart.some(function (v){ return String(v == null ? '' : v).toLowerCase() === tk; });
+            if (!ma) continue;
+            for (var k = 0; k < wart.length; k++){
+                var v = String(wart[k] == null ? '' : wart[k]).trim().toLowerCase();
+                if (EU_STATUSY[v]) return { kod: v, opis: EU_STATUSY[v] };
+            }
+            return { err: 'znalazłem transakcję, ale nie rozpoznaję w niej statusu' };
+        }
+        return { err: 'eupago nie zna tego identyfikatora w tym okresie' };
+    }
+    // Status jednej proby zaplaty. Okno dat bierzemy z daty tej proby ±1 dzien.
+    async function bkEuStatus(token, isoData){
+        var od = bkDzienPrzesuniety(isoData, -1), doo = bkDzienPrzesuniety(isoData, 1);
+        if (!od || !doo) return { err: 'nie znam daty tej próby zapłaty' };
+        var url = EU_REF_API + '?status=&start_date=' + od + '&end_date=' + doo
+                + '&value=&identifier=' + encodeURIComponent(token) + '&service=&channel=';
+        try { return bkEuSzukajStatusu(await bkEuZapytaj(url), token); }
+        catch (e){ return { err: (e && e.message) || String(e) }; }
+    }
+    // Statusy wszystkich prob z listy propozycji dla jednego numeru.
+    async function bkEuStatusy(nr, btn, gotowe){
+        var st = BK_NF[nr];
+        if (!st || !st.kw || !st.kw.zEu.length) return;
+        // Brak naglowka to nie powod, zeby nie probowac: karta panelu poradzi sobie bez
+        // niego. Mowimy o tym i idziemy dalej, zamiast konczyc przed pierwsza proba.
+        var brak = bkEuBrakTokena();
+        if (brak) say('Nie mam jeszcze nagłówka autoryzacji — próbuję przez kartę panelu eupago. '
+                    + 'Musi być otwarta i zalogowana.', '#c47f00');
+        btn.disabled = true;
+        var ile = 0;
+        for (var i = 0; i < st.kw.zEu.length; i++){
+            var c = st.kw.zEu[i];
+            for (var k = 0; k < c.eu.length; k++){
+                ile++;
+                say('Pytam eupago o status próby ' + ile + '…', '#666');
+                c.eu[k].stan = await bkEuStatus(c.eu[k].token, bkDzien(c.eu[k].data));
+            }
+        }
+        say('Statusy pobrane.', '#0a7a2f');
+        btn.disabled = false;
+        if (gotowe) gotowe();
+    }
+    // Wyszukiwanie po OTWARTEJ kwocie — kryterium radio_31. Adres wziety wprost
+    // z linkow sortowania na stronie wynikow, wiec nie zgaduje sie tu nazw pol.
+    async function bkSzukajPoKwocie(kwota, waluta){
+        var v = Number(kwota).toFixed(2);
+        var u = '/search.php?what=open_amount&open_amount_mode=open'
+              + '&open_amount_from=' + encodeURIComponent(v)
+              + '&open_amount_to='   + encodeURIComponent(v)
+              + '&open_amount_currency=' + encodeURIComponent(waluta || 'EUR');
+        var html = '';
+        try {
+            var res = await fetch(u, { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { err: 'brak połączenia z wyszukiwarką' }; }
+        var d = new DOMParser().parseFromString(html, 'text/html');
+        var tab = d.querySelector('#egusli');
+        if (!tab) return { err: 'nie rozpoznaję strony wyników (brak tabeli #egusli)' };
+        var out = [], widziane = {};
+        Array.prototype.slice.call(tab.querySelectorAll('tr')).forEach(function (tr){
+            var a = tr.querySelector('a[href*="auction.php?number="]');
+            if (!a) return;
+            var m = String(a.getAttribute('href') || '').match(/number=(\d+)/);
+            if (!m || widziane[m[1]]) return;
+            var td = tr.querySelectorAll('td');
+            // Daty szukamy PO KSZTALCIE, nie po numerze kolumny: uklad tabeli bywa
+            // przestawiany, a „2026-08-26 11:23:24" nie da sie pomylic z niczym innym.
+            var dt = '', ix = -1;
+            for (var i = 0; i < td.length; i++){
+                var t = String(td[i].textContent || '').replace(/\s+/g, ' ').trim();
+                if (/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(t)){ dt = t; ix = i; break; }
+            }
+            if (!dt) return;
+            widziane[m[1]] = 1;
+            out.push({ num: m[1], data: dt,
+                       open: (ix >= 0 && td[ix + 1]) ? bkNum(td[ix + 1].textContent) : null,
+                       oferta: (td[3] ? String(td[3].textContent || '').replace(/\s+/g, ' ').trim() : '') });
+        });
+        // Wyniki bywaja stronicowane. Jesli sa, mowimy o tym wprost, zamiast po cichu
+        // pokazywac tylko pierwsza strone.
+        var maxP = 1;
+        Array.prototype.slice.call(d.querySelectorAll('a[href*="p="]')).forEach(function (a){
+            var mm = String(a.getAttribute('href') || '').match(/[?&]p=(\d+)/);
+            if (mm && Number(mm[1]) > maxP) maxP = Number(mm[1]);
+        });
+        return { lista: out, stron: maxP };
+    }
+    function bkDzien(t){ var m = String(t || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? m[0] : ''; }
+    function bkDniRoznica(a, b){
+        var pa = String(a || '').split('-'), pb = String(b || '').split('-');
+        if (pa.length !== 3 || pb.length !== 3) return null;
+        var da = Date.UTC(+pa[0], +pa[1] - 1, +pa[2]), db = Date.UTC(+pb[0], +pb[1] - 1, +pb[2]);
+        return Math.round((da - db) / 86400000);
+    }
+    // ---------- skasowany auftrag: slad dla CS PT Finance ----------
+    // eupago obsluguje wylacznie rynek portugalski, wiec odbiorca jest zawsze ten sam.
+    var BK_CS = 'CSPTFinance';
+    // obj_id to WEWNETRZNY identyfikator obiektu, nie numer auftragu (11754877 przy
+    // auftragu 15631632). Strona czyta go z data-obj-id tabeli komentarzy.
+    function bkObjId(d, html){
+        var el = (d && (d.querySelector('[data-obj-id][data-obj="auction"]')
+                     || d.querySelector('[data-obj-id]'))) || null;
+        if (el){
+            var v = String(el.getAttribute('data-obj-id') || '').trim();
+            if (/^\d+$/.test(v)) return v;
+        }
+        var m = String(html || '').match(/data-obj-id=["'](\d+)["']/);
+        return m ? m[1] : '';
+    }
+    // Saldo z NAJNOWSZEGO komentarza o platnosci. Idziemy po wszystkich i bierzemy
+    // ostatni pasujacy — komentarze stoja w kolejnosci od najstarszego.
+    function bkSaldoZKomentarzy(d){
+        var sp = (d && d.querySelectorAll('.commentText')) || [], ost = '';
+        for (var i = 0; i < sp.length; i++){
+            var t = String(sp[i].textContent || '').replace(/\s+/g, ' ').trim();
+            var m = t.match(/Auftrag value\s*-\s*Total of Payments:\s*(-?[\d.,]+)/i);
+            if (m) ost = 'Auftrag value - Total of Payments: ' + m[1];
+        }
+        return ost;
+    }
+    // Jedno zapytanie dopisuje komentarz I przestawia odpowiedzialnego.
+    async function bkOdbij(tekst, objId){
+        // Spacje jako „+", a nie „%20" — tak koduje je przegladarka w ciele formularza
+        // i tak wygladalo zapytanie podejrzane na stronie. PHP zrozumie oba, ale nie ma
+        // powodu wysylac czegos innego niz panel.
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var body = 'fn=reassignComment&username=' + enc(BK_CS)
+                 + '&obj=auction&obj_id=' + enc(objId)
+                 + '&comment=' + enc(tekst) + '&field=responsible';
+        var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                       'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: body });
+        if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?') + ' przy odbijaniu komentarza');
+        return r.text();
+    }
+    // Calosc: odczyt auftragu po ksiegowaniu, wyjecie salda, odbicie. Kazdy krok moze sie
+    // nie udac osobno — i wtedy mowimy DOKLADNIE ktory, bo ksiegowania to nie cofa.
+    async function bkPoDelete(num){
+        var html = '';
+        try {
+            var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3',
+                                  { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { err: 'nie odczytałem auftragu po zaksięgowaniu' }; }
+        var d = new DOMParser().parseFromString(html, 'text/html');
+        var tekst = bkSaldoZKomentarzy(d);
+        if (!tekst) return { err: 'w komentarzach nie ma „Auftrag value - Total of Payments" '
+                                + '— odbij ręcznie' };
+        var oid = bkObjId(d, html);
+        if (!oid) return { err: 'nie odczytałem obj_id auftragu — odbij ręcznie' };
+        try { await bkOdbij(tekst, oid); } catch (e){ return { err: (e && e.message) || String(e) }; }
+        return { ok: true, tekst: tekst, objId: oid };
+    }
+
+    function po_kolor(st){ return (st && st.odbiteBlad) ? '#c47f00' : '#0a7a2f'; }
+    // Numer transakcji -> co o nim wiadomo. Trzymane poza zleceniem, bo to tylko odczyt.
+    var BK_NF = {};
+    async function bkSzukajNf(lista, btn, gotowe){
+        btn.disabled = true;
+        var idx = 0, zrobione = 0, wToku = 0;
+        async function jeden(){
+            while (idx < lista.length){
+                var nr = lista[idx++];
+                wToku++;
+                var st = BK_NF[nr] = { kand: [] };
+                try {
+                    var f = await bkSzukaj(nr);
+                    st.jak = f.jak || '';
+                    if (f.err && !f.nums.length) st.err = f.err;
+                    else if (!f.nums.length) st.stan = 'brak';
+                    else {
+                        // Czytamy KAZDEGO kandydata: przy kilku trzeba wiedziec,
+                        // ktory jest skasowany.
+                        for (var k = 0; k < f.nums.length; k++){
+                            var r = await bkCzytajAuftrag(f.nums[k]);
+                            st.kand.push({ num: f.nums[k], ok: !!r.ok, err: r.err || '',
+                                           deleted: r.deleted, open: r.open, nPay: r.nPay });
+                        }
+                    }
+                } catch (e){ st.err = (e && e.message) || String(e); }
+                wToku--; zrobione++;
+                // „gotowe" i „w toku" osobno: sam ulamek wygladal, jakby pozycje szly
+                // po jednej, a one lecą równolegle — tylko konczą sie w różnym czasie.
+                say('Szukam auftragów po numerze transakcji… gotowe ' + zrobione + '/' + lista.length
+                    + (wToku ? (' · w toku ' + wToku) : '')
+                    + ' (do ' + rownolegle() + ' naraz)', '#666');
+            }
+        }
+        var praca = [];
+        for (var q = 0; q < Math.max(1, Math.min(rownolegle(), lista.length)); q++) praca.push(jeden());
+        await Promise.all(praca);
+        say('Szukanie skończone.', '#0a7a2f');
+        btn.disabled = false;
+        if (gotowe) gotowe();
+    }
+    // Druga droga: po otwartej kwocie i dacie. Wchodzimy w kazdego kandydata z okna dat
+    // i zostawiamy tych, ktorzy maja w srodku tabelke eupago — bo to slad po nieudanej
+    // probie zaplaty, czyli powod, dla ktorego tej wplaty nie ma pod numerem transakcji.
+    async function bkSzukajPoKwocieIDacie(nr, kwota, iso, F, btn, gotowe){
+        var st = BK_NF[nr] || (BK_NF[nr] = { kand: [] });
+        st.kw = { szukane: 0, zEu: [], err: '', okno: '' };
+        btn.disabled = true;
+        if (kwota == null || !isFinite(kwota)){ st.kw.err = 'nie odczytałem wpłaty'; btn.disabled = false; if (gotowe) gotowe(); return; }
+        if (!iso){ st.kw.err = 'nie znam daty płatności tego numeru — wgraj plik jeszcze raz'; btn.disabled = false; if (gotowe) gotowe(); return; }
+        say('Szukam auftragów z otwartą kwotą ' + f2(kwota) + ' ' + (F.waluta || 'EUR') + '…', '#666');
+        var r = await bkSzukajPoKwocie(kwota, F.waluta);
+        if (r.err){ st.kw.err = r.err; btn.disabled = false; say(r.err, '#c00'); if (gotowe) gotowe(); return; }
+        var dni = oknoDni();
+        var w = (r.lista || []).filter(function (x){
+            var d = bkDniRoznica(bkDzien(x.data), iso);
+            return d != null && Math.abs(d) <= dni;
+        });
+        st.kw.wszystkich = (r.lista || []).length;
+        st.kw.stron = r.stron || 1;
+        st.kw.okno = 'od ' + dni + ' dni przed do ' + dni + ' dni po ' + iso;
+        var idx = 0, zrobione = 0, wToku = 0;
+        async function czytaj(){
+            while (idx < w.length){
+                var x = w[idx++];
+                wToku++;
+                try {
+                    var a = await bkCzytajAuftrag(x.num);
+                    if (a.eu && a.eu.length)
+                        st.kw.zEu.push({ num: x.num, data: x.data,
+                                         open: (a.open != null ? a.open : x.open),
+                                         oferta: x.oferta, deleted: a.deleted, eu: a.eu });
+                } catch (e){ /* jeden nieodczytany auftrag nie przerywa calego przegladu */ }
+                wToku--;
+                st.kw.szukane = ++zrobione;
+                say('Sprawdzam auftragi… gotowe ' + zrobione + '/' + w.length
+                    + (wToku ? (' · w toku ' + wToku) : '')
+                    + ' (do ' + rownolegle() + ' naraz) · z tabelką eupago: ' + st.kw.zEu.length, '#666');
+            }
+        }
+        var praca = [];
+        for (var q = 0; q < Math.max(1, Math.min(rownolegle(), w.length)); q++) praca.push(czytaj());
+        await Promise.all(praca);
+        // Po rownoleglym czytaniu kolejnosc jest przypadkowa — ustawiamy po dacie, zeby
+        // lista wygladala tak samo przy kazdym uruchomieniu.
+        st.kw.zEu.sort(function (a, b){ return a.data < b.data ? -1 : (a.data > b.data ? 1 : 0); });
+        say('Sprawdzone ' + w.length + ' auftragów, z tabelką eupago: ' + st.kw.zEu.length + '.', '#0a7a2f');
+        btn.disabled = false;
+        if (gotowe) gotowe();
+    }
+    // Propozycje pod tabela NOT FOUND — osobno, bo nie miesci sie w jednej komorce.
+    function bkPropozycje(j, nf){
+        var h = '';
+        nf.forEach(function (x){
+            var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+            var st = BK_NF[nr];
+            if (!st || !st.kw) return;
+            var k = st.kw;
+            h += '<div style="margin:6px 0;padding:6px 8px;background:#faf7f6;border:1px solid #DBD9D7;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#750000">Propozycje dla ' + esc(nr) + '</b>'
+              +  '<div style="font-size:10px;color:#888;margin-top:2px">';
+            if (k.err){
+                h += '<span style="color:#c00">' + esc(k.err) + '</span></div></div>';
+                return;
+            }
+            h += 'auftragów z otwartą kwotą ' + f2(bkNum(x.amount)) + ' ' + esc((fmt(j.format || S.format).waluta) || 'EUR')
+              +  ': <b>' + (k.wszystkich || 0) + '</b> · w oknie (' + esc(k.okno) + ') sprawdzonych: <b>' + k.szukane + '</b>'
+              +  ' · z tabelką eupago: <b>' + k.zEu.length + '</b>'
+              +  (k.stron > 1 ? (' · <span style="color:#c47f00">wyników jest ' + k.stron
+                                 + ' stron, biorę tylko pierwszą</span>') : '')
+              +  '</div>';
+            if (!k.zEu.length){
+                h += '<div style="font-size:11px;color:#c47f00;margin-top:3px">Żaden auftrag z tego okna nie ma tabelki '
+                  +  'eupago — poszerz okno dat albo szukaj ręcznie.</div></div>';
+                return;
+            }
+            h += '<table style="border-collapse:collapse;font-size:11px;margin-top:4px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Auftrag</td>'
+              +  '<td style="padding:1px 6px">End date</td><td style="padding:1px 6px;text-align:right">Open</td>'
+              +  '<td style="padding:1px 6px">Próba zapłaty w auftragu (data · kwota · referencia · token)</td>'
+              +  '<td style="padding:1px 6px"></td></tr>';
+            var iso = ((j && j.daty) || {})[nr] || '';
+            var kw = bkNum(x.amount);
+            k.zEu.forEach(function (c){
+                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
+                  +  '<a href="/auction.php?number=' + esc(c.num) + '&txnid=3" target="_blank">' + esc(c.num) + '</a>'
+                  +  (c.deleted === true ? ' <b style="color:#c00">DELETED</b>' : '') + '</td>'
+                  +  '<td style="padding:2px 6px;white-space:nowrap">' + esc(c.data) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (c.open == null ? '—' : f2(c.open)) + '</td>'
+                  +  '<td style="padding:2px 6px;font-size:10px">'
+                  +  c.eu.map(function (e){
+                        // Status z eupago: „Expired"/„Canceled" znaczy, ze tamta proba
+                        // NIE doszla — czyli ten auftrag czeka wlasnie na te wplate.
+                        var stn = '';
+                        if (e.stan && e.stan.kod)
+                            stn = ' <b style="color:' + (euNieDoszla(e.stan.kod) ? '#0a7a2f' : '#c47f00')
+                                + '">' + esc(e.stan.opis) + '</b>'
+                                + (euNieDoszla(e.stan.kod) ? ' <span style="color:#0a7a2f">← ta próba nie doszła</span>' : '');
+                        else if (e.stan && e.stan.err)
+                            stn = ' <span style="color:#c00">' + esc(e.stan.err) + '</span>';
+                        return esc(e.data) + ' · ' + esc(e.kwota) + ' · ' + esc(e.ref)
+                             + ' · <span style="font-family:monospace">' + esc(e.token) + '</span>'
+                             + (e.book ? ' <span style="color:#c47f00">[niezaksięgowana]</span>' : '')
+                             + stn
+                             + ' <button class="bk-kop" data-t="' + esc(e.token) + '" style="padding:0 5px;border:1px solid #ccc;'
+                             + 'border-radius:4px;background:#fff;cursor:pointer;font-size:9px">kopiuj token</button>';
+                     }).join('<br>')
+                  +  '</td>'
+                  +  '<td style="padding:2px 6px">'
+                  +  (iso && kw != null
+                        ? ('<button class="bk-nf-ks" data-nr="' + esc(nr) + '" data-num="' + esc(c.num)
+                           + '" data-amt="' + esc(String(kw)) + '" data-iso="' + esc(iso) + '"'
+                           + ' data-del="' + (c.deleted === true ? '1' : '0') + '"'
+                           + ' style="padding:2px 8px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;'
+                           + 'cursor:pointer;font-size:10px">💾 Zaksięguj tutaj</button>')
+                        : '<span style="color:#888;font-size:10px">brak daty</span>')
+                  +  '</td></tr>';
+            });
+            h += '</table>'
+              +  '<div style="margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+              +  '<button class="bk-eu-st" data-nr="' + esc(nr) + '" style="padding:3px 10px;border:1px solid #750000;'
+              +  'border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px" '
+              +  'title="Pyta panel eupago o status każdej próby zapłaty z powyższej listy.">'
+              +  '🔁 Sprawdź statusy w eupago</button>'
+              +  '<span style="font-size:10px;color:#888">wymaga otwartej i zalogowanej karty '
+              +  'https://clientes.eupago.pt</span></div>'
+              +  '<div style="font-size:10px;color:#888;margin-top:3px">Jeśli tamta próba jest <b>Expired</b> albo '
+              +  'anulowana, to ten auftrag czeka na Twoją wpłatę. Możesz też skopiować token i sprawdzić go '
+              +  'ręcznie w panelu (Consult Transactions → Identifier).</div></div>';
+        });
+        return h;
+    }
+    // Co pokazac w kolumnie „Auftrag" przy wierszu NOT FOUND. „j" jest potrzebne, bo
+    // z niego bierze sie data platnosci tego numeru — a bez daty nie ma czego ksiegowac.
+    function bkNfKom(j, nr, kwota){
+        var st = BK_NF[nr];
+        if (!st) return '<span style="color:#888">—</span>';
+        if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu '
+                          + esc(st.zaks) + '</span>'
+                          + (st.odbite ? ('<div style="font-size:10px;color:#0a7a2f">↪ komentarz „'
+                                          + esc(st.odbite) + '" odbity na ' + esc(BK_CS) + '</div>') : '')
+                          + (st.odbiteBlad ? ('<div style="font-size:10px;color:#c00">↪ komentarza NIE odbiłem: '
+                                          + esc(st.odbiteBlad) + '</div>') : '');
+        // Guzik drugiej drogi. Nalezy sie i wtedy, gdy wyszukiwarka nie zna numeru,
+        // i wtedy, gdy w ogole sie nie udala — w obu przypadkach zostaje szukanie
+        // po otwartej kwocie i dacie.
+        var poKwocie = ' <button class="bk-nf-kw" data-nr="' + esc(nr) + '" data-amt="' + esc(String(kwota))
+                     + '" style="margin-left:6px;padding:2px 8px;border:1px solid #750000;border-radius:5px;'
+                     + 'background:#fff;color:#750000;cursor:pointer;font-size:10px">🔎 Szukaj po kwocie i dacie</button>';
+        if (st.err) return '<span style="color:#c00">' + esc(st.err) + '</span>' + poKwocie;
+        // Wyszukiwarka nie zna numeru: najczesciej dlatego, ze WCZESNIEJSZA proba zaplaty
+        // na eupago zostala anulowana — w auftragu jest po niej tabelka, ale tego numeru
+        // w nim nie ma. Wtedy szuka sie po otwartej kwocie i dacie.
+        if (st.stan === 'brak' || !st.kand.length)
+            return '<span style="color:#c00">wyszukiwarka nie zna tego numeru</span>' + poKwocie;
+        var lnk = function (n){
+            return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank">' + esc(n) + '</a>';
+        };
+        if (st.kand.length > 1)
+            return '<span style="color:#c47f00">kilka auftragów: ' + st.kand.map(function (c){
+                return lnk(c.num) + (c.deleted ? ' <b>DELETED</b>' : '');
+            }).join(', ') + ' — rozstrzygnij ręcznie</span>';
+        var c = st.kand[0];
+        var opis = 'auftrag ' + lnk(c.num)
+                 + (c.deleted === true ? ' <b>DELETED</b>' : (c.deleted === false ? ' (aktywny)' : ' (statusu nie odczytałem)'));
+        var iso = ((j && j.daty) || {})[nr] || '';
+        var guzik = function (napis, tlo, del){
+            if (!iso) return ' <span style="color:#c47f00">— nie znam daty płatności tego numeru '
+                           + '(wgraj plik jeszcze raz), więc nie księguję</span>';
+            if (kwota == null || !isFinite(kwota))
+                return ' <span style="color:#c47f00">— nie odczytałem wpłaty, nie księguję</span>';
+            return ' <button class="bk-nf-ks" data-nr="' + esc(nr) + '" data-num="' + esc(c.num)
+                 + '" data-amt="' + esc(String(kwota)) + '" data-iso="' + esc(iso) + '"'
+                 + ' data-del="' + (del ? '1' : '0') + '"'
+                 + ' style="margin-left:6px;padding:2px 8px;border:none;border-radius:5px;background:' + tlo
+                 + ';color:#fff;cursor:pointer;font-size:10px">' + napis + '</button>';
+        };
+        if (!c.ok && c.deleted !== true) return '<span style="color:#c00">' + opis + ' — ' + esc(c.err || 'nie odczytałem') + '</span>';
+        // Skasowane zamowienie: wplata przyszla, a zwrotu nie ma — trzeba zaksiegowac
+        // mimo delete, inaczej pieniadze zawisaja bez pokrycia.
+        if (c.deleted === true)
+            return '<span style="color:#0a7a2f">' + opis + '</span>'
+                 + guzik('💾 Zaksięguj mimo delete', '#5b21b6', true);
+        if (c.open == null)
+            return '<span style="color:#c47f00">' + opis + ' — nie odczytałem open amount, sprawdź ręcznie</span>';
+        // Auftrag zywy: ksiegowac wolno tylko wtedy, gdy JEST NA CZYM. Przy auftragu juz
+        // oplaconym jedno klikniecie zrobiloby nadplate, wiec zamiast guzika sa obie liczby.
+        if (c.open + 0.005 < kwota)
+            return '<span style="color:#c00">' + opis + ' — open amount ' + f2(c.open)
+                 + ' nie pokrywa wpłaty ' + f2(kwota) + ', księguj ręcznie</span>';
+        return '<span style="color:#0a7a2f">' + opis + ' · open ' + f2(c.open) + '</span>'
+             + guzik('💾 Zaksięguj na tym auftragu', '#0a7a2f');
+    }
+
+    // ---------- stan ----------
+    var S = { format: BK_FORMATY[0].id, plik: null, rows: null, zmKwot: 0, zmDat: 0,
+              nazwa: '', banki: null, ksieg: null };
+    function job(){ var o = jGet(BK_JOB_KEY); return (o && o.impId) ? o : null; }
+    function jobZapisz(o){ jSet(BK_JOB_KEY, o || {}); }
+
+    // ---------- ekran ----------
+    var btn = document.createElement('button');
+    btn.id = 'bank-btn';
+    btn.textContent = '🏦 Bank Import';
+    btn.style.cssText = 'position:fixed;top:338px;right:20px;z-index:999999;padding:10px 15px;'
+                      + 'background:#FF2F00;color:#fff;border:none;border-radius:8px;cursor:pointer;'
+                      + 'font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2)';
+
+    var panel = document.createElement('div');
+    panel.id = 'bank-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:204px;right:20px;z-index:999999;'
+                        + 'background:white;border:1px solid #ccc;border-radius:10px;'
+                        + 'box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:16px;'
+                        + 'width:min(960px, calc(100vw - 40px));font-family:sans-serif;'
+                        + 'max-height:calc(100vh - 224px);overflow-y:auto';
+    (document.body || document.documentElement).appendChild(btn);
+    (document.body || document.documentElement).appendChild(panel);
+    btn.onclick = function (){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; };
+
+    function $(s){ return panel.querySelector(s); }
+    function say(t, c){ var e = $('#bk-status'); if (e){ e.innerHTML = t; e.style.color = c || '#333'; } }
+
+    function rysuj(){
+        var F = fmt(S.format), c = ustaw(S.format), j = job();
+        var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+              + '<div style="font-weight:bold;color:#111;font-size:15px">🏦 Bank Import'
+              + ' <span style="font-weight:normal;font-size:11px;color:#750000">HUB v' + esc(BK_VER) + '</span></div>'
+              + '<span id="bk-close" style="cursor:pointer;color:#888;font-size:18px;line-height:1">×</span></div>'
+              + '<div style="font-size:11px;color:#666;margin-bottom:10px">Plik przerabiam tak samo jak stara aplikacja '
+              + '(moduł Bank), a potem wysyłam go do <b>Import payments</b> w prologistics. Import sam nie księguje — '
+              + 'tworzy paczkę, a księguje dopiero „Zaksięguj OK”, czyli przycisk „Book on main account”.</div>';
+
+        // --- format ---
+        h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">1 · Format pliku</div>'
+          +  '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">';
+        BK_FORMATY.forEach(function (x){
+            var on = x.id === S.format;
+            h += '<button class="bk-fmt" data-id="' + esc(x.id) + '" style="padding:8px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:700;'
+              +  (on ? 'border:none;background:#0a7a2f;color:#fff' : 'border:1px solid #ccc;background:#f6f6f6;color:#333') + '">'
+              +  esc(x.nazwa) + '</button>';
+        });
+        h += '</div><div style="font-size:10px;color:#888;margin-bottom:10px">' + esc(F.opis)
+          +  (F.konto ? (' · konto w planie kont: <b>' + esc(F.konto) + '</b>') : '') + '</div>';
+
+        // --- ustawienia importu ---
+        h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">2 · Ustawienia importu w prologistics</div>'
+          +  '<div style="padding:8px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;margin-bottom:10px">';
+        if (!S.banki || !S.ksieg){
+            h += '<div style="font-size:11px;color:#750000;margin-bottom:6px">Listy biorę z prologistics — nic nie zgaduję. '
+              +  (c.bank ? ('Zapisane: bank_setting <b>' + esc(c.bank) + '</b> (' + esc(c.bankNm || '?') + '), booking_setting <b>' + esc(c.booking) + '</b> (' + esc(c.bookingNm || '?') + ').')
+                         : 'Nic jeszcze nie wybrane.')
+              +  '</div><button id="bk-listy" style="padding:6px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz listy ustawień</button>';
+        } else {
+            var pB = bkPodpowiedz(S.banki, F);
+            var opcje = function (map, wyb){
+                var ids = Object.keys(map).filter(function (i){ return !map[i].off; })
+                    .sort(function (a, b){ return map[a].nm.localeCompare(map[b].nm); });
+                var s = '<option value="">— wybierz —</option>';
+                ids.forEach(function (i){
+                    s += '<option value="' + esc(i) + '"' + (String(wyb) === String(i) ? ' selected' : '') + '>'
+                      +  esc(map[i].nm) + ' (' + esc(i) + ')</option>';
+                });
+                return s;
+            };
+            h += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+              +  '<label style="font-size:11px;color:#750000;font-weight:700">bank_setting</label>'
+              +  '<select id="bk-bank" style="font-size:11px;padding:4px;max-width:320px">' + opcje(S.banki, c.bank) + '</select>'
+              +  '<label style="font-size:11px;color:#750000;font-weight:700">booking_setting</label>'
+              +  '<select id="bk-book" style="font-size:11px;padding:4px;max-width:280px">' + opcje(S.ksieg, c.booking) + '</select>'
+              +  '<button id="bk-zapisz" style="padding:5px 12px;border:none;border-radius:6px;background:#0a7a2f;color:#fff;font-weight:700;cursor:pointer;font-size:11px">💾 Zapisz</button>'
+              +  '<button id="bk-listy" style="padding:5px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px">↻ Odśwież listy</button>'
+              +  '</div>'
+              +  '<div style="font-size:10px;color:#750000;margin-top:5px">'
+              +  (pB.length ? ('Po nazwie pasuje: <b>' + pB.map(function (x){ return esc(x.nm) + ' (' + esc(x.id) + ')'; }).join(', ') + '</b>. ')
+                            : ('Żaden aktywny wpis nie ma w nazwie „' + esc(F.nazwa) + '” — wskaż go z listy sam. '))
+              +  'booking_setting mówi, PO CZYM prologistics dopasowuje wiersze do auftragów; zły kończy się paczką, w której nic się nie dopasowało.'
+              +  (bkKotwicaBank(S.banki) ? '' : ' <span style="color:#c00">⚠ na liście banków nie ma znanej pozycji 157 „Vente Unique DE” — sprawdź, czy to ta lista.</span>')
+              +  '</div>';
+        }
+        h += '</div>';
+
+        // --- plik ---
+        h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">3 · Plik z banku</div>'
+          +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+          +  '<input type="file" id="bk-plik" accept=".csv,.xlsx,.xls" style="font-size:12px">'
+          +  '<span style="font-size:10px;color:#888">CSV (średnik, UTF-8) albo XLSX</span></div>';
+
+        if (S.rows){
+            var d = S.rows;
+            h += '<div style="padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:8px">'
+              +  '<div style="font-size:12px;color:#0a7a2f;font-weight:700">✓ ' + esc(S.plik) + ' → ' + esc(S.nazwa) + '</div>'
+              +  '<div style="font-size:11px;color:#166534;margin-top:2px">wierszy danych: <b>' + (d.length - 1) + '</b>'
+              +  ' · poprawionych kwot: <b>' + S.zmKwot + '</b> (kolumna ' + F.kwoty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')'
+              +  ' · poprawionych dat: <b>' + S.zmDat + '</b> (kolumna ' + F.daty.map(function (k){ return esc(d[0][k] || ('#' + k)); }).join(', ') + ')</div>'
+              +  '<details style="margin-top:5px"><summary style="font-size:11px;color:#166534;cursor:pointer;font-weight:700">Podgląd pierwszych wierszy</summary>'
+              +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:10px;margin-top:4px;font-family:monospace">';
+            d.slice(0, 6).forEach(function (r, i){
+                h += '<tr style="' + (i ? 'border-top:1px solid #dcfce7' : 'font-weight:700;color:#666') + '">';
+                r.forEach(function (v, k){
+                    var pod = (F.kwoty.indexOf(k) >= 0 || F.daty.indexOf(k) >= 0) && i > 0;
+                    h += '<td style="padding:1px 5px;white-space:nowrap' + (pod ? ';background:#dcfce7;font-weight:700' : '') + '">' + esc(v) + '</td>';
+                });
+                h += '</tr>';
+            });
+            h += '</table></div></details></div>'
+              +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
+              +  '<button id="bk-wyslij" style="padding:8px 16px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">📤 Wyślij do importu</button>'
+              +  '<button id="bk-pobierz" style="padding:8px 14px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;font-weight:700;cursor:pointer;font-size:12px">⬇ Pobierz plik</button>'
+              +  '</div>';
+        }
+
+        h += '<div id="bk-status" style="margin-top:4px;min-height:16px;font-size:12px;font-weight:bold"></div>';
+        h += '<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>';
+        panel.innerHTML = h;
+
+        $('#bk-close').onclick = function (){ panel.style.display = 'none'; };
+        panel.querySelectorAll('.bk-fmt').forEach(function (b){
+            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; rysuj(); };
+        });
+        var lb = $('#bk-listy');
+        if (lb) lb.onclick = async function (){
+            lb.disabled = true; say('pobieram listy ustawień…', '#666');
+            try {
+                var b = await bkLista(BK_BS_URL, 'banks_list');
+                var k = await bkLista(BK_BK_URL, 'bookings_list');
+                S.banki = b; S.ksieg = k;
+                jSet(BK_BS_KEY, b); jSet(BK_BK_KEY, k);
+                // Podpowiedz wchodzi do pola tylko wtedy, gdy pasuje DOKLADNIE JEDEN
+                // aktywny wpis i nic jeszcze nie bylo wybrane. „Prawie pasuje" jest tu
+                // gorsze niz puste pole.
+                var cc = ustaw(S.format), F2 = fmt(S.format), p = bkPodpowiedz(b, F2);
+                if (!cc.bank && p.length === 1){ cc.bank = p[0].id; cc.bankNm = p[0].nm; ustawZapisz(S.format, cc); }
+                rysuj();
+                say('Listy pobrane: ' + Object.keys(b).length + ' ustawień importu, ' + Object.keys(k).length + ' sposobów dopasowania.'
+                    + (bkKotwicaKsieg(k) ? '' : ' ⚠ nie widzę znanej pozycji 9 „Fulfillment No”.'), '#0a7a2f');
+            } catch (e){
+                say('Nie pobrałem list: ' + esc((e && e.message) || e), '#c00');
+                if ($('#bk-listy')) $('#bk-listy').disabled = false;
+            }
+        };
+        var zp = $('#bk-zapisz');
+        if (zp) zp.onclick = function (){
+            var b = $('#bk-bank').value, k = $('#bk-book').value;
+            if (!b || !k){ say('Wskaż oba ustawienia — bez nich nie wyślę pliku.', '#c47f00'); return; }
+            ustawZapisz(S.format, { bank: b, bankNm: (S.banki[b] || {}).nm || '',
+                                    booking: k, bookingNm: (S.ksieg[k] || {}).nm || '' });
+            say('Zapisane: ' + esc((S.banki[b] || {}).nm || b) + ' (' + esc(b) + ') · '
+                + esc((S.ksieg[k] || {}).nm || k) + ' (' + esc(k) + ').', '#0a7a2f');
+        };
+        $('#bk-plik').onchange = async function (){
+            var f = this.files && this.files[0];
+            if (!f) return;
+            say('czytam plik…', '#666');
+            try {
+                var aoa = await bkCzytaj(f);
+                var w = bkPrzerob(aoa, fmt(S.format));
+                if (w.err){ S.rows = null; rysuj(); say(esc(w.err), '#c00'); return; }
+                S.plik = f.name; S.rows = w.rows; S.zmKwot = w.zmKwot; S.zmDat = w.zmDat;
+                S.nazwa = bkNazwa(fmt(S.format));
+                rysuj();
+                say('Przerobione. Sprawdź podgląd i wyślij do importu.', '#0a7a2f');
+            } catch (e){ S.rows = null; rysuj(); say('Nie przerobiłem pliku: ' + esc((e && e.message) || e), '#c00'); }
+        };
+        var pb = $('#bk-pobierz');
+        if (pb) pb.onclick = function (){
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(bkBlob(S.rows));
+            a.download = S.nazwa;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+            say('Zapisane: ' + esc(S.nazwa), '#0a7a2f');
+        };
+        var wb = $('#bk-wyslij');
+        if (wb) wb.onclick = async function (){
+            var cfg = ustaw(S.format);
+            if (!cfg.bank || !cfg.booking){ say('Najpierw wskaż ustawienia importu (krok 2).', '#c47f00'); return; }
+            if (!confirm('Wysłać ' + (S.rows.length - 1) + ' wierszy do Import payments?\n\n'
+                + 'Plik: ' + S.nazwa + '\n'
+                + 'Ustawienie importu: ' + (cfg.bankNm || '?') + ' (' + cfg.bank + ')\n'
+                + 'Dopasowanie: ' + (cfg.bookingNm || '?') + ' (' + cfg.booking + ')\n'
+                + 'Data księgowania: z wiersza pliku (nie nadpisuję)\n\n'
+                + 'Import utworzy paczkę. NIE zaksięguje jej — to osobny przycisk.')) return;
+            wb.disabled = true; say('wysyłam…', '#666');
+            try {
+                var imp = await bkWyslij(bkBlob(S.rows), S.nazwa, cfg);
+                jobZapisz({ impId: imp, nazwa: S.nazwa, format: S.format, wierszy: S.rows.length - 1,
+                            czas: new Date().toISOString(), booked: false,
+                            daty: bkMapaDat(S.rows, fmt(S.format)) });
+                if (!imp){ say('Plik poszedł, ale nie odczytałem numeru paczki — wejdź na Import payments ręcznie.', '#c47f00'); return; }
+                say('Paczka <b>' + esc(imp) + '</b> utworzona — jeszcze NIEZAKSIĘGOWANA. Odczytuję…', '#0a7a2f');
+                await sprawdz();
+            } catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
+            finally { if ($('#bk-wyslij')) $('#bk-wyslij').disabled = false; }
+        };
+        if (j) sprawdz();
+    }
+
+    // Paczka odczytana z prologistics — stan bierze sie z systemu, a nie z tego,
+    // co sami wyslalismy.
+    async function sprawdz(){
+        var j = job(); if (!j) return;
+        var box = $('#bk-imp'); if (!box) return;
+        box.style.display = 'block';
+        box.innerHTML = '<div style="font-size:11px;color:#666">odczytuję paczkę ' + esc(j.impId) + '…</div>';
+        try {
+            var d = await bkPaczka(j.impId);
+            if (!j.booked) d = await bkProstujNumery(j, d, box);
+            rysujPaczke(j, d);
+        }
+        catch (e){ box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(j.impId)
+                                 + ': ' + esc((e && e.message) || e) + '</div>'; }
+    }
+
+    // Wiersze z numerem zamowienia zamiast transakcji ustawiamy na OK od razu po odczycie
+    // paczki. KAZDY wiersz ruszamy tylko RAZ: numery, ktore sie zapisaly, pamietamy przy
+    // zleceniu — dzieki temu „↻ Odśwież" nie krazy w kolko, a wiersz, ktoremu zapis nie
+    // wyszedl, dostaje kolejna szanse przy nastepnym odswiezeniu.
+    async function bkProstujNumery(j, d, box){
+        var zrobione = (job() || {}).autoOk || [];
+        var doOk = d.rows.filter(function (x){
+            return String(x.state) === 'CHECK' && bkToNumerZamowienia(x)
+                && zrobione.indexOf(String(x.id)) < 0;
+        });
+        if (!doOk.length) return d;
+        var udane = [], bledy = [];
+        for (var i = 0; i < doOk.length; i++){
+            box.innerHTML = '<div style="font-size:11px;color:#666">numer zamówienia zamiast transakcji — '
+                          + 'ustawiam OK… ' + (i + 1) + '/' + doOk.length + '</div>';
+            try { await bkStan(j.impId, doOk[i].id, 'OK'); udane.push(String(doOk[i].id)); }
+            catch (e){ bledy.push(String(doOk[i].payment_descr) + ' — ' + ((e && e.message) || e)); }
+        }
+        var o = job() || j;
+        o.autoOk = zrobione.concat(udane);
+        o.autoOkOpis = { ile: udane.length, bledy: bledy };
+        jobZapisz(o);
+        j.autoOk = o.autoOk; j.autoOkOpis = o.autoOkOpis;
+        // Stan czytamy z systemu jeszcze raz: pokazujemy to, co prologistics NAPRAWDE ma,
+        // a nie to, co sami wyslalismy.
+        return await bkPaczka(j.impId);
+    }
+
+    function rysujPaczke(j, d){
+        var box = $('#bk-imp'); if (!box) return;
+        var rows = d.rows, col = d.colours || {};
+        var by = {};
+        rows.forEach(function (x){ var s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
+        var ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
+        // Prologistics samo oznacza pozycje, ktore juz kiedys wczytano — to jedyna
+        // kontrola dzialajaca niezaleznie od tego, kto i czym je wprowadzil.
+        var seen = rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; });
+
+        var h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;padding-top:8px;border-top:1px solid #eee">'
+              + '<b style="font-size:11px;color:#5b21b6">Paczka importu ' + esc(j.impId) + '</b>'
+              + '<a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
+              + '<span style="font-size:11px;color:#666">wierszy ' + rows.length + '</span>';
+        Object.keys(by).sort().forEach(function (s){
+            h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">'
+              +  esc(s) + ': ' + by[s].length + '</span>';
+        });
+        h += '<button id="bk-imp-re" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
+          +  '<button id="bk-imp-zap" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="Zapomnij tę paczkę — panel przestanie ją pokazywać. W prologistics nic się nie zmieni.">✕ Zapomnij paczkę</button>'
+          +  '</div>';
+
+        if (seen.length){
+            h += '<div style="margin:6px 0;padding:5px 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#c2410c">Prologistics zna już ' + seen.length + ' z tych płatności</b>'
+              +  '<div style="font-size:10px;color:#7c2d12;margin-top:2px">Były wczytane wcześniej — sprawdź, czy nie księgujesz drugi raz: '
+              +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', '))
+              +  (seen.length > 12 ? (' … +' + (seen.length - 12)) : '') + '</div></div>';
+        }
+        var tab = function (tytul, kolor, lista, opis){
+            var t = '<div style="margin:6px 0"><b style="font-size:11px;color:' + kolor + '">' + tytul + ' (' + lista.length + ')</b>'
+                  + (opis ? ('<div style="font-size:10px;color:#888;margin-top:2px">' + opis + '</div>') : '')
+                  + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+                  + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer w pliku</td>'
+                  + '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+                  + '<td style="padding:1px 6px;text-align:right">Open amount</td>'
+                  + '<td style="padding:1px 6px;text-align:right">Różnica</td>'
+                  + '<td style="padding:1px 6px">Auftrag</td></tr>';
+            lista.forEach(function (x){
+                var a = bkNum(x.amount), o = bkNum(x.open_amount);
+                var df = (a != null && o != null) ? r2(a - o) : null;
+                var au = bkAukcja(x);
+                t += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:#c00">' + (df == null ? '—' : f2(df)) + '</td>'
+                  +  '<td style="padding:2px 6px">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td></tr>';
+            });
+            return t + '</table></div></div>';
+        };
+        // CHECK to nie zawsze rozjazd kwoty — przy numerze zamowienia zamiast transakcji
+        // kwota zgadza sie co do grosza. Rozdzielamy wiec oba przypadki, zeby naglowek
+        // nie mowil czegos, czego w tabeli nie widac.
+        var zNumerem = chk.filter(bkToNumerZamowienia);
+        var doWyj = chk.filter(function (x){ return zNumerem.indexOf(x) < 0; });
+        var ao = j.autoOkOpis;
+        if (ao && (ao.ile || (ao.bledy && ao.bledy.length))){
+            h += '<div style="margin:6px 0;padding:5px 7px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#0a7a2f">Ustawiłem OK na ' + ao.ile + ' wierszach</b>'
+              +  '<div style="font-size:10px;color:#166534;margin-top:2px">W pliku stoi numer zamówienia zamiast '
+              +  'identyfikatora transakcji. Prologistics daje wtedy CHECK, choć auftrag jest odnaleziony, '
+              +  'a wpłata zgadza się z open amount co do grosza. Odpowiada to ręcznej zmianie statusu na OK.</div>'
+              +  (ao.bledy && ao.bledy.length
+                    ? ('<div style="font-size:10px;color:#c00;margin-top:2px">Nie zapisało się przy: '
+                       + esc(ao.bledy.join(' · ')) + ' — „↻ Odśwież" spróbuje jeszcze raz.</div>') : '')
+              +  '</div>';
+        }
+        if (zNumerem.length)
+            h += tab('Numer zamówienia zamiast transakcji — status się NIE zapisał', '#c47f00', zNumerem,
+                     'Kwota zgadza się z open amount, więc nie ma tu czego wyjaśniać — nie udało się tylko '
+                     + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.');
+        if (doWyj.length)
+            h += tab('CHECK — do wyjaśnienia', '#c47f00', doWyj,
+                     'Prologistics oznaczyło te wiersze do sprawdzenia. Różnica 0.00 znaczy, że powodem '
+                     + 'NIE jest kwota — wtedy zajrzyj w auftrag.');
+        if (nf.length){
+            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND — prologistics nie znalazł auftragu ('
+              +  nf.length + ')</b>'
+              +  ' <button id="bk-nf" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" '
+              +  'title="Szuka auftragu w wyszukiwarce prologistics po numerze transakcji z eupago — kryterium „payment comment”.">'
+              +  '🔍 Szukaj auftragów po numerze transakcji</button>'
+              +  '<div style="font-size:10px;color:#888;margin-top:2px">Przy eupago to najczęściej zamówienie '
+              +  '<b>skasowane</b> — import po numerze fulfilmentu takiego nie widzi. Numer transakcji z pliku '
+              +  'siedzi natomiast w komentarzu płatności, więc wyszukiwarka go zna: to dokładnie to, co robisz '
+              +  'ręcznie w <span style="font-family:monospace">search.php?express</span>, wpisując numer w pole '
+              +  '„payment comment”.</div>'
+              +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer transakcji</td>'
+              +  '<td style="padding:1px 6px">Data płatności</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px">Auftrag po numerze transakcji</td></tr>';
+            nf.forEach(function (x){
+                var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+                var a = bkNum(x.amount);
+                // Data platnosci pochodzi z PLIKU (kolumna Payment Date przy tym numerze) —
+                // paczka importu daty nie oddaje.
+                var iso = ((j && j.daty) || {})[nr] || '';
+                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
+                  +  (nr ? esc(nr) : '<span style="color:#c00">brak numeru w paczce</span>') + '</td>'
+                  +  '<td style="padding:2px 6px;white-space:nowrap">'
+                  +  (iso ? esc(iso) : '<span style="color:#c47f00">— (wgraj plik jeszcze raz)</span>') + '</td>'
+                  +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+                  +  '<td style="padding:2px 6px">' + bkNfKom(j, nr, a) + '</td></tr>';
+            });
+            h += '</table></div>'
+              +  '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+              +  '<span style="font-size:10px;color:#666">okno dat przy szukaniu po kwocie: ±</span>'
+              +  '<input id="bk-okno" value="' + oknoDni() + '" style="width:34px;font-size:10px;text-align:right">'
+              +  '<span style="font-size:10px;color:#666">dni</span>'
+              +  '<span style="font-size:10px;color:#666;margin-left:8px">czytaj po</span>'
+              +  '<input id="bk-rown" value="' + rownolegle() + '" style="width:30px;font-size:10px;text-align:right">'
+              +  '<span style="font-size:10px;color:#666">auftragów naraz</span>'
+              +  '<button id="bk-okno-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
+              +  '</div>'
+              +  bkPropozycje(j, nf)
+              +  '</div>';
+        }
+
+        var moge = ok.length > 0 && !j.booked;
+        h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +  '<button id="bk-ksieguj"' + (moge ? '' : ' disabled')
+          +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (moge ? '#5b21b6' : '#c7c7c7')
+          +  ';color:#fff;font-weight:700;cursor:' + (moge ? 'pointer' : 'default') + ';font-size:12px">'
+          +  (j.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>'
+          +  '<span style="font-size:10px;color:#888">Odpowiada przyciskowi „' + esc(BK_BLOCK_OPIS)
+          +  '". CHECK i NOT FOUND zostają nietknięte.</span>'
+          +  '<span id="bk-ksieguj-msg" style="font-size:11px;color:#666"></span></div>';
+        box.innerHTML = h;
+
+        $('#bk-imp-re').onclick = function (){ sprawdz(); };
+        var nfb = $('#bk-nf');
+        if (nfb) nfb.onclick = function (){
+            var lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
+                          .filter(function (x){ return x; });
+            if (!lista.length){ say('Te wiersze nie mają numeru w paczce — nie ma czego szukać.', '#c47f00'); return; }
+            bkSzukajNf(lista, nfb, function (){ rysujPaczke(j, d); });
+        };
+        var ok2 = $('#bk-okno-set');
+        if (ok2) ok2.onclick = function (){
+            var v = parseInt(String($('#bk-okno').value || ''), 10);
+            if (!isFinite(v) || v < 0 || v > 30){ say('Podaj liczbę dni od 0 do 30.', '#c47f00'); return; }
+            var r = parseInt(String(($('#bk-rown') || {}).value || ''), 10);
+            if (!isFinite(r) || r < 1 || r > 8){ say('Podaj, ile auftragów naraz — od 1 do 8.', '#c47f00'); return; }
+            gmSet(BK_OKNO_KEY, v); gmSet(BK_ROWN_KEY, r); rysujPaczke(j, d);
+            say('Okno ±' + v + ' dni, czytam po ' + r + ' auftragów naraz.', '#0a7a2f');
+        };
+        box.querySelectorAll('.bk-nf-kw').forEach(function (b){
+            b.onclick = function (){
+                var nr = b.getAttribute('data-nr'), kw = Number(b.getAttribute('data-amt'));
+                var iso = ((j && j.daty) || {})[nr] || '';
+                bkSzukajPoKwocieIDacie(nr, kw, iso, fmt(j.format || S.format), b, function (){ rysujPaczke(j, d); });
+            };
+        });
+        box.querySelectorAll('.bk-eu-st').forEach(function (b){
+            b.onclick = function (){
+                bkEuStatusy(b.getAttribute('data-nr'), b, function (){ rysujPaczke(j, d); });
+            };
+        });
+        box.querySelectorAll('.bk-kop').forEach(function (b){
+            b.onclick = function (){
+                var t = b.getAttribute('data-t');
+                try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); }
+                catch (e){}
+                say('Skopiowane: ' + esc(t) + ' — wklej w eupago w „Consult Transactions → Identifier".', '#0a7a2f');
+            };
+        });
+        box.querySelectorAll('.bk-nf-ks').forEach(function (b){
+            b.onclick = async function (){
+                var nr = b.getAttribute('data-nr'), num = b.getAttribute('data-num');
+                var kw = Number(b.getAttribute('data-amt')), iso = b.getAttribute('data-iso');
+                var skasowany = b.getAttribute('data-del') === '1';
+                var F = fmt(j.format || S.format);
+                if (!confirm('Zaksięgować wpłatę na auftragu ' + num + '?\n\n'
+                    + 'Numer transakcji: ' + nr + '\n'
+                    + 'Kwota: ' + f2(kw) + '\n'
+                    + 'Konto: ' + F.konto + '\n'
+                    + 'Data: ' + iso + ' (z pliku)\n'
+                    + 'Komentarz płatności: pusty\n'
+                    + (skasowany
+                        ? ('\nAuftrag jest SKASOWANY, więc zaraz po zaksięgowaniu dopiszę komentarz\n'
+                           + 'z saldem („Auftrag value - Total of Payments: …") i odbiję go na '
+                           + BK_CS + '.\n')
+                        : '')
+                    + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
+                    + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+                b.disabled = true; b.textContent = 'księguję…';
+                var r = await bkKsiegujAuftrag(num, iso, F.konto, kw);
+                if (r.ok){
+                    var st2 = BK_NF[nr] || (BK_NF[nr] = {});
+                    st2.zaks = num;
+                    var dop = '';
+                    if (skasowany){
+                        b.textContent = 'odbijam komentarz…';
+                        var po = await bkPoDelete(num);
+                        st2.odbite = po.ok ? po.tekst : '';
+                        st2.odbiteBlad = po.err || '';
+                        // Nieudane odbicie NIE cofa ksiegowania — mowimy o tym wprost,
+                        // zeby bylo wiadomo, co zostalo do zrobienia ręcznie.
+                        dop = po.ok ? (' Komentarz „' + po.tekst + '" odbity na ' + BK_CS + '.')
+                                    : (' UWAGA: komentarza nie odbiłem — ' + po.err);
+                    }
+                    say('Zaksięgowane na auftragu ' + esc(num) + ' — ' + f2(kw) + ' na koncie '
+                        + esc(F.konto) + '.' + esc(dop), po_kolor(st2));
+                } else {
+                    say('Nie zaksięgowałem na auftragu ' + esc(num) + ': ' + esc(r.err || '?'), '#c00');
+                    b.disabled = false;
+                }
+                rysujPaczke(j, d);
+            };
+        });
+        $('#bk-imp-zap').onclick = function (){
+            if (!confirm('Zapomnieć paczkę ' + j.impId + '?\n\nW prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
+            jobZapisz({}); box.style.display = 'none'; box.innerHTML = '';
+        };
+        var bb = $('#bk-ksieguj');
+        if (bb) bb.onclick = async function (){
+            var m = $('#bk-ksieguj-msg');
+            if (!confirm('Zaksięgować ' + ok.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
+                + 'Paczka ' + j.impId + ' · ' + (j.nazwa || '') + '\n'
+                + 'Odpowiada to przyciskowi „' + BK_BLOCK_OPIS + '".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
+            try {
+                await bkKsieguj(j.impId, ok.map(function (x){ return x.id; }));
+                var o = job() || j; o.booked = true; jobZapisz(o);
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
+                await sprawdz();
+            } catch (e){
+                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
+                bb.disabled = false;
+            }
+        };
+    }
+
+    // Listy ustawien z poprzedniego uruchomienia — zeby po odswiezeniu strony nie
+    // trzeba bylo ich pobierac od nowa.
+    (function (){
+        var b = jGet(BK_BS_KEY), k = jGet(BK_BK_KEY);
+        if (Object.keys(b).length) S.banki = b;
+        if (Object.keys(k).length) S.ksieg = k;
+    })();
+    rysuj();
+})();
+    }
+
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
@@ -52138,6 +53793,7 @@
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
+        { id: 'bank',     name: 'Bank Import',               test: onProlo,   init: init_bank },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
@@ -52215,6 +53871,7 @@
             .bl-panel[data-bl-mod="issuelog"]{--bl-tint:#A4C2F4;}
             .bl-panel[data-bl-mod="marta"]   {--bl-tint:#DD7E6B;}
             .bl-panel[data-bl-mod="auftrag"] {--bl-tint:#9FC5E8;}
+            .bl-panel[data-bl-mod="bank"]    {--bl-tint:#D5A6BD;}
         `);
 
         // ===== dok paneli: obok siebie, nie jeden na drugim =====================
@@ -52231,6 +53888,7 @@
             { sel: '#ilp-search-panel', mod: 'issuelog', w: 430  },
             { sel: '#mkt-panel',        mod: 'marta',    w: 1100 },
             { sel: '#auftrag-panel',    mod: 'auftrag',  w: 1180 },
+            { sel: '#bank-panel',       mod: 'bank',     w: 960  },
         ];
         // Tylko te wlasnosci nadpisujemy i tylko te oddajemy przy zamknieciu.
         const BL_OWNED = ['position','left','right','top','transform','width',
@@ -52362,6 +54020,7 @@
             { id:'ksieg',    icon:svgIco('<path d="M15 5v2"/><path d="M15 11v2"/><path d="M15 17v2"/><path d="M5 5h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-3a2 2 0 0 0 0 -4v-3a2 2 0 0 1 2 -2"/>'), label:'Ksiegowanie w tickecie', sel:'#ksieg-btn' },
             { id:'auftrag',  icon:svgIco('<path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><rect x="9" y="3" width="6" height="4" rx="2"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie w auftragu', sel:'#auftrag-btn' },
             { id:'mkt',      icon:svgIco('<path d="M3 21h18"/><path d="M5 21v-10l7 -5l7 5v10"/><path d="M9 21v-6h6v6"/>'), label:"Ksiegowanie Marketplace's", sel:'#mkt-btn' },
+            { id:'bank',     icon:svgIco('<path d="M3 21l18 0"/><path d="M3 10l18 0"/><path d="M5 6l7 -3l7 3"/><path d="M4 10l0 11"/><path d="M20 10l0 11"/><path d="M8 14l0 3"/><path d="M12 14l0 3"/><path d="M16 14l0 3"/>'), label:'Bank Import', sel:'#bank-btn' },
             { id:'ins',      icon:svgIco('<path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 14.85a12 12 0 0 1 -8.5 -14.85a12 12 0 0 0 8.5 -3"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie INS', sel:'#ins-btn' },
             { id:'ucod',     icon:svgIco('<path d="M3 8l7.89 5.26a2 2 0 0 0 2.22 0l7.89 -5.26"/><rect x="3" y="5" width="18" height="14" rx="2"/>'), label:'Unpaid COD', sel:'#ucod-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
@@ -52389,6 +54048,7 @@
             { sel: '#ksieg-panel',      needX: true },
             { sel: '#auftrag-panel',    needX: false },
             { sel: '#mkt-panel',        needX: false },
+            { sel: '#bank-panel',       needX: false },
             { sel: '#ins-panel',        needX: true },
             { sel: '#refund-panel',     needX: true },
             { sel: '#klient-panel',     needX: true },
