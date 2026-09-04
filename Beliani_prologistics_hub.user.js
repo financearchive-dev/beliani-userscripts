@@ -14445,9 +14445,17 @@
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
+        // Slowo kluczowe bywa PRZELAMANE w polowie — wydruk z EPO lamie tytul co 35 znakow
+        // („pe nalty 1376"), a Excel potrafi zawinac komorke. O tym, czy numer jest
+        // roszczeniem czy zamowieniem, nie moze decydowac miejsce zlamania wiersza,
+        // wiec miedzy literami dopuszczamy odstep. Nazwa rodzaju i tak idzie dalej
+        // bez odstepow (replace nizej), wiec wynik jest ten sam, co przy calym slowie.
+        function pcPenSlowo(w){ return w.split('').join('\\s*'); }
+        var PC_PEN_RE = new RegExp('(' + ['overpayment', 'underpayment', 'penalty', 'discount']
+            .map(pcPenSlowo).join('|') + '|other\\s*[+-])\\s*(?:no\\.?\\s*)?(\\d+)', 'gi');
         function pcParsePenalties(text){
             var s0 = String(text || ''), out = [];
-            var re = /(overpayment|underpayment|penalty|discount|other\s*[+-])\s*(?:no\.?\s*)?(\d+)/gi, m;
+            var re = new RegExp(PC_PEN_RE.source, 'gi'), m;
             while ((m = re.exec(s0)) !== null){
                 var ty = m[1].toLowerCase().replace(/\s+/g, '');
                 if (ty === 'other+') ty = 'other +'; else if (ty === 'other-') ty = 'other -';
@@ -14456,9 +14464,12 @@
                 // Po jednym slowie kluczowym stoi czasem CALA LISTA numerow:
                 // „overpayment 1078, 1084, 1137, 1184". Kazdy z nich to roszczenie, a nie
                 // zamowienie — bez tego szly do sprawdzania jako cudze zamowienia.
-                // Ciagniemy liste tylko dopoki numery nie sa DLUZSZE od pierwszego i maja
-                // najwyzej cztery cyfry: „penalty 1270, 15395" nie moze polknac zamowienia.
-                var ogon = s0.slice(m.index + m[0].length), maks = Math.min(4, m[2].length);
+                // Ciagniemy liste dopoki numery maja najwyzej cztery cyfry: „penalty 1270,
+                // 15395" nie moze polknac zamowienia. Warunku „nie dluzsze od pierwszego"
+                // tu nie ma i byc nie moze — „penalty 979,1297" to DWA roszczenia, a przy
+                // tamtym warunku 1297 (cztery cyfry po trzycyfrowym 979) wypadalo z listy
+                // i szlo dalej jako zamowienie. 04.09.2026, HK JIANHUI, zamowienie 20249.
+                var ogon = s0.slice(m.index + m[0].length), maks = 4;
                 // ZAKRES: „other - 1115-1117" to trzy roszczenia, nie jedno. Warunki te same,
                 // co w bcExpandRange, ktory rozwija zakresy w tytule: koniec wiekszy od
                 // poczatku, ta sama liczba cyfr, rozpietosc najwyzej 60. Bez nich
@@ -16206,8 +16217,32 @@
 
         // --- PDF: automat na etykietach. Dziala na obu ukladach e-finance
         //     (zlecenie recznie wklepane i zlecenie z wgranego pliku pain.001).
+        // Tresc przelewu skladana Z LINII, a nie przez join(' '). PostFinance lamie pole
+        // Message co PC_EPO_LINIA (35) znakow — tyle ma jedna linia Ustrd w pain.001 —
+        // i lamie TWARDO, w polowie slowa: „Order 15907, 20462, CMAU9949332, pe" + „nalty 1376".
+        // Sklejenie spacja robilo z tego „pe nalty 1376", a wtedy pcParsePenalties nie
+        // widzialo slowa kluczowego i numer ROSZCZENIA 1376 szedl dalej jako numer
+        // ZAMOWIENIA. Modul ciagnal wtedy cudze zamowienie (1376 istnieje — Business Control
+        // Establishment), jego konto, SWIFT i beneficjenta, i pokazywal trzy czerwone
+        // rozjazdy, ktorych nie bylo. 04.09.2026: A-LIFE 20462/15907 i HK JIANHUI 20249/17770.
+        // Regula ta sama, co w pcEpoMsgZLinii przy Wprowadzaniu: linia o dlugosci 35 to
+        // lamanie twarde i nastepna dokleja sie BEZ odstepu; krotsza konczy mysl albo miala
+        // na koncu spacje, ktora wydruk uciął — wtedy odstep dokladamy.
+        function bcMsgZLinii(czesci, dlug){
+            if (!czesci || !czesci.length) return '';
+            var out = String(czesci[0]);
+            for (var i = 1; i < czesci.length; i++){
+                var poprz = (dlug && dlug[i - 1] != null) ? dlug[i - 1] : String(czesci[i - 1]).length;
+                out += (poprz >= PC_EPO_LINIA ? '' : ' ') + czesci[i];
+            }
+            return out.trim();
+        }
         function bcParsePdfText(txt, fname){
             var lines = String(txt || '').split('\n'), fields = {}, cur = null;
+            // Dlugosci ORYGINALNYCH linii tresci. Po sklejeniu lacznikiem czesc jest
+            // dluzsza niz linia, z ktorej powstala, a o kolejnym odstepie decyduje
+            // wlasnie ta linia — nie dlugosc sklejki.
+            var msgDl = [];
             for (var i = 0; i < lines.length; i++){
                 // PDF-y z e-finance przychodza raz z apostrofem prostym ('), raz
                 // z typograficznym (’). BC_LBL trzyma prosty, wiec zamieniamy w locie —
@@ -16226,15 +16261,17 @@
                 if (hit){
                     cur = hit.lb;
                     if (!fields[cur]) fields[cur] = [];
-                    if (hit.v) fields[cur].push(hit.v);
+                    if (hit.v){ fields[cur].push(hit.v); if (cur === 'Message') msgDl.push(hit.v.length); }
                 } else if (cur !== null && /^\s{6,}\S/.test(raw)){
                     var arr = fields[cur], prev = arr.length ? arr[arr.length - 1] : '';
                     // Slowo przeniesione do nastepnej linii: bank urywa je lacznikiem
                     // ("PEN-" + "ALTY" = PENALTY). Sklejamy z powrotem, ale tylko w tresci
                     // przelewu i tylko litera-lacznik-litera — nazw i adresow nie ruszamy.
-                    if (cur === 'Message' && arr.length && /[A-Za-z]-$/.test(prev) && /^[A-Za-z]/.test(ln))
+                    if (cur === 'Message' && arr.length && /[A-Za-z]-$/.test(prev) && /^[A-Za-z]/.test(ln)){
                         arr[arr.length - 1] = prev.slice(0, -1) + ln;
-                    else arr.push(ln);
+                        if (msgDl.length) msgDl[msgDl.length - 1] = ln.length;
+                    }
+                    else { arr.push(ln); if (cur === 'Message') msgDl.push(ln.length); }
                 }
             }
             if (!fields["Recipient's account"]) return null;
@@ -16254,7 +16291,7 @@
                 debit: (fields['Debit account'] || []).slice(1).join(' '),
                 exec: g('Execution date'),
                 status: g('Status'),
-                msg: (fields['Message'] || []).join(' '),
+                msg: bcMsgZLinii(fields['Message'] || [], msgDl),
                 e2e: g('End To End ID'),
                 opt: g('Transfer option')
             };
