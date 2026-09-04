@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.27
+// @version      5.28
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11934,6 +11934,9 @@
     // z tresci: normalizujemy CALA tresc i szukamy w niej znormalizowanego poczatku naszej
     // nazwy. Plik czyta FileReader w przegladarce — nigdzie nie jest wysylany ani zapisywany.
     let bankFile = null;   // ostatnio wczytany plik: { rows, currency, error, name, sum, debits }
+    // Zaznaczenie firm w panelu zlecenia zbiorczego. Trzymane POZA renderem, bo ramka
+    // przerysowuje sie przy kazdej zmianie wklejki, a wybor czlowieka ma to przezyc.
+    let epoSel = null, epoSig = '', epoDom = {};
 
     function bankNameNorm(s) {
         return String(s == null ? '' : s)
@@ -12150,6 +12153,16 @@
         // Dalej juz przeszukanie — dla zlecenia, ktore pokrywa tylko CZESC pozycji.
         // Malejaco, bo duza kwota szybciej wprowadza `zostalo < 0` i przycina galaz.
         const p = poz.slice().sort(function (a, b){ return b.gr - a.gr; });
+        // SUMA OGONA — ile najwyzej da sie jeszcze dolozyc od pozycji i w gore. Bez tego
+        // odciecia galaz, ktora pominela duza kwote, schodzi do samego dna, chociaz dobic
+        // do celu juz nie moze. Zmierzone na wyciagu z 03.09.2026 (trzydziesci firm, jedno
+        // zlecenie na 438 224,76): bez odciecia pelne przeszukanie kosztuje ponad
+        // 200 000 000 krokow i budzet konczy sie ZANIM padnie odpowiedz — z odcieciem
+        // 23 833 kroki, czyli dwa rzedy PONIZEJ budzetu. Roznica nie jest w szybkosci,
+        // tylko w tym, czy odpowiedz w ogole pada: „nie sprawdzilem wszystkich kombinacji”
+        // zamienia sie na pewne „zaden zestaw nie daje tej kwoty”.
+        const ogon = new Array(n + 1); ogon[n] = 0;
+        for (let i = n - 1; i >= 0; i--) ogon[i] = ogon[i + 1] + p[i].gr;
         const wybor = [];
         (function idz(i, zostalo){
             if (przerwane || out.length >= limit) return;
@@ -12157,7 +12170,7 @@
             // wobec czasu, ktory mial chronic.
             if (++krokow > 2000000){ przerwane = true; return; }
             if (zostalo === 0 && wybor.length){ out.push(wybor.slice()); return; }
-            if (i >= n || zostalo < 0) return;
+            if (i >= n || zostalo < 0 || ogon[i] < zostalo) return;
             wybor.push(p[i]);
             idz(i + 1, zostalo - p[i].gr);
             wybor.pop();
@@ -12165,6 +12178,112 @@
         })(0, celGr);
         return { zestawy: out, przerwane: przerwane };
     }
+    // ===== Zlecenie zbiorcze EPO — skladanie kwoty recznie =====
+    // Automat wyzej (epoZestawy) odpowiada tylko wtedy, gdy pasuje DOKLADNIE jeden zestaw.
+    // 03.09.2026 nie pasowal zaden: jedno zlecenie na 438 224,76 i trzydziesci firm bez
+    // przelewu, ktore sumuja sie do 460 314,43 — w paczce bylo cos, czego we wklejce nie ma.
+    // Raport pokazywal wtedy trzydziesci czerwonych wierszy „w pliku nie ma przelewu”
+    // i ani slowem, ile brakuje. Ten panel liczy wprost: suma zaznaczonych firm kontra
+    // kwota zlecenia i roznica miedzy nimi. Odznaczenie firmy odejmuje ja od sumy — kwote
+    // sklada czlowiek, modul tylko dodaje. Zadnego zgadywania.
+    // Po stronie banku wchodza WYLACZNIE wiersze „COLLECTIVE ORDER”: przelewy do
+    // developerow i wplywy nie maja z ta paczka nic wspolnego i do porownania nie ida.
+    function epoTx(rows) {
+        const out = [];
+        (rows || []).forEach(function (t) {
+            if (!(t.amt > 0)) return;   // wplyw ma kwote ujemna — tu nie wchodzi
+            if (String(t.txt || '').toUpperCase().indexOf('COLLECTIVE ORDER') < 0) return;
+            out.push(t);
+        });
+        return out;
+    }
+    // MESSAGE-ID w wyciagu to stempel, ktory sami wpisalismy do pliku: MsgId = 'BEL'
+    // + RRRRMMDD + GGMMSS (painBuild). Czyta sie z niego, ktory to plik pain.001 —
+    // z ktorego dnia i z ktorej godziny — wiec czlowiek wie, czego szukac w e-finance.
+    function epoStempel(txt) {
+        const m = String(txt == null ? '' : txt).match(/\bBEL(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\b/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1] + ' ' + m[4] + ':' + m[5] + ':' + m[6]) : '';
+    }
+    // Startowo zaznaczone sa te firmy, ktore wlasnego przelewu NIE maja — czyli kandydaci
+    // do paczki. Firma z wlasnym przelewem startuje odznaczona, ale zostaje na liscie:
+    // bywa, ze dopasowala sie po kwocie przypadkiem i trzeba ja przerzucic do paczki.
+    function epoDomyslne(list) {
+        const s = {};
+        (list || []).forEach(function (e) {
+            if (e.state === 'missing' || e.state === 'nokey' || e.state === 'epo') s[e.key] = 1;
+        });
+        return s;
+    }
+    function epoPodsumowanie(cel, suma, ile) {
+        const roznica = bal2(suma - cel), zgoda = Math.abs(roznica) < 0.005;
+        return '<span style="color:' + (zgoda ? '#166534' : '#991b1b') + '">' + (zgoda ? '\u2713 ' : '\u26a0 ') +
+            'zaznaczone ' + ile + ' na <strong>' + balFix(suma) + '</strong> &nbsp;\u00b7&nbsp; zlecenie ' +
+            balFix(cel) + ' &nbsp;\u00b7&nbsp; ' +
+            (zgoda ? 'zgadza si\u0119 co do grosza'
+                   : ('r\u00f3\u017cnica <strong>' + (roznica > 0 ? '+' : '') + balFix(roznica) + '</strong> \u2014 ' +
+                      (roznica > 0 ? 'zaznaczono za du\u017co' : 'brakuje pozycji do zaznaczenia'))) + '</span>';
+    }
+    // Przeliczenie BEZ przerysowania ramki: gdyby panel szedl przez innerHTML, kazde
+    // klikniecie gubiloby pozycje przewijania przy trzydziestu wierszach.
+    function epoPrzelicz() {
+        const box = document.getElementById('tm-bank-box');
+        const sumEl = box && box.querySelector('#tm-epo-sum');
+        if (!sumEl) return;
+        let cel = 0;
+        epoTx(bankFile && bankFile.rows).forEach(function (t) { cel = bal2(cel + t.amt); });
+        let suma = 0, ile = 0;
+        Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
+            if (!c.checked) return;
+            suma = bal2(suma + (parseFloat(c.getAttribute('data-amt')) || 0));
+            ile++;
+        });
+        sumEl.innerHTML = epoPodsumowanie(cel, suma, ile);
+    }
+    function epoPanelHtml(m, rows) {
+        const zb = epoTx(rows);
+        if (!zb.length) return '';
+        let cel = 0;
+        zb.forEach(function (t) { cel = bal2(cel + t.amt); });
+        // Zmiana skladu wklejki uniewaznia zaznaczenie — klucze sa inne i przeniesienie
+        // starego wyboru dawaloby sume z firm, ktorych juz na liscie nie ma.
+        const sig = m.list.map(function (e) { return e.key; }).join('|');
+        if (!epoSel || sig !== epoSig) { epoDom = epoDomyslne(m.list); epoSel = epoDomyslne(m.list); epoSig = sig; }
+        let suma = 0, ile = 0;
+        const li = m.list.map(function (e) {
+            const on = !!epoSel[e.key];
+            if (on) { suma = bal2(suma + e.total); ile++; }
+            const ids = e.ids.length
+                ? ' <span style="color:#9ca3af">' + balEsc(e.ids.slice(0, 6).join(', ')) +
+                  (e.ids.length > 6 ? '\u2026' : '') + '</span>'
+                : '';
+            const wl = (e.state === 'ok' || e.state === 'amt' || e.state === 'diff')
+                ? ' <span style="color:#6b7280">(ma w\u0142asny przelew)</span>' : '';
+            const nm = String(e.name || '');
+            return '<label style="display:block;padding:1px 0;cursor:pointer;">' +
+                '<input type="checkbox" class="tm-epo-c" data-key="' + balEsc(e.key) +
+                '" data-amt="' + balFix(e.total) + '"' + (on ? ' checked' : '') +
+                ' style="vertical-align:-2px;margin-right:6px;">' +
+                '<span style="font-family:monospace;">' + balFix(e.total) + '</span> ' +
+                balEsc(nm.length > 72 ? nm.slice(0, 72) + '\u2026' : nm) + wl + ids + '</label>';
+        }).join('');
+        const gl = zb.map(function (t) {
+            const st = epoStempel(t.txt);
+            return balFix(t.amt) + (st ? (' \u2014 plik pain.001 z ' + st) : '');
+        }).join(' &nbsp;\u00b7&nbsp; ');
+        const btn = 'style="font:inherit;font-size:11px;padding:0 5px;margin-left:4px;border:1px solid #d1d5db;' +
+            'border-radius:4px;background:#fff;cursor:pointer;color:#374151;"';
+        return '<div style="background:#fff;border:1px solid #fde68a;border-radius:6px;padding:6px 8px;margin-top:6px;">' +
+            '<div style="font-weight:700;color:#92400e;">Zlecenie zbiorcze EPO: ' + gl + '</div>' +
+            '<div id="tm-epo-sum" style="margin:2px 0 4px;">' + epoPodsumowanie(cel, suma, ile) + '</div>' +
+            '<div style="color:#6b7280;margin-bottom:2px;">Zaznacz firmy, kt\u00f3re posz\u0142y t\u0105 paczk\u0105 \u2014 suma liczy si\u0119 na bie\u017c\u0105co.' +
+            '<button type="button" class="tm-epo-b" data-v="dom" ' + btn + '>domy\u015blne</button>' +
+            '<button type="button" class="tm-epo-b" data-v="all" ' + btn + '>wszystkie</button>' +
+            '<button type="button" class="tm-epo-b" data-v="none" ' + btn + '>\u017cadna</button></div>' +
+            '<div style="' + (m.list.length > 14 ? 'max-height:260px;overflow:auto;' : '') + '">' + li + '</div>' +
+            '<div style="color:#6b7280;margin-top:3px;">Po stronie banku liczy si\u0119 tylko zlecenie zbiorcze \u2014 ' +
+            'przelewy do developer\u00f3w i wp\u0142ywy do tego por\u00f3wnania nie wchodz\u0105.</div></div>';
+    }
+
     // Dopasowanie: znormalizowany klucz nazwy musi wystapic w znormalizowanej tresci przelewu.
     // Kilka przelewow do jednej firmy sumuje sie — bank czasem dzieli platnosc na dwa zlecenia.
     function bankMatch(expected, tx) {
@@ -12288,7 +12407,12 @@
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
                 (e.hits.length > 1 ? ' w ' + e.hits.length + ' przelewach' : '') + '</span>';
         } else if (e.state === 'missing') {
-            tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
+            // Gdy w pliku jest zlecenie zbiorcze, zdanie „nie ma przelewu" jest nieprawdziwe
+            // w tonie: pieniadze najpewniej zeszly, tylko w paczce, ktorej nie rozlozylismy.
+            // Kierujemy wiec do panelu wyzej, zamiast sugerowac brak platnosci.
+            tail = epoTx(bankFile && bankFile.rows).length
+                ? '<span style="color:#991b1b">nie ma osobnego przelewu — składaj kwotę w panelu zlecenia zbiorczego wyżej</span>'
+                : '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
         } else if (e.state === 'epo') {
             const inne = (e.epoRazem || []).filter(function (n) { return n !== e.name; });
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
@@ -12383,6 +12507,10 @@
             '<div style="color:#6b7280;">' + head + '</div>' +
             '<strong>' + title + '</strong>' + warn;
 
+        // Panel zlecenia zbiorczego stoi NAD lista firm, bo gdy w pliku jest paczka EPO,
+        // to on tlumaczy czerwone wiersze pod spodem, a nie odwrotnie.
+        html += epoPanelHtml(m, bankFile.rows);
+
         if (bad.length) {
             html += '<div style="margin-top:4px;">' + bad.map(bankRowHtml).join('') + '</div>';
         }
@@ -12405,6 +12533,32 @@
         }
         html += '<div style="color:#6b7280;margin-top:3px;">Ta kontrola tylko informuje — księgowania nie blokuje.</div>';
         box.innerHTML = html + '</div>';
+        // Listener na KONTENERZE i tylko raz: innerHTML wymieniamy przy kazdej zmianie
+        // wklejki, wiec podpiecie sie do samych checkboxow gubiloby obsluge po pierwszym
+        // przerysowaniu. Zaznaczenie trzyma epoSel, nie DOM.
+        if (!box.__epoBound) {
+            box.__epoBound = 1;
+            box.addEventListener('change', function (ev) {
+                const t = ev.target;
+                if (!t || !t.classList || !t.classList.contains('tm-epo-c')) return;
+                if (!epoSel) epoSel = {};
+                epoSel[t.getAttribute('data-key')] = t.checked ? 1 : 0;
+                epoPrzelicz();
+            });
+            box.addEventListener('click', function (ev) {
+                const t = ev.target;
+                if (!t || !t.classList || !t.classList.contains('tm-epo-b')) return;
+                const v = t.getAttribute('data-v');
+                if (!epoSel) epoSel = {};
+                Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
+                    const k = c.getAttribute('data-key');
+                    const on = (v === 'all') ? true : (v === 'none') ? false : !!epoDom[k];
+                    c.checked = on;
+                    epoSel[k] = on ? 1 : 0;
+                });
+                epoPrzelicz();
+            });
+        }
     }
 
     // ===== Kontrola PO zaksiegowaniu: Export orders payments =====
