@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.26
+// @version      5.27
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -10,6 +10,7 @@
 // @match        https://*.mirakl.net/*
 // @match        https://*.myvtex.com/*
 // @match        https://toolbox.manomano.com/*
+// @match        https://clientes.eupago.pt/*
 // @match        https://seller.octopia.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @connect      sellerhub.bricobravo.com
@@ -26,6 +27,7 @@
 // @connect      www.backend-rates.bazg.admin.ch
 // @connect      backend-rates.bazg.admin.ch
 // @connect      prologistics.info
+// @connect      clientes.eupago.pt
 // @connect      mirakl.net
 // @connect      empik.com
 // @connect      leenbakker.nl
@@ -89,6 +91,9 @@
     // Cnova FR stoi na Octopii. Dopasowanie jest szerokie (cala domena), bo panel
     // czesto rozmawia z osobnym hostem API i rejestrator ma tam dzialac tak samo.
     const onOcto    = () => /(^|\.)octopia\.com$/i.test(H);
+    // Panel eupago — wchodzimy tam WYLACZNIE po to, zeby przeczytac token sesji
+    // z sessionStorage; ten jest per domena, wiec z prologistics go nie widac.
+    const onEupago  = () => /(^|\.)eupago\.pt$/i.test(H);
 
     const HUB = 'beliani_hub_';
     // Moduly, ktore maja byc DOMYSLNIE WYLACZONE. Dopisanie tu id znaczy: nie uruchamiaj
@@ -2423,17 +2428,49 @@
             return null;
         }
 
-        function makeItem(row, orderIdx, amountIdx, source) {
+        // RODZAJ POZYCJI — od tego zależy, czy wolno ją zsumować z inną o tym samym numerze.
+        // Claim (Goodwill, SAFE-T, REVERSAL_REIMBURSEMENT) to OSOBNA decyzja Amazona: nosi ten
+        // sam numer zamówienia co zwrot, ale jest osobnym zdarzeniem i osobną pozycją w tickecie.
+        // Do v3.43 rozdzielał się tylko Goodwill i tylko wtedy, gdy w treści wiersza stało to
+        // słowo. Most z modułu marketplace go nie pisał (refTsv miał dwie kolumny), więc zwrot
+        // 76.99 i Goodwill 23.99 schodziły się w jedną pozycję 100.98 — sprawdzone na
+        // 028-5837017-7371542, rozliczenie 27707864152, i na 302-4779077-4552358, gdzie
+        // Goodwill +78.00 z REVERSAL −78.00 znosiły się do 0.00 i nie szło NIC.
+        //
+        // Teraz rodzaj ma dwa źródła. Kolumna „Rodzaj" (most z marketplace) mówi go WPROST
+        // i jest wiążąca. Ręcznie wklejony arkusz tej kolumny nie ma, więc dla niego zostaje
+        // stare rozpoznanie po słowie w wierszu — rozszerzone o SAFE-T i REVERSAL, bo dotąd
+        // te dwa kleiły się ze zwrotem tak samo jak Goodwill przed 3.43.
+        // Chargebacku tu NIE MA świadomie: parser sumuje go ze zwykłym zwrotem (jedno
+        // zdarzenie, nie osobne roszczenie) i osobną pozycją być nie ma prawa.
+        const KIND_RE = /(goodwill|safe-?t|reversal_reimbursement)/i;
+        function itemKind(row, kindIdx) {
+            if (kindIdx != null && kindIdx >= 0) {
+                const v = String(row[kindIdx] == null ? '' : row[kindIdx]).trim();
+                if (v) return v;
+                // Pusta komórka to prawidłowa odpowiedź „zwykły zwrot" — ale wiersz bywa
+                // przycięty przez trimEnd (pusta ostatnia kolumna znika), więc pustki nie
+                // odróżnimy od braku kolumny. Dlatego lecimy niżej: przy zwykłym zwrocie
+                // szukanie po słowie i tak nic nie znajdzie.
+            }
+            for (const c of row) {
+                const m = String(c == null ? '' : c).match(KIND_RE);
+                if (m) return m[1];
+            }
+            return '';
+        }
+
+        function makeItem(row, orderIdx, amountIdx, source, kindIdx) {
             if (!row || orderIdx < 0 || amountIdx < 0) return null;
             const orderNumber = cleanOrder(row[orderIdx]);
             const amount = findAmountNear(row, amountIdx);
             if (!orderNumber || !amount) return null;
-            const isGoodwill = row.some(c => /goodwill/i.test(String(c || '')));
-            return { orderNumber, amount, source, isGoodwill };
+            const kind = itemKind(row, kindIdx);
+            return { orderNumber, amount, source, kind, isGoodwill: /goodwill/i.test(kind) };
         }
 
-        function parseByIndexes(orderIdx, amountIdx, source) {
-            return rows.map(row => makeItem(row, orderIdx, amountIdx, source)).filter(Boolean);
+        function parseByIndexes(orderIdx, amountIdx, source, kindIdx) {
+            return rows.map(row => makeItem(row, orderIdx, amountIdx, source, kindIdx)).filter(Boolean);
         }
 
         const oldByFixedColumns = parseByIndexes(4, 14, 'old-fixed');
@@ -2449,9 +2486,13 @@
                 c === 'amount' || c.includes('amount') || c.includes('sum of') || c.includes('kwota')
             );
 
+            // Kolumna „Rodzaj" jest opcjonalna — pisze ją most z modułu marketplace (refTsv).
+            // Gdy jej nie ma, kindIdx = −1 i itemKind wraca do szukania słowa w wierszu.
+            const kindIdx = lower.findIndex(c => c === 'rodzaj' || c.includes('rodzaj'));
+
             if (orderIdx >= 0 && amountIdx >= 0) {
                 headerBased = rows.slice(i + 1)
-                    .map(row => makeItem(row, orderIdx, amountIdx, 'header'))
+                    .map(row => makeItem(row, orderIdx, amountIdx, 'header', kindIdx))
                     .filter(Boolean);
                 break;
             }
@@ -2474,11 +2515,13 @@
             }
 
             if (amount) {
+                const kind = itemKind(row, -1);
                 regexBased.push({
                     orderNumber: String(row[orderIdx]).trim(),
                     amount,
                     source: 'regex',
-                    isGoodwill: row.some(c => /goodwill/i.test(String(c || '')))
+                    kind,
+                    isGoodwill: /goodwill/i.test(kind)
                 });
             }
         }
@@ -2490,19 +2533,25 @@
         // v3.43: WYJĄTEK — wiersze \"Goodwill\" NIE są scalane ze zwykłymi zwrotami tego
         // samego zamówienia (klucz zawiera znacznik goodwill). Dzięki temu np. zwykły 18.99
         // + goodwill 18.99 zostają DWIEMA osobnymi pozycjami, a nie jedną 37.98.
+        // Teraz w kluczu stoi RODZAJ, a nie „goodwill tak/nie": ten sam wyjątek obejmuje
+        // SAFE-T i REVERSAL_REIMBURSEMENT, a dwa różne claimy na jednym zamówieniu też się
+        // nie sklejają. Kilka wierszy TEGO SAMEGO rodzaju nadal się sumuje — dokładnie tak,
+        // jak sumuje je parser rozliczenia (jedno zamówienie potrafi mieć kilka SAFE-T).
         const sums = new Map();
         const order = [];
         for (const item of chosen) {
-            const key = item.orderNumber + (item.isGoodwill ? '|G' : '|N');
+            const key = item.orderNumber + '|' + (item.kind || '');
             if (!sums.has(key)) {
                 order.push(key);
-                sums.set(key, { orderNumber: item.orderNumber, sum: 0, source: item.source, isGoodwill: !!item.isGoodwill });
+                sums.set(key, { orderNumber: item.orderNumber, sum: 0, source: item.source,
+                               kind: item.kind || '', isGoodwill: !!item.isGoodwill });
             }
             sums.get(key).sum += parseFloat(item.amount) || 0;
         }
         return order.map(key => {
             const v = sums.get(key);
-            return { orderNumber: v.orderNumber, amount: v.sum.toFixed(2), source: v.source, isGoodwill: v.isGoodwill };
+            return { orderNumber: v.orderNumber, amount: v.sum.toFixed(2), source: v.source,
+                     kind: v.kind, isGoodwill: v.isGoodwill };
         });
     }
 
@@ -4197,6 +4246,25 @@
             };
         }
 
+        // Ta sama kwota już na tickecie, tylko z inną datą księgowania. Nie księgujemy
+        // i nie udajemy, że to nasze — pozycja idzie na listę do sprawdzenia z podaniem
+        // tamtej daty. Tak wygląda i prawdziwy drugi zwrot na tę samą kwotę, i duplikat
+        // sprzed poprawki; rozróżnić je może tylko człowiek (decyzja z 04.09.2026).
+        const inneDaty = findBookedOtherDate(getFrameDoc(ctx), amount, bookingDate);
+        if (inneDaty) {
+            return {
+                ok: false,
+                error: 'Ta kwota jest już na tickecie, ale z inną datą księgowania ('
+                     + opisInnejDaty(inneDaty) + '). Nic nie zaksięgowałem — sprawdź, '
+                     + 'czy to nie ta sama pozycja.',
+                reportType: 'same_amount_other_date',
+                ticketId: ticket.id,
+                ticketHref: ticket.href,
+                auctionUrls: (preSearch && preSearch.urls) || [],
+                stanUsun
+            };
+        }
+
         return {
             ok: true,
             ticketId: ticket.id,
@@ -4392,6 +4460,29 @@
         return extractBookedRefundEntries(doc).filter(e => e.amount === exp).length;
     }
 
+    // Ta sama kwota, ale z INNĄ datą księgowania niż nasza.
+    //
+    // findBookedRefundEntry odsiewa wpisy po dacie (patrz komentarz tam), więc wpis z innej
+    // daty jest dla niej niewidzialny i pozycja szła na ticket drugi raz. Tak w księgach
+    // stanęły noty na 2× kwotę: 028-4504697-9098719 sprzedaż 79.99, a nota 159.98;
+    // 028-8007505-7061115 sprzedaż 99.99, nota 199.98 (rozliczenie 27707864152, 8 pozycji,
+    // 641.02 EUR za dużo).
+    //
+    // Odsiew po dacie ZOSTAJE i to jest dobrze: ticket potrafi mieć starą, niezwiązaną notę
+    // na tę samą kwotę i blokowanie na niej gubiłoby prawdziwe zwroty. Ale i księgować
+    // na ślepo nie wolno. Dlatego trzecia odpowiedź: nie księgujemy i mówimy o tym wprost,
+    // a rozstrzyga człowiek — decyzja z 04.09.2026.
+    function findBookedOtherDate(doc, amount, bookingDate) {
+        const exp = normalizeAmount(amount);
+        const dat = normalizeDateForCompare(bookingDate);
+        if (!exp || !dat) return null;
+        const inne = extractBookedRefundEntries(doc).filter(e => e.amount === exp && e.date !== dat);
+        return inne.length ? inne : null;
+    }
+    function opisInnejDaty(inne) {
+        return inne.map(e => e.amount + ' z ' + e.date).join(', ');
+    }
+
     function findBookedRefundEntry(doc, amount, bookingDate, requireSameDate) {
         const expectedAmount = normalizeAmount(amount);
         if (!expectedAmount) return null;
@@ -4534,7 +4625,14 @@
     // single match, subset (50+50=100), sum-equal i sum-exceeds.
     // v3.16: opis "rozbity na N wpisów" do dopisania w success logu
     function describeSplitInfo(splitInfo) {
-        if (!splitInfo || splitInfo.matchType !== 'subset') return '';
+        if (!splitInfo) return '';
+        // Zapis potwierdzony po numerze nowej noty — kwota i data mogły wyjść inne, niż
+        // prosiliśmy, i właśnie to trzeba napisać, zamiast milczeć.
+        if (splitInfo.matchType === 'new-refund-id') {
+            const e = splitInfo.entries || [];
+            return e.length ? ` (potwierdzone nową notą: ${e.map(x => x.amount + ' z ' + x.date).join(' + ')})` : '';
+        }
+        if (splitInfo.matchType !== 'subset') return '';
         const entries = splitInfo.entries || [];
         if (entries.length < 2) return '';
         const parts = entries.map(e => Number(e.amount).toFixed(2)).join(' + ');
@@ -4557,6 +4655,11 @@
         }
         if (mt === 'sum-exceeds') {
             return `ticket ma już więcej: ${parts} = ${existingRefund.amount}`;
+        }
+        // Nota, której przed startem na tickecie nie było. Mówimy WPROST, że rozpoznaliśmy
+        // ją po numerze, a nie po kwocie i dacie — bo właśnie po to ten test powstał.
+        if (mt === 'new-refund-id') {
+            return `nowa nota na tickecie (rozpoznana po numerze): ${parts}`;
         }
         return `${existingRefund.amount}${existingRefund.date ? ', data ' + existingRefund.date : ''}`;
     }
@@ -5933,14 +6036,56 @@
         let lastError = '';
         let diagSnapshot = ''; // v3.38 (diag)
         let fillTicketAttemptedBooking = false; // v3.25: tracking czy w poprzedniej próbie kliknięto Update
-
+        // ZDJĘCIE NOT KREDYTOWYCH SPRZED PIERWSZEJ PRÓBY.
+        //
+        // Wszystkie dotychczasowe zabezpieczenia rozpoznawały własny zapis po KWOCIE i DACIE.
+        // Gdy setDateField nie chwyciło i prologistics zapisał inną datę, żadne z nich nie
+        // widziało naszej noty — pętla szła dalej i księgowała drugi raz, do trzech podejść.
+        // Numer noty nie kłamie: nowy refundId, którego przed startem nie było, może pochodzić
+        // tylko z naszego Update. Sprawdzamy to PRZED wszystkim innym.
+        let idsPrzed = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
             await loadInFrame(ticketHref, 20000, ctx);
             await sleep(800);
 
+            const wpisyTeraz = extractBookedRefundEntries(getFrameDoc(ctx));
+            if (idsPrzed === null) {
+                idsPrzed = new Set(wpisyTeraz.map(e => e.refundId).filter(Boolean));
+            } else {
+                const nowe = wpisyTeraz.filter(e => e.refundId && !idsPrzed.has(e.refundId));
+                if (nowe.length) {
+                    // Nota, której na starcie nie było. Gdy klikaliśmy już Update — jest nasza
+                    // i pozycja JEST zaksięgowana, choćby kwota rozbiła się na pozycje albo
+                    // data wyszła inna. Gdy nie klikaliśmy, dołożył ją ktoś inny w międzyczasie
+                    // i tym bardziej nie wolno dokładać drugiej.
+                    const opis = { matchType: 'new-refund-id',
+                                   amount: nowe.map(e => e.amount).join(' + '),
+                                   date: nowe[0].date || '',
+                                   text: nowe.map(e => e.amount + ' (' + e.date + ')').join(' + '),
+                                   entries: nowe };
+                    return Object.assign({
+                        ok: true,
+                        wasClosed: wasClosedAtStart,
+                        ticketHref,
+                        ticketId,
+                        bookingAttempts: attempt - 1,
+                        verified: true,
+                        verifyMethod: 'new-refund-id',
+                        articleId: null,
+                        amount: row.amount,
+                        bookingDate: row.bookingDate,
+                        accountNum: row.accountNum,
+                        checkedCreditNoteItems: 0
+                    }, fillTicketAttemptedBooking
+                        ? { verifySplitInfo: opis }
+                        : { alreadyBooked: true, existingRefund: opis });
+                }
+            }
+
             // Przed każdą kolejną próbą sprawdzamy, czy poprzednia próba już nie dodała wpisu.
-            // Szukamy też tej samej kwoty z inną datą oraz rozbicia na kilka pozycji,
-            // żeby nie zrobić duplikatu.
+            // Szukamy też rozbicia kwoty na kilka pozycji, żeby nie zrobić duplikatu.
+            // (Ta sama kwota z INNĄ datą nie idzie już tędy — zajmuje się nią osobna kontrola
+            // niżej, bo nie wiadomo, czy to duplikat, czy prawdziwy drugi zwrot.)
             // v3.43: gdy dla tego zamówienia+kwoty są ≥2 osobne pozycje (zwykły + goodwill),
             // tę sztukę uznajemy za już zaksięgowaną dopiero gdy liczba wpisów tej kwoty
             // osiągnęła jej numer (row.dupIndex). Inaczej zostawiamy normalną ochronę.
@@ -5991,6 +6136,23 @@
                     checkedCreditNoteItems: 0,
                     alreadyBooked: true,
                     existingRefund: existingRefundBefore
+                };
+            }
+
+            // Ta sama kwota z inną datą księgowania. Nasz własny zapis odsiał już wyżej test
+            // po numerze noty, więc to, co tu zostaje, było na tickecie przed nami. Nie
+            // księgujemy i nie zamiatamy tego pod „już zaksięgowane" — pozycja ma trafić
+            // do człowieka z podaną datą tamtej noty (decyzja z 04.09.2026).
+            const inneDatyB = findBookedOtherDate(getFrameDoc(ctx), row.amount, row.bookingDate);
+            if (inneDatyB) {
+                return {
+                    ok: false,
+                    error: 'Ta kwota jest już na tickecie, ale z inną datą księgowania ('
+                         + opisInnejDaty(inneDatyB) + '). Nic nie zaksięgowałem — sprawdź, '
+                         + 'czy to nie ta sama pozycja.',
+                    reportType: 'same_amount_other_date',
+                    ticketHref,
+                    ticketId
                 };
             }
 
@@ -6840,8 +7002,23 @@
         const progressList = document.getElementById('tm-t-progress-list');
         let ok = 0, fail = 0, already = 0, escalated = 0;
 
-        // Wspólna kolejka indeksów pozycji do przetworzenia
-        const queue = previewRows.map((_, i) => i);
+        // Wspólna kolejka — GRUPAMI po numerze zamówienia, nie pojedynczymi indeksami.
+        // Jedno zamówienie to jeden ticket, a od rozdzielenia claimów ma ono często dwie
+        // pozycje (zwrot + Goodwill / SAFE-T). Przy płaskiej kolejce dwa workery brały je
+        // naraz, każdy widział ticket jeszcze pusty i każdy księgował jako pierwszy —
+        // żadne zabezpieczenie nie ma szans, bo w chwili sprawdzania obie próby były
+        // uczciwie „pierwsze". Grupa idzie w całości do jednego workera, po kolei, więc
+        // druga pozycja widzi już notę po pierwszej. Kolejność w grupie zostaje z tablicy,
+        // czyli zgodna z dupIndex nadanym w buildPreviewRows.
+        const queue = (function (){
+            const g = new Map();
+            previewRows.forEach(function (r, i){
+                const k = String((r && r.orderNumber) || ('#' + i));
+                if (!g.has(k)) g.set(k, []);
+                g.get(k).push(i);
+            });
+            return [...g.values()];
+        })();
 
         // Pomocnik do logowania — każdy worker dorzuca swoje wiersze do progress listy
         function logLine(html, color) {
@@ -7006,14 +7183,18 @@
             const ctx = createFrameCtx();
             try {
                 while (queue.length > 0) {
-                    const i = queue.shift();
-                    if (i == null) break;
-                    const wynik = await processOne(workerLabel, i, ctx);
-                    freeCtx(ctx); // zwolnij pamięć po każdej pozycji
-                    // Przerwa jest po to, zeby nie zasypac prologistics. Pozycja pominieta
-                    // nie wyslala do niego ani jednego zapytania, wiec nie ma czego
-                    // odczekiwac: przy 91 pominietych to bylo 27 sekund czekania na nic.
-                    if (wynik !== 'pominiete') await sleep(300);
+                    const grupa = queue.shift();
+                    if (!grupa || !grupa.length) break;
+                    // Cała grupa (= jedno zamówienie, jeden ticket) w jednym workerze,
+                    // po kolei — patrz komentarz przy budowie kolejki.
+                    for (const i of grupa) {
+                        const wynik = await processOne(workerLabel, i, ctx);
+                        freeCtx(ctx); // zwolnij pamięć po każdej pozycji
+                        // Przerwa jest po to, zeby nie zasypac prologistics. Pozycja pominieta
+                        // nie wyslala do niego ani jednego zapytania, wiec nie ma czego
+                        // odczekiwac: przy 91 pominietych to bylo 27 sekund czekania na nic.
+                        if (wynik !== 'pominiete') await sleep(300);
+                    }
                 }
             } finally {
                 destroyFrameCtx(ctx);
@@ -32927,6 +33108,54 @@
                                       zwrot: r.zwrot };
                          }) };
             });
+        // --- zwroty i claimy zaksiegowane WIECEJ NIZ RAZ ---
+        // Kwote porownywalismy dotad wylacznie po stronie sprzedazy (zlaKwota nizej).
+        // Po stronie zwrotow i claimow pytalismy tylko, czy jest JAKIS slad — wiec nota
+        // kredytowa na 2x kwote przechodzila bez slowa. Na rozliczeniu 27707864152 tak
+        // przeszlo osiem pozycji na 641.02 EUR, w tym Goodwill 28.79 i SAFE-T 115.28,
+        // a takze piec zwyklych zwrotow. Cztery z nich widac bylo golym okiem: w tym samym
+        // pliku stala sprzedaz zamowienia, a nota byla dokladnie dwa razy wieksza.
+        //
+        // Po stronie ksiag liczymy SALDO NOTY z uwzglednieniem kierunku, a nie sume modulow.
+        // Jedna nota potrafi miec pozycje w obie strony: SAFE-T ksieguje sie odwrotnie niz
+        // zwrot, zdarza sie tez przeksiegowanie. Suma modulow robila z takiej pary falszywy
+        // duplikat — sprawdzone na 306-5376143-5846719, gdzie nota ma 439.99 w jedna strone
+        // i 429.99 w druga: to nie jest podwojne ksiegowanie, tylko kwota zaksiegowana pod
+        // cudzym numerem. Po przejsciu na saldo ta pozycja slusznie wypada z listy.
+        // Po stronie raportu sumujemy modulami, bo tam kazda pozycja to osobne zdarzenie.
+        // Zglaszamy tylko NADWYZKE: brak sladu ma juz swoja sekcje.
+        //
+        // Falszywy alarm jest mozliwy i tak to opisujemy: jedna nota kredytowa potrafi
+        // zbierac pozycje z kilku rozliczen, a wtedy w ksiegach slusznie stoi wiecej niz
+        // w tym raporcie. Dlatego to jest lista DO SPRAWDZENIA, a nie werdykt.
+        const oczek = {};
+        Object.keys(p.ref || {}).forEach(function (id){
+            oczek[id] = r2((oczek[id] || 0) + Math.abs(p.ref[id]));
+        });
+        (p.refExtra || []).forEach(function (x){
+            if (!x || !x.id) return;
+            oczek[x.id] = r2((oczek[x.id] || 0) + Math.abs(x.amt));
+        });
+        const podwojne = [];
+        Object.keys(oczek).forEach(function (id){
+            const w = (poFf[mkFfBaza(id)] || []).filter(function (r){
+                return /^CREDIT\b/i.test(String(r.auf || ''));
+            });
+            if (!w.length) return;
+            const wKsiegach = r2(Math.abs(w.reduce(function (a, r){
+                return a + Math.abs(r.kwota) * (r.zwrot ? 1 : (r.sprzedaz ? -1 : 0));
+            }, 0)));
+            const ma = r2(oczek[id]);
+            if (wKsiegach <= ma + 0.02) return;
+            podwojne.push({ id: id, ma: ma, jest: wKsiegach, nadwyzka: r2(wKsiegach - ma),
+                            krotnosc: (ma > 0.005 ? (wKsiegach / ma) : 0),
+                            auf: w.map(function (r){ return r.auf; }).filter(Boolean)
+                                  .filter(function (v, i, t){ return t.indexOf(v) === i; }).join(', '),
+                            pozycje: w.map(function (r){
+                                return Math.abs(r.kwota) * (r.zwrot ? 1 : (r.sprzedaz ? -1 : 0));
+                            }) });
+        });
+        podwojne.sort(function (a, b){ return b.nadwyzka - a.nadwyzka; });
         // --- wiersze exportu bez odpowiednika w raporcie ---
         const znane = {};
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
@@ -33012,6 +33241,8 @@
             niepewne: niepewne.sort(function (a, b){ return b.kwota - a.kwota; }),
             zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
             claimy: claimy,
+            podwojne: podwojne,
+            podwojneSuma: r2(podwojne.reduce(function (a, x){ return a + x.nadwyzka; }, 0)),
             stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
             wyj: wyj,
             wyjBez: wyj.filter(function (x){ return !x.ile; }),      // v3.95: tylko te bez sladu
@@ -33944,6 +34175,20 @@
                            + (x.paid && x.paid.toUpperCase() !== 'YES' ? ('  <span style="color:#c47f00">Paid ' + esc(x.paid) + '</span>') : '');
                   }).join('<br>') + '</div>');
         }
+        if ((k.podwojne || []).length){
+            h += sek('❌ Zaksięgowane dwa razy — ' + k.podwojne.length + ' poz. na ' + f2(k.podwojneSuma)
+                     + ' ' + esc(p.cur) + ' za dużo', '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">Nota kredytowa tego zamówienia jest <b>większa</b> niż zwrot i claimy z tego rozliczenia razem wzięte. Zwykle znaczy to, że ta sama kwota weszła na ticket drugi raz. Uwaga: jedna nota potrafi zbierać pozycje z kilku rozliczeń — wtedy nadwyżka jest prawdziwa i w porządku. Otwórz notę i policz pozycje, zanim cokolwiek wyksięgujesz.</div>'
+                + '<div style="' + mono + '">'
+                + k.podwojne.map(function (x){
+                      const kr = (x.krotnosc >= 1.98 && x.krotnosc <= 2.02) ? '  <b>(dokładnie 2×)</b>' : '';
+                      return esc(x.id) + '  w rozliczeniu ' + f2(x.ma) + ', w księgach <b style="color:#c00">'
+                           + f2(x.jest) + '</b>  (nadwyżka <b>' + f2(x.nadwyzka) + '</b>)' + kr
+                           + (x.auf ? ('<br>&nbsp;&nbsp;&nbsp;&nbsp;→ ' + knLinki(x.auf)) : '')
+                           + '  <span style="color:#888">pozycje noty: '
+                           + x.pozycje.map(function (v){ return f2(v); }).join(' + ') + '</span>';
+                  }).join('<br>') + '</div>');
+        }
         if (k.bezKonta.length){
             h += sek('❌ Nie mam konta dla tego typu — ' + k.bezKonta.length, '#c00',
                 '<div style="font-size:10px;color:#666;margin-bottom:3px">Tabela kont dla '
@@ -34021,7 +34266,7 @@
         }
 
         if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length
-            && !k.wyjBez.length && !k.bezKonta.length)
+            && !k.wyjBez.length && !k.bezKonta.length && !(k.podwojne || []).length)
             h += sek('✔ Wszystko zaksięgowane i na właściwych kontach', '#0a7a2f',
                      '<div style="font-size:10px;color:#666">' + k.nDopasowanych + ' z ' + k.nOrd
                      + ' zamówień ma płatność, konta zgodne z typem klienta, kwoty się zgadzają'
@@ -34092,6 +34337,17 @@
             k.zlaKwota.forEach(function (x){
                 L.push('\t' + x.id + '\texport ' + f2(x.wExporcie) + '\traport ' + f2(x.wRaporcie)
                        + '\tróżnica ' + f2(x.roznica) + '\t' + (x.auf || ''));
+            });
+        }
+        if ((k.podwojne || []).length){
+            L.push(''); L.push('ZAKSIĘGOWANE DWA RAZY (' + k.podwojne.length + ' na '
+                   + f2(k.podwojneSuma) + ' ' + p.cur + ' za dużo)');
+            L.push('\t(nota kredytowa większa niż zwrot + claimy z tego rozliczenia; jedna nota'
+                 + ' potrafi zbierać pozycje z kilku rozliczeń — sprawdź, zanim wyksięgujesz)');
+            k.podwojne.forEach(function (x){
+                L.push('\t' + x.id + '\trozliczenie ' + f2(x.ma) + '\tksięgi ' + f2(x.jest)
+                       + '\tnadwyżka ' + f2(x.nadwyzka) + '\t' + (x.auf || '')
+                       + '\t' + x.pozycje.map(function (v){ return f2(v); }).join(' + '));
             });
         }
         if (k.brakZwrot.length){
@@ -35467,11 +35723,23 @@
             return rows.map(function (r){
                 return alleDmy(r.data) + '\t' + r.id + '\t' + f2(Math.abs(r.amt)) + '\t' + r.typ;
             }).join('\n');
-        return 'Order number\tAmount\n' + rows.map(function (r){ return r.id + '\t' + f2(r.amt); }).join('\n');
+        // TRZECIA KOLUMNA „Rodzaj" — bez niej modul ticketa nie ma z czego poznac, ze pozycja
+        // jest claimem, i skleja ja ze zwrotem tego samego zamowienia. Tak przepadl podzial,
+        // ktory parser rozliczenia robi od 4.36: zwrot 76.99 + Goodwill 23.99 szly jako jedna
+        // pozycja 100.98 (028-5837017-7371542), a Goodwill +78.00 z REVERSAL −78.00 znosily
+        // sie do 0.00 i nie szlo nic (302-4779077-4552358). Przy zwyklym zwrocie rodzaj jest
+        // pusty, wiec wiersz wyglada tak samo jak dotad.
+        //
+        // Opisu tu NADAL nie ma i to jest swiadome (patrz refTsvNote nizej): opis niesie
+        // liczby i daty, a sama nazwa rodzaju jest jednym slowem i parsera nie rusza.
+        return 'Order number\tAmount\tRodzaj\n' + rows.map(function (r){
+            return r.id + '\t' + f2(r.amt) + '\t' + String(r.rodzaj || '');
+        }).join('\n');
     }
     // To samo z opisem potracenia w trzeciej kolumnie. Do modulu ticketa NIE idzie —
-    // on rozpoznaje format po ukladzie kolumn i trzecia by go zmylila. To jest wyciag
-    // dla czlowieka: do arkusza, do maila, do komentarza w ticketcie.
+    // on rozpoznaje format po ukladzie kolumn, a OPIS niesie wlasne liczby i daty, wiec
+    // mialby z czego wziac zla kwote. To jest wyciag dla czlowieka: do arkusza, do maila,
+    // do komentarza w ticketcie. (Sama nazwa rodzaju to co innego — ta idzie, patrz wyzej.)
     function refTsvNote(rows){
         return 'Order number\tAmount\tOpis\n' + rows.map(function (r){
             return r.id + '\t' + f2(r.amt) + '\t' + String(r.note || '').replace(/[\t\r\n]+/g, ' ').trim();
@@ -44750,7 +45018,12 @@
         // Allegro rozni sie od poprzednich tym, ze „rozliczenie" to nie jeden plik, tylko
         // TRZY: operacje, raporty zamowien i billing — te same, ktore idą do importu.
         { id: 'alle', nazwa: 'Allegro ↔ Export payments',
-          opis: 'operacje Allegro kontra zestawienie z prologistics · te same pliki co do importu · sprawdza też konta sprzedaży B2B/B2C', gotowe: true }
+          opis: 'operacje Allegro kontra zestawienie z prologistics · te same pliki co do importu · sprawdza też konta sprzedaży B2B/B2C', gotowe: true },
+        // EuPago jest pierwszym, ktory ZESTAWIENIE bierze sam z panelu operatora,
+        // a nie z wrzuconego pliku: plik MOVS i tak powstaje w przegladarce
+        // z danych, ktore panel oddaje w JSON-ie.
+        { id: 'eupago', nazwa: 'EuPago ↔ Export payments',
+          opis: 'zestawienia wypłat prosto z panelu eupago kontra zestawienie z prologistics · saldo per zamówienie, nie wiersz po wierszu', gotowe: true }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
     // export.php — dzieki temu zmiana nazwy konta w prologistics widac tu od razu,
@@ -44858,7 +45131,8 @@
                     : (x.id === 'amazon' ? salRysujAmz
                     : (x.id === 'mano' ? salRysujMM
                     : (x.id === 'alle' ? salRysujAlle
-                    : (x.id === 'safer' ? salRysujSP : salRysujPP)))))();
+                    : (x.id === 'eupago' ? salRysujEu
+                    : (x.id === 'safer' ? salRysujSP : salRysujPP))))))();
             };
         });
     }
@@ -47676,6 +47950,1040 @@
         } finally { b.disabled = false; }
     }
 
+    // ---------- EuPago ↔ Export payments ----------
+    // Zestawien z panelu NIE POBIERAMY jako plikow. Guzik „Excel" w eupago to zwykly
+    // `excelHtml5` z DataTables — plik MOVS…xlsx sklada sie w przegladarce z danych,
+    // ktore juz tam sa, i dlatego nie ma zadnego zadania pobierania do odtworzenia.
+    // Sa za to trzy zapytania, ktorymi panel karmi swoje tabele, i z nich bierzemy JSON:
+    //   /movimentos/listar_pag_emitidos    — lista wyplat (batch = nazwa pliku MOVS)
+    //   /movimentos/list_payments_references?nome_ficheiro=…  — pozycje jednej wyplaty
+    //   /movimentos/detail_payment?nome_ficheiro=…            — podsumowanie faktury
+    // Kolumny `list_payments_references` sa jeden do jednego z plikiem MOVS, wiec
+    // XLSX-a nie tykamy wcale — i omijamy przy okazji jego uszkodzony arkusz stylow.
+    const EU_TOK_KEY = 'tm_eu_token_v1';
+    const EU_API = 'https://clientes.eupago.pt/clientes';
+    const EU_KONTO = '1232';                    // EUPAGO PT Beliani DE, EUR
+    // Wlasne zaokraglanie i format: r2/f2 nalezą do init_mkt, a siegniecie po funkcje
+    // z cudzego init_* konczy sie cichym ReferenceError dopiero przy kliknieciu.
+    function euR2(n){ return Math.round((Number(n) || 0) * 100) / 100; }
+    function euF2(n){ return (Number(n) || 0).toFixed(2); }
+
+    function euTokCzytaj(){
+        let s = '';
+        try { s = GM_getValue(EU_TOK_KEY, '') || ''; } catch (e){ return null; }
+        if (!s) return null;
+        let o; try { o = JSON.parse(s); } catch (e){ return null; }
+        if (!o || !o.tok) return null;
+        if (o.exp && o.exp < Date.now() + 60000) return { przeterminowany: true, exp: o.exp };
+        return o;
+    }
+    function euBrakTokena(){
+        const t = euTokCzytaj();
+        if (t && !t.przeterminowany) return '';
+        return 'nie mam ważnej sesji eupago — otwórz https://clientes.eupago.pt/backoffice/index.html, '
+             + 'zaloguj się i wróć tutaj'
+             + (t && t.exp ? (' (poprzednia wygasła ' + new Date(t.exp).toLocaleString('pl-PL') + ')') : '');
+    }
+    const EU_MOST_Z = 'tm_eu_most_zlec';
+    const EU_MOST_O = 'tm_eu_most_odp';
+    function euGetWprost(sciezka, params){
+        const t = euTokCzytaj();
+        if (!t || t.przeterminowany) return Promise.reject(new Error(euBrakTokena()));
+        // Lamacz pamieci podrecznej i naglowek, ktory panel wysyla przy swoich
+        // zapytaniach — miedzy prologistics a eupago stoi Cloudflare i nie chcemy
+        // dostac po drodze niczego z zapasu.
+        const pp = {};
+        Object.keys(params || {}).forEach(function (k){ pp[k] = params[k]; });
+        if (pp._ === undefined) pp._ = Date.now();
+        const q = Object.keys(pp).map(function (k){
+            return encodeURIComponent(k) + '=' + encodeURIComponent(pp[k]); }).join('&');
+        const url = EU_API + sciezka + (q ? ('?' + q) : '');
+        return new Promise(function (ok, zle){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 120000, anonymous: false,
+                headers: { 'Authorization': t.tok, 'Accept': 'application/json, text/plain, */*',
+                           'X-Requested-With': 'XMLHttpRequest', 'cache-control': 'no-cache' },
+                onload: function (r){
+                    const tresc = String(r.responseText || '');
+                    const ct = ((String(r.responseHeaders || '')
+                                .match(/content-type:\s*([^\r\n;]+)/i)) || ['', ''])[1].trim();
+                    const gdzie = (r.finalUrl && r.finalUrl !== url)
+                        ? (', po przekierowaniu na ' + r.finalUrl) : '';
+                    if (r.status === 401 || r.status === 403){
+                        zle(new Error('eupago odrzuciło sesję (HTTP ' + r.status + ') — zaloguj się w panelu jeszcze raz')); return; }
+                    if (r.status < 200 || r.status >= 300){
+                        const b = new Error('eupago: HTTP ' + r.status + ' na ' + sciezka + gdzie);
+                        b.most = (r.status >= 500);           // po stronie serwera — most moze pomoc
+                        zle(b); return; }
+                    try { ok(JSON.parse(tresc)); }
+                    catch (e){
+                        // Kluczowe, zeby powiedziec, CO przyszlo: strona aplikacji znaczy
+                        // zla sciezke, strona logowania — brak sesji, a pusta tresc —
+                        // ze menedzer skryptow urwal odpowiedz.
+                        const b = new Error('eupago oddało ' + (ct || 'nieznany typ') + ' zamiast JSON-a'
+                            + ' — ścieżka ' + sciezka + ', HTTP ' + r.status + ', ' + tresc.length + ' B'
+                            + gdzie + '. Początek: ' + tresc.replace(/\s+/g, ' ').slice(0, 220));
+                        b.most = true;                        // to wlasnie leczy most
+                        zle(b);
+                    }
+                },
+                onerror: function (){ const b = new Error('nie połączyłem się z eupago'); b.most = true; zle(b); },
+                ontimeout: function (){ zle(new Error('eupago nie odpowiedziało w 120 s')); }
+            });
+        });
+    }
+    // Most. Zlecenie ladujemy do wspolnego magazynu skryptu, karta panelu eupago
+    // wykonuje je u siebie (wtedy zapytanie jest wewnetrzne i ma komplet ciasteczek)
+    // i odklada odpowiedz pod drugim kluczem. Ten sam uklad co token ManoMano.
+    let euNrZlec = 0, euMostZnany = false;
+    function euGetMostem(sciezka, params){
+        const id = 'z' + Date.now().toString(36) + '-' + (++euNrZlec);
+        try {
+            GM_setValue(EU_MOST_O, '');
+            GM_setValue(EU_MOST_Z, JSON.stringify({ id: id, sciezka: sciezka,
+                                                    params: params || {}, kiedy: Date.now() }));
+        } catch (e){
+            return Promise.reject(new Error('nie mam gdzie zostawić zlecenia dla karty eupago')); }
+        if (!euMostZnany){
+            euMostZnany = true;
+            salSay('eupago nie oddaje pozycji wprost — proszę o nie kartę panelu…', '#c47f00');
+        }
+        return new Promise(function (ok, zle){
+            const start = Date.now();
+            const zegar = setInterval(function (){
+                let o = null;
+                try { o = JSON.parse(GM_getValue(EU_MOST_O, '') || 'null'); } catch (e){ o = null; }
+                if (o && o.id === id){
+                    clearInterval(zegar);
+                    // odpowiedz potrafi wazyc setki kilobajtow — nie zostawiamy jej w magazynie
+                    try { GM_setValue(EU_MOST_O, ''); GM_setValue(EU_MOST_Z, ''); } catch (e){}
+                    if (o.ok) ok(o.dane);
+                    else zle(new Error('karta eupago nie pobrała: ' + o.blad));
+                    return;
+                }
+                if (Date.now() - start > 120000){
+                    clearInterval(zegar);
+                    zle(new Error('karta panelu eupago nie odpowiedziała w 2 min. Otwórz '
+                        + 'https://clientes.eupago.pt/backoffice/index.html, zaloguj się '
+                        + 'i zostaw tę kartę otwartą — HUB pobiera przez nią.'));
+                }
+            }, 400);
+        });
+    }
+    async function euGet(sciezka, params){
+        try { return await euGetWprost(sciezka, params); }
+        catch (e){
+            if (!e || !e.most) throw e;
+            return await euGetMostem(sciezka, params);
+        }
+    }
+    // Lista wyplat idzie przez DataTables po stronie serwera, wiec zapytanie musi miec
+    // komplet jego parametrow — inaczej serwer nie wie, czego chcemy.
+    function euZapytanieWyplat(ile, strona){
+        const kol = ['estado', 'data', 'data_pagamento', 'valor', 'total', 'comissao',
+                     'iva', 'nib', 'batch', 'periodo', ''];
+        const p = { draw: 1, start: (strona - 1) * ile, length: ile,
+                    page: strona, per_page: ile, _: Date.now() };
+        kol.forEach(function (n, i){
+            p['columns[' + i + '][data]'] = n;
+            p['columns[' + i + '][name]'] = '';
+            p['columns[' + i + '][searchable]'] = 'true';
+            p['columns[' + i + '][orderable]'] = 'false';
+            p['columns[' + i + '][search][value]'] = '';
+            p['columns[' + i + '][search][regex]'] = 'false';
+        });
+        p['order[0][column]'] = 0; p['order[0][dir]'] = 'asc';
+        p['search[value]'] = ''; p['search[regex]'] = 'false';
+        return p;
+    }
+    function euNum(v){
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        let t = String(v == null ? '' : v).replace(/[\s €]/g, '');
+        if (!t || !/\d/.test(t)) return null;
+        // „1.234,56" i „1,234.56" — rozstrzyga to, ktory separator stoi dalej.
+        const k = t.lastIndexOf(','), p = t.lastIndexOf('.');
+        if (k > p) t = t.replace(/\./g, '').replace(',', '.');
+        else t = t.replace(/,/g, '');
+        const n = parseFloat(t);
+        return isFinite(n) ? n : null;
+    }
+    // Format daty z API nie jest umowiony — panel przepuszcza go przez wlasne
+    // getFormatedDate(). Bierzemy wiec wszystkie ksztalty, jakie moga sie tam pojawic,
+    // a czego NIE rozpoznamy, zglosimy wprost zamiast po cichu wyrzucic z miesiaca.
+    function euData(v){
+        if (v == null || v === '') return '';
+        if (typeof v === 'number' || /^\d{10}$|^\d{13}$/.test(String(v).trim())){
+            const ms = Number(v) * (String(v).trim().length <= 10 ? 1000 : 1);
+            const d = new Date(ms);
+            return isNaN(d) ? '' : d.toISOString().slice(0, 10);
+        }
+        const s = String(v).trim();
+        let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return m[1] + '-' + m[2] + '-' + m[3];
+        m = s.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})/);
+        if (m){
+            // Dzien wiekszy od 12 rozstrzyga uklad; inaczej amerykanski, bo taki
+            // wychodzi z eksportu MOVS („08/30/2026, 13:07:56").
+            const a = +m[1], b = +m[2];
+            const dz = a > 12 ? a : b, ms2 = a > 12 ? b : a;
+            return m[3] + '-' + String(ms2).padStart(2, '0') + '-' + String(dz).padStart(2, '0');
+        }
+        return '';
+    }
+    // Odpowiedz jest stronicowana (page / totalPages / totalItems), a wiersze siedza
+    // w `entries`. Dwie rzeczy, ktore wygladaja inaczej, niz sugeruje ekran panelu:
+    //   `batch` jest ZAWSZE null — nazwa pliku, ktora adresuje pozostale wywolania,
+    //   stoi w `fich`; oraz okres to DWA pola (`data_inicial`, `data_final`), a nie
+    //   jeden napis „od - do" (ten panel sklada sobie sam, przeliczajac jeszcze strefe).
+    // Kwoty przychodza tekstem z przecinkiem dziesietnym („109989,85").
+    async function euWyplaty(od, postep){
+        const out = [];
+        for (let strona = 1; strona <= 10; strona++){
+            if (postep) postep('lista wypłat'
+                + (strona > 1 ? (' — strona ' + strona) : '') + '…');
+            const j = await euGet('/movimentos/listar_pag_emitidos', euZapytanieWyplat(100, strona));
+            const lista = (j && (j.entries || j.aaData || j.data)) || [];
+            lista.forEach(function (x){
+                const okr = String(x.periodo || '').split(/\s+[-–]\s+/);
+                out.push({ estado: x.estado || '',
+                           plik: String(x.fich || x.fich_link || x.batch || '').trim(),
+                           data: euData(x.data_emissao || x.data),
+                           dataPl: euData(x.data_pagamento),
+                           valor: euNum(x.valor), total: euNum(x.total),
+                           prowizja: euNum(x.comissao), iva: euNum(x.iva), nib: x.nib || '',
+                           okresOd: euData(x.data_inicial) || euData(okr[0] || ''),
+                           okresDo: euData(x.data_final) || euData(okr[1] || ''),
+                           link: x.link_comprovativo || '' });
+            });
+            if (!lista.length) break;
+            if (j && j.totalPages && strona >= j.totalPages) break;
+            if (!j || !j.totalPages) break;
+            // Lista idzie od najnowszej. Gdy cofnelismy sie juz przed poczatek zakresu,
+            // dalsze strony sa tylko starsze — nie ma po co po nie siegac.
+            const naj = out[out.length - 1];
+            if (od && naj && naj.okresDo && naj.okresDo < od) break;
+        }
+        return out.filter(function (x){ return x.plik; });
+    }
+    async function euPozycje(plik){
+        const j = await euGet('/movimentos/list_payments_references', { nome_ficheiro: plik });
+        if (!j || j.estado === 21 || !j.aaData) return [];
+        return j.aaData.map(function (x){
+            return { plik: plik, wyst: euData(x.data_emissao), usluga: x.servico || '',
+                     ref: String(x.referencia == null ? '' : x.referencia),
+                     id: String(x.identificador == null ? '' : x.identificador).trim(),
+                     kwota: euR2(euNum(x.valor) || 0), data: euData(x.data_pagamento),
+                     miejsce: x.local || '', prowizja: euNum(x.comissao) || 0,
+                     iva: euNum(x.iva) || 0, prowRazem: euNum(x.total_comissoes) || 0,
+                     kanal: x.nome_canal || '', surowaData: x.data_pagamento };
+        });
+    }
+    // Export payments dla 1232 czytamy WLASNYM parserem, bo wspolny (mkExpZAoa) nie
+    // oddaje kolumny Comment — a to w niej siedzi identyfikator eupago.
+    function euExpZAoa(aoa, nazwa){
+        if (!Array.isArray(aoa) || !aoa.length) return { err: nazwa + ': puste zestawienie' };
+        const hdr = (aoa[0] || []).map(function (c){ return String(c == null ? '' : c).trim(); });
+        const ix = {};
+        hdr.forEach(function (c, i){ if (c) ix[c.toLowerCase()] = i; });
+        const brak = ['auftrag number', 'debit', 'credit', 'amount', 'comment']
+            .filter(function (k){ return ix[k] == null; });
+        if (brak.length)
+            return { err: nazwa + ': to nie wygląda na „Export payments" — brak kolumn: ' + brak.join(', ') };
+        const txt = function (v){
+            if (v == null) return '';
+            if (typeof v === 'number') return (v === Math.floor(v)) ? String(Math.floor(v)) : String(v);
+            return String(v).trim();
+        };
+        const rows = [];
+        for (let i = 1; i < aoa.length; i++){
+            const r = aoa[i] || [];
+            const deb = txt(r[ix['debit']]), cre = txt(r[ix['credit']]);
+            if (!deb && !cre) continue;
+            rows.push({ auf: txt(r[ix['auftrag number']]), deb: deb, cre: cre,
+                        kwota: euR2(euNum(r[ix['amount']]) || 0),
+                        com: txt(r[ix['comment']]),
+                        paid: ix['paid status'] == null ? '' : txt(r[ix['paid status']]),
+                        data: ix['payment date'] == null ? '' : euData(r[ix['payment date']]),
+                        plik: nazwa });
+        }
+        return { rows: rows };
+    }
+    // ---------- klucze ----------
+    // Identyfikator z eupago wystepuje w TRZECH postaciach i wszystkie trzeba znac:
+    //   32-znakowy hash  -> stoi na poczatku kolumny Comment w Export payments,
+    //   sam numer        -> to numer auftragu (kolumna „Auftrag number", przed „/"),
+    //   ticket/auftrag   -> laczy obie rodziny.
+    function euHash(c){
+        const m = String(c || '').trim().match(/^([0-9a-fA-F]{32})\b/);
+        return m ? ('h:' + m[1].toLowerCase()) : '';
+    }
+    function euKluczeEu(id){
+        const s = String(id || '').trim();
+        if (/^[0-9a-fA-F]{32}$/.test(s)) return ['h:' + s.toLowerCase()];
+        let m = s.match(/^(\d+)\s*\/\s*(\d+)$/);
+        if (m) return ['t:' + m[1], 'a:' + m[2]];
+        if (/^\d+$/.test(s)) return ['a:' + s];
+        return [];
+    }
+    function euKluczeEx(r){
+        const k = [];
+        const h = euHash(r.com); if (h) k.push(h);
+        let m = String(r.auf || '').match(/^\s*(\d+)\s*\//);
+        if (m) k.push('a:' + m[1]);
+        m = String(r.auf || '').match(/^CREDIT\s+\d+\s+TICKET\s+(\d+)/i);
+        if (m) k.push('t:' + m[1]);
+        return k;
+    }
+    // ---------- kontrola ----------
+    function euKontrola(eu, ex, mies, ostPokryty){
+        // Rodziny kluczy. Wiersz eksportu niosacy hash I numer auftragu jest mostem
+        // miedzy nimi: bez tego jedno zamowienie oplacone dwiema platnosciami — jedna
+        // z hashem, druga z numerem auftragu — rozpada sie na dwie grupy i saldo
+        // nigdy nie schodzi. Sprawdzone na sierpniu 2026: cztery takie przypadki.
+        const rodzic = {};
+        const znajdz = function (a){
+            if (rodzic[a] === undefined) rodzic[a] = a;
+            while (rodzic[a] !== a){ rodzic[a] = rodzic[rodzic[a]]; a = rodzic[a]; }
+            return a;
+        };
+        const polacz = function (a, b){ const x = znajdz(a), y = znajdz(b); if (x !== y) rodzic[x] = y; };
+        ex.forEach(function (r){
+            r._k = euKluczeEx(r);
+            r._zwrot = (r.cre === EU_KONTO);
+            r._v = euR2(r._zwrot ? -r.kwota : r.kwota);
+            r._k.forEach(function (k){ znajdz(k); });
+            for (let i = 1; i < r._k.length; i++) polacz(r._k[0], r._k[i]);
+        });
+        const euM = [], euPoza = [], bezDaty = [];
+        eu.forEach(function (x){
+            x._k = euKluczeEu(x.id);
+            x._k.forEach(function (k){ znajdz(k); });
+            for (let i = 1; i < x._k.length; i++) polacz(x._k[0], x._k[i]);
+            if (!x.data) bezDaty.push(x);
+            else if (x.data.slice(0, 7) === mies) euM.push(x);
+            else euPoza.push(x);
+        });
+        const E = {}, X = {};
+        const dodaj = function (M, k, kw, poz){
+            if (!M[k]) M[k] = { kw: 0, poz: [] };
+            M[k].kw = euR2(M[k].kw + kw); M[k].poz.push(poz);
+        };
+        euM.forEach(function (x){ dodaj(E, x._k.length ? znajdz(x._k[0]) : ('?e' + x.ref), x.kwota, x); });
+        ex.forEach(function (r){ dodaj(X, r._k.length ? znajdz(r._k[0]) : ('?x' + r.auf), r._v, r); });
+
+        const zgodne = [], rozne = [], tylkoEu = [], tylkoEx = [];
+        Object.keys(E).forEach(function (k){
+            if (X[k]){
+                if (Math.abs(E[k].kw - X[k].kw) < 0.015) zgodne.push(k);
+                else rozne.push({ k: k, eu: E[k], ex: X[k] });
+            } else tylkoEu.push({ k: k, v: E[k] });
+        });
+        Object.keys(X).forEach(function (k){ if (!E[k]) tylkoEx.push({ k: k, v: X[k] }); });
+
+        // Klucz zapasowy: kwota i data (+/-2 dni). Okolo trzydziestu wierszy miesiecznie
+        // prologistics ksieguje BEZ identyfikatora w komentarzu i tylko tak da sie je
+        // dopasowac. Laczymy wylacznie przy obustronnej jednoznacznosci — jeden do jednego.
+        // Numer dnia nie wystarczy: 2026-08-03 i 2026-07-01 dziela dwie doby wedlug
+        // samego „03" i „01", a naprawde miesiac. Liczymy wiec doby od epoki.
+        const doba = function (s){
+            const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+            return m ? Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000) : null;
+        };
+        const dataEx = function (v){
+            return v.poz.map(function (r){ return r.data || ''; }).sort()[0] || '';
+        };
+        // Parujemy TYLKO jeden do jednego. Wczesniej brany byl pierwszy wolny wiersz
+        // o tej kwocie, a 138,20 potrafi wystapic siedem razy w miesiacu — wtedy
+        // wynik zalezal od kolejnosci wierszy i dwa przebiegi dawaly rozne raporty.
+        // Lepiej zostawic taki wiersz do sprawdzenia, niz sparowac go z przypadkowym.
+        const spar = [], zajete = {};
+        const kand = tylkoEu.map(function (a){
+            const d = doba(a.v.poz[0].data);
+            const l = [];
+            if (d === null) return l;
+            tylkoEx.forEach(function (b, j){
+                const e = doba(dataEx(b.v));
+                if (e !== null && Math.abs(a.v.kw - b.v.kw) < 0.015 && Math.abs(d - e) <= 2) l.push(j);
+            });
+            return l;
+        });
+        const ileNaEx = {};
+        kand.forEach(function (l){ l.forEach(function (j){ ileNaEx[j] = (ileNaEx[j] || 0) + 1; }); });
+        tylkoEu.forEach(function (a, i){
+            const l = kand[i];
+            if (l.length !== 1 || ileNaEx[l[0]] !== 1) return;   // niejednoznaczne — zostawiamy
+            const b = tylkoEx[l[0]];
+            zajete[l[0]] = 1; a._spar = b; spar.push({ eu: a.v, ex: b.v });
+        });
+        const euZost = tylkoEu.filter(function (a){ return !a._spar; });
+        let exZost = tylkoEx.filter(function (b, j){ return !zajete[j]; });
+        // Ksiegowania z dni, ktorych zadne zestawienie eupago jeszcze nie obejmuje, nie
+        // sa bledem — czekaja na kolejna wyplate. Ostatnia konczy okres kilka dni przed
+        // koncem miesiaca, wiec w sierpniu 2026 bylo tego 78 pozycji.
+        const czeka = [];
+        if (ostPokryty){
+            exZost = exZost.filter(function (b){
+                if (dataEx(b.v) > ostPokryty){ czeka.push(b); return false; }
+                return true;
+            });
+        }
+        // Dlaczego akurat ten wiersz zostal sam? Bez identyfikatora w komentarzu jedynym
+        // kluczem jest numer auftragu, ktorego eupago w ogole nie zna — wtedy „brak
+        // w eupago" znaczy „nie mam czym sparowac", a nie „pieniadze nie doszly".
+        // Liczba pozycji eupago na te sama kwote mowi, czy da sie to rozstrzygnac recznie.
+        const naKwote = {};
+        eu.forEach(function (x){
+            const g = Math.round(Math.abs(x.kwota) * 100);
+            naKwote[g] = (naKwote[g] || 0) + 1;
+        });
+        exZost.forEach(function (b){
+            b.bezId = !b.v.poz.some(function (q){ return euHash(q.com); });
+            b.ileKwot = naKwote[Math.round(Math.abs(b.v.kw) * 100)] || 0;
+        });
+        // Zaplata i ksiegowanie tego samego zamowienia powinny stac w tym samym dniu
+        // albo dzien obok — tak jest w 2151 z 2156 par lipca. Wiekszy rozjazd to prawie
+        // zawsze zle wpisana data ksiegowania. Saldo sie zgadza, wiec do bledow tego nie
+        // liczymy; pokazujemy osobno, zeby dalo sie poprawic.
+        const poId = {};
+        eu.forEach(function (x){
+            const kl = euHash(x.id);                 // ten sam ksztalt klucza co po stronie eksportu
+            if (kl) (poId[kl] = poId[kl] || []).push(x); });
+        const daty = [];
+        zgodne.forEach(function (k){
+            const rodzina = E[k].poz.map(function (x){ return x.data || ''; }).filter(Boolean);
+            X[k].poz.forEach(function (q){
+                // identyfikator z komentarza celuje w konkretna zaplate; bez niego
+                // zostaje cala rodzina i porownanie jest z natury luzniejsze
+                const h = euHash(q.com);
+                const wlasne = (h && poId[h])
+                    ? poId[h].map(function (x){ return x.data || ''; }).filter(Boolean) : null;
+                const dEu = (wlasne && wlasne.length) ? wlasne : rodzina;
+                if (!dEu.length) return;
+                let naj = null;
+                dEu.forEach(function (de){
+                    const d = euDniMiedzy(q.data, de);
+                    if (d === null) return;
+                    if (naj === null || Math.abs(d) < Math.abs(naj.dni)) naj = { dni: d, dataEu: de };
+                });
+                if (!naj || Math.abs(naj.dni) <= 2) return;
+                daty.push({ k: k, auf: q.auf, kwota: q._v, dataEx: q.data,
+                            dataEu: naj.dataEu, dni: naj.dni });
+            });
+        });
+        daty.sort(function (a, b){ return Math.abs(b.dni) - Math.abs(a.dni); });
+
+        // Referencje WSZYSTKICH pozycji, takze spoza miesiaca — numer wyczytany
+        // z auftragu moze wskazac zaplate z sasiedniego zestawienia i wtedy chcemy
+        // to nazwac po imieniu, a nie zglosic jako brak.
+        const poRef = {};
+        eu.forEach(function (x){ if (x.ref) (poRef[x.ref] = poRef[x.ref] || []).push(x); });
+        return { mies: mies, ostPokryty: ostPokryty, poRef: poRef, daty: daty,
+                 nEu: eu.length, nEuM: euM.length, nEuPoza: euPoza.length, bezDaty: bezDaty,
+                 nEx: ex.length, nZam: Object.keys(E).length, zgodne: zgodne.length,
+                 rozne: rozne, tylkoEu: euZost, tylkoEx: exZost, czeka: czeka, spar: spar,
+                 sumaEuM: euR2(euM.reduce(function (a, x){ return a + x.kwota; }, 0)),
+                 sumaEx: euR2(ex.reduce(function (a, r){ return a + r._v; }, 0)) };
+    }
+    // ---------- wypis ----------
+    function euAufNr(auf){
+        const m = String(auf || '').match(/^\s*(\d+)\s*\/\s*(\d+)/);
+        return m ? { nr: m[1], txn: m[2] } : null;
+    }
+    function euAufLink(auf){
+        const a = euAufNr(auf);
+        if (!a) return salEsc(auf || '');
+        return '<a href="/auction.php?number=' + a.nr + '&txnid=' + a.txn + '" target="_blank">'
+             + salEsc(a.nr + ' / ' + a.txn) + '</a>';
+    }
+    // Komentarz z numerem wyglada zawsze tak samo, bo jest kopiowany z panelu eupago:
+    //   „Transaction Information: Transaction ID: … Reference: 76265969 … Amount paid: 138,20 €"
+    // Bierzemy tekst calej strony i tniemy po naglowku bloku — jeden auftrag moze miec
+    // kilka takich komentarzy (kilka prob platnosci albo kilka pozycji) i kazdy liczy sie
+    // osobno. Czytamy tekst, nie klasy CSS, zeby nie zalezec od ukladu tabeli.
+    function euRefyZeStrony(html){
+        let t = '';
+        try {
+            const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+            t = (d.body && d.body.textContent) || '';
+        } catch (e){ t = String(html || '').replace(/<[^>]*>/g, ' '); }
+        t = t.replace(/\s+/g, ' ');
+        const out = [], byl = {};
+        const czesci = t.split(/Transaction Information\s*:/i);
+        for (let i = 1; i < czesci.length; i++){
+            const c = czesci[i].slice(0, 700);
+            const m = c.match(/Reference\s*:\s*(\d{4,})/i);
+            if (!m || byl[m[1]]) continue;
+            byl[m[1]] = 1;
+            const k = c.match(/Amount paid\s*:\s*([\d.,]+)/i);
+            out.push({ ref: m[1], kwota: k ? euNum(k[1]) : null });
+        }
+        return out;
+    }
+    // Wierszy bez pary jest kilka na miesiac, wiec i stron tyle samo — po trzy naraz,
+    // tak jak przy nadwyzkach VAT. Wynik wpisujemy z powrotem do raportu.
+    async function euNumeryZAuftragow(r, postep){
+        const lista = r.tylkoEx.filter(function (b){ return euAufNr(b.v.poz[0].auf); });
+        if (!lista.length) return;
+        let i = 0, zrobione = 0;
+        async function robotnik(){
+            while (i < lista.length){
+                const b = lista[i++];
+                if (postep) postep('Szukam numeru transakcji w auftragach — '
+                                 + (++zrobione) + '/' + lista.length + '…');
+                try {
+                    const res = await fetch(slAufUrl(euAufNr(b.v.poz[0].auf)), { credentials: 'same-origin' });
+                    if (!res || !res.ok){ b.refErr = 'HTTP ' + (res ? res.status : '?'); continue; }
+                    b.refy = euRefyZeStrony(await res.text());
+                } catch (e){ b.refErr = (e && e.message) || String(e); }
+            }
+        }
+        await Promise.all([robotnik(), robotnik(), robotnik()]);
+
+        // Po numerze siegamy do pozycji eupago, ktore zostaly bez pary.
+        const wolne = {};
+        r.tylkoEu.forEach(function (a){
+            (a.v.poz || []).forEach(function (x){
+                if (x.ref) (wolne[x.ref] = wolne[x.ref] || []).push(a); });
+        });
+        const zeStrony = [];
+        r.tylkoEx.forEach(function (b){
+            if (!b.refy || !b.refy.length) return;
+            const trafy = [];
+            b.refy.forEach(function (x){
+                (wolne[x.ref] || []).forEach(function (a){
+                    if (trafy.indexOf(a) < 0) trafy.push(a); });
+            });
+            const refy = b.refy.map(function (x){ return x.ref; });
+            if (!trafy.length){
+                // Numer jest, ale pozycji nie ma wsrod niesparowanych. Albo lezy poza
+                // sprawdzanym miesiacem (inne zestawienie), albo nie pobralismy jej wcale.
+                const poza = [];
+                refy.forEach(function (rf){
+                    ((r.poRef && r.poRef[rf]) || []).forEach(function (x){ poza.push(x); }); });
+                b._numerPoza = { refy: refy, poz: poza };
+                return;
+            }
+            const suma = euR2(trafy.reduce(function (sm, a){ return sm + a.v.kw; }, 0));
+            if (Math.abs(suma - b.v.kw) < 0.015){
+                b._zeStrony = { poz: trafy, suma: suma, refy: refy };
+                trafy.forEach(function (a){ a._zeStrony = b; });
+                zeStrony.push(b);
+            } else {
+                // Numer jest, ale kwoty sie nie schodza — to zostaje do sprawdzenia
+                // i ma o tym powiedziec wprost, zamiast cicho zniknac z raportu.
+                b._numer = { refy: refy, suma: suma };
+            }
+        });
+        r.zeStrony = zeStrony;
+        r.tylkoEu = r.tylkoEu.filter(function (a){ return !a._zeStrony; });
+        r.tylkoEx = r.tylkoEx.filter(function (b){ return !b._zeStrony; });
+    }
+    // Szukamy TYLKO numerow, ktore zostaly bez pokrycia, i przerywamy, gdy wszystkie
+    // sie znajda. Zestawienia biore od najstarszego z nieprzeczytanych, bo zaplata
+    // trafia do najblizszej wyplaty po niej.
+    async function euPozniejsze(r, wyplaty, postep){
+        const brak = (r.tylkoEx || []).filter(function (b){
+            return b._numerPoza && !b._numerPoza.poz.length; });
+        if (!brak.length) return;
+        const szukane = {};
+        brak.forEach(function (b){
+            b._numerPoza.refy.forEach(function (x){ szukane[x] = b; }); });
+        let wyp;
+        try { wyp = await euWyplaty(null, function (){}); }
+        catch (e){
+            brak.forEach(function (b){ b._numerPoza.blad = (e && e.message) || String(e); });
+            return;
+        }
+        const mam = {};
+        (wyplaty || []).forEach(function (w){ mam[w.plik] = 1; });
+        const nowe = wyp.filter(function (w){
+                          return !mam[w.plik] && (w.okresOd || '') > (r.ostPokryty || ''); })
+                        .sort(function (a, b){ return (a.okresOd || '') < (b.okresOd || '') ? -1 : 1; })
+                        .slice(0, 10);
+        for (let i = 0; i < nowe.length; i++){
+            if (!Object.keys(szukane).length) break;
+            if (postep) postep('Szukam późniejszej zapłaty — zestawienie ' + (i + 1) + '/'
+                             + nowe.length + ' (' + nowe[i].plik + ')…');
+            let lista = [];
+            try { lista = await euPozycje(nowe[i].plik); }
+            catch (e){ continue; }
+            lista.forEach(function (x){
+                const b = szukane[x.ref];
+                if (!b) return;
+                b._numerPoza.poz.push(x);
+                b._numerPoza.wyplata = nowe[i];
+                delete szukane[x.ref];
+            });
+        }
+    }
+    function euDniMiedzy(a, b){
+        const p = String(a || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+        const q = String(b || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (!p || !q) return null;
+        return Math.round((Date.UTC(+q[1], +q[2] - 1, +q[3])
+                         - Date.UTC(+p[1], +p[2] - 1, +p[3])) / 86400000);
+    }
+    // Jeden opis dla tabeli i dla schowka — inaczej rozjezdzaja sie po pierwszej poprawce.
+    function euOpisNumeru(b){
+        const q = b.v.poz[0] || {};
+        const n = b._numerPoza;
+        if (!n.poz.length)
+            return 'numer z auftragu ' + n.refy.join(', ') + ' — '
+                 + (n.blad ? ('nie sprawdziłem młodszych zestawień: ' + n.blad)
+                           : 'nie ma go w żadnym zestawieniu, które przejrzałem');
+        const dni = euDniMiedzy(q.data, n.poz[0].data);
+        return 'numer z auftragu ' + n.refy.join(', ') + ' — eupago zapłacone '
+             + n.poz[0].data
+             + (dni === null ? ''
+                : (dni > 0 ? (', ' + dni + ' dni po księgowaniu (' + (q.data || '') + ')')
+                   : dni < 0 ? (', ' + (-dni) + ' dni przed księgowaniem (' + (q.data || '') + ')')
+                             : ''))
+             + (n.wyplata ? (', wypłata ' + (n.wyplata.dataPl || n.wyplata.data)) : '')
+             + '. Sprawdź datę księgowania.';
+    }
+    function euRender(r, wyp, zle){
+        const bl = r.rozne.length + r.tylkoEu.length + r.tylkoEx.length;
+        const H = [];
+        H.push('<div style="border:1px solid ' + (bl ? '#f5c2c7' : '#badbcc') + ';background:'
+             + (bl ? '#fff5f5' : '#f3fbf6') + ';border-radius:8px;padding:8px;margin-bottom:8px">'
+             + '<div style="font-weight:700">' + (bl ? ('Do sprawdzenia: ' + bl + ' pozycji') : 'Wszystko się zgadza')
+             + '</div><div style="font-size:11px;color:#555;margin-top:2px">'
+             + 'EuPago ' + EU_KONTO + ' · ' + salEsc(r.mies) + ' · zestawień ' + wyp.length
+             + ' · pozycji eupago ' + r.nEuM + ' (poza miesiącem ' + r.nEuPoza + ')'
+             + ' · wierszy w prologistics ' + r.nEx
+             + ' · zamówień ' + r.nZam + ', zgodnych ' + r.zgodne + '</div></div>');
+        (zle || []).forEach(function (x){
+            H.push('<div style="color:#c00;font-size:11px">błąd pobierania: ' + salEsc(x) + '</div>'); });
+        if (r.bezDaty.length)
+            H.push('<div style="color:#c00;font-size:11px;margin-bottom:6px">Nie rozpoznałem daty płatności w '
+                 + r.bezDaty.length + ' pozycjach eupago (np. „' + salEsc(String(r.bezDaty[0].surowaData)) + '") — '
+                 + 'nie wiem, do którego miesiąca należą, więc ich nie sprawdziłem.</div>');
+
+        const tab = function (tyt, kolor, nag, wier){
+            if (!wier.length) return;
+            H.push('<div style="margin-top:8px"><div style="font-weight:700;color:' + kolor + ';font-size:12px">'
+                 + salEsc(tyt) + '</div>'
+                 + '<div style="max-height:260px;overflow:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+                 + '<tr style="color:#999;font-size:10px">'
+                 + nag.map(function (h){ return '<td style="padding:1px 6px">' + salEsc(h) + '</td>'; }).join('')
+                 + '</tr>' + wier.join('') + '</table></div></div>');
+        };
+        const kom = function (t){ return '<td style="padding:2px 6px">' + t + '</td>'; };
+        const kwo = function (t){ return '<td style="padding:2px 6px;text-align:right">' + t + '</td>'; };
+
+        tab('Wypłaty w zestawieniach (' + wyp.length + ')', '#333',
+            ['Wypłata', 'Okres', 'Pozycji', 'Total', 'Prowizja', 'Przelew', 'Zgodność'],
+            wyp.map(function (w){
+                const suma = euR2((w._poz || []).reduce(function (a, x){ return a + x.kwota; }, 0));
+                const prow = euR2((w._poz || []).reduce(function (a, x){ return a + x.prowizja; }, 0));
+                const ok = (w.total == null) || Math.abs(suma - w.total) < 0.02;
+                return '<tr style="border-top:1px solid #f1f5f9">'
+                     + kom('<code>' + salEsc(w.dataPl || w.data) + '</code>')
+                     + kom('<span style="color:#666">' + salEsc((w.okresOd || '?') + '…' + (w.okresDo || '?')) + '</span>')
+                     + kwo(String((w._poz || []).length))
+                     + kwo(salPln(suma)) + kwo(salPln(prow)) + kwo(salPln(euR2(suma - prow)))
+                     + kom(ok ? '<span style="color:#0a7a2f">zgadza się z panelem</span>'
+                              : ('<span style="color:#c00">panel podaje ' + salPln(w.total) + '</span>')) + '</tr>';
+            }));
+
+        tab('Saldo się nie zgadza (' + r.rozne.length + ')', '#c00',
+            ['Auftrag', 'eupago', 'prologistics', 'Różnica', 'Pozycji'],
+            r.rozne.sort(function (a, b){ return Math.abs(b.eu.kw - b.ex.kw) - Math.abs(a.eu.kw - a.ex.kw); })
+              .map(function (x){
+                return '<tr style="border-top:1px solid #f1f5f9">'
+                     + kom(euAufLink((x.ex.poz[0] || {}).auf))
+                     + kwo(salPln(x.eu.kw)) + kwo(salPln(x.ex.kw))
+                     + kwo('<b>' + salPln(euR2(x.eu.kw - x.ex.kw)) + '</b>')
+                     + kom('<span style="color:#888">' + x.eu.poz.length + ' ↔ ' + x.ex.poz.length + '</span>') + '</tr>';
+            }));
+
+        tab('W eupago, brak w prologistics (' + r.tylkoEu.length + ')', '#c00',
+            ['Data', 'Usługa', 'Referencja', 'Kwota', 'Identyfikator'],
+            r.tylkoEu.sort(function (a, b){ return a.v.poz[0].data < b.v.poz[0].data ? -1 : 1; })
+              .map(function (a){
+                const x = a.v.poz[0];
+                return '<tr style="border-top:1px solid #f1f5f9">'
+                     + kom(salEsc(x.data)) + kom(salEsc(x.usluga)) + kom('<code>' + salEsc(x.ref) + '</code>')
+                     + kwo(salPln(a.v.kw))
+                     + kom('<code style="font-size:10px">' + salEsc(x.id) + '</code>') + '</tr>';
+            }));
+
+        tab('W prologistics, brak w eupago (' + r.tylkoEx.length + ')', '#c00',
+            ['Data', 'Auftrag', 'Konto', 'Kwota', 'Wierszy', 'Klucz', 'Ta kwota w eupago'],
+            r.tylkoEx.map(function (b){
+                const q = b.v.poz[0];
+                let klucz;
+                if (b._numer)
+                    klucz = '<span style="color:#c00">numer z auftragu ' + salEsc(b._numer.refy.join(', '))
+                          + ', ale eupago ma na nim ' + salPln(b._numer.suma) + '</span>';
+                else if (b._numerPoza)
+                    klucz = '<span style="color:#c47f00">' + salEsc(euOpisNumeru(b)) + '</span>';
+                else if (b.refErr)
+                    klucz = '<span style="color:#c00">nie odczytałem auftragu: ' + salEsc(b.refErr) + '</span>';
+                else if (b.bezId)
+                    klucz = '<span style="color:#c47f00">bez identyfikatora'
+                          + (b.refy ? ', w auftragu też nie ma numeru' : ' — tylko nr auftragu') + '</span>';
+                else
+                    klucz = '<span style="color:#64748b">identyfikator jest, eupago go nie ma</span>';
+                const ile = b.bezId
+                    ? (b.ileKwot === 0 ? '<span style="color:#c00">0 pozycji</span>'
+                       : (b.ileKwot === 1 ? '<span style="color:#0a7a2f">1 pozycja</span>'
+                          : '<span style="color:#c47f00">' + b.ileKwot + ' pozycji</span>'))
+                    : '<span style="color:#94a3b8">—</span>';
+                return '<tr style="border-top:1px solid #f1f5f9">'
+                     + kom(salEsc(q.data || '')) + kom(euAufLink(q.auf))
+                     + kom(salEsc(q._zwrot ? q.deb : q.cre))
+                     + kwo(salPln(b.v.kw)) + kwo(String(b.v.poz.length))
+                     + kom(klucz) + kom(ile) + '</tr>';
+            }));
+
+        if ((r.zeStrony || []).length)
+            tab('Odzyskane numerem transakcji z auftragu (' + r.zeStrony.length + ')', '#0a7a2f',
+                ['Auftrag', 'Kwota', 'Numer transakcji', 'Pozycje eupago'],
+                r.zeStrony.map(function (b){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom(euAufLink(b.v.poz[0].auf)) + kwo(salPln(b.v.kw))
+                         + kom('<code>' + salEsc(b._zeStrony.refy.join(', ')) + '</code>')
+                         + kom(b._zeStrony.poz.map(function (a){
+                               const x = a.v.poz[0];
+                               return salEsc(x.data + ' ' + x.usluga + ' ' + euF2(a.v.kw)); }).join('<br>'))
+                         + '</tr>';
+                }));
+
+        if ((r.daty || []).length)
+            tab('Zapłata i księgowanie w różnych dniach (' + r.daty.length + ') — salda się zgadzają',
+                '#c47f00',
+                ['Auftrag', 'Kwota', 'Księgowanie', 'Zapłata w eupago', 'Rozjazd'],
+                r.daty.map(function (x){
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom(euAufLink(x.auf)) + kwo(salPln(x.kwota))
+                         + kom(salEsc(x.dataEx)) + kom(salEsc(x.dataEu))
+                         + kom(x.dni > 0 ? ('zapłata ' + x.dni + ' dni później')
+                                         : ('zapłata ' + (-x.dni) + ' dni wcześniej'))
+                         + '</tr>';
+                }));
+
+        if (r.czeka.length){
+            const suma = euR2(r.czeka.reduce(function (a, b){ return a + b.v.kw; }, 0));
+            H.push('<div style="margin-top:8px;border:1px solid #ffe0a3;background:#fffbf0;border-radius:8px;padding:8px">'
+                 + '<div style="font-weight:700;color:#c47f00;font-size:12px">Czekają na zestawienie eupago ('
+                 + r.czeka.length + ')</div>'
+                 + '<div style="font-size:11px;color:#555;margin-top:2px">Księgowania po ' + salEsc(r.ostPokryty)
+                 + ' na ' + salPln(suma) + '. Ostatnia wypłata kończy okres wcześniej niż miesiąc — te pozycje '
+                 + 'wejdą do kolejnej i nie są błędem.</div></div>');
+        }
+        if (r.spar.length){
+            H.push('<div style="margin-top:8px"><details><summary style="font-size:11px;color:#0a7a2f;cursor:pointer">'
+                 + 'Sparowane kwotą i datą (' + r.spar.length + ') — prologistics nie zapisał identyfikatora w komentarzu'
+                 + '</summary><div style="font-size:11px;max-height:200px;overflow:auto;margin-top:4px">'
+                 + r.spar.map(function (s){
+                     return '<div>' + salEsc(s.eu.poz[0].data) + ' · ' + salPln(s.eu.kw)
+                          + ' ↔ ' + euAufLink((s.ex.poz[0] || {}).auf) + '</div>'; }).join('')
+                 + '</div></details></div>');
+        }
+        return H.join('');
+    }
+    function euTekst(r, wyp, zle){
+        const L = [];
+        L.push('EuPago ' + EU_KONTO + ' ↔ Export payments');
+        L.push('miesiąc ' + r.mies + ' · zestawień ' + wyp.length + ' · pokryte do ' + (r.ostPokryty || '?'));
+        L.push('pozycji eupago ' + r.nEuM + ' (poza miesiącem ' + r.nEuPoza + '), wierszy w prologistics ' + r.nEx);
+        L.push('zamówień ' + r.nZam + ', zgodnych ' + r.zgodne);
+        (zle || []).forEach(function (x){ L.push('błąd pobierania: ' + x); });
+        L.push('');
+        L.push('WYPŁATY');
+        wyp.forEach(function (w){
+            const suma = euR2((w._poz || []).reduce(function (a, x){ return a + x.kwota; }, 0));
+            const prow = euR2((w._poz || []).reduce(function (a, x){ return a + x.prowizja; }, 0));
+            L.push('   ' + (w.dataPl || w.data) + '  okres ' + (w.okresOd || '?') + '…' + (w.okresDo || '?')
+                 + '  pozycji ' + (w._poz || []).length + '  total ' + euF2(suma)
+                 + '  prowizja ' + euF2(prow) + '  przelew ' + euF2(euR2(suma - prow))
+                 + ((w.total != null && Math.abs(suma - w.total) >= 0.02) ? ('  ⚠ panel: ' + euF2(w.total)) : ''));
+        });
+        const sek = function (tyt, tab, fmt){
+            if (!tab.length) return;
+            L.push(''); L.push(tyt + ' (' + tab.length + ')');
+            tab.forEach(function (x){ L.push('   ' + fmt(x)); });
+        };
+        sek('SALDO SIĘ NIE ZGADZA', r.rozne, function (x){
+            return ((x.ex.poz[0] || {}).auf || '?') + '  eupago ' + euF2(x.eu.kw) + ', prologistics ' + euF2(x.ex.kw)
+                 + '  różnica ' + euF2(euR2(x.eu.kw - x.ex.kw)); });
+        sek('W EUPAGO, BRAK W PROLOGISTICS', r.tylkoEu, function (a){
+            const x = a.v.poz[0];
+            return x.data + '  ' + x.usluga + '  ref ' + x.ref + '  ' + euF2(a.v.kw) + '  id ' + x.id; });
+        sek('W PROLOGISTICS, BRAK W EUPAGO', r.tylkoEx, function (b){
+            const q = b.v.poz[0];
+            return (q.data || '') + '  ' + (q.auf || '') + '  ' + euF2(b.v.kw)
+                 + '  (' + b.v.poz.length + ' wierszy)'
+                 + (b._numer ? ('  — numer z auftragu ' + b._numer.refy.join(', ')
+                                + ', ale eupago ma na nim ' + euF2(b._numer.suma))
+                    : b._numerPoza ? ('  — ' + euOpisNumeru(b))
+                    : b.refErr ? ('  — nie odczytałem auftragu: ' + b.refErr)
+                    : b.bezId ? ('  — bez identyfikatora'
+                                 + (b.refy ? ', w auftragu też nie ma numeru' : '')
+                                 + '; ta kwota w eupago: ' + b.ileKwot + ' poz.')
+                              : '  — identyfikator jest, eupago go nie ma'); });
+        sek('ZAPŁATA I KSIĘGOWANIE W RÓŻNYCH DNIACH (salda się zgadzają)', r.daty || [], function (x){
+            return (x.auf || '') + '  ' + euF2(x.kwota)
+                 + '  księgowanie ' + x.dataEx + ', zapłata ' + x.dataEu
+                 + '  (' + (x.dni > 0 ? ('+' + x.dni) : String(x.dni)) + ' dni)'; });
+        sek('ODZYSKANE NUMEREM TRANSAKCJI Z AUFTRAGU', r.zeStrony || [], function (b){
+            return (b.v.poz[0].auf || '') + '  ' + euF2(b.v.kw)
+                 + '  numer ' + b._zeStrony.refy.join(', '); });
+        if (r.czeka.length)
+            L.push('\nCZEKAJĄ NA ZESTAWIENIE EUPAGO (' + r.czeka.length + ') — księgowania po ' + r.ostPokryty
+                 + ', razem ' + euF2(euR2(r.czeka.reduce(function (a, b){ return a + b.v.kw; }, 0))));
+        if (r.spar.length)
+            L.push('SPAROWANE KWOTĄ I DATĄ (' + r.spar.length + ') — bez identyfikatora w komentarzu');
+        const bl = r.rozne.length + r.tylkoEu.length + r.tylkoEx.length;
+        L.push('');
+        L.push(bl ? ('DO SPRAWDZENIA: ' + bl + ' pozycji') : 'Wszystko się zgadza.');
+        return L.join('\n');
+    }
+    // ---------- ekran ----------
+    let SAL_EU = null;          // { wyplaty, pozycje, ostPokryty }
+    let SAL_EU_EXP = null;      // wiersze Export payments
+    let SAL_EU_WYNIK = '';
+    // Zestawienia z eupago scalone w jeden arkusz — uklad kolumn jak w pliku MOVS,
+    // z dolozona na przodzie informacja, z ktorej wyplaty pochodzi wiersz. Dzieki temu
+    // jeden plik zastepuje piec pobieranych recznie.
+    function salEuXlsx(){
+        if (!SAL_EU || !SAL_EU.pozycje.length){ salSay('Najpierw pobierz z eupago.', '#c47f00'); return; }
+        const poPliku = {};
+        SAL_EU.wyplaty.forEach(function (x){ poPliku[x.plik] = x; });
+        const w = [['Zestawienie', 'Wypłata', 'Okres od', 'Okres do', 'Issuance Date', 'Service',
+                    'Reference', 'Identifier', 'Value(€)', 'Payment Date', 'Place',
+                    'Commission(€)', 'VAT(€)', '(Commission + VAT)(€)', 'Channel']];
+        SAL_EU.pozycje.forEach(function (x){
+            const y = poPliku[x.plik] || {};
+            w.push([x.plik, y.dataPl || y.data || '', y.okresOd || '', y.okresDo || '',
+                    x.wyst, x.usluga, x.ref, x.id, x.kwota, x.data, x.miejsce,
+                    x.prowizja, x.iva, x.prowRazem, x.kanal]);
+        });
+        const suma = function (f){ return euR2(SAL_EU.pozycje.reduce(function (a, x){ return a + f(x); }, 0)); };
+        w.push([]);
+        w.push(['RAZEM', SAL_EU.wyplaty.length + ' zestawień', '', '', '', '', '',
+                SAL_EU.pozycje.length + ' pozycji', suma(function (x){ return x.kwota; }), '', '',
+                suma(function (x){ return x.prowizja; }), suma(function (x){ return x.iva; }),
+                suma(function (x){ return x.prowRazem; }), '']);
+        const blob = slXlsxBlob('EuPago', w);
+        const nazwa = 'eupago-' + (SAL_EU.wyplaty.length ? (SAL_EU.wyplaty[SAL_EU.wyplaty.length - 1].okresOd
+                       + '_' + SAL_EU.wyplaty[0].okresDo) : 'zestawienia') + '.xlsx';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nazwa;
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + nazwa + ' — ' + SAL_EU.pozycje.length + ' pozycji z '
+             + SAL_EU.wyplaty.length + ' zestawień.', '#0a7a2f');
+    }
+    async function salRysujEu(){
+        const p = salPanel(), u = salUst();
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · EuPago ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam konto <b>' + EU_KONTO + '</b> '
+            + '(EUPAGO PT Beliani DE). Zestawienia biorę wprost z panelu eupago — nie z plików MOVS, bo te '
+            + 'i tak powstają w przeglądarce z tych samych danych. Miesiąc wyznacza <b>data płatności</b>, '
+            + 'a nie okres wypłaty.</div>'
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="sal-eupobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
+            + '<button id="sal-eueu" style="padding:5px 14px;border:1px solid #750000;background:#fff;color:#750000;border-radius:6px;font-weight:700;cursor:pointer">⬇ Pobierz z eupago</button>'
+            + '</div>'
+            + '<div id="sal-euinfo" style="font-size:11px;color:#888;margin-bottom:4px">Nic jeszcze nie pobrane.</div>'
+            + '<div id="sal-stan-eu" style="font-size:11px;margin-bottom:2px;display:none"></div>'
+            + '<div id="sal-stan-pl" style="font-size:11px;margin-bottom:8px;display:none"></div>'
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<button id="sal-euporownaj" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+            + '<button id="sal-euxlsx" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Wszystkie pobrane zestawienia eupago w jednym arkuszu, w układzie kolumn pliku MOVS">📗 Zestawienia (XLSX)</button>'
+            + '<button id="sal-eukopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+            + '</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="sal-euwynik"></div>';
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-eupobierz').onclick = function (){ salEuExport(this); };
+        p.querySelector('#sal-eueu').onclick = function (){ salEuPanel(this); };
+        p.querySelector('#sal-euporownaj').onclick = function (){ salEuPorownaj(this); };
+        p.querySelector('#sal-euxlsx').onclick = function (){ salEuXlsx(); };
+        p.querySelector('#sal-eukopiuj').onclick = function (){
+            try { GM_setClipboard(SAL_EU_WYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
+            catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
+        };
+        const zapisz = function (){
+            const o = salUst();
+            o.od = p.querySelector('#sal-od').value; o.do = p.querySelector('#sal-do').value;
+            salUstZapisz(o);
+        };
+        p.querySelector('#sal-od').onchange = zapisz;
+        p.querySelector('#sal-do').onchange = zapisz;
+        salEuInfo();
+    }
+    // Osobny wiersz stanu dla kazdego zrodla: eupago i prologistics chodza rownolegle
+    // i jeden komunikat nie ma szans obsluzyc obu. Sekundy dopisuje zegar, a nie
+    // wywolanie postepu — dlugie zapytanie nie daje znaku zycia i licznik stalby na zerze.
+    const EU_STAN = {}, EU_ETY = { eu: 'eupago', pl: 'prologistics' };
+    function euStanRysuj(ktore){
+        const p = salPanel();
+        const el = p ? p.querySelector('#sal-stan-' + ktore) : null;
+        if (!el) return;
+        const st = EU_STAN[ktore];
+        if (!st){ el.style.display = 'none'; el.textContent = ''; return; }
+        el.style.display = '';
+        el.style.color = st.kolor || '#666';
+        el.textContent = EU_ETY[ktore] + ': ' + st.tekst
+            + (st.t0 ? (' · ' + Math.round((Date.now() - st.t0) / 1000) + ' s') : '');
+    }
+    function euStanStop(ktore){
+        const st = EU_STAN[ktore];
+        if (st && st.zegar) clearInterval(st.zegar);
+    }
+    function euStanStart(ktore, tekst){
+        euStanStop(ktore);
+        EU_STAN[ktore] = { tekst: tekst, t0: Date.now(), kolor: '#666',
+                           zegar: setInterval(function (){ euStanRysuj(ktore); }, 250) };
+        euStanRysuj(ktore);
+    }
+    function euStanTekst(ktore, tekst){
+        if (!EU_STAN[ktore] || !EU_STAN[ktore].t0) return euStanStart(ktore, tekst);
+        EU_STAN[ktore].tekst = tekst;
+        euStanRysuj(ktore);
+    }
+    function euStanKoniec(ktore, tekst, kolor){
+        const st = EU_STAN[ktore];
+        const ile = st && st.t0 ? Math.round((Date.now() - st.t0) / 1000) : 0;
+        euStanStop(ktore);
+        EU_STAN[ktore] = { tekst: tekst + (ile ? (' · ' + ile + ' s') : ''), t0: 0,
+                           kolor: kolor || '#0a7a2f' };
+        euStanRysuj(ktore);
+    }
+    function salEuInfo(){
+        const e = salPanel().querySelector('#sal-euinfo');
+        if (!e) return;
+        const cz = [];
+        cz.push(SAL_EU_EXP ? ('prologistics: ' + SAL_EU_EXP.length + ' wierszy') : 'prologistics: nie pobrane');
+        cz.push(SAL_EU ? ('eupago: ' + SAL_EU.wyplaty.length + ' wypłat, ' + SAL_EU.pozycje.length
+                          + ' pozycji, pokryte do ' + (SAL_EU.ostPokryty || '?'))
+                       : 'eupago: nie pobrane');
+        e.textContent = cz.join(' · ');
+    }
+    async function salEuExport(b){
+        const p = salPanel();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ euStanKoniec('pl', 'uzupełnij zakres dat', '#c47f00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            euStanKoniec('pl', 'moduł Export payments jest wyłączony w launcherze', '#c00'); return; }
+        b.disabled = true;
+        const t0 = Date.now();
+        euStanStart('pl', 'zaczynam…');
+        try {
+            const wynik = await window.__TM_EXPORT_FETCH([EU_KONTO], od, doo, 'excel', function (i, n, nazwa, etap){
+                euStanTekst('pl', nazwa + (etap ? (' · ' + etap) : ''));
+            });
+            const rows = [], zle = [];
+            wynik.forEach(function (x){
+                if (x.blad){ zle.push(x.nazwa + ': ' + x.blad); return; }
+                if (!x.buf){ zle.push(x.nazwa + ': brak ruchu w tym zakresie'); return; }
+                const r = euExpZAoa(slXls(x.buf), x.nazwa || EU_KONTO);
+                if (r.err){ zle.push(r.err); return; }
+                r.rows.forEach(function (y){ rows.push(y); });
+            });
+            SAL_EU_EXP = rows;
+            salEuInfo();
+            euStanKoniec('pl', rows.length
+                    ? (rows.length + ' wierszy' + (zle.length ? (' · problemy: ' + zle.join('; ')) : ''))
+                    : ('nie wczytałem ani jednego wiersza. ' + zle.join('; ')),
+                   rows.length ? (zle.length ? '#c47f00' : '#0a7a2f') : '#c00');
+        } catch (e){
+            euStanKoniec('pl', 'nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+    async function salEuPanel(b){
+        const p = salPanel();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ euStanKoniec('eu', 'uzupełnij zakres dat', '#c47f00'); return; }
+        const brak = euBrakTokena();
+        if (brak){ euStanKoniec('eu', brak, '#c00'); return; }
+        b.disabled = true;
+        const t0 = Date.now();
+        euStanStart('eu', 'pytam o listę wypłat…');
+        try {
+            const wyp = await euWyplaty(od, function (t){ euStanTekst('eu', t); });
+            // Bierzemy kazda wyplate, ktorej OKRES dotyka wybranego zakresu — plus jedna
+            // wczesniejsza, bo platnosci z pierwszych dni miesiaca siedza w wyplacie,
+            // ktora okresem zaczyna sie jeszcze w poprzednim.
+            const dotyka = wyp.filter(function (w){
+                return (w.okresDo || w.dataPl || '') >= od && (w.okresOd || w.dataPl || '') <= doo;
+            });
+            if (!dotyka.length){
+                // Rozrozniamy dwie zupelnie rozne przyczyny — bez tego jeden komunikat
+                // opisuje i pusta odpowiedz, i zle odczytany okres.
+                if (!wyp.length)
+                    euStanKoniec('eu', 'nie oddało ani jednej wypłaty — sprawdź, czy panel pokazuje '
+                         + 'je na ekranie Movimentos.', '#c00');
+                else
+                    euStanKoniec('eu', 'przyszło ' + wyp.length + ' wypłat, ale żadna nie obejmuje '
+                         + od + '…' + doo + '. Okresy, które odczytałem: '
+                         + wyp.slice(0, 4).map(function (w){
+                               return (w.okresOd || '?') + '…' + (w.okresDo || '?'); }).join(', ')
+                         + (wyp.length > 4 ? ' …' : '') + '.', '#c47f00');
+                return; }
+            const poz = [];
+            for (let i = 0; i < dotyka.length; i++){
+                euStanTekst('eu', 'pozycje ' + (i + 1) + '/' + dotyka.length + ' — ' + dotyka[i].plik);
+                const lista = await euPozycje(dotyka[i].plik);
+                dotyka[i]._poz = lista;
+                lista.forEach(function (x){ poz.push(x); });
+            }
+            const ost = poz.reduce(function (a, x){ return (x.data && x.data > a) ? x.data : a; }, '');
+            SAL_EU = { wyplaty: dotyka, pozycje: poz, ostPokryty: ost };
+            salEuInfo();
+            const x = salPanel().querySelector('#sal-euxlsx');
+            if (x) x.style.display = poz.length ? '' : 'none';
+            euStanKoniec('eu', dotyka.length + ' wypłat, ' + poz.length + ' pozycji, pokryte do '
+                 + (ost || '?'), '#0a7a2f');
+        } catch (e){
+            euStanKoniec('eu', 'nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+    async function salEuPorownaj(b){
+        const p = salPanel(), out = p.querySelector('#sal-euwynik'), kop = p.querySelector('#sal-eukopiuj');
+        if (!SAL_EU){ salSay('Najpierw pobierz z eupago.', '#c47f00'); return; }
+        if (!SAL_EU_EXP || !SAL_EU_EXP.length){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        const od = p.querySelector('#sal-od').value;
+        const mies = String(od || '').slice(0, 7);
+        if (!/^\d{4}-\d{2}$/.test(mies)){ salSay('Zakres dat musi zaczynać się od pierwszego dnia miesiąca.', '#c00'); return; }
+        b.disabled = true;
+        try {
+            const r = euKontrola(SAL_EU.pozycje, SAL_EU_EXP.slice(), mies, SAL_EU.ostPokryty);
+            // Numer transakcji stoi w komentarzu auftragu, nie w wierszu platnosci —
+            // dla wierszy bez pary doczytujemy go ze strony. To kilka stron na miesiac.
+            if (r.tylkoEx.length) await euNumeryZAuftragow(r, function (t){ salSay(t, '#666'); });
+            // Numer bez pokrycia znaczy, ze zaplata przyszla pozniej — dociagamy mlodsze
+            // zestawienia tylko po to, zeby podac date. Gdy wszystko sie schodzi, ten
+            // krok nie wysyla ani jednego zapytania.
+            await euPozniejsze(r, SAL_EU.wyplaty, function (t){ salSay(t, '#666'); });
+            SAL_EU_WYNIK = euTekst(r, SAL_EU.wyplaty, []);
+            out.innerHTML = euRender(r, SAL_EU.wyplaty, []);
+            kop.style.display = '';
+            const bl = r.rozne.length + r.tylkoEu.length + r.tylkoEx.length;
+            salSay((bl ? ('Do sprawdzenia: ' + bl + ' pozycji.') : 'Wszystko się zgadza.')
+                 + (r.czeka.length ? (' ' + r.czeka.length + ' czeka na kolejne zestawienie.') : '')
+                 + (r.spar.length ? (' ' + r.spar.length + ' sparowane kwotą i datą.') : '')
+                 + ((r.zeStrony || []).length ? (' ' + r.zeStrony.length
+                        + ' odzyskane numerem z auftragu.') : '')
+                 + ((r.daty || []).length ? (' ' + r.daty.length
+                        + ' z rozjazdem dat.') : ''),
+                   bl ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salSay('Błąd porównania: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
     async function salRysujPP(){
         const p = salPanel(), u = salUst();
         const et = await salEtykiety(), akt = salAktywne();
@@ -48611,6 +49919,125 @@
     // z tego, ze teraz dziali obok dziewieciu innych modulow: prefiks kluczy ustawien,
     // guzik w zwyklym drzewie dokumentu (launcher go potrzebuje) i bezpiecznik na ramki.
     // Panel zostaje w shadow DOM — dzieki temu jego style nie mieszaja sie z reszta.
+    // ===== Most do panelu eupago (v5.27) =====
+    // Panel clientes.eupago.pt trzyma sesje w DWOCH miejscach naraz: ciasteczkach
+    // i tokenie JWT w `sessionStorage.access_token`. Kazde zapytanie do API idzie
+    // z naglowkiem `Authorization: <token>` — bez slowa „Bearer", token wprost, po
+    // obcieciu cudzyslowow (`sessionStorage.getItem('access_token').replace(/\"/g,"")`
+    // — tak robi js/modules/movimentos/pagamentos_emitidos.js, linia 552).
+    //
+    // sessionStorage jest per DOMENA i per KARTA, wiec polowka HUB-a stojaca na
+    // prologistics nie ma jak go przeczytac. Stad ten modul: siedzi na panelu, czyta
+    // token i oddaje go przez GM_setValue — wspolne dla wszystkich domen skryptu.
+    // Ten sam uklad co przy ManoMano (init_mmtok), z jedna roznica: tam trzeba bylo
+    // token PRZECHWYCIC z naglowka, bo nie lezal w storage. Tu lezy, wiec wystarczy
+    // go odczytac — a przechwytywanie zostaje jako zapas, gdy panel go odswiezy.
+    //
+    // Ten modul NICZEGO NIE WYSYLA i niczego nie klika.
+    function init_eutok(){
+        const KLUCZ = 'tm_eu_token_v1';
+        let mam = false;
+        function chmurka(tekst, kolor, ile){
+            const d = document.createElement('div');
+            d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;background:'
+                + kolor + ';color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:7px 11px;'
+                + 'border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);cursor:pointer;max-width:300px';
+            d.textContent = tekst;
+            d.onclick = function (){ d.remove(); };
+            if (document.body) document.body.appendChild(d);
+            setTimeout(function (){ if (d.parentNode) d.remove(); }, ile);
+        }
+        function zapisz(v){
+            const t = String(v == null ? '' : v).replace(/"/g, '').trim();
+            if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) return;      // sam JWT, bez „Bearer"
+            let exp = 0;
+            try {
+                const cz = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                exp = (JSON.parse(atob(cz + '==='.slice((cz.length + 3) % 4))).exp || 0) * 1000;
+            } catch (e){ exp = 0; }
+            if (exp && exp < Date.now()) return;                  // przeterminowanego nie zapisujemy
+            try { GM_setValue(KLUCZ, JSON.stringify({ tok: t, exp: exp, kiedy: Date.now() })); }
+            catch (e){ return; }
+            if (mam) return;
+            mam = true;
+            chmurka('✓ HUB ma sesję eupago'
+                + (exp ? (' — ważna do ' + new Date(exp).toLocaleString('pl-PL').slice(0, 16)) : '')
+                + '. Możesz wrócić do prologistics.', '#0a7a2f', 12000);
+        }
+        const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        // 1) Droga glowna — token lezy w sessionStorage. Po zalogowaniu pojawia sie
+        //    od razu, ale skrypt startuje w document-idle i bywa szybszy niz logowanie,
+        //    wiec zagladamy cyklicznie przez pierwsze pol godziny.
+        const czytaj = function (){
+            try { zapisz(W.sessionStorage && W.sessionStorage.getItem('access_token')); } catch (e){}
+        };
+        czytaj();
+        const zegar = setInterval(function (){
+            czytaj();
+            if (mam) clearInterval(zegar);
+        }, 4000);
+        setTimeout(function (){ clearInterval(zegar); }, 1800000);
+        // 2) Zapas — gdy panel odswiezy token (jest tez `refresh_token`), nowy zobaczymy
+        //    w naglowku najblizszego zapytania.
+        try {
+            const proto = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
+            const stary = proto && proto.setRequestHeader;
+            if (typeof stary === 'function'){
+                proto.setRequestHeader = function (n, v){
+                    try { if (String(n).toLowerCase() === 'authorization') zapisz(v); } catch (e){}
+                    return stary.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        // Cisza jest tu najgorsza — po 20 s bez tokenu mowimy wprost, co zrobic.
+        setTimeout(function (){
+            if (mam) return;
+            chmurka('HUB nie widzi jeszcze sesji eupago. Zaloguj się do panelu i zostaw '
+                  + 'tę kartę otwartą przez chwilę.', '#c47f00', 15000);
+        }, 20000);
+        // 3) Most. Czesc zapytan (pozycje wyplaty) puszczona z prologistics wraca jako
+        //    strona panelu zamiast JSON-a. Z TEJ karty to samo zapytanie jest wewnetrzne
+        //    i przechodzi zawsze, wiec wykonujemy tu zlecenia zostawione przez Salda.
+        const MOST_Z = 'tm_eu_most_zlec', MOST_O = 'tm_eu_most_odp';
+        let ostatnieZlec = '', zrobione = 0;
+        function tokTeraz(){
+            try { return (JSON.parse(GM_getValue(KLUCZ, '') || '{}').tok) || ''; }
+            catch (e){ return ''; }
+        }
+        function wykonaj(z){
+            const q = Object.keys(z.params || {}).map(function (k){
+                return encodeURIComponent(k) + '=' + encodeURIComponent(z.params[k]); }).join('&');
+            const url = 'https://clientes.eupago.pt/clientes' + z.sciezka + (q ? ('?' + q) : '');
+            return fetch(url, { method: 'GET', credentials: 'include', cache: 'no-store',
+                    headers: { 'Authorization': tokTeraz(),
+                               'Accept': 'application/json, text/plain, */*',
+                               'X-Requested-With': 'XMLHttpRequest' } })
+                .then(function (r){
+                    return r.text().then(function (tresc){
+                        if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + z.sciezka);
+                        try { return JSON.parse(tresc); }
+                        catch (e){ throw new Error('panel oddał ' + (r.headers.get('content-type') || '?')
+                            + ' zamiast JSON-a: ' + tresc.replace(/\s+/g, ' ').slice(0, 160)); }
+                    });
+                });
+        }
+        setInterval(function (){
+            let z = null;
+            try { z = JSON.parse(GM_getValue(MOST_Z, '') || 'null'); } catch (e){ z = null; }
+            if (!z || !z.id || z.id === ostatnieZlec) return;
+            if (Date.now() - (z.kiedy || 0) > 180000) return;   // przeterminowanego nie ruszamy
+            ostatnieZlec = z.id;
+            wykonaj(z).then(function (d){
+                GM_setValue(MOST_O, JSON.stringify({ id: z.id, ok: true, dane: d, kiedy: Date.now() }));
+                zrobione++;
+                if (zrobione === 1) chmurka('HUB pobiera dane przez tę kartę — zostaw ją otwartą.',
+                                            '#0a58ca', 8000);
+            }, function (e){
+                GM_setValue(MOST_O, JSON.stringify({ id: z.id, ok: false,
+                    blad: (e && e.message) || String(e), kiedy: Date.now() }));
+            });
+        }, 600);
+    }
     function init_vatcalc() {
 (function () {
   "use strict";
@@ -50513,6 +51940,7 @@
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
+        { id: 'eutok',    name: 'EuPago — sesja panelu',     test: onEupago,  init: init_eutok },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
