@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.30
+// @version      5.31
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -19861,6 +19861,30 @@
             }
             return out;
         }
+        // Komorka SCALONA trzyma wartosc w lewym gornym rogu zakresu, a rysuje sie przez
+        // caly zakres. Gdy ten rog wypada w kolumnie ukrytej, a zakres siega kolumny
+        // widocznej, czlowiek widzi te wartosc na ekranie — mimo ze „stoi w ukrytej
+        // kolumnie". Wygaszanie ukrytych kolumn broni przed liczba, ktorej NIKT nie widzi
+        // (w ukrytej kolumnie potrafi wisiec stary numer konta); tutaj jego przeslanka
+        // jest falszywa i kasuje dane widoczne golym okiem.
+        // P/I FOR 260901 (Zhongshan Yunji, order 21841, 07.09.2026): ukryta kolumna D,
+        // a caly blok bankowy to scalenia D57:S57 … D62:S62 — na ekranie widac komplet,
+        // a modul nie odczytal ani nazwy, ani konta 774-1-00290201, ani SWIFT-u KWHKHKHH.
+        // Zwracamy zbior kotwic „{wiersz}:{kolumna}", ktorych wygaszac NIE WOLNO.
+        function piMergeWidoczne(ws, ukryte){
+            var out = {}, mg = (ws && ws['!merges']) || [];
+            for (var i = 0; i < mg.length; i++){
+                var m = mg[i];
+                if (!m || !m.s || !m.e) continue;
+                if (!ukryte[m.s.c]) continue;              // kotwica i tak jest widoczna
+                for (var c = m.s.c; c <= m.e.c; c++){
+                    if (ukryte[c]) continue;
+                    out[m.s.r + ':' + m.s.c] = 1;          // zakres wychodzi na widok
+                    break;
+                }
+            }
+            return out;
+        }
         // Arkusz jako tablica wierszy, z WYCIETYMI ukrytymi kolumnami. Zostawiamy
         // puste miejsce zamiast usuwac kolumne, zeby nie przesuwac pozostalych —
         // reguly czytajace „wartosc w prawo od etykiety" musza dzialac jak dotad.
@@ -19880,9 +19904,11 @@
                 }
                 return aoa;
             }
+            var widoczne = piMergeWidoczne(ws, ukryte);
             for (var r = 0; r < aoa.length; r++){
                 var row = aoa[r]; if (!row) continue;
-                for (var c = 0; c < row.length; c++) row[c] = ukryte[c] ? null : piTekst(row[c]);
+                for (var c = 0; c < row.length; c++)
+                    row[c] = (ukryte[c] && !widoczne[r + ':' + c]) ? null : piTekst(row[c]);
             }
             return aoa;
         }
@@ -19923,6 +19949,10 @@
                 + piZasieg.toString() + '\n'
                 + piOpcjeAoa.toString() + '\n'
                 + piHiddenCols.toString() + '\n'
+                // Bez tej linii piAoa wola w workerze funkcje, ktorej tam nie ma —
+                // ReferenceError w workerze nie ma jak sie pokazac na ekranie i wyglada
+                // jak zawis albo ciche zejscie na sciezke zapasowa.
+                + piMergeWidoczne.toString() + '\n'
                 + piTekst.toString() + '\n'
                 + piAoa.toString() + '\n'
                 + piAoaAll.toString() + '\n'
@@ -53413,7 +53443,8 @@
         var st = BK_NF[nr];
         if (!st) return '<span style="color:#888">—</span>';
         if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu '
-                          + esc(st.zaks) + '</span>'
+                          + '<a href="/auction.php?number=' + esc(st.zaks) + '&txnid=3" target="_blank"'
+                          + ' style="color:#0a7a2f">' + esc(st.zaks) + '</a></span>'
                           + (st.odbite ? ('<div style="font-size:10px;color:#0a7a2f">↪ komentarz „'
                                           + esc(st.odbite) + '" odbity na ' + esc(BK_CS) + '</div>') : '')
                           + (st.odbiteBlad ? ('<div style="font-size:10px;color:#c00">↪ komentarza NIE odbiłem: '
