@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.33
+// @version      5.34
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -4144,6 +4144,10 @@
             return {
                 orderNumber: item.orderNumber, amount: item.amount, accountNum, bookingDate: rowDate,
                 source: item.source || '', isGoodwill: !!item.isGoodwill, auftragNumber: item.auftragNumber || '',
+                // Rodzaj pozycji („Goodwill", „SAFE-T Reimbursement", „REVERSAL_REIMBURSEMENT")
+                // musi dojechac az do ksiegowania: decyduje nie tylko o tym, czy pozycja
+                // scala sie ze zwrotem, ale i o tym, czy wolno rozbic ja na artykuly.
+                kind: item.kind || '',
                 dupTotal: dupCount.get(k), dupIndex: idx,
                 loading: true, error: null, selected: false, booked: false, skipped: false
             };
@@ -6219,7 +6223,20 @@
                     throw new Error('Strona ticketu nie wyrenderowała się poprawnie (brak Auftrag Details / broken items / textarea / przycisku Update). Sprawdź ticket ręcznie.');
                 }
 
-                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                // CLAIM IDZIE NA JEDNĄ POZYCJĘ, nie rozbija się na artykuły.
+                // Goodwill, SAFE-T i REVERSAL_REIMBURSEMENT to jedno zdarzenie na CAŁYM
+                // zamówieniu — decyzja Amazona, a nie zwrot za konkretny produkt. Przy
+                // zaznaczonych pozycjach z credit note prologistics dzieli wpisaną kwotę
+                // po artykułach i robi osobny refund na każdy: SAFE-T 101.72 na tickecie
+                // z dwoma pozycjami wychodził jako 50.86 + 50.86. Suma się zgadza, ale
+                // czyta się to jak zwrot za produkty, którego nie było.
+                // Mechanizm jest ten sam, którym księguje się nieopłacone pobranie (1088)
+                // i z tego samego powodu — patrz komentarz przy fillTicket.
+                // Zwykły zwrot zostaje BEZ zmian: tam rozbicie na artykuły jest właściwe.
+                const jestClaim = !!String(row.kind || '').trim();
+                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx,
+                                                    { total: row.dupTotal || 1, index: row.dupIndex || 1 },
+                                                    jestClaim ? { pierwszaPozycja: true } : null);
 
                 // v3.25: jeśli fillTicket zwrócił sukces (nie noSolution), to znaczy że
                 // Update został kliknięty. W następnej iteracji pre-check potencjalnie
@@ -33727,7 +33744,13 @@
         // w zapytaniu miedzydomenowym. Mowimy to ZANIM ktos kliknie i zobaczy 404.
         if (onProlo){
             const vh = {};
-            jobs.forEach(function (j){ if (mkTodo(j) && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
+            // Warunek ten sam, co w vtexPass: numer z przelewu ALBO sama kwota. Dotad
+            // stalo tu samo „j.ref" i zlecenie z arkusza nie dawalo nawet tego baneru —
+            // z arkusza OBI milczalo wszedzie.
+            jobs.forEach(function (j){
+                if (mkTodo(j) && j.kind === 'vtex' && j.host && (j.ref || j.amount != null))
+                    vh[j.host] = (vh[j.host] || 0) + 1;
+            });
             Object.keys(vh).forEach(function (host){
                 h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
                   +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
@@ -39053,13 +39076,28 @@
             try { await shDopiszSklep(jobs); } catch (e){}
             return ok;
         }
-        // Przejscie dla VTEX. Referencja z przelewu rowna sie nazwie raportu, wiec nie ma
-        // tu zadnego zgadywania po dacie — albo trafiamy dokladnie, albo wcale.
-        // Okno dat jest szerokie wstecz, bo data w referencji to dzien rozliczenia,
-        // a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
+        // Przejscie dla VTEX. Gdy zlecenie przyszlo z wyciagu, referencja z przelewu rowna
+        // sie nazwie raportu i nie ma tu zadnego zgadywania — albo trafiamy dokladnie,
+        // albo wcale. Okno dat jest szerokie wstecz, bo data w referencji to dzien
+        // rozliczenia, a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
+        //
+        // ZLECENIE BEZ NUMERU (z arkusza albo dopisane recznie) dotad wypadalo juz
+        // w filtrze i przelot konczyl sie na „return 0", zanim wyslal jedno zapytanie.
+        // Z zewnatrz wygladalo to na zerwana sesje z panelem — i tak tez brzmial
+        // komunikat, chociaz z sesja bylo wszystko w porzadku. Teraz takie zlecenie
+        // dopasowujemy PO KWOCIE: netto raportu (to samo, ktore i tak sprawdzamy przy
+        // dopasowaniu po nazwie) musi rownac sie kwocie z wyciagu. Tak samo dopasowuje
+        // sie Galaxus i Wayfair.
+        //
+        // Czy przelot w ogole DOTARL do panelu — bez tego przy kazdym zerze szedl ten
+        // sam komunikat o sesji, takze wtedy, gdy panel odpowiedzial normalnie, tylko
+        // nic nie pasowalo.
+        let vtexDotarl = false;
         async function vtexPass(jobs, host){
             const todo = Object.keys(jobs).filter(function (k){
-                return mkTodo(jobs[k]) && jobs[k].ref && jobs[k].kind === 'vtex' && (jobs[k].host || '') === host;
+                const j = jobs[k];
+                return mkTodo(j) && j.kind === 'vtex' && (j.host || '') === host
+                    && (j.ref || j.amount != null);
             });
             if (!todo.length) return 0;
             let from = '9999-12-31', to = '0000-01-01';
@@ -39070,8 +39108,10 @@
             });
             say(host + ' — pobieram raporty ' + from + ' … ' + to + '…');
             let reps = null, fromCache = false;
+            vtexDotarl = false;
             try {
                 reps = await vtexReports(host, from, to);
+                vtexDotarl = true;
                 if (location.hostname === host) vtexCacheSave(host, reps);   // odkladamy na potem
             } catch (e){
                 // Zapas: zestawienia odlozone przy ostatniej wizycie na stronie OBI.
@@ -39089,16 +39129,72 @@
             }
             void fromCache;
 
-            let ok = 0;
+            // Data rozliczenia siedzi w NAZWIE raportu („PODE-RRRRMMDD-N") — to ta sama
+            // data, ktora przy dopasowaniu po nazwie wyznacza okno. Sluzy tylko do tego,
+            // zeby przy kilku kandydatach powiedziec, ktory jest najblizszy wplywu.
+            function vtexDataRap(nazwa){
+                const m = String(nazwa || '').match(/(\d{4})(\d{2})(\d{2})/);
+                return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
+            }
+            // Netto raportu liczymy TYLKO wtedy, gdy jest po co: przy zleceniu bez numeru.
+            // Przy dopasowaniu po nazwie parsujemy jeden raport, a nie sto — jsonData
+            // kazdego z nich to osobny JSON i przeliczanie wszystkich na zapas kosztuje.
+            let nettoRap = null;
+            function vtexNetta(){
+                if (nettoRap) return nettoRap;
+                nettoRap = reps.map(function (r){
+                    let net = null;
+                    try { net = vtexAgg(vtexRows(r)).net; } catch (e){ net = null; }
+                    const nm = String(r.payoutReportFileName || '');
+                    return { rep: r, nazwa: nm, net: net, data: vtexDataRap(nm) };
+                });
+                return nettoRap;
+            }
+
+            let ok = 0, nieJednozn = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                // Porownujemy takze po sklejeniu spacji i bez wielkosci liter — nazwa
-                // raportu bywa zapisana inaczej niz referencja w wyciagu.
-                const want = j.ref.replace(/\s+/g, '').toUpperCase();
-                const rep = reps.filter(function (r){
-                    return String(r.payoutReportFileName || '').replace(/\s+/g, '').toUpperCase() === want;
-                })[0];
-                if (!rep){ j.msg = 'nie znalazłem raportu o nazwie ' + j.ref; jobsSave(jobs); continue; }
+                let rep = null;
+                if (j.ref){
+                    // Porownujemy takze po sklejeniu spacji i bez wielkosci liter — nazwa
+                    // raportu bywa zapisana inaczej niz referencja w wyciagu.
+                    const want = j.ref.replace(/\s+/g, '').toUpperCase();
+                    rep = reps.filter(function (r){
+                        return String(r.payoutReportFileName || '').replace(/\s+/g, '').toUpperCase() === want;
+                    })[0];
+                    if (!rep){ j.msg = 'nie znalazłem raportu o nazwie ' + j.ref; jobsSave(jobs); continue; }
+                } else {
+                    // Bez numeru — po kwocie. Jednoznaczne albo wcale: przy kilku raportach
+                    // o tej samej kwocie NIE wybieramy sami, bo pomylka znaczy tu cudzy cykl
+                    // w ksiegach. Mowimy, ktore to raporty i ktory jest najblizszy daty
+                    // wplywu, zeby czlowiek rozstrzygnal jednym spojrzeniem.
+                    const kand = vtexNetta().filter(function (x){ return x.net != null && eq(x.net, j.amount); });
+                    if (!kand.length){
+                        j.msg = 'w okresie ' + from + ' … ' + to + ' nie ma raportu na ' + f2(j.amount)
+                              + ' ' + (j.cur || '') + ' — zlecenie jest bez numeru z przelewu, więc szukam po kwocie';
+                        jobsSave(jobs); continue;
+                    }
+                    if (kand.length > 1){
+                        const dz = mkDay(j.date);
+                        const opis = kand.slice().sort(function (a, b){
+                            const da = mkDay(a.data), db = mkDay(b.data);
+                            if (da == null || db == null || dz == null) return 0;
+                            return Math.abs(da - dz) - Math.abs(db - dz);
+                        }).map(function (x){ return x.nazwa + (x.data ? (' z ' + x.data) : ''); });
+                        nieJednozn++;
+                        j.msg = 'kwocie ' + f2(j.amount) + ' odpowiada więcej niż jeden raport ('
+                              + kand.length + ') — nie zgaduję. '
+                              + 'Najbliższy dacie wpływu: ' + opis[0] + '. Pozostałe: ' + opis.slice(1).join(', ')
+                              + '. Wpisz właściwy numer w wyciągu albo załóż zlecenie z numerem.';
+                        jobsSave(jobs); continue;
+                    }
+                    rep = kand[0].rep;
+                    // Numer zapisujemy przy zleceniu — tak samo robi eBay po rozpoznaniu
+                    // wyplaty. Dzieki temu widac, KTORY raport wszedl, a powtorny przelot
+                    // idzie juz pewna droga po nazwie.
+                    j.ref = kand[0].nazwa;
+                    j.refSkad = 'po kwocie';
+                }
                 try {
                     const rows = vtexRows(rep);
                     const a = vtexAgg(rows);
@@ -39122,8 +39218,20 @@
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
-            if (!ok) say('OBI: raportów w tym okresie ' + reps.length + ', ale żaden nie ma nazwy z przelewu. Widziane nazwy: '
-                + names.slice(0, 6).join(', ') + (names.length > 6 ? ' …' : ''), '#c47f00');
+            // Zdanie musi pasowac do tego, CZEGO szukalismy. Przy zleceniu bez numeru
+            // szukamy po kwocie i „zaden nie ma nazwy z przelewu" bylo wtedy nieprawda.
+            if (!ok){
+                const bylyNr = todo.some(function (k){ return !!jobs[k].ref; });
+                // Niejednoznaczne to NIE to samo co „nic nie pasuje" — przy pierwszym
+                // trzeba wybrac raport, przy drugim szukac gdzie indziej.
+                say(nieJednozn
+                    ? ('OBI: raportów w tym okresie ' + reps.length + ', a przy ' + nieJednozn
+                       + ' zleceniu kwota pasuje do kilku naraz — nie wybieram sam. Szczegóły przy zleceniach.')
+                    : ('OBI: raportów w tym okresie ' + reps.length + ', ale żaden nie pasuje'
+                       + (bylyNr ? ' nazwą z przelewu' : ' kwotą z wyciągu')
+                       + '. Widziane nazwy: ' + names.slice(0, 6).join(', ')
+                       + (names.length > 6 ? ' …' : '') + '. Szczegóły przy zleceniach.'), '#c47f00');
+            }
             return ok;
         }
 
@@ -39273,9 +39381,15 @@
                 return host ? (h === host) : true;
             }).length;
         }
+        // Licznik BEZ wymogu numeru z przelewu. Stalo tu „&& jobs[k].ref", a licznik
+        // bramkuje wywolanie przelotu — wiec zlecenie z arkusza albo dopisane recznie
+        // nigdy nie doczekalo sie galxPass. Sam przelot numeru nie potrzebuje: dopasowuje
+        // po kwocie wyplaty (referencji, czyli UUID, w pliku i tak nie ma). Galaxus stoi
+        // zreszta na liscie recznego dodawania wlasnie dlatego, ze dopasowanie po kwocie
+        // jest przy nim normalna droga — warunek przeczyl temu, po co ta lista powstala.
         function galxLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'galx' && mkTodo(jobs[k]) && jobs[k].ref;
+                return jobs[k].kind === 'galx' && mkTodo(jobs[k]);
             }).length;
         }
         // Zlecenia eBaya, ktorym brakuje ROZPOZNANIA wyplaty. Inaczej niz przy Galaxusie
@@ -39538,9 +39652,11 @@
                         + ' i czy wypłata jest już widoczna w panelu.', false, true);
             return ile;
         }
+        // Bez wymogu numeru — z tego samego powodu co przy galxLeft. wayfPass i tak szuka
+        // po kwocie, nie po numerze (tak stoi w komentarzu przy liscie recznego dodawania).
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
+                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]);
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
@@ -39770,8 +39886,14 @@
                 try {
                     const got = await vtexPass(jobsLoad(), vhosts[vi]);
                     ok += got;
+                    // O sesji mowimy TYLKO wtedy, gdy panel naprawde nie odpowiedzial.
+                    // Dotad to zdanie szlo przy kazdym zerze — takze wtedy, gdy panel
+                    // odpowiedzial normalnie, a zlecenie po prostu nie pasowalo do zadnego
+                    // raportu. Czlowiek szedl wtedy klikac w panelu i dostawal to samo.
                     if (!got && mkHostsOf(jobsLoad(), 'vtex').indexOf(vhosts[vi]) >= 0)
-                        problem.push('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
+                        problem.push(vtexDotarl
+                            ? (mkPanelUrl(vhosts[vi]) + ': panel odpowiedział, ale nie dopasowałem rozliczenia — powód stoi przy zleceniu')
+                            : ('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa'));
                 } catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
