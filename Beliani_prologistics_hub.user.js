@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.31
+// @version      5.33
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -56,6 +56,7 @@
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
 // @grant        GM_cookie
@@ -5403,6 +5404,9 @@
         const tekst = String((o && o.komentarz) || '').trim();
         const osoba = String((o && o.osoba) || '').trim();
         const osobaId = String((o && o.osobaId) || '').trim();
+        // Zwroty: kwota rozbija sie na wszystkie pozycje, a brak solution konczy sie
+        // eskalacja. Unpaid COD tej flagi NIE podaje i dziala dokladnie jak dotad.
+        const rozbij = !!(o && o.rozbijNaPozycje);
         if (!kwota) return { ok: false, error: 'brak kwoty do zaksięgowania w tickecie' };
         if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) return { ok: false, error: 'zła data księgowania: ' + data };
         if (!konto) return { ok: false, error: 'brak konta' };
@@ -5444,7 +5448,8 @@
 
                 let fill;
                 try {
-                    fill = await fillTicket(kwota, data, konto, ctx, null, { pierwszaPozycja: true });
+                    fill = await fillTicket(kwota, data, konto, ctx, null,
+                                            rozbij ? null : { pierwszaPozycja: true });
                 } catch (e) {
                     ostatniBlad = (e && e.message) || String(e);
                     await sleep(900);
@@ -5456,11 +5461,32 @@
                     break;
                 }
                 if (fill.noSolution) {
+                    if (rozbij) {
+                        // Przy zwrotach brak solution NIE jest koncem drogi: zostawiamy
+                        // „Please add solution" i przepinamy ticket — tak samo, jak robi
+                        // to zwykle ksiegowanie w tickecie.
+                        let esk = null;
+                        try { esk = await escalateNoSolutionTicket(ctx, href, fill.reason, 'Please add solution'); }
+                        catch (e) { esk = { ok: false, error: (e && e.message) || String(e) }; }
+                        w.ksieg = { ok: false, noSolution: true, escalated: true,
+                                    error: fill.reasonText || 'w tickecie nie ma na czym zaksięgować',
+                                    eskalacja: esk };
+                        break;
+                    }
                     // Bez eskalacji „Please add solution" — patrz komentarz nad funkcja.
                     w.ksieg = { ok: false, error: fill.reasonText || 'w tickecie nie ma na czym zaksięgować' };
                     break;
                 }
                 kliknietoUpdate = true;
+                // Zeszlismy na pierwsza pozycje albo zgadywalismy kategorie — przy zwrotach
+                // zostawiamy o tym slad, zeby ktos to poprawil.
+                if (rozbij && (fill.fallbackUsed || fill.autoFilledCategory)) {
+                    const tekstEsk = (fill.fallbackUsed && fill.autoFilledCategory)
+                        ? 'Please add solution and check category'
+                        : (fill.fallbackUsed ? 'Please add solution' : 'Please check category');
+                    try { w.eskalacja = await addEscalationComment(ctx, tekstEsk); }
+                    catch (e) { w.eskalacja = { ok: false, error: (e && e.message) || String(e) }; }
+                }
 
                 // KOMENTARZ I ODBICIE TERAZ, poki ramka zyje po przeladowaniu z Update.
                 // Wczesniej wracalismy tu na ramke osobnym wczytaniem — ~30 s na pozycje
@@ -52961,45 +52987,63 @@
             return o;
         } catch (e){ return null; }
     }
-    function bkEuXTok(){
-        try {
-            var o = JSON.parse(gmGet(EU_XAUTH_KEY, '') || '{}');
-            return (o && o.tok) ? String(o.tok) : '';
-        } catch (e){ return ''; }
+    // === x-auth-token LICZONY z DATY ===
+    // Panel NIE przechowuje tokenu — sklada go w script.js jako
+    //   btoa('Auth-Token-Eupago-' + RRRRMMDD),   miesiac 1-indeksowany, z zerem wiodacym.
+    // Sprawdzone na zywym serwerze: zly token daje 401 „AUTH_INVALID", a poprawny przechodzi
+    // autoryzacje (200, a przy szerokim zapytaniu 504 — co i tak znaczy „naglowek przyjety").
+    // Wartosc zalezy WYLACZNIE od daty, wiec liczymy ja sami: bez sesji, bez podgladania panelu.
+    var EU_XAUTH_PREFIX = 'Auth-Token-Eupago-';
+    var EU_XAUTH_WIN = 'bank_imp_eu_xauth_win';        // zapamietany wariant, ktory przeszedl
+    function bkEuPad(n){ return (n < 10 ? '0' : '') + n; }
+    // offset dni od dzis; m1=true => miesiac getMonth()+1 (tak liczy panel), false => bez +1.
+    function bkEuTokenDnia(offset, m1){
+        var d = new Date();
+        d.setDate(d.getDate() + (offset || 0));
+        var mm = bkEuPad(d.getMonth() + (m1 ? 1 : 0));
+        return btoa(EU_XAUTH_PREFIX + d.getFullYear() + mm + bkEuPad(d.getDate()));
     }
-    function bkEuBrakTokena(){
-        if (bkEuXTok()) return '';
-        return 'nie mam jeszcze nagłówka „' + EU_XAUTH_NAG + '" — otwórz '
-             + 'https://clientes.eupago.pt/backoffice/index.html, zaloguj się i kliknij tam '
-             + 'cokolwiek (np. Consult). HUB podejrzy nagłówek w ruchu panelu i zapamięta go.';
+    // Kandydaci: najpierw wariant, ktory ostatnio przeszedl, potem dzis z miesiacem +1
+    // (najpewniejszy), na koncu zapasy na wypadek innego indeksu miesiaca albo przesuniecia
+    // o dzien kolo polnocy / strefy czasowej. Zly token daty = 401, wiec probowanie jest tanie.
+    function bkEuKandydaci(){
+        var lista = [{ o: 0, m1: true }, { o: 0, m1: false },
+                     { o: -1, m1: true }, { o: 1, m1: true }];
+        var win = null;
+        try { win = JSON.parse(gmGet(EU_XAUTH_WIN, '') || 'null'); } catch (e){}
+        if (win && typeof win.o === 'number'){
+            lista = lista.filter(function (x){ return !(x.o === win.o && x.m1 === win.m1); });
+            lista.unshift(win);
+        }
+        return lista.map(function (x){ return { wariant: x, tok: bkEuTokenDnia(x.o, x.m1) }; });
     }
-    // Postac naglowka Authorization NIE JEST USTALONA: pod /clientes/... dziala goly token
-    // (tak chodzi Salda), a /api/intern/v1.02 oddal na goly 401 z „AUTH_INVALID". Probujemy
-    // wiec obu znanych postaci i zapamietujemy te, ktora przeszla — zgadywanie na sztywno
-    // konczyloby sie modulem, ktory milczy albo klamie.
-    // Naglowki takie, jakie wysyla panel — z „x-auth-token" i jego typem tresci.
-    function bkEuNaglowki(){
-        var n = { 'accept': 'application/json, text/javascript, */*; q=0.01',
-                  'content-type': 'application/x-www-form-urlencoded, application/json',
-                  'cache-control': 'no-cache' };
-        n[EU_XAUTH_NAG] = bkEuXTok();
-        return n;
+    function bkEuZapamietaj(w){ try { gmSet(EU_XAUTH_WIN, JSON.stringify({ o: w.o, m1: w.m1 })); } catch (e){} }
+    // Token zawsze umiemy policzyc, wiec nic nie blokuje proby.
+    function bkEuBrakTokena(){ return ''; }
+    function bkEuNaglowki(tok){
+        return { 'accept': 'application/json, text/javascript, */*; q=0.01',
+                 'content-type': 'application/x-www-form-urlencoded, application/json',
+                 'cache-control': 'no-cache',
+                 'x-auth-token': tok };
     }
-    function bkEuJedno(url){
+    function bkEuJedno(url, tok){
         return new Promise(function (ok, zle){
             if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
             GM_xmlhttpRequest({
                 method: 'POST', url: url, timeout: 120000, anonymous: false, data: EU_BODY,
-                headers: bkEuNaglowki(),
+                headers: bkEuNaglowki(tok),
                 onload: function (r){
                     var tresc = String(r.responseText || '');
                     if (r.status === 401 || r.status === 403){
-                        var ba = new Error('eupago odrzuciło nagłówek „' + EU_XAUTH_NAG + '" (HTTP '
-                                         + r.status + ') — wejdź na kartę panelu i kliknij Consult, '
-                                         + 'żeby HUB podejrzał świeży');
-                        ba.auth = true; ba.most = true; zle(ba); return; }
+                        // Zly token daty. Kaze probowac nastepnego kandydata, nie mostu.
+                        var ba = new Error('eupago odrzuciło token (HTTP ' + r.status + ')');
+                        ba.auth = true; zle(ba); return; }
                     if (r.status < 200 || r.status >= 300){
-                        var b = new Error('eupago: HTTP ' + r.status); b.most = (r.status >= 500); zle(b); return; }
+                        // 5xx / Cloudflare: token PRZESZEDL autoryzacje, tylko odpowiedzi nie da
+                        // sie tu uzyc. 5xx bywa CHWILOWE (backend eupago potrafi oddac 504 na
+                        // wolniejszym zapytaniu), wiec zaznaczamy je do PONOWIENIA; dopiero potem most.
+                        var b = new Error('eupago: HTTP ' + r.status); b.most = true;
+                        b.http5xx = (r.status >= 500); zle(b); return; }
                     try { ok(JSON.parse(tresc)); }
                     catch (e){
                         var b2 = new Error('eupago oddało nie-JSON (' + tresc.length + ' B): '
@@ -53008,18 +53052,43 @@
                     }
                 },
                 onerror: function (){ var b = new Error('nie połączyłem się z eupago'); b.most = true; zle(b); },
-                ontimeout: function (){ zle(new Error('eupago nie odpowiedziało w 120 s')); }
+                ontimeout: function (){ var b = new Error('eupago nie odpowiedziało w 120 s'); b.most = true; b.http5xx = true; zle(b); }
             });
         });
     }
-    // Wprost z prologistics. Miedzy nim a eupago stoi Cloudflare, wiec zamiast JSON-a
-    // potrafi wrocic strona — wtedy oznaczamy blad jako „do mostu".
+    // Wprost z prologistics. Przechodzimy po kandydatach tokenu (dziś ±1, oba indeksy
+    // miesiaca): 401 znaczy zla data — nastepny kandydat; 200 — sukces i zapamietanie
+    // wariantu; 5xx/Cloudflare — token przeszedl, ale odpowiedz idzie mostem.
     async function bkEuWprost(url){
-        var brak = bkEuBrakTokena();
-        // Bez naglowka NIE konczymy sprawy: z karty panelu zapytanie leci jego wlasnym
-        // jQuery i naglowek doklada sie sam. Dlatego zamiast bledu — droga przez most.
-        if (brak){ var b = new Error(brak); b.most = true; throw b; }
-        return await bkEuJedno(url);
+        var kand = bkEuKandydaci();
+        var czekaj = function (ms){ return new Promise(function (r){ setTimeout(r, ms); }); };
+        for (var i = 0; i < kand.length; i++){
+            var proby5xx = 0;
+            while (true){
+                try {
+                    var d = await bkEuJedno(url, kand[i].tok);
+                    bkEuZapamietaj(kand[i].wariant);
+                    return d;
+                } catch (e){
+                    if (e && e.auth) break;                             // zla data — nastepny kandydat
+                    // 504 i inne 5xx bywaja chwilowe — ponawiamy TEN SAM token dwa razy,
+                    // z sekunda przerwy, zanim uznamy, ze trzeba mostu.
+                    if (e && e.http5xx && proby5xx < 2){
+                        proby5xx++;
+                        say('eupago odpowiedziało ' + ((e.message||'').replace('eupago: ','')) + ' — ponawiam ('
+                            + proby5xx + '/2)…', '#c47f00');
+                        await czekaj(1200);
+                        continue;
+                    }
+                    if (e && e.most){ bkEuZapamietaj(kand[i].wariant); throw e; }  // auth OK, do mostu
+                    throw e;
+                }
+            }
+        }
+        var b = new Error('eupago odrzuciło token na każdą datę (dziś ±1, oba warianty miesiąca) '
+                        + '— panel mógł zmienić sposób liczenia tokenu; próbuję jeszcze mostem');
+        b.most = true;
+        throw b;
     }
     // Most: zlecenie do wspolnej pamieci skryptu, wykonuje je otwarta karta panelu.
     var bkNrZlec = 0;
@@ -53032,16 +53101,11 @@
             var nag = { 'Authorization': '', 'X-Requested-With': '',
                         'accept': 'application/json, text/javascript, */*; q=0.01',
                         'content-type': 'application/x-www-form-urlencoded, application/json' };
-            nag[EU_XAUTH_NAG] = bkEuXTok();
+            // Token liczony z daty — ten sam, ktory sklada panel. Karta ma komplet
+            // ciasteczek eupago, wiec zapytanie z tym naglowkiem przechodzi.
+            nag['x-auth-token'] = bkEuKandydaci()[0].tok;
             gmSet(EU_MOST_Z, JSON.stringify({ id: id, url: url, metoda: 'POST', body: EU_BODY,
                                               naglowki: nag,
-                                              // Wykonaj to jQuery panelu: wtedy naglowek
-                                              // autoryzacji doklada sie sam i nie trzeba
-                                              // znac jego wartosci.
-                                              przezJq: true,
-                                              // Gdy jQuery panelu nie wystarczy, karta
-                                              // przechodzi po kandydatach z wlasnej pamieci.
-                                              probujNaglowek: EU_XAUTH_NAG,
                                               sciezka: '/api/intern/v1.02/references',
                                               params: {}, kiedy: Date.now() }));
         } catch (e){ return Promise.reject(new Error('nie mam gdzie zostawić zlecenia dla karty eupago')); }
@@ -53133,11 +53197,6 @@
     async function bkEuStatusy(nr, btn, gotowe){
         var st = BK_NF[nr];
         if (!st || !st.kw || !st.kw.zEu.length) return;
-        // Brak naglowka to nie powod, zeby nie probowac: karta panelu poradzi sobie bez
-        // niego. Mowimy o tym i idziemy dalej, zamiast konczyc przed pierwsza proba.
-        var brak = bkEuBrakTokena();
-        if (brak) say('Nie mam jeszcze nagłówka autoryzacji — próbuję przez kartę panelu eupago. '
-                    + 'Musi być otwarta i zalogowana.', '#c47f00');
         btn.disabled = true;
         var ile = 0;
         for (var i = 0; i < st.kw.zEu.length; i++){
@@ -54139,6 +54198,2396 @@
     }
 
 
+    // ===== Zwroty =====
+    function init_zwr() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+    // Modul „Ksiegowanie w tickecie" pracuje w ukrytych ramkach na tym samym hoscie —
+    // bez tej bramki panel montowalby sie w kazdej z nich.
+    if (window.top !== window.self) return;
+    if (document.getElementById('zwr-btn')) return;
+
+    var ZW_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
+    var ZW_TOL = 0.005;          // grosz
+    var ZW_MIES = 3;             // eupago zwraca na zrodlo tylko do trzech miesiecy
+    var ZW_SKOKI = 6;            // ile auftragow w lancuchu maksymalnie odwiedzamy
+    var ZW_KONTO = '1232';       // konto eupago — na nim ksiegujemy zwrot
+
+    // Most do karty panelu eupago. Operacje na pieniadzach wykonuje TAM init_zwrop —
+    // dzieki temu access_token i CSRF zostaja w panelu i nie przechodza przez kod HUB-a.
+    var ZW_OP_Z = 'zwr_op_zlec';
+    var ZW_OP_O = 'zwr_op_odp';
+    var ZW_OP_H = 'zwr_op_puls';   // znak zycia karty eupago: wersja + czas
+
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function att(s){ return esc(s).replace(/\n/g, '&#10;'); }
+    function dom(html){ return new DOMParser().parseFromString(String(html || ''), 'text/html'); }
+    function flat(s){ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
+    function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function $(s){ return document.querySelector(s); }
+    function czekaj(ms){ return new Promise(function (r){ setTimeout(r, ms); }); }
+    function gmGet(k, d){ try { return GM_getValue(k, d); } catch (e){ return d; } }
+    function gmSet(k, v){ try { GM_setValue(k, v); } catch (e){} }
+
+    // Kwota z tekstu. Prosby pisza ja na kilka sposobow: „129.99", „1 240,00", „1,240.00".
+    // Ostatni separator decyduje o czesci dziesietnej — reszta to tysiace.
+    function money(s){
+        var t = String(s == null ? '' : s).replace(/[^\d.,\-]/g, '');
+        if (!t) return null;
+        var ok = t.lastIndexOf(','), kr = t.lastIndexOf('.');
+        if (ok >= 0 && kr >= 0){
+            if (ok > kr) t = t.replace(/\./g, '').replace(',', '.');
+            else t = t.replace(/,/g, '');
+        } else if (ok >= 0){
+            // Sam przecinek: „1,240" to tysiace, „12,40" to grosze.
+            t = (/,\d{3}$/.test(t) && t.replace(/[^\d]/g, '').length > 3) ? t.replace(/,/g, '') : t.replace(',', '.');
+        }
+        var v = parseFloat(t);
+        return isFinite(v) ? v : null;
+    }
+
+    // ===== Poziomy autoryzacji — arkusz „2025" =====
+    // Plik „CS Authorization Levels for Tickets" ma DWA arkusze o roznych progach.
+    // Obowiazuje „2025" (ustalenie z 07.09.2026) — mimo ze drugi nazywa sie „current".
+    // Kolumna Cash; voucher to zawsze dwukrotnosc i tu go nie liczymy.
+    // Progi sa OSTRE („<150" znaczy 149.99 przechodzi, 150.00 juz nie).
+    var ZW_POZIOMY = [
+        { st: 'process controller specialist', lvl: 2, cash: 250 },
+        { st: 'senior team leader',            lvl: 4, cash: 1000 },
+        { st: 'junior team leader',            lvl: 3, cash: 500 },
+        { st: 'cs representative',             lvl: 0, cash: 50 },
+        { st: 'junior specialist',             lvl: 0, cash: 50 },
+        { st: 'senior specialist',             lvl: 2, cash: 250 },
+        { st: 'senior assistant',              lvl: 0, cash: 50 },
+        { st: 'area coordinator',              lvl: 2, cash: 250 },
+        { st: 'junior manager',                lvl: 5, cash: 1500 },
+        // „Senior Manager" stoi w arkuszu w DWOCH wierszach: Level 5 (<1500) i Level 6
+        // (razem z Head of CS, >1500). Bierzemy ostrzejszy odczyt — nadwyzke odblokujesz
+        // recznie, a nie odwrotnie.
+        { st: 'senior manager',                lvl: 5, cash: 1500 },
+        { st: 'team leader',                   lvl: 3, cash: 500 },
+        { st: 'head of cs',                    lvl: 6, cash: Infinity },
+        { st: 'specialist',                    lvl: 1, cash: 150 },
+        { st: 'assistant',                     lvl: 0, cash: 50 },
+        { st: 'manager',                       lvl: 5, cash: 1500 },
+        { st: 'director',                      lvl: 5, cash: 1500 },
+        { st: 'ceo',                           lvl: 7, cash: Infinity }
+    ];
+    // Dopasowanie od NAJDLUZSZEJ nazwy — inaczej „Senior Specialist" wpadlby do
+    // „Specialist" i dostal limit 150 zamiast 250. Sortujemy sami, zeby kolejnosc
+    // wpisow wyzej nie decydowala o poprawnosci.
+    ZW_POZIOMY.sort(function (a, b){ return b.st.length - a.st.length; });
+
+    // Limity z arkusza dotycza WYLACZNIE Customer Service — plik nazywa sie
+    // „CS Authorization Levels for Tickets". Ksiegowa z „Junior Accountant" nie jest
+    // nim objeta, wiec ani nie liczymy jej limitu, ani nie uznajemy jej „ok" za zgode.
+    //
+    // WYJATKI (ustalenie z 07.09.2026): licza sie takze Data Processing oraz imiennie
+    // Hanna Kot i wlasciciel Stephan Widmer. Sa poza drabinka z arkusza, wiec ich zgoda
+    // nie ma limitu kwotowego. Trzymamy to w jednym miejscu, zeby dalo sie poprawic.
+    var ZW_DZIALY_OK = [/customer\s*service/, /(^|[^a-z])cs([^a-z]|$)/, /data\s*processing/];
+    var ZW_OSOBY_OK = ['stephan widmer', 'hanna kot'];
+
+    function czyCS(os){
+        if (!os) return false;
+        var d = String(os.department || '').toLowerCase();
+        for (var i = 0; i < ZW_DZIALY_OK.length; i++) if (ZW_DZIALY_OK[i].test(d)) return true;
+        return ZW_OSOBY_OK.indexOf(String(os.name || '').trim().toLowerCase()) >= 0;
+    }
+    // Bez limitu jest WYLACZNIE wlasciciel. Data Processing podlega tej samej tabeli
+    // co CS — liczy sie po stanowisku (Specialist 150, Senior Specialist 250 itd.),
+    // bo nazwy stanowisk sa tam takie same.
+    var ZW_WLASCICIEL = 'stephan widmer';
+    function bezLimitu(os){
+        return !!os && String(os.name || '').trim().toLowerCase() === ZW_WLASCICIEL;
+    }
+
+    function poziomZeStanowiska(st){
+        var s = String(st == null ? '' : st).toLowerCase();
+        if (!s) return null;
+        for (var i = 0; i < ZW_POZIOMY.length; i++){
+            if (s.indexOf(ZW_POZIOMY[i].st) >= 0) return ZW_POZIOMY[i];
+        }
+        return null;
+    }
+
+    // Dane pracownika. Prologistics wystawia globalne getEmployeeByUsername(login),
+    // ktore oddaje m.in. { name, position, supervisor, inactive }.
+    // PULAPKA: w ScriptCacie `unsafeWindow` nie zawsze prowadzi do kontekstu strony —
+    // sprawdzone na zywo, funkcja w konsoli JEST, a modul jej nie widzial. Dlatego
+    // probujemy po kolei trzech drog, a na koncu wstrzykujemy skrypt do strony: on
+    // wykonuje sie JUZ w jej kontekscie i wynik oddaje przez DOM.
+    // Lista pracownikow. Strona dociaga ja po starcie zapytaniem
+    //   POST /api/filtersOptions/   z  type[]=employees
+    // i wklada do window.DD_OPTIONS. Pytamy tego samego adresu SAMI — dzieki temu nie
+    // zalezymy od tego, jak ScriptCat izoluje skrypt od kontekstu strony, a dane sa
+    // dokladnie tak swieze jak w dymku przy imieniu.
+    // UWAGA: „employees" to OBIEKT kluczowany loginem, nie tablica.
+    var ZW_LISTA = null;             // { <login>: {...} } — wazna na czas jednego przelotu
+    var ZW_EMP = {};                 // odczyty juz zamienione na nasz ksztalt
+
+    async function pobierzPracownikow(){
+        try {
+            var res = await fetch('/api/filtersOptions/', {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded',
+                           'X-Requested-With': 'XMLHttpRequest' },
+                body: 'type[]=employees&type[]=users_ext&shop_id=&siteid=&id='
+            });
+            if (!res || !res.ok) return null;
+            var j = await res.json();
+            var o = (j && (j.options || j)) || {};
+            var mapa = {};
+            ['employees', 'users_ext'].forEach(function (t){
+                var g = o[t];
+                if (!g) return;
+                Object.keys(g).forEach(function (k){ if (!mapa[k]) mapa[k] = g[k]; });
+            });
+            return Object.keys(mapa).length ? mapa : null;
+        } catch (e){ return null; }
+    }
+
+    // Surowy wpis -> ksztalt, ktorego uzywa modul. Pola te same, co oddaje
+    // getEmployeeByUsername na stronie.
+    function zWpisu(login, e){
+        if (!e) return null;
+        return { id: login, name: e.value || login, position: e.position || '',
+                 supervisor: e.supervisor || '', inactive: (e.inactive === '1'),
+                 department: (e.department_name === 'NULL' ? '' : (e.department_name || '')) };
+    }
+
+    function empKontekst(){
+        var kand = [];
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) kand.push(unsafeWindow); } catch (e){}
+        try { if (window && window.wrappedJSObject) kand.push(window.wrappedJSObject); } catch (e){}
+        try { kand.push(window); } catch (e){}
+        try { if (document.defaultView) kand.push(document.defaultView); } catch (e){}
+        for (var i = 0; i < kand.length; i++){
+            try { if (kand[i] && typeof kand[i].getEmployeeByUsername === 'function') return kand[i]; }
+            catch (e){}
+        }
+        return null;
+    }
+
+    // Ostatnia droga: skrypt wstrzykniety do strony. Wykonuje sie synchronicznie
+    // w chwili dopiecia, wiec wynik mozemy odczytac od razu.
+    function empPrzezStrone(loginy){
+        var wynik = {};
+        try {
+            var id = 'zwr-emp-' + Math.random().toString(36).slice(2);
+            var box = document.createElement('div');
+            box.id = id; box.style.display = 'none';
+            document.body.appendChild(box);
+            var sc = document.createElement('script');
+            sc.textContent = '(function(){try{var o={};' + JSON.stringify(loginy)
+                + '.forEach(function(l){try{var e=getEmployeeByUsername(l);'
+                + 'if(e)o[l]={name:e.name,position:e.position,supervisor:e.supervisor,inactive:e.inactive};'
+                + '}catch(x){}});var b=document.getElementById(' + JSON.stringify(id) + ');'
+                + 'if(b)b.textContent=JSON.stringify(o);}catch(x){}})();';
+            document.documentElement.appendChild(sc);
+            sc.remove();
+            try { wynik = JSON.parse(box.textContent || '{}') || {}; } catch (e){ wynik = {}; }
+            box.remove();
+        } catch (e){}
+        return wynik;
+    }
+
+    // Narzedzie „Refund request" podaje IMIE I NAZWISKO, nie login. Lista pracownikow
+    // niesie jedno i drugie, wiec dopasowujemy wstecz.
+    function pracownikPoNazwie(nazwa){
+        var n = flat(nazwa).toLowerCase();
+        if (!n || !ZW_LISTA) return null;
+        var k = Object.keys(ZW_LISTA);
+        for (var i = 0; i < k.length; i++){
+            var e = ZW_LISTA[k[i]];
+            if (e && flat(e.value || '').toLowerCase() === n) return zWpisu(k[i], e);
+        }
+        return null;
+    }
+
+    function pracownik(login){
+        if (!login) return null;
+        var l = String(login);
+        if (Object.prototype.hasOwnProperty.call(ZW_EMP, l)) return ZW_EMP[l];
+        // 1. lista pobrana na poczatku przelotu — droga glowna
+        if (ZW_LISTA && ZW_LISTA[l]){ ZW_EMP[l] = zWpisu(l, ZW_LISTA[l]); return ZW_EMP[l]; }
+        // 2. zapas: globalne strony, gdy piaskownica na to pozwala
+        var W = empKontekst();
+        if (W){
+            try {
+                var e = W.getEmployeeByUsername(l);
+                if (e){ ZW_EMP[l] = e; return e; }
+            } catch (err){}
+        }
+        // 3. ostatnia droga: skrypt wykonany w kontekscie strony
+        var przez = empPrzezStrone([l]);
+        ZW_EMP[l] = przez[l] || null;
+        return ZW_EMP[l];
+    }
+
+    // ===== Komentarze ticketu =====
+    // Wzor wziety z Unpaid COD (init_ucod). Kopiujemy, a nie wolamy — funkcja z cudzego
+    // init_* jest z tego domkniecia niedostepna i skonczyloby sie cichym ReferenceError.
+    function tekstKomentarza(span){
+        try {
+            var h = String(span.innerHTML || '').replace(/<br\s*\/?>/gi, '\n');
+            var d = span.ownerDocument.createElement('div');
+            d.innerHTML = h;
+            return String(d.textContent || '');
+        } catch (e){ return String((span && span.textContent) || ''); }
+    }
+    function czytajKomentarze(d, zrodlo){
+        var out = [];
+        d.querySelectorAll('tr.comment-row').forEach(function (tr){
+            var span = tr.querySelector('span.commentText');
+            if (!span) return;
+            var tds = tr.querySelectorAll('td');
+            var aut = tr.querySelector('td.comment-author');
+            var a   = tr.querySelector('a.comment-author-name, span.comment-author-name');
+            out.push({
+                nr: out.length,
+                zrodlo: zrodlo || 'ticket',
+                data: tds[0] ? flat(tds[0].textContent) : '',
+                autor: a ? flat(a.textContent) : (aut ? flat(aut.textContent) : ''),
+                autorId: (aut && aut.getAttribute('data-user')) || '',
+                src: tr.getAttribute('data-src') || '',
+                tekst: tekstKomentarza(span)
+            });
+        });
+        return out;
+    }
+
+    // Kwota i waluta z prosby. Trzy zapisy widziane w tickietach:
+    //   „Amount: 129.99" + osobne „Currency: EUR"
+    //   „Amount & Currency: 179.00 RON"
+    //   „Amount & Currency:15,595 HUF"
+    var ZW_KW_WAL = /amount\s*(?:&|and)\s*currency\s*:?\s*([-+]?[\d.,\s'’]+?)\s*([A-Za-z]{3})\b/i;
+    var ZW_KW     = /\bamount\b[^:\n]{0,20}:?\s*([-+]?[\d.,\s'’]+)/i;
+    var ZW_WAL    = /\bcurrency\b[^:\n]{0,20}:?\s*([A-Za-z]{3})\b/i;
+    var ZW_METODA = /payment\s*method\s*:?\s*([^\n]+)/i;
+
+    // Kwota pisana PROZA — tak wyglada wiekszosc prosb spoza formularza.
+    // Waluta MUSI stac przy liczbie: to jedyne, co odroznia kwote od cyfr IBAN-u,
+    // numeru zamowienia czy daty. Do tego komentarz musi mowic o zwrocie.
+    var ZW_WALUTY = '(?:EUR|EURO|€|PLN|ZŁ|ZL|USD|GBP|CHF)';
+    var ZW_PROZA = new RegExp('(?:^|[^\\d.,])(\\d{1,3}(?:[ .,]\\d{3})*(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)'
+                            + '\\s*' + ZW_WALUTY + '(?![A-Za-z0-9])', 'gi');
+    var ZW_OZWROCIE = /refund|reembols|zwrot|devolu/i;
+
+    function kwotaZProzy(s){
+        if (!ZW_OZWROCIE.test(s)) return null;
+        var m, znal = [];
+        ZW_PROZA.lastIndex = 0;
+        while ((m = ZW_PROZA.exec(s))){
+            var v = money(m[1]);
+            if (v != null && v > 0 && znal.indexOf(v) < 0) znal.push(v);
+        }
+        // Dwie ROZNE kwoty w jednym komentarzu — nie zgadujemy ktora. W zbiorce
+        // z 488 komentarzy nie bylo ani jednego takiego, ale to kosztuje jedna linijke.
+        return znal.length === 1 ? znal[0] : null;
+    }
+
+    function zProsby(t){
+        var s = String(t == null ? '' : t);
+        var kwota = null, waluta = '', metoda = '';
+        var m = ZW_KW_WAL.exec(s);
+        if (m){ kwota = money(m[1]); waluta = m[2].toUpperCase(); }
+        if (kwota == null){
+            var m2 = ZW_KW.exec(s);
+            if (m2) kwota = money(m2[1]);
+        }
+        if (kwota == null) kwota = kwotaZProzy(s);
+        if (!waluta){
+            var m3 = ZW_WAL.exec(s);
+            if (m3) waluta = m3[1].toUpperCase();
+        }
+        if (!waluta && kwota != null){
+            var m5 = /(?:EUR|EURO|€)/i.exec(s);
+            if (m5) waluta = 'EUR';
+        }
+        var m4 = ZW_METODA.exec(s);
+        if (m4) metoda = flat(m4[1]).slice(0, 60);
+        return { kwota: kwota, waluta: waluta, metoda: metoda };
+    }
+
+    // ===== SWIFT wg kodu banku =====
+    // SWIFT wg kodu banku — przepisane wprost z panelu eupago
+    // (backoffice/js/modules/pagamentos/listagem.js: lancuch else-if na polu IBAN).
+    // Panel podstawia SWIFT lokalnie, po „PT50" + czterech cyfrach banku, i nigdzie
+    // o to nie pyta. Robimy dokladnie to samo, wiec dostajemy te sama wartosc,
+    // ktora wpisalby czlowiek klikajac recznie.
+    var ZW_BIC_PT = {
+        '0001': 'BGALPTTGXXX', '0007': 'BESCPTPL', '0008': 'BAIPPTPL', '0010': 'BBPIPTPL',
+        '0014': 'IVVSPTPL', '0018': 'TOTAPTPL', '0019': 'BBVAPTPL', '0022': 'BRASPTPL',
+        '0023': 'ACTVPTPL', '0025': 'CXBIPTPL', '0027': 'BPIPPTPL', '0032': 'BARCPTPL',
+        '0033': 'BCOMPTPL', '0035': 'CGDIPTPL', '0036': 'MPIOPTPL', '0038': 'BNIFPTPL',
+        '0045': 'CCCMPTPL', '0046': 'CRBNPTPL', '0047': 'ESSIPTPL', '0048': 'BFIAPTPL',
+        '0059': 'CEMAPTP2XXX', '0061': 'BDIGPTPL', '0063': 'BNFIPTPL', '0064': 'BPGPPTPL',
+        '0065': 'BESZPTPL', '0073': 'IBNBPTP1XXX', '0079': 'BPNPPTPL', '0086': 'EFISPTPL',
+        '0097': 'CCCHPTP1XXX', '0098': 'CERTPTP1XXX', '0099': 'CSSOPTPXXXX', '0160': 'BESAPTPAXXX',
+        '0186': 'CFESPTPL', '0189': 'BAPAPTPL', '0191': 'BNICPTPL', '0193': 'CTTVPTPL',
+        '0235': 'BLJCPTPT', '0244': 'MPCGPTP1XXX', '0269': 'BKBKPTPLXXX', '0781': 'IGCPPTPL',
+        '5180': 'CDCTPTP2XXX', '5200': 'CDOTPTP1XXX', '5340': 'CTIUPTP1XXX'
+    };
+    var ZW_BIC_KEY = 'zwr_swift_wg_banku';
+    function bicMapa(){
+        // Wpisy reczne maja pierwszenstwo nad tablica — gdyby eupago cos u siebie
+        // zmienilo, mozna to nadpisac bez czekania na nowa wersje.
+        var d = {};
+        Object.keys(ZW_BIC_PT).forEach(function (k){ d[k] = ZW_BIC_PT[k]; });
+        try {
+            var m = JSON.parse(gmGet(ZW_BIC_KEY, '') || 'null');
+            if (m && typeof m === 'object'){ Object.keys(m).forEach(function (k){ d[k] = m[k]; }); }
+        } catch (e){}
+        return d;
+    }
+    function bicNorm(v){
+        // Bez obcinania koncowki: panel wysyla to, co ma w tablicy, a ma obie postacie
+        // — osmioznakowa (CGDIPTPL) i jedenastoznakowa (BGALPTTGXXX). Jego walidacja
+        // przepuszcza 8, 11 albo pusto, wiec skracanie tylko oddalaloby nas od zrodla.
+        return String(v == null ? '' : v).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    }
+    function bicZapisz(kod, bic){
+        var v = bicNorm(bic);
+        if (!kod || !v) return;
+        var m = {};
+        try { m = JSON.parse(gmGet(ZW_BIC_KEY, '') || '{}') || {}; } catch (e){}
+        m[kod] = v;
+        try { gmSet(ZW_BIC_KEY, JSON.stringify(m)); } catch (e){}
+    }
+    function kodBanku(iban){
+        var v = String(iban || '').toUpperCase();
+        return /^PT\d{6}/.test(v) ? v.slice(4, 8) : '';
+    }
+    function bicZPamieci(iban){
+        var k = kodBanku(iban);
+        return k ? (bicMapa()[k] || '') : '';
+    }
+
+    // Calosc: tablica z panelu plus ewentualny wpis reczny. Bez zapytan na zewnatrz.
+    function bicDlaIban(iban){
+        return bicZPamieci(iban);
+    }
+
+    // eupago przyjmuje IBAN wylacznie w postaci ciaglej. Ludzie wklejaja go z kropkami
+    // („PT50.0035.0201..."), myslnikami albo spacjami — zdejmujemy wszystko poza
+    // literami i cyframi.
+    function ibanNorm(v){ return String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+
+    // IBAN z tekstu komentarza. Klient podaje go z odstepami albo bez; bierzemy postac
+    // bez spacji i sprawdzamy dlugosc — sam wzorzec „dwie litery i cyfry" trafialby tez
+    // w numery zamowien czy faktur. Portugalski ma 25 znakow, ale dopuszczamy caly zakres
+    // IBAN (15-34), bo klient bywa z innego kraju.
+    var ZW_IBAN = /\b([A-Z]{2}\d{2}(?:[ .\-]?[A-Za-z0-9]){11,40})/g;
+    function ibanZTekstu(t){
+        var x = String(t == null ? '' : t).toUpperCase();
+        var m, out = '';
+        ZW_IBAN.lastIndex = 0;
+        while ((m = ZW_IBAN.exec(x))){
+            var kand = ibanNorm(m[1]);
+            // Dlugosc rozstrzyga: sam wzorzec „dwie litery i cyfry" trafialby tez
+            // w numery zamowien i faktur. IBAN ma od 15 do 34 znakow, portugalski 25.
+            if (kand.length >= 15 && kand.length <= 34){ out = kand; break; }
+        }
+        return out;
+    }
+    // Szukamy od NAJNOWSZEGO komentarza — gdy klient poprawil numer, liczy sie ostatni.
+    function ibanZKomentarzy(kom){
+        for (var i = (kom || []).length - 1; i >= 0; i--){
+            var v = ibanZTekstu(kom[i].tekst);
+            if (v) return { iban: v, autor: kom[i].autor || '', data: kom[i].data || '',
+                            zrodlo: kom[i].zrodlo || '', src: kom[i].src || '',
+                            // Tresc przycinamy — w dymku i tak nie zmiesci sie wiecej,
+                            // a chodzi o to, zeby dalo sie rozpoznac komentarz.
+                            tekst: flat(kom[i].tekst).slice(0, 400) };
+        }
+        return null;
+    }
+
+    // Zgoda przelozonego w komentarzu. Bywa jednym slowem — „ok", „ok for refund",
+    // „approved". Zawezamy do KROTKICH komentarzy, zeby zwykle „ok" w srodku zdania
+    // nie udawalo autoryzacji.
+    var ZW_ZGODA = /^(?:ok|okay|oki?)\b|^\s*approved?\b|\bok\s+(?:for|to)\s+refund\b|\brefund\s+approved\b|^\s*zgoda\b|^\s*akceptuj/i;
+    function czyZgoda(t){
+        var x = flat(t);
+        if (!x || x.length > 80) return false;
+        return ZW_ZGODA.test(x);
+    }
+
+    // Prosba o zwrot = OSTATNI komentarz data-src="finance". Kwoty NIE WYMAGAMY:
+    // w prawdziwych ticketach takie komentarze brzmia „Refund requested" albo
+    // „hey team, can you check this refund?" i kwoty nie podaja. Gdy jednak ja podaja,
+    // ta z komentarza wygrywa z open amount — jest bardziej szczegolowa.
+    function znajdzProsbe(kom){
+        var bezKwoty = null;
+        for (var i = kom.length - 1; i >= 0; i--){
+            var k = kom[i];
+            if (String(k.src).toLowerCase() !== 'finance') continue;
+            var p = zProsby(k.tekst);
+            // Komentarz Z KWOTA wygrywa zawsze, choćby byl starszy. Po prosbie potrafi
+            // przyjsc dopisek w rodzaju „hey team, request above" — teź jest finance,
+            // ale kwoty nie niesie i nie moze przykryc wlasciwej prosby.
+            if (p.kwota != null) return { kom: k, kwota: p.kwota, waluta: p.waluta, metoda: p.metoda };
+            if (!bezKwoty) bezKwoty = { kom: k, kwota: null, waluta: p.waluta, metoda: p.metoda };
+        }
+        return bezKwoty;
+    }
+
+    // ===== Strony prologistics =====
+    var CACHE = {};
+    function pamiec(k, robota){ if (!CACHE[k]) CACHE[k] = robota(); return CACHE[k]; }
+
+    async function czytajTicket(rma){
+        var html = '';
+        var t0 = Date.now();
+        try {
+            var res = await fetch('/rma.php?rma_id=' + encodeURIComponent(rma), { credentials: 'same-origin' });
+            dz('GET rma.php', rma, 'HTTP', res && res.status, (Date.now() - t0) + 'ms');
+            if (!res || !res.ok) return { ok: false, err: 'ticket ' + rma + ': HTTP ' + (res ? res.status : '?') };
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarłem ticketu ' + rma }; }
+        var d = dom(html);
+        if (!d.querySelector('tr.comment-row') && !d.getElementById('auftrag_details'))
+            return { ok: false, err: 'ticket ' + rma + ': strona nie wygląda na ticket' };
+        return { ok: true, kom: czytajKomentarze(d, 'ticket'), aufy: aufyZeStrony(d) };
+    }
+    function czytajTicketC(rma){ return pamiec('t' + rma, function (){ return czytajTicket(rma); }); }
+
+    function aufyZeStrony(d){
+        var out = [], widz = {};
+        d.querySelectorAll('a[href*="auction.php"]').forEach(function (a){
+            var m = /number=(\d+)/.exec(a.getAttribute('href') || '');
+            if (m && !widz[m[1]]){ widz[m[1]] = 1; out.push(m[1]); }
+        });
+        return out;
+    }
+
+    // Tabelka „Eupago Payments" — ta sama, ktora czyta Bank Import.
+    // Kolumny: Date, Amount, Referencia, Token.
+    function euTabela(d){
+        var t = d.querySelector('table[data-simple-nav="Eupago Payments"]');
+        if (!t) return null;
+        var poz = [];
+        t.querySelectorAll('tr').forEach(function (tr){
+            var td = tr.querySelectorAll('td');
+            if (td.length < 4) return;
+            var dt = String(td[0].textContent || '').trim();
+            if (!/^\d{4}-\d{2}-\d{2}/.test(dt)) return;
+            poz.push({ data: dt.slice(0, 10),
+                       kwota: money(td[1].textContent),
+                       ref:   String(td[2].textContent || '').trim(),
+                       token: String(td[3].textContent || '').trim() });
+        });
+        return poz;
+    }
+
+    function ticketyZeStrony(d){
+        var out = [], widz = {};
+        d.querySelectorAll('a[href*="rma.php"]').forEach(function (a){
+            var m = /rma_id=(\d+)/.exec(a.getAttribute('href') || '');
+            if (m && !widz[m[1]]){ widz[m[1]] = 1; out.push(m[1]); }
+        });
+        return out;
+    }
+
+    // „Auftrag value - Total of Payments" stoi na stronie DWA razy: w podsumowaniu tabeli
+    // Payments (w <b>) i jako zwykly tekst w komentarzu wczesniejszego ksiegowania.
+    // Bierzemy wylacznie ten z <b>, i to ostatni. Separator tysiecy MUSI wejsc do wzorca:
+    // prologistics pisze te kwote po angielsku, wiec „€ 1,149.97" bez przecinka czytaloby
+    // sie jako 1,14.
+    function openAmount(d){
+        var bs = d.querySelectorAll('b'), node = null;
+        for (var i = 0; i < bs.length; i++)
+            if (/Auftrag value\s*-\s*Total of Payments/i.test(bs[i].textContent || '')) node = bs[i];
+        if (!node) return null;
+        var box = (node.closest && node.closest('td')) || node.parentNode;
+        var t = String((box && box.textContent) || '').replace(/Auftrag value\s*-\s*Total of Payments/i, ' ');
+        var m = t.match(/-?\s*\d[\d'’\s,.]*/);
+        return m ? money(m[0]) : null;
+    }
+
+    // Tabelka „Refund request" na auftragu to NARZEDZIE DO ZWROTOW PRZELEWEM. Wpis w niej
+    // jest wlasciwa droga dopiero wtedy, gdy od wplaty minely trzy miesiace i eupago nie
+    // zwroci juz na zrodlo. Wczesniej to pomylka — i warto o niej powiedziec wprost.
+    // Tabela „Payments" auftragu. Ujemna pozycja na koncie eupago to slad po zwrocie,
+    // ktory JUZ poszedl — a tego z samego eupago nie widac, bo platnosc zostaje „paga".
+    function platnosciAuftragu(d){
+        var t = d.querySelector('table[data-simple-nav="Payments under billing information"]');
+        if (!t) return [];
+        var out = [];
+        t.querySelectorAll('tr').forEach(function (tr){
+            var td = tr.querySelectorAll('td');
+            if (td.length < 3) return;
+            var kw = money(flat(td[2].textContent));
+            if (kw == null) return;
+            out.push({ data: flat(td[0].textContent), konto: flat(td[1].textContent), kwota: kw });
+        });
+        return out;
+    }
+    // Drugi slad: komentarz ksiegujacy zwrot, w postaci „<numer> Reembolso <kwota> €".
+    var ZW_REEMB = /reembolso/i;
+    function juzZwrocone(wyplaty, kom, kwota){
+        var uj = (wyplaty || []).filter(function (p){
+            return p.kwota < 0 && String(p.konto) === String(ZW_KONTO);
+        });
+        var suma = 0;
+        uj.forEach(function (p){ suma += Math.abs(p.kwota); });
+        var slad = null;
+        (kom || []).forEach(function (k){ if (!slad && ZW_REEMB.test(k.tekst || '')) slad = k; });
+        if (!uj.length && !slad) return null;
+        var dokladne = kwota != null && uj.some(function (p){
+            return Math.abs(Math.abs(p.kwota) - kwota) < ZW_TOL;
+        });
+        return { pozycje: uj, suma: suma, slad: slad, dokladne: !!dokladne };
+    }
+
+    function refundTool(d){
+        var t = d.querySelector('table[data-simple-nav="Refund request"], table#refundTable');
+        if (!t) return null;
+        var glowy = [];
+        var hr = t.querySelector('tr.table-heading-row');
+        if (hr) hr.querySelectorAll('td').forEach(function (td){ glowy.push(flat(td.textContent).toLowerCase()); });
+        var out = [];
+        t.querySelectorAll('tr.table-row').forEach(function (tr){
+            var td = tr.querySelectorAll('td');
+            if (!td.length) return;
+            function kol(nazwa){
+                var i = glowy.indexOf(nazwa);
+                return (i >= 0 && td[i]) ? flat(td[i].textContent) : '';
+            }
+            var sel = tr.querySelector('select.state-select');
+            var stan = '';
+            if (sel){
+                var o = sel.querySelector('option[selected]') || sel.options[sel.selectedIndex];
+                stan = o ? flat(o.textContent) : '';
+            }
+            // „changed by Sandra Paola Alvarez on 2026-08-31 12:14:35" — pierwsza litera
+            // slowa „changed" bywa CYRYLICKA, wiec jej nie dotykamy i celujemy w „by ... on".
+            var zat = '', zatData = '';
+            var log = tr.querySelector('a.log-info');
+            if (log){
+                var mm = /\bby\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2}[^<]*)/i.exec(flat(log.textContent));
+                if (mm){ zat = flat(mm[1]); zatData = flat(mm[2]); }
+            }
+            out.push({ kwota: money(kol('refund amount')), stan: stan,
+                       kto: kol('username'), data: kol('date'),
+                       metoda: kol('payment method'),
+                       zatwierdzil: zat, zatwierdzonoData: zatData,
+                       iban: ibanNorm(kol('iban/account number') || kol('iban') || ''),
+                       nazwisko: kol('name') || kol('customer name'),
+                       firma: kol('company name'),
+                       refundId: sel ? (sel.getAttribute('data-refund-id') || '') : '',
+                       // log_id to numer importu — tym adresuje sie zmiane statusu.
+                       logId: sel ? (sel.getAttribute('data-log-id') || '') : '' });
+        });
+        return out.length ? out : null;
+    }
+
+    // Czy auftrag jest SKASOWANY. Status stoi w zrodle strony jako `const isDeleted = +"1";`
+    // — plakietke w naglowku sklada dopiero skrypt strony, wiec w HTML-u pobranym fetch-em
+    // klas „auftrag-status--*" po prostu NIE MA. Tak samo czyta to Unpaid COD i Bank Import.
+    function usunZeZrodla(html){
+        var m = String(html || '').match(/\bconst\s+isDeleted\s*=\s*([^;\n]{0,40});/);
+        if (!m) return null;
+        var v = m[1].replace(/[\s+"']/g, '').toLowerCase();
+        if (v === '1' || v === 'true') return true;
+        if (v === '0' || v === '' || v === 'false' || v === 'null') return false;
+        return null;
+    }
+    function usuniety(d, html){
+        try {
+            // Naglowek opisuje TE transakcje, ktora czytamy — reszta strony wymienia takze
+            // pozostale transakcje tego numeru, wiec szukanie po calej stronie klamaloby.
+            var nag = d && d.querySelector('h1.header-title, .header-title');
+            var stat = nag ? nag.querySelector('[class*="auftrag-status--"]') : null;
+            if (stat){
+                var kl = String(stat.className || '');
+                if (/auftrag-status--deleted/i.test(kl)) return true;
+                if (/auftrag-status--active/i.test(kl)) return false;
+            }
+        } catch (e){}
+        return usunZeZrodla(html);
+    }
+
+    // Identyfikator obiektu, ktorego zada js_backend.php przy odbijaniu komentarza.
+    function objIdAuftragu(d, html){
+        try {
+            var el = d.querySelector('[data-obj-id]');
+            if (el){
+                var v = el.getAttribute('data-obj-id');
+                if (/^\d+$/.test(v)) return v;
+            }
+        } catch (e){}
+        var m = String(html || '').match(/data-obj-id=["'](\d+)["']/);
+        return m ? m[1] : '';
+    }
+
+    async function czytajAuftrag(num){
+        var html = '';
+        try {
+            // txnid=3: bez niego prologistics pokazuje strone bez czesci sekcji.
+            var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3',
+                                  { credentials: 'same-origin' });
+            dz('GET auction.php', num, 'HTTP', res && res.status);
+            if (!res || !res.ok) return { ok: false, err: 'auftrag ' + num + ': HTTP ' + (res ? res.status : '?') };
+            html = await res.text();
+        } catch (e){ return { ok: false, err: 'nie otwarłem auftragu ' + num }; }
+        var d = dom(html);
+        return { ok: true, num: num, eu: euTabela(d), kom: czytajKomentarze(d, 'auftrag'),
+                 open: openAmount(d), tool: refundTool(d), deleted: usuniety(d, html),
+                 wyplaty: platnosciAuftragu(d),
+                 objId: objIdAuftragu(d, html),
+                 tickety: ticketyZeStrony(d), dalej: kolejneAufy(d, num) };
+    }
+    function czytajAuftragC(num){ return pamiec('a' + num, function (){ return czytajAuftrag(num); }); }
+
+    // Nastepne auftragi w lancuchu: wszystkie inne numery, do ktorych strona linkuje.
+    // Zamiana i przeksiegowanie zostawiaja taki link — po nim idziemy dalej.
+    function kolejneAufy(d, biezacy){
+        return aufyZeStrony(d).filter(function (n){ return n !== String(biezacy); });
+    }
+
+    // Idziemy lancuchem, dopoki nie trafimy na auftrag z tabelka Eupago Payments.
+    // Kolejnosc: wszerz, zeby najblizszy sasiad wygral z dalekim.
+    async function szukajEupago(start){
+        var kolejka = start.slice(), widziane = {}, odw = [];
+        while (kolejka.length && odw.length < ZW_SKOKI){
+            var n = kolejka.shift();
+            if (!n || widziane[n]) continue;
+            widziane[n] = 1;
+            odw.push(n);
+            var a = await czytajAuftragC(n);
+            if (!a.ok) continue;
+            if (a.eu && a.eu.length) return { ok: true, auf: n, poz: a.eu, odwiedzone: odw };
+            (a.dalej || []).forEach(function (x){ if (!widziane[x]) kolejka.push(x); });
+        }
+        return { ok: false, odwiedzone: odw };
+    }
+
+    // ===== eupago: status platnosci =====
+    // Token do /api/intern liczy sie z daty — panel sklada go tak samo.
+    // Szczegoly i uzasadnienie: patrz Bank Import (bkEuTokenDnia).
+    function euTokenDnia(){
+        var d = new Date();
+        return btoa('Auth-Token-Eupago-' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()));
+    }
+    // ===== Odczyt platnosci w eupago =====
+    // Platnosc czekajaca na zwrot LEZY W ARCHIWUM — po to jest przeciez odarchiwizowanie.
+    // Lista biezaca (status pusty) archiwum NIE OBEJMUJE: zapytanie o token przez caly rok
+    // oddawalo zero, choc w panelu ta sama platnosc wyszukiwala sie od razu. To byla
+    // JEDYNA przyczyna — token z kolumny „Token" auftragu JEST identyfikatorem eupago,
+    // a data tez sie zgadza (roznica godzin to strefa czasowa).
+    //
+    // Archiwum panel odpytuje adresem „?status=arquivada" i NIE przekazuje mu ani daty,
+    // ani kwoty, ani identyfikatora — filtruje wyszukiwarka DataTables, czyli polem
+    // search[value] w ciele. Sprawdzone na zywo: po numerze referencji oddaje dokladnie
+    // jeden wiersz, a komplet columns[] nie jest do tego potrzebny.
+    function euBody(szukane){
+        return 'draw=1&start=0&length=25&search[value]=' + encodeURIComponent(szukane)
+             + '&search[regex]=false';
+    }
+    function euZapytaj(url, body){
+        return new Promise(function (ok, zle){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'POST', url: url, timeout: 120000, anonymous: false, data: body,
+                headers: { 'accept': 'application/json, text/javascript, */*; q=0.01',
+                           'content-type': 'application/x-www-form-urlencoded, application/json',
+                           'cache-control': 'no-cache',
+                           'x-auth-token': euTokenDnia() },
+                onload: function (r){
+                    dz('eupago', url.replace(/^https:\/\/[^/]+/, ''), 'HTTP', r.status,
+                       'szukane=' + (body.match(/search\[value\]=([^&]*)/) || [])[1]);
+                    if (r.status === 401 || r.status === 403){ zle(new Error('eupago odrzuciło token (HTTP ' + r.status + ')')); return; }
+                    if (r.status < 200 || r.status >= 300){ zle(new Error('eupago: HTTP ' + r.status)); return; }
+                    var j = null;
+                    try { j = JSON.parse(r.responseText || '{}'); } catch (e){ zle(new Error('eupago oddało nie-JSON')); return; }
+                    ok((j && j.data) || []);
+                },
+                onerror: function (){ zle(new Error('nie połączyłem się z eupago')); },
+                ontimeout: function (){ zle(new Error('eupago nie odpowiedziało w 120 s')); }
+            });
+        });
+    }
+    var EU_URL = 'https://clientes.eupago.pt/api/intern/v1.02/references';
+    // Wsrod wynikow bierzemy ten, ktorego identyfikator albo referencja zgadza sie
+    // doslownie — wyszukiwarka DataTables szuka po wszystkich kolumnach i potrafi oddac
+    // wiersz podobny, a przy zwrocie „podobny" to za malo.
+    function euDopasuj(lista, token, ref){
+        var t = String(token || '').toLowerCase(), rf = String(ref || '');
+        for (var i = 0; i < lista.length; i++){
+            var w = lista[i];
+            if (t && String(w.identificador || '').toLowerCase() === t) return w;
+            if (t && String(w.externalTransactionID || '').toLowerCase() === t) return w;
+            if (rf && String(w.referencia || '') === rf) return w;
+        }
+        return null;
+    }
+    // Najpierw archiwum (tam czekaja platnosci do zwrotu), potem lista biezaca.
+    // Szukamy po tokenie, a gdy nie trafi — po numerze referencji z auftragu.
+    async function euStatus(token, data, ref){
+        var proby = [
+            { url: EU_URL + '?status=arquivada', body: euBody(token), arch: true },
+            { url: EU_URL + '?status=arquivada', body: euBody(ref),   arch: true },
+            { url: EU_URL + '?status=',          body: euBody(token), arch: false },
+            { url: EU_URL + '?status=',          body: euBody(ref),   arch: false }
+        ];
+        for (var i = 0; i < proby.length; i++){
+            if (!/search\[value\]=[^&]+/.test(proby[i].body)) continue;   // pusty klucz pomijamy
+            var lista = await euZapytaj(proby[i].url, proby[i].body);
+            var w = euDopasuj(lista, token, ref);
+            if (w){ w.__archiwum = proby[i].arch; return w; }
+        }
+        return null;
+    }
+    // Numer, ktorym adresuje sie operacje na platnosci. Panel bierze go z DT_RowId
+    // wiersza tabeli; nazwa pola bywa rozna, wiec probujemy po kolei i mowimy wprost,
+    // gdy zadne nie pasuje — zamiast wysylac zapytanie z losowym numerem.
+    function euRefId(w){
+        if (!w) return '';
+        var kand = ['DT_RowId', 'refid', 'id_referencia', 'id', 'idReferencia'];
+        for (var i = 0; i < kand.length; i++){
+            var v = w[kand[i]];
+            if (v != null && String(v) !== '') return String(v).replace(/^row_/, '');
+        }
+        return '';
+    }
+    var EU_STANY = { paga: 'Paid', pendente: 'Pending', expirada: 'Expired', cancelada: 'Cancelled',
+                     devolvida: 'Returned', reembolsada: 'Refunded', transferida: 'Transferred',
+                     'em processamento': 'Processing', chargeback: 'Chargeback' };
+    function stanPL(e){
+        var s = String(e == null ? '' : e).toLowerCase().trim();
+        return EU_STANY[s] || (s ? s : '—');
+    }
+    // Zwrot dopuszczalny tylko dla tych stanow — tak samo jak w panelu.
+    function stanPozwala(e){
+        var s = String(e == null ? '' : e).toLowerCase().trim();
+        return s === 'paga' || s === 'transferida' || s === 'em processamento';
+    }
+
+    function miesiaceOd(data){
+        try {
+            var d = new Date(data + 'T12:00:00'), n = new Date();
+            return (n.getFullYear() - d.getFullYear()) * 12 + (n.getMonth() - d.getMonth())
+                 + ((n.getDate() < d.getDate()) ? -1 : 0);
+        } catch (e){ return null; }
+    }
+
+    // ===== Most: operacje na pieniadzach wykonuje karta panelu eupago =====
+    var opNr = 0;
+    var OP_NAZWY = { unarchive: 'odarchiwizowanie', archive: 'archiwizacja',
+                     detail: 'szczegóły płatności', refund: 'zwrot' };
+    // Zlecenie wykonuje KARTA PANELU eupago. Gdy jej nie ma, nic sie nie dzieje —
+    // a puste „w toku…" wyglada wtedy jak zawieszenie. Dlatego odliczamy na glos.
+    function mostem(op, dane, ile){
+        return new Promise(function (ok, zle){
+            var id = 'zwr' + (++opNr) + '_' + String(Math.random()).slice(2, 8);
+            var z = { id: id, op: op, kiedy: Date.now() };
+            Object.keys(dane || {}).forEach(function (k){ z[k] = dane[k]; });
+            dz('MOST →', op, pulsOpis(), 'refid=' + (dane && dane.refid || '—'),
+               'trid=' + (dane && dane.trid || '—'),
+               'kwota=' + (dane && dane.amount != null ? dane.amount : '—'),
+               'iban=' + maskIban(dane && dane.iban),
+               'bic=' + ((dane && dane.bic) || '—'));
+            gmSet(ZW_OP_Z, JSON.stringify(z));
+            var limit = ile || 60000;
+            var start = Date.now(), koniec = start + limit;
+            var opis = OP_NAZWY[op] || op;
+            say('⏳ ' + opis + ' — czekam na kartę panelu eupago…', '#c47f00');
+            // Odpowiedz odbieramy nasluchem, gdy jest dostepny — zegar zostaje do
+            // odliczania czasu i jako zapas.
+            var skonczone = false;
+            var przyjmij = function (v){
+                if (skonczone) return false;
+                var o2 = null;
+                try { o2 = v ? JSON.parse(v) : null; } catch (e){ return false; }
+                if (!o2 || o2.id !== id) return false;
+                skonczone = true;
+                clearInterval(zegar);
+                gmSet(ZW_OP_O, '');
+                if (o2.ver && o2.ver !== ZW_VER){
+                    zle(new Error('karta panelu eupago pracuje na wersji ' + o2.ver
+                                + ', a moduł na ' + ZW_VER
+                                + ' — ODŚWIEŻ kartę clientes.eupago.pt i spróbuj ponownie'));
+                    return true;
+                }
+                dz('MOST ←', op, o2.ok ? 'OK' : ('BŁĄD: ' + (o2.err || '?')),
+                   o2.trid ? ('trid=' + o2.trid) : '');
+                if (o2.ok) ok(o2); else zle(new Error(o2.err || 'karta panelu odmówiła'));
+                return true;
+            };
+            try {
+                if (typeof GM_addValueChangeListener === 'function')
+                    GM_addValueChangeListener(ZW_OP_O, function (k, st, nw){ przyjmij(nw); });
+            } catch (e){}
+            var zegar = setInterval(function (){
+                if (przyjmij(gmGet(ZW_OP_O, ''))) return;
+                if (skonczone) return;
+                var minelo = Math.round((Date.now() - start) / 1000);
+                if (minelo >= 3)
+                    say('⏳ ' + opis + ' — czekam na kartę panelu eupago… ' + minelo + ' s z '
+                      + Math.round(limit / 1000) + '. ' + pulsOpis()
+                      + ' <b>Karta musi być otwarta i zalogowana</b>; '
+                      + 'jeśli właśnie zainstalowałeś nową wersję, odśwież ją.', '#c47f00');
+                if (Date.now() > koniec){
+                    clearInterval(zegar); skonczone = true;
+                    zle(new Error('karta panelu eupago nie odpowiedziała przez '
+                                + Math.round(limit / 1000) + ' s. Otwórz clientes.eupago.pt, '
+                                + 'zaloguj się i ODŚWIEŻ kartę, potem spróbuj ponownie. '
+                                + 'Płatność została w archiwum — nic się nie zmieniło'));
+                }
+            }, 400);
+        });
+    }
+
+    // ===== Panel =====
+    var S = { rows: [], busy: false, stop: false, reczne: false };
+
+    var btn = document.createElement('button');
+    btn.id = 'zwr-btn';
+    btn.textContent = '💶 Zwroty';
+    btn.style.cssText = 'position:fixed;top:339px;right:20px;z-index:999999;padding:10px 15px;'
+                      + 'background:#FF2F00;color:#fff;border:none;border-radius:8px;cursor:pointer;'
+                      + 'font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2)';
+
+    var panel = document.createElement('div');
+    panel.id = 'zwr-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:204px;right:20px;z-index:999999;'
+                        + 'background:white;border:1px solid #ccc;border-radius:10px;'
+                        + 'box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:16px;'
+                        + 'width:min(1180px, calc(100vw - 40px));font-family:sans-serif;'
+                        + 'max-height:calc(100vh - 224px);overflow-y:auto';
+    panel.innerHTML =
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      +   '<div style="font-weight:bold;color:#111;font-size:15px">💶 Zwroty — eupago'
+      +     ' <span style="font-weight:normal;font-size:11px;color:#750000">HUB v' + ZW_VER + '</span></div>'
+      +   '<span id="zwr-close" style="cursor:pointer;color:#888;font-size:18px;line-height:1">×</span>'
+      + '</div>'
+      + '<div style="font-size:11px;color:#666;margin-bottom:8px">'
+      +   'Wklej wiersze ze skrzynki (From / Subject / Received). Numer brany jest z tematu — '
+      +   'po <b>Ticket:</b> albo po <b>auftrag:</b>. '
+      +   'Prośba, kwota i osoba prosząca — z <b>ostatniego komentarza finance</b>, który podaje kwotę. '
+      +   'Płatność szukana jest w tabelce <b>Eupago Payments</b>, idąc łańcuchem auftragów.'
+      + '</div>'
+      + '<textarea id="zwr-paste" spellcheck="false" placeholder="Wklej wiersze ze skrzynki…" '
+      +   'style="width:100%;height:90px;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:12px;resize:vertical;box-sizing:border-box;font-family:monospace"></textarea>'
+
+      + '<div style="margin-top:8px">'
+      +   '<label style="font-size:12px;color:#333;cursor:pointer;display:inline-flex;gap:6px;align-items:center">'
+      +     '<input type="checkbox" id="zwr-reczne">'
+      +     '<span>➕ Pozwól ręcznie zaakceptować wiersze, których <b>nie umiem odczytać</b> '
+      +       '<span style="color:#666;font-weight:normal">(brak prośby, nieznane stanowisko itp. — kwotę potwierdzasz sam; '
+      +       'dotyczy tylko pozycji, dla których znalazłem płatność w eupago)</span></span>'
+      +   '</label>'
+      + '</div>'
+
+      + '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      +   '<button id="zwr-check" style="flex:1;min-width:180px;padding:9px;background:#332524;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🔍 Sprawdź</button>'
+      +   '<button id="zwr-swifty" title="Podgląd i uzupełnienie tablicy SWIFT-ów. Kod banku to cztery cyfry z IBAN-u po PT i sumie kontrolnej." '
+      +     'style="width:130px;padding:9px;background:#fff;color:#750000;border:1px solid #750000;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🏦 SWIFT-y</button>'
+      +   '<button id="zwr-log" title="Zapisuje plik z całą drogą sprawdzania i wykonania — co pobrano, skąd kwota, jak wypadła autoryzacja, co odpowiedziało eupago. Numery kont zamaskowane." '
+      +     'style="width:150px;padding:9px;background:#fff;color:#750000;border:1px solid #750000;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">📋 Zapisz log</button>'
+      +   '<button id="zwr-clear" style="width:120px;padding:9px;background:#750000;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold">🧹 Wyczyść</button>'
+      + '</div>'
+
+      + '<div style="margin-top:8px;padding:8px;background:#F6E7E6;border:1px solid #FFCCB7;border-radius:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +   '<span style="font-size:12px;color:#750000;font-weight:bold">⚙️ Równolegle:</span>'
+      +   '<input type="number" id="zwr-par" min="1" max="8" value="5" '
+      +     'title="Ile pozycji sprawdzanych naraz. Same zwroty idą ZAWSZE po kolei." '
+      +     'style="width:55px;padding:4px 6px;border:1px solid #750000;border-radius:4px;font-size:12px;text-align:center">'
+      +   '<button id="zwr-all" style="padding:7px 10px;background:#fff;color:#750000;border:1px solid #750000;border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">☑ Zaznacz / odznacz</button>'
+      +   '<button id="zwr-stop" disabled style="padding:7px 10px;background:#fff;color:#750000;border:1px solid #750000;border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">⛔ Przerwij</button>'
+      +   '<button id="zwr-do" disabled style="flex:1;min-width:240px;padding:7px;background:#FF2F00;color:white;border:none;border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">💸 Wykonaj zwroty</button>'
+      +   '<span style="font-size:10px;color:#750000;font-style:italic;width:100%">Zwrot to prawdziwe pieniądze wychodzące do klienta. Przejrzyj tabelę, zanim zaznaczysz.</span>'
+      + '</div>'
+
+      + '<div id="zwr-warn" style="display:none;margin-top:8px;padding:8px;background:#fff4e5;border:1px solid #f0b429;'
+      +   'border-radius:6px;font-size:12px;color:#8a5a00;font-weight:bold">'
+      +   '⚠ Zwrot w toku — nie zamykaj tej karty ani karty panelu eupago. '
+      +   'Operacje wykonuje <b>karta clientes.eupago.pt</b>: musi być otwarta i zalogowana. '
+      +   'Płatność jest na ten czas wyciągnięta z archiwum; przerwanie w połowie zostawi ją odarchiwizowaną.'
+      + '</div>'
+      + '<div id="zwr-status" style="margin-top:8px;color:#333;min-height:16px;font-size:12px;font-weight:bold"></div>'
+      + '<div id="zwr-out" style="margin-top:10px;overflow-x:auto"></div>';
+
+    function say(t, c){ var e = $('#zwr-status'); if (e){ e.innerHTML = t; e.style.color = c || '#333'; } }
+    // Stan karty eupago wprost z jej pulsu. „Cisza" znaczy: nie ma tam wykonawcy —
+    // i to zupelnie inna usterka niz wykonawca, ktory jest, ale odpowiada wolno.
+    function puls(){
+        try { return JSON.parse(gmGet(ZW_OP_H, '') || 'null'); } catch (e){ return null; }
+    }
+    function pulsOpis(){
+        var p = puls();
+        if (!p || !p.czas) return 'Karta eupago milczy — nie ma na niej wykonawcy.';
+        var wiek = Math.round((Date.now() - p.czas) / 1000);
+        return 'Karta eupago: puls ' + wiek + ' s temu, wersja ' + (p.ver || '?')
+             + ', zegar ' + (p.zrodlo || '?') + (p.nasluch ? ', nasłuch jest' : ', bez nasłuchu')
+             + (p.ukryta ? ', w tle' : '') + '.';
+    }
+
+    // ===== Dziennik =====
+    // Zapisujemy KAZDY krok, zeby diagnoza nie wymagala kolejnego podejscia. Numery kont
+    // maskujemy: do rozpoznania problemu wystarczy kod banku i dlugosc, a plik bywa
+    // przesylany dalej.
+    var ZW_LOG = [];
+    function maskIban(v){
+        var x = ibanNorm(v);
+        if (!x) return '';
+        return x.length > 10 ? (x.slice(0, 8) + '…' + x.slice(-3) + ' (' + x.length + ' zn.)') : x;
+    }
+    function dz(){
+        var cz = new Date().toTimeString().slice(0, 8);
+        var t = Array.prototype.slice.call(arguments).map(function (v){
+            if (v == null) return '—';
+            if (typeof v === 'object'){ try { return JSON.stringify(v); } catch (e){ return String(v); } }
+            return String(v);
+        }).join(' ');
+        ZW_LOG.push(cz + '  ' + t);
+        if (ZW_LOG.length > 4000) ZW_LOG.splice(0, 1000);   // zabezpieczenie przed puchnieciem
+    }
+    function zapiszLog(){
+        var L = [];
+        L.push('=== Zwroty — dziennik pracy ===');
+        L.push('HUB ' + ZW_VER + '   ' + new Date().toString());
+        L.push('Numery kont są zamaskowane celowo.');
+        L.push('');
+        L.push('--- WIERSZE ---');
+        S.rows.forEach(function (r, i){
+            L.push('[' + i + '] ' + (r.line || '').slice(0, 120));
+            L.push('     rodzaj=' + (r.rodzaj || '—') + '  nr=' + (r.nr || '—')
+                 + '  ticket=' + (r.rma || '—') + '  auftrag=' + (r.auf || '—'));
+            L.push('     kwota=' + f2(r.kwota) + ' (' + (r.kwotaZ || '—') + ')'
+                 + '  waluta=' + (r.waluta || '—') + '  open=' + f2(r.open));
+            L.push('     prosil=' + (r.prosil || '—') + ' [' + (r.prosilId || '—') + ']'
+                 + '  z=' + (r.prZ || '—') + '  data=' + (r.prosbaData || '—'));
+            L.push('     stanowisko=' + (r.stanowisko || '—') + '  dzial=' + (r.dzial || '—')
+                 + '  limit=' + (r.poziom ? f2(r.poziom.cash) : '—')
+                 + '  autOk=' + String(r.autOk)
+                 + (r.autBezLimitu ? ' (bez limitu)' : '')
+                 + (r.zgodaKto ? ('  zgoda=' + r.zgodaKto + ' z ' + r.zgodaSkad) : ''));
+            L.push('     eupago: estado=' + (r.estado || '—') + '  refid=' + (r.refid || '—')
+                 + '  trid=' + (r.trid || '—') + '  archiwum=' + String(!!r.archiwum)
+                 + '  data=' + (r.platData || '—') + '  kwota=' + f2(r.platKwota)
+                 + '  wiek=' + (r.mies != null ? (r.mies + ' mies.') : '—'));
+            L.push('     iban=' + (maskIban(r.ibanGotowy) || '—')
+                 + '  bank=' + (r.kodBanku || '—') + '  swift=' + (r.bicGotowy || '—')
+                 + (r.ibanKom ? ('  [z komentarza: ' + (r.ibanKom.autor || '—')
+                                 + ' ' + (r.ibanKom.data || '') + ']') : ''));
+            if (r.tool && r.tool.length)
+                L.push('     RefundRequest: stan=' + (r.tool[0].stan || '—')
+                     + '  kwota=' + f2(r.tool[0].kwota)
+                     + '  iban=' + (maskIban(r.tool[0].iban) || '—')
+                     + '  zatwierdzil=' + (r.tool[0].zatwierdzil || '—'));
+            L.push('     deleted=' + String(r.deleted) + '  status=' + (r.st || '—'));
+            L.push('     uwagi: ' + (r.msg || '—'));
+            L.push('');
+        });
+        L.push('--- PRZEBIEG ---');
+        ZW_LOG.forEach(function (x){ L.push(x); });
+        var blob = new Blob([L.join('\n')], { type: 'text/plain;charset=utf-8' });
+        var el = document.createElement('a');
+        el.href = URL.createObjectURL(blob);
+        el.download = 'Zwroty-dziennik-' + dzisISO() + '-'
+                    + new Date().toTimeString().slice(0, 5).replace(':', '') + '.txt';
+        document.body.appendChild(el); el.click(); el.remove();
+        setTimeout(function (){ URL.revokeObjectURL(el.href); }, 4000);
+        say('Dziennik zapisany (' + ZW_LOG.length + ' wpisów).', '#16a34a');
+    }
+
+    document.body.appendChild(btn);
+    document.body.appendChild(panel);
+    btn.onclick = function (){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; };
+    $('#zwr-close').onclick = function (){ panel.style.display = 'none'; };
+
+    // ===== Wklejka -> numery ticketow =====
+    // Wiersz naglowka skrzynki („From  Subject  Received  Size") pomijamy w ciszy —
+    // inaczej za kazdym razem robil sie z niego czerwony wiersz „brak numeru".
+    function naglowekSkrzynki(s){
+        return /^from\b/i.test(s) && /\bsubject\b/i.test(s) && /\breceived\b/i.test(s);
+    }
+    // Temat MOWI WPROST, czym jest numer. Maile o zmianie odpowiedzialnego pisza
+    // „New responsible for auftrag: 14888837/3" — czyli numer auftragu z pozycja po
+    // ukosniku, a nie numer ticketu. Do adresu idzie sam numer, bez „/3".
+    // Gdy temat niczego nie podpisuje, probujemy najpierw ticketu, potem auftragu.
+    function zTematu(s){
+        var m = /(?:\bticket|\brma)\w*\s*(?:no\.?|nr|#|:)?\s*(\d{4,9})/i.exec(s);
+        if (m) return { rodzaj: 'ticket', nr: m[1] };
+        m = /\bauftrag\w*\s*(?:no\.?|nr|#|:)?\s*(\d{5,9})(?:\s*\/\s*\d+)?/i.exec(s);
+        if (m) return { rodzaj: 'auftrag', nr: m[1] };
+        m = /#\s*(\d{4,9})/.exec(s);
+        if (m) return { rodzaj: 'nieznany', nr: m[1] };
+        m = /\b(\d{6,9})\b/.exec(s);
+        return m ? { rodzaj: 'nieznany', nr: m[1] } : null;
+    }
+    function zWklejki(txt){
+        var out = [], widz = {};
+        String(txt || '').split(/\r?\n/).forEach(function (w){
+            var s = flat(w);
+            if (!s) return;
+            if (naglowekSkrzynki(s)) return;
+            var z = zTematu(s);
+            if (!z) { out.push({ line: s, nr: '', rodzaj: '', maili: 1, st: 'err',
+                                 msg: 'nie znalazłem numeru w tym wierszu' }); return; }
+            var k = z.rodzaj + z.nr;
+            if (widz[k]) { widz[k].maili++; return; }
+            var r = { line: s, nr: z.nr, rodzaj: z.rodzaj, rma: (z.rodzaj === 'ticket' ? z.nr : ''),
+                      maili: 1, st: 'new', msg: '', sel: false, wyjatek: false };
+            widz[k] = r;
+            out.push(r);
+        });
+        return out;
+    }
+
+    // ===== Sprawdzanie jednego wiersza =====
+    function dopisz(r, t){ r.msg = r.msg ? (r.msg + '; ' + t) : t; }
+
+    // Prosba stoi raz w tickecie, raz w komentarzach auftragu. Szukamy w kolejnosci
+    // zgodnej z tym, od czego weszlismy — a gdy tam jej nie ma, zagladamy po sasiedzku.
+    // Z kilku znalezionych prosb wybieramy NAJLEPSZA: ta, ktora podaje kwote, bije te
+    // bez kwoty; przy remisie wygrywa nowsza. Dzieki temu prosba z auftragu („Refund
+    // requested", bez kwoty) nie przykrywa tej z ticketu, w ktorej kwota stoi wprost.
+    function lepsza(a, b){
+        if (!a) return b;
+        if (!b) return a;
+        var ka = (a.pr.kwota != null), kb = (b.pr.kwota != null);
+        if (ka !== kb) return ka ? a : b;
+        return (String(b.pr.kom.data || '') > String(a.pr.kom.data || '')) ? b : a;
+    }
+
+    async function ustalProsbe(r){
+        if (r.rodzaj === 'auftrag'){
+            r.krok = 'czytam auftrag ' + r.nr; render();
+            var a = await czytajAuftragC(r.nr);
+            if (!a.ok) return { err: a.err };
+            var tks = a.tickety || [];
+            var naj = null;
+            var wszystkie = (a.kom || []).slice();
+            var p = znajdzProsbe(a.kom || []);
+            if (p) naj = { pr: p, skad: 'auftrag', rma: '' };
+            // Numery ticketow mamy z LINKOW auftragu — otwierac ich nie trzeba, zeby je
+            // pokazac. A strona ticketu odpowiada okolo 30 s, wiec otwieramy je TYLKO
+            // wtedy, gdy prosba z auftragu nie podaje kwoty i moze jej brakowac.
+            var trzebaTicketow = !p || p.kwota == null;
+            if (trzebaTicketow && tks.length){
+                r.krok = 'czytam ' + tks.length + ' ticket' + (tks.length > 1 ? 'y' : '')
+                       + ' (~30 s każdy)'; render();
+                // Rownolegle, nie po kolei — inaczej trzy tickety to poltorej minuty.
+                var wyn = await Promise.all(tks.map(function (nr){ return czytajTicketC(nr); }));
+                for (var i = 0; i < wyn.length; i++){
+                    var t1 = wyn[i];
+                    if (!t1 || !t1.ok) continue;
+                    wszystkie = wszystkie.concat(t1.kom || []);
+                    var p2 = znajdzProsbe(t1.kom);
+                    if (p2) naj = lepsza(naj, { pr: p2, skad: 'ticket', rma: tks[i] });
+                }
+            }
+            // Ticket pokazujemy zawsze, gdy jakis jest — nawet przy prosbie z auftragu.
+            r.rma = (naj && naj.rma) || tks[0] || '';
+            if (naj) return { pr: naj.pr, skad: naj.skad, aufy: [r.nr], zrodloAuf: r.nr,
+                              tickety: tks, kom: wszystkie };
+            return { aufy: [r.nr], zrodloAuf: r.nr, tickety: tks,
+                     err: 'brak komentarza finance — ani w auftragu, ani w '
+                        + (tks.length ? ('jego ' + tks.length + ' ticketach') : 'żadnym tickecie (auftrag ich nie ma)') };
+        }
+        r.krok = 'czytam ticket ' + r.nr + ' (~30 s)'; render();
+        var t = await czytajTicketC(r.nr);
+        if (t.ok){
+            r.rma = r.nr;
+            var naj2 = null;
+            var wsz2 = (t.kom || []).slice();
+            var p3 = znajdzProsbe(t.kom);
+            if (p3) naj2 = { pr: p3, skad: 'ticket', auf: (t.aufy || [])[0] || '' };
+            // Auftragi czytamy rownolegle — te strony sa szybkie, ale bywa ich kilka.
+            r.krok = 'czytam auftragi ticketu'; render();
+            var aWyn = await Promise.all((t.aufy || []).map(function (n){ return czytajAuftragC(n); }));
+            for (var j = 0; j < aWyn.length; j++){
+                var a2 = aWyn[j];
+                if (!a2 || !a2.ok) continue;
+                wsz2 = wsz2.concat(a2.kom || []);
+                var p4 = znajdzProsbe(a2.kom || []);
+                if (p4) naj2 = lepsza(naj2, { pr: p4, skad: 'auftrag', auf: t.aufy[j] });
+            }
+            if (naj2) return { pr: naj2.pr, skad: naj2.skad, aufy: t.aufy,
+                               zrodloAuf: naj2.auf || (t.aufy || [])[0] || '', kom: wsz2 };
+            return { aufy: t.aufy, zrodloAuf: (t.aufy || [])[0] || '',
+                     err: 'brak komentarza finance — ani w tickecie, ani w jego auftragach' };
+        }
+        // Numer nie byl w temacie podpisany i ticketem nie jest — probujemy auftragu.
+        if (r.rodzaj === 'nieznany'){ r.rodzaj = 'auftrag'; return await ustalProsbe(r); }
+        return { err: t.err };
+    }
+
+    // Do odbicia idzie osoba, ktora PROSILA — a gdy prosb bylo kilka, ta najnizsza
+    // stanowiskiem. To ona prowadzi sprawe; przelozony tylko zatwierdzil.
+    function doOdbicia(kom, domyslnyId, domyslnaNazwa){
+        var kand = [], widz = {};
+        (kom || []).forEach(function (k){
+            if (String(k.src).toLowerCase() !== 'finance') return;
+            var id = k.autorId || k.autor;
+            if (!id || widz[id]) return;
+            widz[id] = 1;
+            var os = pracownik(k.autorId || k.autor);
+            var p = (os && czyCS(os)) ? poziomZeStanowiska(os.position) : null;
+            kand.push({ id: k.autorId || '', nazwa: (os && os.name) || k.autor || '',
+                        lvl: p ? p.lvl : null });
+        });
+        var znane = kand.filter(function (x){ return x.lvl != null; });
+        if (znane.length){
+            znane.sort(function (a, b){ return a.lvl - b.lvl; });
+            return znane[0];
+        }
+        if (kand.length) return kand[0];
+        return { id: domyslnyId || '', nazwa: domyslnaNazwa || '', lvl: null };
+    }
+
+    // Tresc komentarza w formacie, jakiego uzywacie: numer referencji, slowo Reembolso
+    // i kwota z przecinkiem — dokladnie tak, jak stoi w szczegolach transakcji eupago.
+    function trescKomentarza(r){
+        var kw = f2(r.kwota).replace('.', ',');
+        return (r.euRef || r.token || '') + '\tReembolso\t' + kw + ' €';
+    }
+
+    function dzisISO(){
+        var d = new Date();
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    }
+
+    // Ksiegowanie w AUFTRAGU — ten sam POST, ktory wysyla formularz „Make payment".
+    // Kwota UJEMNA oznacza wyplate; przy zwrocie zawsze taka idzie.
+    async function ksiegujAuftrag(num, dataISO, kwota, opis){
+        var m = String(dataISO || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return { ok: false, err: 'zła data księgowania' };
+        var b = [];
+        var add = function (k, v){ b.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); };
+        add('number', String(num));
+        add('txnid', '3');
+        add('Date_Month', m[2]);
+        add('Date_Day', String(parseInt(m[3], 10)));   // select ma 1..31, bez zera wiodacego
+        add('Date_Year', m[1]);
+        add('account', ZW_KONTO);
+        add('amount', Number(kwota).toFixed(2));
+        add('paycomment', flat(opis));
+        try {
+            dz('POST auction.php (księgowanie)', 'auftrag=' + num, 'konto=' + ZW_KONTO,
+               'kwota=' + Number(kwota).toFixed(2));
+            var res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                body: b.join('&') });
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            return { ok: true };
+        } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
+    }
+
+    // Jedno zapytanie dopisuje komentarz I przestawia odpowiedzialnego na auftragu.
+    // Sam komentarz, BEZ odbicia — dokladnie to, co wysyla guzik „Add comment"
+    // na auftragu. Pole „src" strona wysyla puste i tak je zostawiamy; roznica wobec
+    // odbicia jest jedna: nie ma „field=responsible", wiec nikt nie dostaje sprawy.
+    async function dopiszKomentarz(objId, tekst){
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var body = 'fn=addComment&text=' + enc(tekst)
+                 + '&obj=auction&src=&obj_id=' + enc(objId);
+        var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                       'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: body });
+        if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?'));
+        return r.text();
+    }
+
+    async function odbijAuftrag(objId, login, tekst){
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var body = 'fn=reassignComment&username=' + enc(login)
+                 + '&obj=auction&obj_id=' + enc(objId)
+                 + '&comment=' + enc(tekst) + '&field=responsible';
+        var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                       'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: body });
+        if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?'));
+        return r.text();
+    }
+
+    // Zapis po zwrocie. Miejsce idzie za miejscem prosby: z auftragu — w auftragu,
+    // z ticketu — w tickecie. Zadna z tych porazek nie moze podwazyc samego zwrotu.
+    // Co zrobic z wpisem w „Refund request" po WYKONANYM zwrocie:
+    //   * wpis eupago            → „Refund Done"        (zwrot poszedl wlasnie ta droga),
+    //   * wpis na przelew bankowy → „Refund Deactivated" (wyplata z banku jest juz
+    //     niepotrzebna, a zostawiona czynna oddalaby te same pieniadze drugi raz).
+    // Tylko wpis na DOKLADNIE te kwote, ktora zwracamy — przy kilku prosbach na jednym
+    // auftragu ruszenie cudzej byloby zablokowaniem czyjejs wyplaty.
+    function doZmiany(tool, kwota){
+        var out = [];
+        (tool || []).forEach(function (t){
+            if (!t.logId) return;
+            if (/deactivat|done/i.test(String(t.stan || ''))) return;
+            if (kwota == null || t.kwota == null) return;
+            if (Math.abs(t.kwota - kwota) >= ZW_TOL) return;
+            out.push({ logId: t.logId, metoda: t.metoda || '',
+                       nowy: /eupago/i.test(String(t.metoda || ''))
+                             ? 'Refund Done' : 'Refund Deactivated' });
+        });
+        return out;
+    }
+    // Ten sam adres, ktorego uzywa Refund Checker — nie wymyslamy drugiego.
+    async function ustawStanImportu(logId, stan){
+        var fd = new FormData();
+        fd.append('new_status', stan);
+        fd.append('log_id', logId);
+        var res = await fetch('/api/refunds/updateRefundStatus/',
+                              { method: 'POST', body: fd, credentials: 'same-origin' });
+        var j = null;
+        try { j = await res.json(); } catch (e){}
+        if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+        if (!j || !j.success) throw new Error((j && j.message) ? j.message : 'serwer: success=false');
+        return (j.data && j.data.state) ? String(j.data.state) : stan;
+    }
+    async function ustawImporty(r){
+        var lista = doZmiany(r.tool, r.kwota);
+        for (var i = 0; i < lista.length; i++){
+            var w = lista[i];
+            r.krok = 'ustawiam import ' + w.logId; render();
+            try {
+                var st = await ustawStanImportu(w.logId, w.nowy);
+                dz('IMPORT', w.logId, '→', st);
+                dopisz(r, 'import ' + w.logId + ' (' + (w.metoda || '—') + ') → ' + st);
+            } catch (e){
+                dz('IMPORT', w.logId, 'BŁĄD:', (e && e.message) || e);
+                dopisz(r, 'import ' + w.logId + ' NIE ustawiony (' + ((e && e.message) || e)
+                        + ') — ustaw „' + w.nowy + '" ręcznie');
+            }
+        }
+    }
+
+    async function zapiszPoZwrocie(r){
+        // Ustawiamy ZARAZ po zwrocie, przed ksiegowaniem: gdyby ksiegowanie sie wywalilo,
+        // czynne zlecenie wyplaty z banku zostaloby na kwote wlasnie oddana przez eupago.
+        await ustawImporty(r);
+        var tekst = trescKomentarza(r);
+        r.komTekst = tekst;
+        var kto = r.odbicie || { id: r.prosilId, nazwa: r.prosil };
+
+        if (r.prZ === 'auftrag' && r.auf){
+            r.krok = 'księguję w auftragu'; render();
+            // ZWROT TO WYPLATA, nie wplata. Dodatnia kwota przez „Make payment" dopisuje
+            // druga platnosc obok oryginalnej i wywala open amount na podwojny minus —
+            // sprawdzone na auftragu 15532654. Ujemna zdejmuje ja z sumy wplat.
+            var kwotaKsieg = -Math.abs(r.kwota);
+            var b = await ksiegujAuftrag(r.auf, dzisISO(), kwotaKsieg, tekst);
+            if (!b.ok){ dopisz(r, 'auftrag: NIE zaksięgowane (' + b.err + ') — zrób ręcznie'); return; }
+            dopisz(r, 'auftrag: zaksięgowane ' + f2(kwotaKsieg) + ' na ' + ZW_KONTO);
+            // Nowy open amount czytamy WPROST z auftragu, zamiast liczyc go w pamieci.
+            // Liczony bylby tylko naszym domyslem; odczytany potwierdza ksiegowanie.
+            // Bez pamieci podrecznej — tam siedzi jeszcze strona sprzed operacji.
+            try {
+                var po = await czytajAuftrag(r.auf);
+                if (po.ok){
+                    r.openPo = po.open;
+                    dz('open amount po ksiegowaniu', r.auf, 'bylo=' + f2(r.open), 'jest=' + f2(po.open));
+                    render();
+                }
+            } catch (e){}
+            if (!r.objId){ dopisz(r, 'auftrag: brak obj_id — komentarz i odbicie zrób ręcznie'); return; }
+            // Skasowanego auftragu nie odbijamy na nikogo, ale komentarz ma zostac —
+            // idzie wiec osobnym wywolaniem, tym samym, ktorego uzywa guzik „Add comment".
+            if (r.deleted){
+                r.krok = 'dopisuję komentarz'; render();
+                try {
+                    await dopiszKomentarz(r.objId, tekst);
+                    dopisz(r, 'auftrag skasowany — komentarz dopisany, bez odbicia');
+                } catch (e){
+                    dopisz(r, 'auftrag skasowany — komentarz NIE poszedł ('
+                            + ((e && e.message) || e) + ') — dopisz ręcznie');
+                }
+                return;
+            }
+            if (!kto.id){ dopisz(r, 'nie wiem, na kogo odbić — zrób ręcznie'); return; }
+            r.krok = 'odbijam'; render();
+            try {
+                await odbijAuftrag(r.objId, kto.id, tekst);
+                dopisz(r, 'auftrag: komentarz dopisany, odbite na „' + (kto.nazwa || kto.id) + '"');
+            } catch (e){
+                dopisz(r, 'auftrag: odbicie NIE poszło (' + ((e && e.message) || e) + ') — zrób ręcznie');
+            }
+            return;
+        }
+
+        // Ticket obsluguje modul „Ksiegowanie w tickecie" — on umie ksiegowac, dopisac
+        // komentarz i odbic w jednym przebiegu, razem z przywroceniem stanu ticketu.
+        if (!r.rma){ dopisz(r, 'nie mam numeru ticketu — księgowanie zrób ręcznie'); return; }
+        if (typeof window.__TM_UCOD_TICKET !== 'function'){
+            dopisz(r, 'ticket POMINIĘTY — włącz moduł „Ksiegowanie w tickecie" (⚙ Moduły), '
+                    + 'bo to on obsługuje zapis w tickecie');
+            return;
+        }
+        r.krok = 'księguję w tickecie'; render();
+        var t = null;
+        try {
+            t = await window.__TM_UCOD_TICKET({
+                rmaId: r.rma, amount: Number(r.kwota).toFixed(2), bookingDate: dzisISO(),
+                accountNum: ZW_KONTO, komentarz: tekst,
+                osoba: kto.nazwa || '', osobaId: kto.id || '',
+                // Zwrot rozbija sie na WSZYSTKIE pozycje ticketu, a brak solution konczy
+                // sie „Please add solution" — inaczej niz Unpaid COD, ktory ksieguje
+                // calosc na jednej pozycji i eskalacji nie robi.
+                rozbijNaPozycje: true
+            });
+        } catch (e){ t = { ok: false, error: (e && e.message) || String(e) }; }
+        if (!t || !t.ok){
+            dopisz(r, 'ticket NIE zaksięgowany: '
+                    + ((t && ((t.ksieg && t.ksieg.error) || t.error)) || 'nieznany błąd')
+                    + ' — dokończ ręcznie');
+            if (t && t.ksieg && t.ksieg.escalated)
+                dopisz(r, 'ticket: zostawiono „Please add solution" i przepięto');
+            return;
+        }
+        if (t.eskalacja) dopisz(r, 'ticket: dopisano „Please add solution / check category"');
+        if (t.ksieg && t.ksieg.alreadyBooked) dopisz(r, 'ticket: takie księgowanie już tam było');
+        else dopisz(r, 'ticket: zaksięgowane ' + f2(r.kwota) + ' na ' + ZW_KONTO
+                     + ', odbite na „' + (kto.nazwa || kto.id) + '"');
+    }
+
+    async function sprawdz(r){
+        r.st = 'busy'; r.msg = '';
+        dz('=== sprawdzam', r.rodzaj || '?', r.nr, '===');
+        var u = await ustalProsbe(r);
+        // Brak prosby NIE konczy sprawy. Szukamy platnosci dalej, zeby dalo sie
+        // zaakceptowac wiersz recznie — inaczej kazda nietypowa prosba to „do reki".
+        var pr = u.pr || null;
+        r.krok = '';
+        if (u.err) dopisz(r, u.err);
+        r.brakProsby = !pr;
+        r.prZ = u.skad || '';
+        r.kwota = pr ? pr.kwota : null;
+        r.kwotaZ = (pr && pr.kwota != null) ? 'prośby' : '';
+        r.waluta = (pr && pr.waluta) || '';
+        r.metoda = (pr && pr.metoda) || '';
+
+        // Komentarz finance zwykle kwoty nie podaje — wtedy bierzemy OPEN AMOUNT auftragu
+        // (ustalenie z 07.09.2026). Zapamietujemy skad, zeby bylo widac w tabeli.
+        var zrAuf = u.zrodloAuf || (u.aufy || [])[0] || '';
+        if (zrAuf){
+            var az = await czytajAuftragC(zrAuf);
+            if (az.ok){
+                r.open = az.open;
+                r.tool = az.tool || null;
+                r.deleted = az.deleted;
+                r.objId = az.objId || '';
+                if (r.kwota == null){
+                    if (az.open != null && Math.abs(az.open) > 0){
+                        r.kwota = Math.abs(az.open);
+                        r.kwotaZ = 'open amount';
+                    } else {
+                        // Zatwierdzona kwota z „Refund request" jest ustaleniem, nie
+                        // domyslem — bierzemy ja przed kwota wplaty.
+                        var zat = null;
+                        (az.tool || []).forEach(function (tw){
+                            if (zat == null && /refund\s*approved/i.test(String(tw.stan || ''))
+                                && tw.kwota != null && tw.kwota > 0) zat = tw.kwota;
+                        });
+                        if (zat != null){
+                            r.kwota = zat;
+                            r.kwotaZ = 'Refund request';
+                        } else {
+                            // Skasowany auftrag zwykle ma open amount wyzerowany. Kwoty nie
+                            // narzucamy, ale podpowiadamy te, ktora faktycznie wplynela —
+                            // do potwierdzenia recznego, nie do cichego uzycia.
+                            dopisz(r, 'open amount auftragu ' + zrAuf + ' jest pusty'
+                                    + ' — kwotę potwierdź ręcznie');
+                        }
+                    }
+                }
+            }
+        }
+        r.prosil = pr ? (pr.kom.autor || '') : '';
+        r.prosilId = pr ? (pr.kom.autorId || '') : '';
+        r.prosbaData = pr ? (pr.kom.data || '') : '';
+        // Caly komentarz prosby zostaje przy wierszu — do podgladu w dymku.
+        r.prosbaKom = pr ? pr.kom : null;
+        r.odbicie = doOdbicia(u.kom, r.prosilId, r.prosil);
+        r.ibanKom = ibanZKomentarzy(u.kom);
+
+        // Uprawnienie osoby proszacej. Bez prosby nie ma kogo szukac — inaczej
+        // dopisywalibysmy „nie znalazlem osoby »«" przy kazdym takim wierszu.
+        var os = pr ? pracownik(r.prosilId || r.prosil) : null;
+        r.stanowisko = os ? String(os.position || '') : '';
+        r.przelozony = os ? String(os.supervisor || '') : '';
+        var p = poziomZeStanowiska(r.stanowisko);
+        r.poziom = p;
+        if (!pr){
+            r.autOk = null;
+        } else if (!os){
+            dopisz(r, 'nie odczytałem stanowiska osoby „' + (r.prosilId || r.prosil) + '"');
+            r.autOk = null;
+        } else if (os.inactive){
+            // Konto nieaktywne — dawny limit nie jest zadna podstawa.
+            r.stanowisko = String(os.position || '');
+            r.przelozony = String(os.supervisor || '');
+            r.nieaktywny = true;
+            dopisz(r, 'konto osoby „' + (r.prosilId || r.prosil) + '" jest nieaktywne');
+            r.autOk = null;
+        } else if (!czyCS(os)){
+            // Nie „brak w tabeli" — tabela po prostu jej nie dotyczy. To dwie rozne rzeczy
+            // i mylenie ich brzmi jak usterka danych zamiast jak reguly.
+            r.spozaCS = true;
+            r.dzial = String(os.department || '');
+            dopisz(r, 'osoba „' + (r.prosilId || r.prosil) + '" jest spoza Customer Service ('
+                    + (r.dzial || 'dział nieznany') + ') — tabela autoryzacji jej nie obejmuje');
+            r.autOk = null;
+        } else if (bezLimitu(os)){
+            r.autOk = true;
+            r.autBezLimitu = true;
+            r.dzial = String(os.department || '');
+            dopisz(r, '„' + (os.name || r.prosil) + '" jest poza drabinką CS ('
+                    + (r.dzial || 'dział nieznany') + ') — limit kwotowy nie ma zastosowania');
+        } else if (!p){
+            dopisz(r, 'stanowiska „' + r.stanowisko + '" nie ma w tabeli autoryzacji');
+            r.autOk = null;
+        } else if (r.kwota == null){
+            // Nieznana kwota to NIE jest kwota w limicie. Bez tego „null < 50" wychodzilo
+            // w JavaScripcie jako 0 < 50 i wiersz falszywie dostawal zgode.
+            r.autOk = null;
+        } else {
+            r.autOk = (r.kwota < p.cash);
+        }
+        // Skasowany auftrag NIE WYMAGA autoryzacji — tak mowia reguly z arkusza
+        // („no authorization is needed if the order needs to be deleted"). Wtedy limit
+        // stanowiska nie ma zastosowania i wiersz przechodzi bez odblokowywania.
+        if (r.deleted === true && r.autOk !== true){
+            r.autOk = true;
+            r.autBezLimitu = true;
+            dopisz(r, 'auftrag skasowany — autoryzacja niewymagana');
+        }
+
+        // Zgoda W NARZEDZIU „Refund request": State = „Refund approved", a kto i kiedy
+        // stoi w odnosniku zmian. To jest autoryzacja tak samo wazna jak komentarz.
+        // „Refund Done" w narzedziu znaczy, ze zwrot juz sie odbyl — drugi raz nie wolno.
+        if (r.tool && r.tool.length){
+            for (var td = 0; td < r.tool.length; td++){
+                if (/refund\s*done/i.test(String(r.tool[td].stan || ''))){
+                    r.st = 'blok';
+                    dopisz(r, 'Refund request ma stan „Refund Done" — zwrot już wykonany');
+                    return;
+                }
+            }
+        }
+        if (r.autOk !== true && r.tool && r.tool.length){
+            for (var ti = 0; ti < r.tool.length; ti++){
+                var tw = r.tool[ti];
+                if (!/refund\s*approved/i.test(String(tw.stan || ''))) continue;
+                r.autOk = true;
+                r.zgodaKto = tw.zatwierdzil || tw.kto || '';
+                r.zgodaSkad = 'Refund request';
+                r.zgodaData = tw.zatwierdzonoData || '';
+                var os2 = pracownikPoNazwie(r.zgodaKto);
+                var p2 = os2 ? poziomZeStanowiska(os2.position) : null;
+                r.zgodaStanowisko = os2 ? String(os2.position || '') : '';
+                // Mowimy, gdy nawet zatwierdzajacy nie ma na taka kwote uprawnien —
+                // decyzje zostawiamy uzytkownikowi, ale nie chowamy tego.
+                if (os2 && !czyCS(os2))
+                    dopisz(r, 'zatwierdził „' + r.zgodaKto + '" spoza Customer Service ('
+                            + (os2.department || 'dział nieznany') + ')');
+                else if (p2 && r.kwota != null && !(r.kwota < p2.cash))
+                    dopisz(r, 'zatwierdził „' + r.zgodaKto + '" (' + r.zgodaStanowisko
+                            + ', do ' + f2(p2.cash) + ') — kwota przekracza także jego limit');
+                break;
+            }
+        }
+
+        // Zgoda W KOMENTARZU: krotkie „ok", „ok for refund", „approved". Liczy sie tylko
+        // wtedy, gdy pisze ja KTOS INNY niz proszacy i ma na taka kwote uprawnienia.
+        if (r.autOk !== true && u.kom && r.kwota != null){
+            for (var ki = u.kom.length - 1; ki >= 0; ki--){
+                var k = u.kom[ki];
+                if (!czyZgoda(k.tekst)) continue;
+                if (k.autorId && r.prosilId && k.autorId === r.prosilId) continue;
+                var os3 = pracownik(k.autorId || k.autor);
+                if (!czyCS(os3)) continue;              // „ok" spoza CS nie jest zgoda
+                var p3 = os3 ? poziomZeStanowiska(os3.position) : null;
+                // Data Processing i wlasciciel stoja poza drabinka — ich zgoda wiaze
+                // niezaleznie od kwoty, bo nie ma limitu, do ktorego dalo by sie porownac.
+                if (!bezLimitu(os3) && (!p3 || !(r.kwota < p3.cash))) continue;
+                r.autOk = true;
+                r.zgodaKto = os3.name || k.autor || '';
+                r.zgodaSkad = 'komentarz';
+                r.zgodaKom = k;
+                r.zgodaData = k.data || '';
+                r.zgodaStanowisko = String(os3.position || '');
+                break;
+            }
+        }
+
+        // Platnosc eupago — lancuchem auftragow
+        var aufy = u.aufy || [];
+        if (!aufy.length && r.rodzaj === 'auftrag') aufy = [r.nr];
+        if (!aufy.length){ r.st = 'err'; dopisz(r, 'nie wiem, od którego auftragu zacząć'); return; }
+        r.krok = 'szukam płatności w łańcuchu auftragów'; render();
+        var zn = await szukajEupago(aufy);
+        r.odwiedzone = zn.odwiedzone || [];
+        if (!zn.ok){
+            r.st = 'err';
+            dopisz(r, 'brak tabelki Eupago Payments w łańcuchu (' + r.odwiedzone.length + ' auftragów)');
+            return;
+        }
+        r.auf = zn.auf;
+        // Z kilku prob zaplaty bierzemy te, ktora zgadza sie kwota; gdy zadna — najnowsza.
+        var poz = zn.poz.slice().sort(function (a, b){ return a.data < b.data ? 1 : -1; });
+        var traf = poz.filter(function (x){ return x.kwota != null && Math.abs(x.kwota - r.kwota) < ZW_TOL; });
+        var w = traf.length ? traf[0] : poz[0];
+        r.token = w.token;
+        r.platData = w.data;
+        r.platKwota = w.kwota;
+        // „Nie zgadza sie z zadna proba" mowimy TYLKO wtedy, gdy kwote w ogole znamy —
+        // inaczej to zarzut o niezgodnosc z niczym.
+        // Zwrot MNIEJSZY od wplaty to zwrot czesciowy — rzecz normalna, nie usterka.
+        // Alarmujemy dopiero, gdy oddajemy WIECEJ, niz wplynelo.
+        if (r.kwota != null && !traf.length && w.kwota != null){
+            if (r.kwota > w.kwota + ZW_TOL)
+                dopisz(r, 'UWAGA: zwrot ' + f2(r.kwota) + ' jest WIĘKSZY niż wpłata ' + f2(w.kwota));
+            else
+                dopisz(r, 'zwrot częściowy: ' + f2(r.kwota) + ' z wpłaty ' + f2(w.kwota));
+        }
+        if (r.kwota == null && w.kwota != null && w.kwota > 0){
+            r.kwota = w.kwota;
+            r.kwotaZ = 'płatności eupago';
+            // Kwota jest znana DOPIERO TERAZ, wiec limit trzeba policzyc od nowa —
+            // wczesniejsza ocena zapadla przy nieznanej kwocie i nic nie znaczy.
+            if (r.poziom && !r.autBezLimitu && !r.zgodaKto){
+                r.autOk = (r.kwota < r.poziom.cash);
+                if (r.autOk === false)
+                    dopisz(r, 'kwota ' + f2(r.kwota) + ' przekracza limit '
+                            + f2(r.poziom.cash) + ' osoby proszącej');
+            }
+        }
+
+        // Czy zwrot juz poszedl. Sprawdzamy PRZED wiekiem i przed pytaniem eupago o status,
+        // bo to jedyna kontrola, ktorej pominiecie kosztuje oddanie tych samych pieniedzy
+        // drugi raz. Auftrag jest w pamieci, wiec nie ma tu dodatkowego zapytania.
+        var aufZ = await czytajAuftragC(r.auf);
+        var jz = aufZ.ok ? juzZwrocone(aufZ.wyplaty, aufZ.kom, r.kwota) : null;
+        dz('kontrola: czy juz zwrocone', r.auf, 'odczyt=' + (aufZ.ok ? 'ok' : 'blad'),
+           'wyplat=' + ((aufZ.wyplaty || []).length),
+           'ujemnych=' + (jz ? jz.pozycje.length : 0),
+           'slad=' + (jz && jz.slad ? 'tak' : 'nie'));
+        if (jz){
+            r.juzZwrot = jz;
+            var opisJZ = [];
+            if (jz.pozycje.length)
+                opisJZ.push('w Payments jest ' + jz.pozycje.map(function (p){
+                    return f2(p.kwota) + ' z ' + (p.data || '?');
+                }).join(', ') + ' na koncie ' + ZW_KONTO);
+            if (jz.slad)
+                opisJZ.push('komentarz „' + flat(jz.slad.tekst).slice(0, 60) + '" z '
+                          + (jz.slad.data || '?'));
+            if (jz.dokladne || (r.kwota != null && jz.suma + ZW_TOL >= r.kwota)){
+                r.st = 'blok';
+                dopisz(r, 'ZWROT JUŻ ZOSTAŁ WYKONANY — ' + opisJZ.join('; ')
+                        + '. Nie ruszam tej płatności.');
+                return;
+            }
+            // Slad jest, ale kwoty sie nie pokrywaja — to moze byc wczesniejszy, inny
+            // zwrot. Nie blokujemy, ale mowimy wprost, zeby bylo co sprawdzic.
+            dopisz(r, 'UWAGA: na auftragu jest już ślad zwrotu (' + opisJZ.join('; ')
+                    + '), ale kwota się nie pokrywa — sprawdź, zanim wykonasz');
+        }
+
+        // Wiek platnosci — powyzej trzech miesiecy eupago nie zwroci na zrodlo,
+        // a taki zwrot robicie poza eupago. Nie probujemy go tu wcale.
+        var mies = miesiaceOd(w.data);
+        r.mies = mies;
+        // Wpis w narzedziu „Refund request" jest wlasciwy dopiero po trzech miesiacach.
+        // Przy mlodszej wplacie to pomylka — mowimy o tym, ale zwrotu nie blokujemy.
+        if (r.tool && r.tool.length && mies != null && mies < ZW_MIES){
+            // O „idź przez eupago" mowimy tylko wtedy, gdy wpis faktycznie szedl na
+            // przelew — przy wpisie eupago byloby to zdanie bez sensu.
+            var bank = r.tool.filter(function (t){ return !/eupago/i.test(String(t.metoda || '')); });
+            if (bank.length)
+                dopisz(r, 'jest wpis w Refund request na przelew (' + (bank[0].metoda || '—')
+                        + ', ' + f2(bank[0].kwota) + ', „' + (bank[0].stan || '—')
+                        + '") — a tę wpłatę da się zwrócić przez eupago');
+            var dw = doZmiany(r.tool, r.kwota);
+            if (dw.length)
+                dopisz(r, 'po zwrocie ustawię import ' + dw.map(function (x){
+                    return x.logId + ' → ' + x.nowy; }).join(', '));
+        }
+        if (mies != null && mies >= ZW_MIES){
+            r.st = 'stare';
+            dopisz(r, 'płatność ma ' + mies + ' mies. — zwrot poza eupago');
+            return;
+        }
+
+        // Status w eupago
+        r.krok = 'pytam eupago o status'; render();
+        try {
+            var e = await euStatus(w.token, w.data, w.ref);
+            if (!e){ r.st = 'err';
+                dopisz(r, 'eupago nie zna tej płatności — ani w archiwum, ani na liście bieżącej');
+                return; }
+            r.estado = e.estado || '';
+            r.euRef = String(e.referencia || '');
+            r.archiwum = !!e.__archiwum;
+            r.refid = euRefId(e);
+            r.serwis = e.nome_servico || '';
+            // refundID != null znaczy, ze zwrot juz sie odbyl. Bez tego dalo by sie
+            // zwrocic te sama platnosc drugi raz.
+            if (e.refundID != null && String(e.refundID) !== ''){
+                r.refundID = String(e.refundID);
+                r.st = 'blok';
+                dopisz(r, 'ta płatność ma już zwrot (refundID ' + r.refundID + ')');
+                return;
+            }
+            if (!r.refid) dopisz(r, 'w odpowiedzi eupago nie ma numeru płatności — zwrot niemożliwy');
+            // IBAN i SWIFT ustalamy JUZ TERAZ, zeby bylo je widac w tabeli PRZED akceptacja,
+            // a nie dopiero wtedy, gdy zwrot na zrodlo sie odbije.
+            var ib = '';
+            (r.tool || []).forEach(function (tw){ if (!ib && tw.iban) ib = tw.iban; });
+            if (!ib && r.ibanKom && r.ibanKom.iban) ib = r.ibanKom.iban;
+            r.ibanGotowy = ib;
+            r.kodBanku = ib ? kodBanku(ib) : '';
+            r.bicGotowy = ib ? bicZPamieci(ib) : '';
+        } catch (err){
+            r.st = 'err'; dopisz(r, 'status z eupago: ' + (err && err.message ? err.message : err)); return;
+        }
+
+        if (!stanPozwala(r.estado)){
+            r.st = 'blok';
+            dopisz(r, 'stan „' + stanPL(r.estado) + '" nie pozwala na zwrot');
+            return;
+        }
+        if (!r.refid){ r.st = 'blok'; return; }
+        // Od tego miejsca zwrot jest technicznie mozliwy: platnosc znaleziona, stan
+        // pozwala, numer mamy. Co nie wyszlo — to odczyt prosby albo uprawnien; takie
+        // wiersze idą do RECZNEGO potwierdzenia zamiast na smietnik.
+        if (r.autOk === false){ r.st = 'brak-aut'; return; }
+        // Skasowany auftrag przy nieodczytanym stanowisku tez nie wymaga autoryzacji —
+        // brakuje wtedy tylko prosby albo kwoty, a nie zgody.
+        // Kwota podstawiona z wplaty to podpowiedz, nie ustalenie — zawsze do potwierdzenia.
+        dz('wynik: kwota=' + f2(r.kwota) + ' (' + (r.kwotaZ || '—') + ')',
+           'autOk=' + String(r.autOk), 'estado=' + (r.estado || '—'), 'refid=' + (r.refid || '—'));
+        r.krok = '';
+        if (r.brakProsby || r.kwota == null || r.kwotaZ === 'płatności eupago'
+            || (r.autOk === null && r.deleted !== true)){ r.st = 'reczne'; return; }
+        r.st = 'ok';
+    }
+
+    // ===== Wykonanie zwrotu =====
+    // Kolejnosc jak przy recznej robocie: odarchiwizuj -> szczegoly (trid) -> zwrot.
+    // Gdy zwrot padnie, platnosc MUSI wrocic do archiwum — inaczej zostaje wyciagnieta
+    // i nikt o niej nie pamieta.
+    async function wykonaj(r){
+        r.st = 'busy';
+        var odarch = false;
+        // Odarchiwizowujemy TYLKO to, co znalezlismy w archiwum. Platnosc z listy
+        // biezacej jest juz dostepna — proba wyjecia jej stamtad tylko by odbila.
+        if (r.archiwum){
+            r.krok = 'odarchiwizowuję'; render();
+            try {
+                await mostem('unarchive', { refid: r.refid });
+                odarch = true;
+            } catch (e){
+                // „erro" to najczesciej „juz odarchiwizowana" — resztka po wczesniejszej
+                // nieudanej probie. Zwrot idzie na trid i stan archiwum go nie blokuje,
+                // wiec przerywanie tutaj kosztowaloby cale podejscie bez powodu.
+                // odarch zostaje FALSE: skoro nie my ja wyjelismy, nie nam ja chowac.
+                dopisz(r, 'odarchiwizowanie nie przeszło (' + e.message
+                        + ') — próbuję dalej, płatność mogła już być wyjęta');
+            }
+        } else {
+            dopisz(r, 'płatność nie była w archiwum — pomijam odarchiwizowanie');
+        }
+        r.krok = 'czytam szczegóły płatności'; render();
+        try {
+            var d = await mostem('detail', { refid: r.refid });
+            r.trid = d.trid || '';
+            if (!r.trid) throw new Error('szczegóły płatności nie podały trid');
+        } catch (e){
+            r.st = 'fail'; dopisz(r, e.message);
+            if (odarch) { try { await mostem('archive', { refid: r.refid }); dopisz(r, 'zarchiwizowana z powrotem'); } catch (e2){ dopisz(r, 'UWAGA: została odarchiwizowana'); } }
+            return;
+        }
+        r.krok = 'wysyłam zwrot'; render();
+        // „Jak jest request w auftragu, to zwrot jest z auftragu" — wtedy motyw nazywa
+        // auftrag, nawet gdy ticket przy okazji znalezlismy.
+        var powod = (r.prZ === 'auftrag' || !r.rma) ? ('Auftrag ' + (r.auf || r.nr))
+                                                    : ('Ticket #' + r.rma);
+        // Puste iban/bic = zwrot NA ZRODLO platnosci. To droga domyslna i probujemy jej
+        // pierwszej — pieniadze wracaja tam, skad przyszly, bez podawania konta.
+        var ibanZTool = '';
+        (r.tool || []).forEach(function (tw){ if (!ibanZTool && tw.iban) ibanZTool = tw.iban; });
+        var ibanSkad = ibanZTool ? 'Refund request' : '';
+        if (!ibanZTool && r.ibanKom && r.ibanKom.iban){
+            ibanZTool = r.ibanKom.iban;
+            ibanSkad = 'komentarza' + (r.ibanKom.autor ? (' („' + r.ibanKom.autor + '")') : '');
+        }
+        var bicDoPrzelewu = r.bicGotowy || bicZPamieci(ibanZTool);
+        try {
+            await mostem('refund', { trid: r.trid, amount: r.kwota, reason: powod, iban: '' }, 120000);
+        } catch (e){
+            var msg = String((e && e.message) || e);
+            // IBAN_MISSING znaczy, ze na zrodlo sie nie da — trzeba przelewu. IBAN mamy
+            // w tabelce „Refund request". To odmowa WALIDACJI, wiec pieniadze jeszcze
+            // sie nie ruszyly i ponowienie nie grozi podwojnym zwrotem.
+            if (/iban/i.test(msg) && ibanZTool && !bicDoPrzelewu){
+                bicDoPrzelewu = bicDlaIban(ibanZTool);
+                if (bicDoPrzelewu){
+                    r.bicGotowy = bicDoPrzelewu;
+                    dopisz(r, 'SWIFT ' + bicDoPrzelewu + ' dla banku ' + (kodBanku(ibanZTool) || '?'));
+                } else {
+                    // Banku nie ma w tablicy panelu — i to NIE jest powod, zeby stanac.
+                    // Formularz panelu przepuszcza puste pole BIC i tak samo je wysyla,
+                    // wiec probujemy tak samo; gdyby eupago odmowilo, wiersz i tak
+                    // skonczy bledem, a Ty dopiszesz SWIFT recznie.
+                    dopisz(r, 'banku ' + (kodBanku(ibanZTool) || '?') + ' nie ma w tablicy eupago '
+                            + '— próbuję bez SWIFT-u, tak jak robi to panel');
+                }
+            }
+            if (/iban/i.test(msg) && ibanZTool){
+                dopisz(r, 'zwrot na źródło odrzucony (' + msg + ') — ponawiam przelewem na IBAN z '
+                        + (ibanSkad || 'Refund request'));
+                r.krok = 'zwrot przelewem'; render();
+                try {
+                    var w2 = await mostem('refund', { trid: r.trid, amount: r.kwota, reason: powod,
+                                                      iban: ibanZTool, bic: bicDoPrzelewu }, 120000);
+                    if (w2 && w2.ibanWyslany !== undefined && !w2.ibanWyslany)
+                        dopisz(r, 'UWAGA: karta panelu wysłała PUSTY IBAN mimo że go podałem — odśwież ją');
+                    r.ibanUzyty = ibanZTool;
+                } catch (e3){
+                    r.st = 'fail'; dopisz(r, 'zwrot przelewem też odrzucony: ' + ((e3 && e3.message) || e3));
+                    if (odarch){
+                    try { await mostem('archive', { refid: r.refid }); dopisz(r, 'zarchiwizowana z powrotem'); }
+                        catch (e4){ dopisz(r, 'UWAGA: została odarchiwizowana — zarchiwizuj ręcznie'); }
+                    }
+                    return;
+                }
+            } else {
+                r.st = 'fail';
+                dopisz(r, 'zwrot odrzucony: ' + msg
+                        + (/iban/i.test(msg)
+                           ? ' — a IBAN-u nie ma ani w Refund request, ani w komentarzach' : ''));
+                if (odarch){
+                try { await mostem('archive', { refid: r.refid }); dopisz(r, 'zarchiwizowana z powrotem'); }
+                    catch (e2){ dopisz(r, 'UWAGA: została odarchiwizowana — zarchiwizuj ręcznie'); }
+                }
+                return;
+            }
+        }
+        if (r.ibanUzyty) dopisz(r, 'zwrot przelewem na ' + r.ibanUzyty
+                                  + (r.bicGotowy ? (' (' + r.bicGotowy + ')') : ''));
+        // Zwrot przeszedl — odkladamy platnosc tam, skad ja wzielismy. Robimy to ZAWSZE,
+        // nie tylko po niepowodzeniu: modul ja odarchiwizowal, wiec modul ja archiwizuje.
+        if (!odarch){
+            // Nie my ja wyjelismy — nie nam ja chowac. Zostawiamy stan taki, jaki byl.
+            dopisz(r, 'zwrot wykonany');
+            await zapiszPoZwrocie(r);
+            r.st = 'done'; r.krok = '';
+            return;
+        }
+        r.krok = 'archiwizuję z powrotem'; render();
+        try {
+            await mostem('archive', { refid: r.refid });
+            dopisz(r, 'zwrot wykonany, płatność zarchiwizowana z powrotem');
+            await zapiszPoZwrocie(r);
+            r.st = 'done'; r.krok = '';
+        } catch (e){
+            // Zwrot JEST zrobiony — tego nie wolno zamazac bledem archiwizacji.
+            r.trzebaZarchiwizowac = true;
+            dopisz(r, 'ZWROT WYKONANY, ale nie udało się zarchiwizować z powrotem ('
+                    + (e && e.message ? e.message : e) + ') — zarchiwizuj ręcznie w panelu');
+            await zapiszPoZwrocie(r);
+            r.st = 'done'; r.krok = '';
+        }
+    }
+
+    // ===== Tabela =====
+    var TD = 'padding:5px 6px;border:1px solid #e5e7eb;vertical-align:top';
+    function th(t, extra){ return '<th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;' + (extra || '') + '">' + t + '</th>'; }
+    function tLnk(id){ return id ? ('<a href="https://www.prologistics.info/rma.php?rma_id=' + esc(id) + '" target="_blank" style="color:#750000;font-weight:bold">' + esc(id) + '</a>') : '—'; }
+    function aLnk(n){ return n ? ('<a href="https://www.prologistics.info/auction.php?number=' + esc(n) + '&txnid=3" target="_blank" style="color:#750000;font-weight:bold">' + esc(n) + '</a>') : '—'; }
+
+    function mozna(r){
+        if (r.st === 'ok') return true;
+        if (r.st === 'brak-aut' && r.wyjatek) return true;
+        // Reczna akceptacja tylko wtedy, gdy zwrot ma sie o co oprzec: znany numer
+        // platnosci i dodatnia kwota. Bez tego eupago i tak by odmowilo.
+        if (r.st === 'reczne' && r.reczne && r.refid && r.kwota > 0) return true;
+        return false;
+    }
+
+    // Tresc komentarza do dymka. Bardzo dlugie wpisy przycinamy — dymek i tak nie
+    // pokaze wiecej, a caly komentarz stoi w tickecie albo auftragu.
+    function dymekKom(k, etykieta){
+        if (!k) return '';
+        var t = String(k.tekst || '');
+        if (t.length > 600) t = t.slice(0, 600) + '…';
+        return etykieta + ': ' + (k.autor || '—')
+             + (k.data ? ('  ' + k.data) : '')
+             + (k.zrodlo ? ('  (' + k.zrodlo + ')') : '')
+             + '\n\n' + t;
+    }
+
+    // Open amount w kolumnie auftragu. Przy sprawdzaniu jedna liczba; po zaksiegowanym
+    // zwrocie „bylo → jest", gdzie „jest" pochodzi z ponownego odczytu auftragu.
+    function openTxt(r){
+        if (r.open == null) return '';
+        var teraz = (r.openPo != null ? r.openPo : r.open);
+        var zmiana = (r.openPo != null && Math.abs(r.openPo - r.open) > ZW_TOL);
+        return '<div style="font-size:10px;color:' + (Math.abs(teraz) > ZW_TOL ? '#c47f00' : '#666')
+             + '" title="Auftrag value - Total of Payments">open: '
+             + (zmiana
+                ? ('<span style="text-decoration:line-through;color:#999">' + f2(r.open)
+                   + '</span> \u2192 ' + f2(r.openPo))
+                : f2(teraz))
+             + '</div>';
+    }
+
+    function autKom(r){
+        if (r.autBezLimitu)
+            return '<span style="color:#16a34a;font-weight:bold">bez limitu</span>'
+                 + '<div style="font-size:10px;color:#666">'
+                 + esc(r.deleted === true ? 'auftrag skasowany' : (r.dzial || 'poza drabinką CS'))
+                 + (r.stanowisko ? ('<br>' + esc(r.stanowisko)) : '') + '</div>';
+        if (r.spozaCS && !r.autBezLimitu && !r.zgodaKto)
+            return '<span style="color:#c47f00;font-weight:bold">spoza CS</span>'
+                 + '<div style="font-size:10px;color:#666">' + esc(r.stanowisko || '—')
+                 + (r.dzial ? ('<br>' + esc(r.dzial)) : '') + '</div>';
+        if (r.nieaktywny)
+            return '<span style="color:#b91c1c;font-weight:bold">konto nieaktywne</span>'
+                 + '<div style="font-size:10px;color:#666">' + esc(r.stanowisko || '—')
+                 + (r.przelozony ? ('<br>przełożony: ' + esc(r.przelozony)) : '') + '</div>';
+        if (r.zgodaKto){
+            var zr = 'z: ' + esc(r.zgodaSkad || '') + (r.zgodaData ? (' · ' + esc(r.zgodaData)) : '');
+            // Gdy zgoda pada w komentarzu, pokazujemy jej TRESC — inaczej trzeba
+            // otwierac ticket, zeby sprawdzic, czy to naprawde zgoda.
+            if (r.zgodaKom)
+                zr = '<span style="border-bottom:1px dotted #16a34a;cursor:help" title="'
+                   + att(dymekKom(r.zgodaKom, 'zgoda')) + '">' + zr + ' ▾</span>';
+            return '<span style="color:#16a34a;font-weight:bold">zatwierdzone</span>'
+                 + '<div style="font-size:10px;color:#666">' + esc(r.zgodaKto)
+                 + (r.zgodaStanowisko ? (' · ' + esc(r.zgodaStanowisko)) : '')
+                 + '<br>' + zr + '</div>';
+        }
+        if (r.autOk === true)
+            return '<span style="color:#16a34a;font-weight:bold">w limicie</span>'
+                 + '<div style="font-size:10px;color:#666">' + esc(r.stanowisko || '—')
+                 // Kwota obok limitu — zeby „w limicie" przy za duzej kwocie od razu
+                 // rzucalo sie w oczy, zamiast wygladac na usterke.
+                 + '<br>' + f2(r.kwota) + ' z '
+                 + (isFinite(r.poziom.cash) ? f2(r.poziom.cash) : 'bez limitu') + '</div>';
+        if (r.autOk === false)
+            return '<span style="color:#b91c1c;font-weight:bold">ponad limit</span>'
+                 + '<div style="font-size:10px;color:#b91c1c">' + esc(r.stanowisko || '—')
+                 + '<br>' + f2(r.kwota) + ' przy limicie ' + f2(r.poziom.cash)
+                 + (r.przelozony ? ('<br>przełożony: ' + esc(r.przelozony)) : '') + '</div>';
+        return '<span style="color:#888">nieznana</span>';
+    }
+    function stTxt(r){
+        if (r.st === 'ok')       return '<span style="color:#16a34a;font-weight:bold">gotowe do zwrotu</span>';
+        if (r.st === 'done')     return r.trzebaZarchiwizowac
+            ? '<span style="color:#c47f00;font-weight:bold">✔ zwrócone<br>⚠ do archiwizacji</span>'
+            : '<span style="color:#16a34a;font-weight:bold">✔ zwrócone</span>';
+        if (r.st === 'busy')     return '<span style="color:#c47f00">' + esc(r.krok || 'w toku') + '…</span>';
+        if (r.st === 'brak-aut') return '<span style="color:#b91c1c;font-weight:bold">zablokowane</span>';
+        if (r.st === 'reczne')   return '<span style="color:#c47f00;font-weight:bold">do potwierdzenia</span>';
+        if (r.st === 'stare')    return '<span style="color:#c47f00;font-weight:bold">poza eupago</span>';
+        if (r.st === 'blok')     return '<span style="color:#b91c1c;font-weight:bold">zablokowane</span>';
+        if (r.st === 'fail')     return '<span style="color:#b91c1c;font-weight:bold">nieudane</span>';
+        if (r.st === 'err')      return '<span style="color:#b91c1c">do ręki</span>';
+        return '<span style="color:#888">—</span>';
+    }
+
+    function render(){
+        var el = $('#zwr-out');
+        if (!el) return;
+        if (!S.rows.length){
+            el.innerHTML = '<div style="font-size:12px;color:#888;padding:8px">Wklej wiersze ze skrzynki i kliknij „Sprawdź”.</div>';
+            return;
+        }
+        var h = '<div style="font-size:12px;font-weight:bold;color:#333;margin-bottom:6px">Podgląd:</div>'
+              + '<div style="overflow-x:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:6px">'
+              + '<table style="width:100%;min-width:1120px;border-collapse:collapse;font-size:12px;table-layout:auto">'
+              + '<thead><tr style="background:#f3f4f6">'
+              + th('✓', 'text-align:center;width:34px') + th('Ticket') + th('Auftrag')
+              + th('Kwota', 'text-align:right') + th('Prosił') + th('Autoryzacja')
+              + th('Płatność eupago') + th('Status') + th('Uwagi')
+              + '</tr></thead><tbody>';
+        S.rows.forEach(function (r, i){
+            var bg = (r.st === 'done' && r.trzebaZarchiwizowac) ? '#fffbeb'
+                   : r.st === 'done' ? '#ecfdf5'
+                   : (r.st === 'ok' ? '#ecfdf5'
+                   : (r.st === 'reczne' ? '#fffbeb'
+                   : (r.st === 'busy' ? '#F6E7E6'
+                   : ((r.st === 'brak-aut' || r.st === 'blok' || r.st === 'fail' || r.st === 'err') ? '#fef2f2'
+                   : (r.st === 'stare' ? '#fffbeb' : '#fff')))));
+            var can = mozna(r);
+            h += '<tr style="background:' + bg + '">'
+              +  '<td style="' + TD + ';text-align:center">'
+                 + (can && r.st !== 'done' ? '<input type="checkbox" class="zwr-chk" data-i="' + i + '"' + (r.sel ? ' checked' : '') + '>' : '')
+                 + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">' + tLnk(r.rma)
+                 + (r.maili > 1 ? ('<span style="color:#999" title="tyle maili dotyczy tej pozycji"> ×' + r.maili + '</span>') : '')
+                 + (r.rodzaj === 'auftrag'
+                    ? '<div style="font-size:10px;color:#0a58ca" title="We wklejce był numer auftragu, nie ticketu">z auftragu</div>' : '')
+                 + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">' + aLnk(r.auf)
+                 + (r.odwiedzone && r.odwiedzone.length > 1
+                    ? ('<div style="font-size:10px;color:#666">łańcuch: ' + r.odwiedzone.length + '</div>') : '')
+                 // Open amount auftragu — zeby nie trzeba bylo go otwierac, zeby
+                 // zobaczyc, czy cos na nim jeszcze wisi.
+                 + openTxt(r)
+                 + '</td>'
+              +  '<td style="' + TD + ';text-align:right;font-weight:bold">'
+                 + ((r.st === 'reczne' && S.reczne)
+                    ? ('<input type="text" class="zwr-kw" data-i="' + i + '" value="' + att(r.kwota != null ? f2(r.kwota) : '') + '" '
+                       + 'style="width:96px;padding:3px 5px;border:1px solid #c47f00;border-radius:4px;font-size:12px;text-align:right;font-weight:bold">')
+                    : f2(r.kwota))
+                 + (r.waluta ? (' <span style="color:#999;font-weight:normal">' + esc(r.waluta) + '</span>') : '')
+                 + (r.kwotaZ === 'open amount'
+                    ? '<div style="font-size:10px;color:#0a58ca;font-weight:normal" title="Prośba nie podała kwoty — wzięty open amount auftragu">z open amount</div>' : '')
+                 + (r.kwotaZ === 'ręcznie'
+                    ? '<div style="font-size:10px;color:#c47f00;font-weight:normal">wpisana ręcznie</div>' : '')
+                 + (r.kwotaZ === 'Refund request'
+                    ? '<div style="font-size:10px;color:#0a58ca;font-weight:normal" title="Kwota zatwierdzona w narzędziu Refund request">z Refund request</div>' : '')
+                 + (r.kwotaZ === 'płatności eupago'
+                    ? '<div style="font-size:10px;color:#c47f00;font-weight:normal" title="Prośba i open amount milczą — podstawiona kwota faktycznej wpłaty. Potwierdź ręcznie.">z wpłaty eupago</div>' : '')
+                 + (r.metoda ? ('<div style="font-size:10px;color:#666;font-weight:normal">' + esc(r.metoda) + '</div>') : '')
+                 + (r.tool && r.tool.length
+                    ? ('<div style="font-size:10px;color:#c47f00;font-weight:normal" title="Wpis w narzędziu Refund request na auftragu">Refund request: '
+                       + f2(r.tool[0].kwota)
+                       + (r.tool[0].iban
+                          ? ('<br><span style="border-bottom:1px dotted #c47f00;cursor:help" title="'
+                             + att('IBAN: ' + r.tool[0].iban
+                                   + '\nodbiorca: ' + (r.tool[0].nazwisko || '—')
+                                   + (r.tool[0].firma ? ('\nfirma: ' + r.tool[0].firma) : '')
+                                   + '\nwpis: ' + (r.tool[0].kto || '—')
+                                   + (r.tool[0].data ? ('  ' + r.tool[0].data) : ''))
+                             + '">IBAN jest ▾</span>') : '') + '</div>') : '')
+                 + ((!(r.tool && r.tool.length && r.tool[0].iban) && r.ibanKom)
+                    ? ('<div style="font-size:10px;color:#c47f00;font-weight:normal;'
+                       + 'border-bottom:1px dotted #c47f00;display:inline-block;cursor:help" title="'
+                       + att('IBAN: ' + r.ibanKom.iban
+                             + '\npodał: ' + (r.ibanKom.autor || '—')
+                             + (r.ibanKom.data ? ('  ' + r.ibanKom.data) : '')
+                             + (r.ibanKom.zrodlo ? ('  (' + r.ibanKom.zrodlo + ')') : '')
+                             + '\n\nkomentarz:\n' + (r.ibanKom.tekst || ''))
+                       + '">IBAN z komentarza ▾</div>') : '')
+                 + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">'
+                 + (r.prosbaKom
+                    ? ('<span style="border-bottom:1px dotted #0a58ca;cursor:help" title="'
+                       + att(dymekKom(r.prosbaKom, 'prośba')) + '">' + esc(r.prosil || '—') + ' ▾</span>')
+                    : esc(r.prosil || '—'))
+                 + (r.prosbaData ? ('<div style="font-size:10px;color:#666">' + esc(r.prosbaData) + '</div>') : '')
+                 + (r.prZ === 'auftrag' ? '<div style="font-size:10px;color:#0a58ca" title="Prośba stała w komentarzach auftragu, nie ticketu">prośba z auftragu</div>' : '')
+                 + (r.odbicie && r.odbicie.nazwa && r.odbicie.id !== r.prosilId
+                    ? ('<div style="font-size:10px;color:#0a58ca" title="Na tę osobę pójdzie odbicie — najniższa stanowiskiem spośród proszących">odbicie: '
+                       + esc(r.odbicie.nazwa) + '</div>') : '')
+                 + '</td>'
+              +  '<td style="' + TD + '">' + autKom(r)
+                 + (r.st === 'brak-aut'
+                    ? ('<label style="display:block;margin-top:4px;font-size:10px;color:#750000;cursor:pointer">'
+                       + '<input type="checkbox" class="zwr-wyj" data-i="' + i + '"' + (r.wyjatek ? ' checked' : '') + '> '
+                       + 'znam wyjątek, przepuść</label>') : '')
+                 + ((r.st === 'reczne' && S.reczne)
+                    ? ('<label style="display:block;margin-top:4px;font-size:10px;color:#750000;cursor:pointer">'
+                       + '<input type="checkbox" class="zwr-rzc" data-i="' + i + '"' + (r.reczne ? ' checked' : '') + '> '
+                       + 'potwierdzam ręcznie</label>') : '')
+                 + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">' + esc(stanPL(r.estado))
+                 + (r.archiwum ? '<div style="font-size:10px;color:#0a58ca">z archiwum</div>' : '')
+                 + (r.ibanGotowy
+                    ? ('<div style="font-size:10px;color:#666;margin-top:3px">SWIFT '
+                       + (r.kodBanku ? ('<span style="color:#999">' + esc(r.kodBanku) + '</span> ') : '')
+                       + '<input type="text" class="zwr-bic" data-i="' + i + '" value="' + att(r.bicGotowy || '')
+                       + '" placeholder="ustalę sam" '
+                       + 'title="Potrzebny tylko do zwrotu przelewem. Pusty — ustalę ze sprawdzarki IBAN-ów. '
+                       + 'Wpisany raz zapamiętuje się dla tego banku." '
+                       + 'style="width:92px;padding:2px 4px;border:1px solid #ccc;border-radius:4px;font-size:10px"></div>') : '')
+                 + (r.platData ? ('<div style="font-size:10px;color:' + (r.st === 'stare' ? '#c47f00' : '#666') + '">'
+                                  + esc(r.platData) + (r.mies != null ? (' · ' + r.mies + ' mies.') : '') + '</div>') : '')
+                 + '</td>'
+              +  '<td style="' + TD + ';white-space:nowrap">' + stTxt(r) + '</td>'
+              +  '<td style="' + TD + ';color:#555">' + esc(r.msg || '') + '</td></tr>';
+        });
+        el.innerHTML = h + '</tbody></table></div>';
+        el.querySelectorAll('.zwr-chk').forEach(function (c){
+            c.onchange = function (){ S.rows[parseInt(c.getAttribute('data-i'), 10)].sel = c.checked; odswiezGuzik(); };
+        });
+        el.querySelectorAll('.zwr-bic').forEach(function (inp){
+            inp.onchange = function (){
+                var r = S.rows[parseInt(inp.getAttribute('data-i'), 10)];
+                var v = bicNorm(inp.value);
+                if (v && v.length !== 8 && v.length !== 11){
+                    say('SWIFT ma 8 albo 11 znaków — „' + inp.value + '" ma ' + v.length + '.', '#c00');
+                    inp.value = r.bicGotowy || '';
+                    return;
+                }
+                r.bicGotowy = v;
+                // Zapamietujemy dla KODU BANKU, nie dla wiersza — nastepnym razem sam sie wpisze.
+                if (v && r.kodBanku){
+                    bicZapisz(r.kodBanku, v);
+                    say('Zapamiętałem SWIFT ' + v + ' dla banku ' + r.kodBanku + '.', '#16a34a');
+                }
+                render();
+            };
+        });
+        el.querySelectorAll('.zwr-rzc').forEach(function (c){
+            c.onchange = function (){
+                var r = S.rows[parseInt(c.getAttribute('data-i'), 10)];
+                r.reczne = c.checked;
+                if (!c.checked) r.sel = false;
+                render();
+            };
+        });
+        el.querySelectorAll('.zwr-kw').forEach(function (inp){
+            // 'change', nie 'input' — przerysowanie przy kazdym znaku zabieraloby kursor.
+            inp.onchange = function (){
+                var r = S.rows[parseInt(inp.getAttribute('data-i'), 10)];
+                var v = money(inp.value);
+                if (v == null || !(v > 0)){
+                    say('Kwota „' + inp.value + '” nie jest dodatnią liczbą.', '#c00');
+                    inp.value = (r.kwota != null) ? f2(r.kwota) : '';
+                    return;
+                }
+                r.kwota = v; r.kwotaZ = 'ręcznie'; say('');
+                render();
+            };
+        });
+        el.querySelectorAll('.zwr-wyj').forEach(function (c){
+            c.onchange = function (){
+                var r = S.rows[parseInt(c.getAttribute('data-i'), 10)];
+                r.wyjatek = c.checked;
+                if (!c.checked) r.sel = false;
+                render(); odswiezGuzik();
+            };
+        });
+        odswiezGuzik();
+    }
+    function odswiezGuzik(){
+        var g = $('#zwr-do');
+        if (g) g.disabled = S.busy || !S.rows.filter(function (r){ return r.sel && mozna(r) && r.st !== 'done'; }).length;
+    }
+
+    // ===== Guziki =====
+    // Tablica SWIFT-ow: podglad i wypelnienie z reki. Kazdy wiersz to „kod = SWIFT",
+    // np. „0035 = CGDIPTPL". Zapisane raz, dziala dla wszystkich przyszlych zwrotow.
+    $('#zwr-swifty').onclick = function (){
+        var m = bicMapa();
+        var teraz = Object.keys(m).sort().map(function (k){ return k + ' = ' + m[k]; }).join('\n');
+        var pod = prompt(
+            'SWIFT-y banków — po jednym w wierszu, w postaci „kod = SWIFT".\n'
+          + 'Kod banku to cztery cyfry z IBAN-u zaraz po PT i sumie kontrolnej,\n'
+          + 'np. PT50 0035 … → 0035.\n\n'
+          + 'Zapisane tu wartości mają pierwszeństwo i działają dla wszystkich zwrotów.',
+            teraz);
+        if (pod == null) return;
+        var nowa = {}, zle = [];
+        String(pod).split(/\r?\n/).forEach(function (w){
+            var t = flat(w);
+            if (!t) return;
+            var mm = /^(\d{4})\s*[=:]\s*([A-Za-z0-9]{8}|[A-Za-z0-9]{11})$/.exec(t);
+            if (mm) nowa[mm[1]] = bicNorm(mm[2]); else zle.push(t);
+        });
+        try { gmSet(ZW_BIC_KEY, JSON.stringify(nowa)); } catch (e){}
+        // Wiersze na ekranie od razu biora nowe wartosci — bez ponownego sprawdzania.
+        S.rows.forEach(function (r){ if (r.ibanGotowy) r.bicGotowy = bicZPamieci(r.ibanGotowy); });
+        render();
+        say('Zapisane SWIFT-y: ' + Object.keys(nowa).length
+          + (zle.length ? ('. Pominięte wiersze (' + zle.length + '): ' + zle.join(' | ')) : '.'),
+            zle.length ? '#c47f00' : '#16a34a');
+    };
+    $('#zwr-log').onclick = function (){
+        try { zapiszLog(); }
+        catch (e){ say('Nie zapisałem dziennika: ' + ((e && e.message) || e), '#c00'); }
+    };
+    $('#zwr-clear').onclick = function (){
+        S.rows = []; CACHE = {};
+        var t = $('#zwr-paste'); if (t) t.value = '';
+        say(''); render();
+    };
+    $('#zwr-reczne').onchange = function (){
+        S.reczne = this.checked;
+        if (!S.reczne) S.rows.forEach(function (r){ if (r.st === 'reczne'){ r.reczne = false; r.sel = false; } });
+        render();
+    };
+    $('#zwr-all').onclick = function (){
+        var wsz = S.rows.filter(function (r){ return mozna(r) && r.st !== 'done'; });
+        var brak = wsz.some(function (r){ return !r.sel; });
+        wsz.forEach(function (r){ r.sel = brak; });
+        render();
+    };
+    $('#zwr-stop').onclick = function (){ S.stop = true; say('Przerywam po bieżącej pozycji…', '#c47f00'); };
+
+    $('#zwr-check').onclick = async function (){
+        if (S.busy) return;
+        var txt = ($('#zwr-paste') || {}).value || '';
+        S.rows = zWklejki(txt);
+        CACHE = {};
+        if (!S.rows.length){ say('Nie ma czego sprawdzać.', '#c00'); render(); return; }
+        S.busy = true; S.stop = false;
+        $('#zwr-check').disabled = true; $('#zwr-stop').disabled = false;
+        render();
+        // Lista pracownikow raz na kliknieciu — nie raz na wiersz. Odswieza sie przy
+        // kazdym „Sprawdz", wiec nowy pracownik, odejscie i awans sa widoczne od razu.
+        say('pobieram listę pracowników…', '#c47f00');
+        ZW_EMP = {};
+        ZW_LISTA = await pobierzPracownikow();
+        if (!ZW_LISTA) say('Nie pobrałem listy pracowników — stanowiska mogą być nieznane.', '#c47f00');
+        var doZrob = S.rows.filter(function (r){ return r.nr; });
+        var n = Math.max(1, Math.min(8, parseInt(($('#zwr-par') || {}).value, 10) || 5));
+        var idx = 0, gotowe = 0, wToku = 0;
+        function pisz(){ say('gotowe ' + gotowe + '/' + doZrob.length + ' · w toku ' + wToku + ' (do ' + n + ' naraz)'); }
+        async function robotnik(){
+            while (idx < doZrob.length && !S.stop){
+                var r = doZrob[idx++];
+                wToku++; pisz();
+                try { await sprawdz(r); }
+                catch (e){ r.st = 'err'; dopisz(r, 'błąd: ' + (e && e.message ? e.message : e)); }
+                wToku--; gotowe++; pisz(); render();
+            }
+        }
+        var eki = [];
+        for (var i = 0; i < n; i++) eki.push(robotnik());
+        await Promise.all(eki);
+        S.busy = false;
+        $('#zwr-check').disabled = false; $('#zwr-stop').disabled = true;
+        say(S.stop ? 'Przerwane.' : ('Sprawdzone: ' + gotowe + ' z ' + doZrob.length + '.'), S.stop ? '#c47f00' : '#16a34a');
+        render();
+    };
+
+    $('#zwr-do').onclick = async function (){
+        if (S.busy) return;
+        var wyb = S.rows.filter(function (r){ return r.sel && mozna(r) && r.st !== 'done'; });
+        if (!wyb.length) return;
+        var suma = wyb.reduce(function (a, r){ return a + (r.kwota || 0); }, 0);
+        if (!confirm('Zwrócić ' + wyb.length + ' płatności na łączną kwotę ' + f2(suma) + '?\n\n'
+                   + 'To prawdziwe pieniądze wychodzące do klientów. Operacji nie da się cofnąć.')) return;
+        S.busy = true; S.stop = false;
+        $('#zwr-check').disabled = true; $('#zwr-do').disabled = true; $('#zwr-stop').disabled = false;
+        var w = $('#zwr-warn'); if (w) w.style.display = 'block';
+        // Zwroty idą PO KOLEI. Rownolegle zwiekszaloby tylko ryzyko, a zysku nie ma —
+        // takich pozycji jest kilka, nie kilkaset.
+        var ile = 0;
+        for (var i = 0; i < wyb.length && !S.stop; i++){
+            say('zwrot ' + (i + 1) + '/' + wyb.length + ' — ticket ' + wyb[i].rma + '…', '#c47f00');
+            try { await wykonaj(wyb[i]); }
+            catch (e){ wyb[i].st = 'fail'; dopisz(wyb[i], 'błąd: ' + (e && e.message ? e.message : e)); }
+            if (wyb[i].st === 'done'){ wyb[i].sel = false; ile++; }
+            render();
+        }
+        S.busy = false;
+        $('#zwr-check').disabled = false; $('#zwr-stop').disabled = true;
+        if (w) w.style.display = 'none';
+        say('Zwrócone: ' + ile + ' z ' + wyb.length + '.', ile === wyb.length ? '#16a34a' : '#c47f00');
+        render();
+    };
+
+    render();
+})();
+    }
+
+    // ===== Zwroty — wykonawca na karcie eupago =====
+    // Osobny modul, zeby nie ruszac init_eutok. Wykonuje operacje DOKLADNIE tak, jak
+    // robi to panel: jego wlasnym jQuery, jego access_tokenem z sessionStorage i jego
+    // getCsrfMagic(). Dzieki temu poswiadczenia nie opuszczaja karty panelu.
+    function init_zwrop() {
+(function () {
+    'use strict';
+    if (!/(^|\.)eupago\.pt$/i.test(location.hostname)) return;
+    if (window.top !== window.self) return;
+
+    var ZW_OP_Z = 'zwr_op_zlec';
+    var ZW_OP_O = 'zwr_op_odp';
+    var ZW_OP_H = 'zwr_op_puls';   // znak zycia karty eupago: wersja + czas
+    var W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+
+    function chmurka(tekst, kolor, ile){
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;right:12px;bottom:60px;z-index:2147483000;background:'
+            + kolor + ';color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:7px 11px;'
+            + 'border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);cursor:pointer;max-width:320px';
+        d.textContent = tekst;
+        d.onclick = function (){ d.remove(); };
+        if (document.body) document.body.appendChild(d);
+        setTimeout(function (){ if (d.parentNode) d.remove(); }, ile || 8000);
+    }
+    function token(){
+        try { return String(W.sessionStorage.getItem('access_token') || '').replace(/"/g, '').trim(); }
+        catch (e){ return ''; }
+    }
+    function csrf(){
+        try { return (typeof W.getCsrfMagic === 'function') ? W.getCsrfMagic() : null; }
+        catch (e){ return null; }
+    }
+    function cfg(k){
+        try { return (W.configfrontend && W.configfrontend[k]) ? String(W.configfrontend[k]) : ''; }
+        catch (e){ return ''; }
+    }
+    var ZWOP_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+                 ? GM_info.script.version : '?';
+    function odpowiedz(id, ok, dane){
+        // Wersja w KAZDEJ odpowiedzi — panel po drugiej stronie pozna po niej, ze ta
+        // karta nie zostala odswiezona i pracuje na starym kodzie.
+        var o = { id: id, ok: !!ok, ver: ZWOP_VER, kiedy: Date.now() };
+        Object.keys(dane || {}).forEach(function (k){ o[k] = dane[k]; });
+        try { GM_setValue(ZW_OP_O, JSON.stringify(o)); } catch (e){}
+    }
+
+    // Zapytanie skladane tak samo jak w panelu: cialo form-urlencoded, naglowek
+    // Authorization z sessionStorage, pole CSRF dorzucone, gdy strona je wystawia.
+    function poslij(url, dane, zTokenem, ciasteczka){
+        return new Promise(function (ok, zle){
+            var body = new URLSearchParams();
+            Object.keys(dane || {}).forEach(function (k){ body.append(k, String(dane[k])); });
+            var c = csrf();
+            if (c && c.name) body.append(c.name, c.value);
+            var nag = { 'Content-Type': 'application/x-www-form-urlencoded, application/json',
+                        'cache-control': 'no-cache' };
+            if (zTokenem){
+                var t = token();
+                if (!t){ zle(new Error('nie ma access_token — zaloguj się w panelu eupago')); return; }
+                nag['Authorization'] = t;
+            }
+            fetch(url, { method: 'POST', credentials: ciasteczka ? 'include' : 'same-origin',
+                         headers: nag, body: body.toString() })
+                .then(function (r){
+                    return r.text().then(function (t){
+                        var j = null;
+                        try { j = JSON.parse(t); } catch (e){}
+                        ok({ status: r.status, json: j, tekst: t.slice(0, 300) });
+                    });
+                })
+                .catch(function (e){ zle(new Error('nie wysłałem: ' + e.message)); });
+        });
+    }
+
+    // Pole „bic" dokladamy TYLKO, gdy mamy wartosc. Pusty ciag serwer odrzucal jako
+    // BIC_INVALID, a przy zwrocie na zrodlo (bez IBAN-u) i tak nie jest potrzebny.
+    function bicOpc(dane, bic){
+        var v = String(bic == null ? '' : bic).replace(/\s+/g, '').toUpperCase();
+        if (v) dane.bic = v;
+        return dane;
+    }
+
+    async function wykonaj(z){
+        var us = cfg('url_server'), core = cfg('core_server');
+        if (!us || !core) throw new Error('strona panelu nie wystawiła configfrontend — odśwież ją');
+
+        if (z.op === 'unarchive' || z.op === 'archive'){
+            var sc = z.op === 'unarchive' ? '/pagamentos/desarquivar_referenciabo'
+                                          : '/pagamentos/arquivar_referenciabo';
+            var r = await poslij(us + sc, { refid: z.refid }, true, false);
+            if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + r.tekst);
+            if (!r.json || r.json.tipo !== 'sucesso'){
+                // Samo „?" nie pozwala niczego ustalic. Pokazujemy status i tresc,
+                // przycieta — inaczej diagnoza wymaga kolejnego podejscia z konsola.
+                var opis = (r.json && (r.json.tipo || r.json.mensagem || r.json.message))
+                        || (r.tekst ? r.tekst.slice(0, 160) : '(pusta odpowiedź)');
+                throw new Error('panel odpowiedział HTTP ' + r.status + ': ' + opis);
+            }
+            return {};
+        }
+        if (z.op === 'detail'){
+            var d = await poslij(us + '/pagamentos/detail_reference', { refid: z.refid }, true, false);
+            if (d.status < 200 || d.status >= 300) throw new Error('HTTP ' + d.status + ' ' + d.tekst);
+            var trid = d.json && d.json.transacao ? d.json.transacao.trid : '';
+            return { trid: trid ? String(trid) : '',
+                     valor: (d.json && d.json.transacao) ? d.json.transacao.valor : '' };
+        }
+        if (z.op === 'refund'){
+            // Zwrot idzie na TRID, nie na refid — panel bierze go z detail_reference.
+            // iban/bic puste = zwrot na zrodlo platnosci.
+            var f = await poslij(core + '/management/v1.02/refund/' + encodeURIComponent(z.trid),
+                                 // IBAN pusty = zwrot na zrodlo platnosci; podany = przelew.
+                                 // BIC-a NIE wysylamy jako pustego ciagu: serwer odpowiadal wtedy
+                                 // BIC_INVALID, czyli waliduje pole, skoro jest obecne. Idzie
+                                 // wylacznie wtedy, gdy naprawde go mamy.
+                                 bicOpc({ amount: Number(z.amount),
+                                          reason: String(z.reason || '').slice(0, 250),
+                                          iban: String(z.iban || '') }, z.bic),
+                                 false, true);
+            if (f.status < 200 || f.status >= 300){
+                var kod = (f.json && (f.json.code || f.json.message)) || f.tekst || ('HTTP ' + f.status);
+                throw new Error(String(kod));
+            }
+            // Oddajemy TO, CO NAPRAWDE poszlo — inaczej stary wykonawca po cichu
+            // wysylalby puste pole, a panel raportowalby, ze wyslal IBAN.
+            return { odp: (f.json && f.json.transactionStatus) || 'ok',
+                     ibanWyslany: String(z.iban || '') };
+        }
+        throw new Error('nieznana operacja „' + z.op + '"');
+    }
+
+    var ostatnie = '';
+    function obsluz(s){
+        s = String(s || '');
+        if (!s || s === ostatnie) return;
+        ostatnie = s;
+        var z = null;
+        try { z = JSON.parse(s); } catch (e){ return; }
+        if (!z || !z.id) return;
+        // Zlecenia starsze niz pieciu minut ignorujemy — to resztka po zamknietej karcie.
+        if (z.kiedy && (Date.now() - z.kiedy) > 300000) return;
+        try { GM_setValue(ZW_OP_Z, ''); } catch (e){}
+        chmurka('HUB: ' + z.op + '…', '#332524', 4000);
+        wykonaj(z).then(function (d){
+            odpowiedz(z.id, true, d || {});
+            chmurka('HUB: ' + z.op + ' — OK', '#0a7a2f', 5000);
+        }).catch(function (e){
+            odpowiedz(z.id, false, { err: e && e.message ? e.message : String(e) });
+            chmurka('HUB: ' + z.op + ' — ' + (e && e.message ? e.message : e), '#a10000', 12000);
+        });
+    }
+    // Droga glowna: nasluch na zmiane wartosci — powinien odpalac sie natychmiast po
+    // zapisie z drugiej karty. Nie ufamy mu jednak na slowo: gdyby milczal, zostaje
+    // zegar ponizej, a puls powie w dzienniku, ktore z dwojga naprawde zadzialalo.
+    var mamNasluch = false;
+    try {
+        if (typeof GM_addValueChangeListener === 'function'){
+            GM_addValueChangeListener(ZW_OP_Z, function (klucz, stara, nowa){ obsluz(nowa); });
+            mamNasluch = true;
+        }
+    } catch (e){}
+
+    // Puls: znak zycia dla panelu. Dzieki niemu „czekam na kartę eupago" przestaje byc
+    // zagadka — panel widzi, czy wykonawca tam jest, w jakiej wersji i od kiedy milczy.
+    var ileTykniec = 0;
+    function puls(zrodlo){
+        ileTykniec++;
+        try {
+            GM_setValue(ZW_OP_H, JSON.stringify({
+                ver: ZW_VER, czas: Date.now(), zrodlo: zrodlo,
+                nasluch: mamNasluch, tyk: ileTykniec,
+                ukryta: (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+            }));
+        } catch (e){}
+    }
+    function tyknij(){
+        puls(zegarZrodlo);
+        var v = '';
+        try { v = GM_getValue(ZW_OP_Z, '') || ''; } catch (e){ return; }
+        obsluz(v);
+    }
+
+    // Zegar w Web Workerze. Karta w tle dlawi setInterval do rzedu jednego przebiegu
+    // na minute — Web Worker ma wlasny watek i wlasny zegar, ktorego przegladarka nie
+    // dlawi. Jesli polityka strony zabroni utworzenia workera z blob-a, schodzimy na
+    // zwykly setInterval; wtedy puls to pokaze i bedzie wiadomo, czemu jest wolniej.
+    var zegarZrodlo = 'interval';
+    try {
+        var kod = 'setInterval(function(){ postMessage(1); }, 700);';
+        var url = URL.createObjectURL(new Blob([kod], { type: 'text/javascript' }));
+        var wrk = new Worker(url);
+        wrk.onmessage = tyknij;
+        zegarZrodlo = 'worker';
+    } catch (e){
+        setInterval(tyknij, 700);
+    }
+    puls(zegarZrodlo);
+})();
+    }
+
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
@@ -54149,6 +56598,8 @@
         { id: 'bank',     name: 'Bank Import',               test: onProlo,   init: init_bank },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
+        { id: 'zwr',      name: 'Zwroty',                    test: onProlo,   init: init_zwr },
+        { id: 'zwrop',    name: 'Zwroty — wykonawca eupago', test: onEupago,  init: init_zwrop },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
         { id: 'refund',   name: 'Refund Checker',            test: onProlo,   init: init_refund },
         { id: 'vatcalc',  name: 'Kalkulator VAT',            test: onProlo,   init: init_vatcalc },
@@ -54376,6 +56827,7 @@
             { id:'bank',     icon:svgIco('<path d="M3 21l18 0"/><path d="M3 10l18 0"/><path d="M5 6l7 -3l7 3"/><path d="M4 10l0 11"/><path d="M20 10l0 11"/><path d="M8 14l0 3"/><path d="M12 14l0 3"/><path d="M16 14l0 3"/>'), label:'Bank Import', sel:'#bank-btn' },
             { id:'ins',      icon:svgIco('<path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 14.85a12 12 0 0 1 -8.5 -14.85a12 12 0 0 0 8.5 -3"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie INS', sel:'#ins-btn' },
             { id:'ucod',     icon:svgIco('<path d="M3 8l7.89 5.26a2 2 0 0 0 2.22 0l7.89 -5.26"/><rect x="3" y="5" width="18" height="14" rx="2"/>'), label:'Unpaid COD', sel:'#ucod-btn' },
+            { id:'zwr',      icon:svgIco('<path d="M12 3v18"/><path d="M17 8a4 4 0 0 0 -4 -3h-2a3 3 0 0 0 0 6h2a3 3 0 0 1 0 6h-2a4 4 0 0 1 -4 -3"/>'), label:'Zwroty', sel:'#zwr-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
             { id:'vies',     icon:svgIco('<path d="M11.46 20.85a12 12 0 0 1 -7.96 -14.85a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3a12 12 0 0 1 -.09 7.06"/><path d="M15 19l2 2l4 -4"/>'), label:'VIES / KRS / GUS', sel:'#viesBtn' },
