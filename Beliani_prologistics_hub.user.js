@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.39
+// @version      5.40
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -2019,6 +2019,25 @@
         return ACCOUNTS[String(num || '').trim()] || null;
     }
 
+    // Rynek z ostatniej kolumny listy Allegro -> konto rozliczeniowe. Kody wpisuje modul
+    // „Allegro CZ/HU/SK — lista do ksiegowania" wedlug wybranego tam rynku, wiec konta
+    // nie trzeba juz wskazywac reka. Nazwy kont sa te same, co w planie kont wyzej:
+    // 1148 Allegro CZ, 1516 Allegro HU, 1517 Allegro SK.
+    // PL jest tu SWIADOMIE nieobecne: tam wybor 1069/1071 zostaje przy czlowieku.
+    const ALLEGRO_KONTA = { 'CZ': '1148', 'HU': '1516', 'SK': '1517' };
+    function allegroKontoRynku(m) {
+        return ALLEGRO_KONTA[String(m || '').trim().toUpperCase()] || '';
+    }
+    // Rynki z wklejki — bez powtorzen i bez pustych.
+    function allegroRynki(items) {
+        const out = [];
+        (items || []).forEach(function (i) {
+            const m = String((i && i.market) || '').trim().toUpperCase();
+            if (m && out.indexOf(m) < 0) out.push(m);
+        });
+        return out;
+    }
+
     function updateAccountLabel() {
         const inp = document.getElementById('tm-t-account');
         const label = document.getElementById('tm-t-account-label');
@@ -2288,6 +2307,7 @@
         if (isAllegroUuid) {
             const sums = new Map();
             const dates = new Map();
+            const mkts = new Map();
             const order = [];
             const toYmd = function (d) { const p = String(d || '').trim().split('.'); return p.length === 3 ? p[2] + '-' + p[1] + '-' + p[0] : ''; };
             for (const r of rows) {
@@ -2295,14 +2315,22 @@
                 if (!UUID_RE.test(orderNumber)) continue;
                 const n = parseFloat(String(r[2] || '').replace(/\s/g, '').replace(',', '.'));
                 if (isNaN(n) || n === 0) continue;
-                if (!sums.has(orderNumber)) { order.push(orderNumber); dates.set(orderNumber, toYmd(r[0])); }
+                if (!sums.has(orderNumber)) {
+                    order.push(orderNumber);
+                    dates.set(orderNumber, toYmd(r[0]));
+                    // PIATA kolumna: kod rynku (CZ/HU/SK) dopisany przez listę Allegro.
+                    // Po nim wychodzi konto, wiec nie trzeba go wskazywac reka. Starsze
+                    // wklejki tej kolumny nie maja — zostaje pusto i konto wybiera czlowiek.
+                    mkts.set(orderNumber, String(r[4] || '').trim().toUpperCase());
+                }
                 sums.set(orderNumber, (sums.get(orderNumber) || 0) + Math.abs(n));
             }
             return order
                 .map(orderNumber => {
                     const total = sums.get(orderNumber);
                     if (total == null || total === 0) return null;
-                    return { orderNumber, amount: total.toFixed(2), source: 'allegro', date: dates.get(orderNumber) || '' };
+                    return { orderNumber, amount: total.toFixed(2), source: 'allegro',
+                             date: dates.get(orderNumber) || '', market: mkts.get(orderNumber) || '' };
                 })
                 .filter(Boolean);
         }
@@ -3226,12 +3254,34 @@
         if (isAllegroMode) {
             // Zapamietaj konto sprzed przelaczenia — patrz komentarz w galezi else.
             if (accInp.dataset.prevAcc === undefined) accInp.dataset.prevAcc = accInp.value;
-            const r = document.querySelector('input[name="tm-t-allegro-acc-r"]:checked');
-            accInp.value = r ? r.value : '1069';
-            accInp.readOnly = true;
-            updateAccountLabel();
-            if (accToggle) accToggle.style.display = '';
-            if (note) note.style.display = '';
+            // Lista z kolumna „Rynek" rozstrzyga konto SAMA. Przelacznik 1069/1071 nie ma
+            // wtedy nic do rzeczy i znika — zeby nie udawal, ze cokolwiek jeszcze zmienia.
+            const rynki = allegroRynki(items);
+            if (rynki.length) {
+                accInp.value = allegroKontoRynku(rynki[0]) || accInp.value;
+                accInp.readOnly = true;
+                updateAccountLabel();
+                if (accToggle) accToggle.style.display = 'none';
+                if (note) {
+                    note.style.display = '';
+                    note.innerHTML = '🔒 Format Allegro: <b>każdy zwrot księguje się na SWOJEJ dacie</b> z listy — '
+                        + 'pole „Data" wyżej jest wtedy nieużywane. Konto bierze się z kolumny <b>Rynek</b>: '
+                        + rynki.map(function (m) { return m + ' → ' + (allegroKontoRynku(m) || '?'); }).join(', ')
+                        + (rynki.length > 1 ? ' — każdy wiersz idzie na swoje konto.' : '.');
+                }
+            } else {
+                const r = document.querySelector('input[name="tm-t-allegro-acc-r"]:checked');
+                accInp.value = r ? r.value : '1069';
+                accInp.readOnly = true;
+                updateAccountLabel();
+                if (accToggle) accToggle.style.display = '';
+                if (note) {
+                    note.style.display = '';
+                    note.innerHTML = '🔒 Format Allegro: <b>każdy zwrot księguje się na SWOJEJ dacie</b> z listy — '
+                        + 'pole „Data" wyżej jest wtedy nieużywane. Konto tylko 1069/1071 '
+                        + '(lista z kolumną „Rynek" wybiera konto sama).';
+                }
+            }
         } else {
             accInp.readOnly = false;
             // Wyjscie z trybu Allegro przywraca konto sprzed przelaczenia. Wczesniej
@@ -3262,8 +3312,16 @@
                 + inf.mergedList.slice(0, 12).map(m => `<strong>${m.orderNumber}</strong> ${m.rows}×→${m.amount}`).join(', ')
                 + (inf.mergedList.length > 12 ? '…' : '') + `</div>`
             : '';
+        // Rynek z listy Allegro pokazujemy WPROST razem z kontem, ktore z niego wychodzi —
+        // to jedyna rzecz w tej wklejce, ktorej nie widac w numerach i kwotach.
+        const rynkiP = allegroRynki(items);
+        const rline = rynkiP.length
+            ? `<div style="color:#0a7a2f;margin-top:2px">rynek z listy: `
+                + rynkiP.map(m => `<strong>${m}</strong> → konto ${allegroKontoRynku(m) || '<span style="color:#c00">nieznane</span>'}`).join(', ')
+                + `</div>`
+            : '';
         el.innerHTML = items.length
-            ? `<span style="color:#16a34a">✓ ${items.length} pozycji${note}:</span> ` + items.slice(0, 20).map(i => `<strong>${i.orderNumber}</strong>→${i.amount}`).join(', ') + (items.length > 20 ? '…' : '') + mlist
+            ? `<span style="color:#16a34a">✓ ${items.length} pozycji${note}:</span> ` + items.slice(0, 20).map(i => `<strong>${i.orderNumber}</strong>→${i.amount}`).join(', ') + (items.length > 20 ? '…' : '') + rline + mlist
             : '<span style="color:#888">Nie znaleziono pozycji</span>';
     }
 
@@ -4127,7 +4185,22 @@
     function validateBooking(items, bookingDate, accountNum) {
         const allegro = items.length && items.every(i => i.source === 'allegro');
         if (allegro) {
-            if (accountNum !== '1069' && accountNum !== '1071') return 'Zwroty Allegro: wybierz konto 1069 lub 1071.';
+            // Lista z kolumną „Rynek" sama mówi, gdzie księgować (CZ→1148, HU→1516,
+            // SK→1517), więc pola konta nikt tu nie wskazuje. Bez tej kolumny zostaje
+            // stara droga: 1069 albo 1071 z przełącznika.
+            const rynki = allegroRynki(items);
+            if (rynki.length) {
+                const zle = rynki.filter(m => !allegroKontoRynku(m));
+                if (zle.length) return 'Nieznany rynek w kolumnie „Rynek": ' + zle.join(', ')
+                                     + '. Obsługuję CZ, HU i SK — dla Allegro PL zostaw tę kolumnę pustą '
+                                     + 'i wybierz konto 1069 albo 1071.';
+                const bezRynku = items.filter(i => !String(i.market || '').trim()).length;
+                if (bezRynku) return 'Część wierszy ma rynek w kolumnie „Rynek", a ' + bezRynku
+                                   + ' nie ma. Wklej listę z jednego eksportu — inaczej nie wiem, '
+                                   + 'gdzie zaksięgować te bez rynku.';
+            } else if (accountNum !== '1069' && accountNum !== '1071') {
+                return 'Zwroty Allegro: wybierz konto 1069 lub 1071 (albo wklej listę z kolumną „Rynek").';
+            }
             if (items.some(i => !/^\d{4}-\d{2}-\d{2}$/.test(i.date || ''))) return 'Brak/zła data w liście Allegro (kolumna Data).';
             return null;
         }
@@ -4150,8 +4223,13 @@
             const k = item.orderNumber + '|' + item.amount;
             const idx = (dupSeen.get(k) || 0) + 1; dupSeen.set(k, idx);
             const rowDate = (item.date) ? item.date : bookingDate;
+            // Konto z kolumny „Rynek", gdy lista je niesie. Kazdy wiersz niesie SWOJE
+            // konto az do ksiegowania (checkOne dostaje row.accountNum), wiec wklejka
+            // z dwoch rynkow tez zaksieguje sie tam, gdzie trzeba.
+            const kontoWiersza = allegroKontoRynku(item.market) || accountNum;
             return {
-                orderNumber: item.orderNumber, amount: item.amount, accountNum, bookingDate: rowDate,
+                orderNumber: item.orderNumber, amount: item.amount, accountNum: kontoWiersza, bookingDate: rowDate,
+                market: String(item.market || '').trim().toUpperCase(),
                 source: item.source || '', isGoodwill: !!item.isGoodwill, auftragNumber: item.auftragNumber || '',
                 dupTotal: dupCount.get(k), dupIndex: idx,
                 loading: true, error: null, selected: false, booked: false, skipped: false
@@ -10600,9 +10678,22 @@
         return (arr || []).slice().sort(function (a, b) { return rank(a.type) - rank(b.type); });
     }
 
+    // Kod rynku do ostatniej kolumny. Tylko CZ/HU/SK: po nim modul „Ksiegowanie
+    // w tickecie" wie od razu, ze wiersz idzie na 1148 / 1516 / 1517. Przy PL zostaje
+    // pusto — tam konto (1069 albo 1071) wybiera sie w tamtym module i wpisanie
+    // czegokolwiek tutaj przejeloby ten wybor po cichu.
+    function marketCode(key) {
+        const k = String(key || '').toLowerCase();
+        return (k === 'cz' || k === 'hu' || k === 'sk') ? k.toUpperCase() : '';
+    }
+
     function buildTable(rowsArr) {
         const tb = $('#al-body');
         if (!tb) return;
+        // Rynek bierzemy ZE STANU, nie z listy rozwijanej: po jej przelaczeniu bez
+        // ponownego pobrania tabela pokazywalaby kod rynku, z ktorego tych wierszy nie ma.
+        const st0 = loadState();
+        const kod = marketCode((st0 && st0.market) || getMarket());
         tb.innerHTML = '';
         sortB2BFirst(rowsArr).forEach(function (r, i) {
             const tr = document.createElement('tr');
@@ -10612,7 +10703,8 @@
                 '<td style="padding:4px 6px;border:1px solid #e5e7eb;color:#000;white-space:nowrap;">' + (r.date || '') + '</td>' +
                 '<td style="padding:4px 6px;border:1px solid #e5e7eb;font-family:monospace;color:#000;">' + (r.orderId || '') + '</td>' +
                 '<td style="padding:4px 6px;border:1px solid #e5e7eb;text-align:right;font-family:monospace;color:#000;">' + (r.amount || '') + '</td>' +
-                '<td style="padding:4px 6px;border:1px solid #e5e7eb;text-align:center;font-weight:bold;color:' + color + ';">' + (r.type || '') + '</td>';
+                '<td style="padding:4px 6px;border:1px solid #e5e7eb;text-align:center;font-weight:bold;color:' + color + ';">' + (r.type || '') + '</td>' +
+                '<td style="padding:4px 6px;border:1px solid #e5e7eb;text-align:center;font-weight:bold;color:#000;">' + kod + '</td>';
             tb.appendChild(tr);
         });
     }
@@ -10623,8 +10715,9 @@
         const st = loadState();
         const rowsArr = (st && st.rows) || [];
         if (!rowsArr.length) { msg('Brak danych do eksportu.'); return; }
-        const lines = ['Data;Order number;Kwota;Typ'];
-        sortB2BFirst(rowsArr).forEach(function (r) { lines.push([r.date || '', r.orderId || '', r.amount || '', r.type || ''].join(';')); });
+        const kodCsv = marketCode((st && st.market) || getMarket());
+        const lines = ['Data;Order number;Kwota;Typ;Rynek'];
+        sortB2BFirst(rowsArr).forEach(function (r) { lines.push([r.date || '', r.orderId || '', r.amount || '', r.type || '', kodCsv].join(';')); });
         const csv = '\uFEFF' + lines.join('\r\n');
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
@@ -10713,6 +10806,7 @@
                         '<th style="padding:5px 6px;text-align:left;border:1px solid #e5e7eb;">Order number</th>' +
                         '<th style="padding:5px 6px;text-align:right;border:1px solid #e5e7eb;">Kwota</th>' +
                         '<th style="padding:5px 6px;text-align:center;border:1px solid #e5e7eb;">Typ</th>' +
+                        '<th style="padding:5px 6px;text-align:center;border:1px solid #e5e7eb;" title="Kod rynku. Moduł „Księgowanie w tickecie” bierze po nim konto: CZ→1148, HU→1516, SK→1517.">Rynek</th>' +
                     '</tr></thead>' +
                     '<tbody id="al-body"></tbody>' +
                 '</table>' +
@@ -40648,7 +40742,11 @@
         try {
             const jobs2 = jobsLoad();
             const k2 = mkKluczPamieci(jobs2, job);
-            impRender(k2 ? jobs2[k2] : job, d);
+            const j2 = k2 ? jobs2[k2] : job;
+            // Klucz musi jechac RAZEM ze zleceniem: obiekt wziety wprost z pamieci
+            // „__k" nie ma, a ekran paczki po nim siega do zlecenia (patrz impRender).
+            if (k2) j2.__k = k2;
+            impRender(j2, d);
         } catch (e){}
     }
     // tylkoTe — gdy podane, sprawdzamy WYLACZNIE te numery i doklejamy wynik do
@@ -41227,6 +41325,15 @@
     function impRender(job, d){
         const box = document.getElementById('mk-imp-box');
         if (!box) return;
+        // KLUCZ ZLECENIA rozstrzygamy RAZ, na caly ten ekran. „mkKlucz" oddaje samą
+        // referencję, gdy obiekt nie niesie „__k" — a przy wpisach ręcznych i z arkusza
+        // referencja NIE jest kluczem (zlecenie leży pod „MAN_…"/„SH_…"). Wtedy każde
+        // jobsLoad()[klucz] mijało się ze zleceniem: flaga „booked" nie zapisywała się,
+        // arkusz nie dostawał wpisu, a impCheck kończył cichym „ta pozycja nie ma numeru
+        // paczki" — panel zostawał na „wysłane, odczytuję paczkę jeszcze raz…", chociaż
+        // w prologistics pozycje były już zaksięgowane.
+        const jobsK0 = jobsLoad();
+        const kluczJob = mkKluczPamieci(jobsK0, job) || mkKlucz(job);
         const rows = d.rows, col = d.colours || {};
         const by = {};
         rows.forEach(function (x){ const s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
@@ -41396,7 +41503,7 @@
         // po zaksiegowaniu nadal oddaje te wiersze jako OK, wiec licznik nie odroznia
         // „jest co ksiegowac" od „juz zrobione". Flage czytamy swiezo z dysku, bo
         // impRender bywa wolany z zamknieciem, ktore pamieta starszy stan zlecenia.
-        const jbNow = jobsLoad()[mkKlucz(job)] || job;
+        const jbNow = jobsK0[kluczJob] || job;
         // v3.82: przy Amazonie ksiegowanie jest ZABLOKOWANE, dopoki nie sprawdzisz typow
         // klienta. Typ decyduje o koncie VAT, a po zaksiegowaniu jego poprawienie jest juz
         // grzebaniem w zaksiegowanych pozycjach — dlatego kontrola stoi PRZED, a nie obok.
@@ -41425,7 +41532,7 @@
         try { box.scrollIntoView({ block: 'nearest' }); } catch (e){}
 
         const re = box.querySelector('#mk-imp-re');
-        if (re) re.onclick = function(){ impCheck(mkKlucz(job)); };
+        if (re) re.onclick = function(){ impCheck(kluczJob); };
         const nfb = box.querySelector('#mk-nf-check');
         if (nfb) nfb.onclick = async function(){
             const lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
@@ -41444,8 +41551,8 @@
             // Klucz wedruje RAZEM ze zleceniem — tak samo jak w impCheck. Obiekt wziety
             // wprost z pamieci „__k" nie ma, a bez niego zapis flagi po sprawdzeniu
             // typow szukalby zlecenia po referencji.
-            const jj = jobsLoad()[mkKlucz(job)] || job;
-            jj.__k = mkKlucz(job);
+            const jj = jobsLoad()[kluczJob] || job;
+            jj.__k = kluczJob;
             amzTypZPaczki(jj, d, tr);
         };
         const ts = box.querySelector('#mk-tol-set');
@@ -41470,7 +41577,7 @@
                 m.textContent = 'księguję na subkoncie…';
                 await impBookSub(job.impId, near.map(function (x){ return x.id; }));
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
-                await impCheck(mkKlucz(job));
+                await impCheck(kluczJob);
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
                 fx.disabled = false;
@@ -41486,7 +41593,7 @@
             try {
                 await impBook(job.impId, ok.map(function (x){ return x.id; }));
                 const jobs = jobsLoad();
-                const kj = mkKlucz(job);
+                const kj = kluczJob;
                 if (jobs[kj]){
                     jobs[kj].booked = true; jobs[kj].checked = true;
                     jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg);   // v3.88
@@ -41860,17 +41967,29 @@
     }
 
     async function impCheck(ref){
-        const j = jobsLoad()[ref];
-        if (!j || !j.impId){ say('Ta pozycja nie ma numeru paczki — otwórz Import payments ręcznie.', '#c47f00'); return; }
+        const jobsC = jobsLoad();
+        // Klucz albo referencja — przy wpisach recznych i z arkusza to NIE to samo.
+        const kC = jobsC[ref] ? String(ref) : mkKluczRef(jobsC, ref);
+        const j = kC ? jobsC[kC] : null;
+        // Dwa rozne powody, dwa rozne komunikaty. „Nie ma numeru paczki" przy zleceniu,
+        // ktorego w ogole nie odnalezlismy, bylo mylace — a wlasnie tak konczylo sie
+        // odczytanie paczki po zaksiegowaniu i panel zostawal na „wysłane…" bez slowa
+        // wyjasnienia, choc w prologistics wszystko juz poszlo.
+        if (!j){
+            say('Nie znajduję tego zlecenia w pamięci modułu (klucz „' + ref + '") — '
+              + 'odśwież stronę i wczytaj paczkę jeszcze raz. W prologistics nic to nie zmienia.', '#c47f00');
+            return;
+        }
+        if (!j.impId){ say('Ta pozycja nie ma numeru paczki — otwórz Import payments ręcznie.', '#c47f00'); return; }
         // Widok paczki musi wiedziec, KTORE to zlecenie. Referencja do tego nie wystarcza
         // (przy zleceniach z arkusza jest pusta), wiec niesiemy klucz tak samo, jak robi
         // to jobList przy rysowaniu listy.
-        j.__k = ref;
+        j.__k = kC;
         say('Czytam paczkę ' + j.impId + '…');
         try {
             const d = await impRows(j.impId);
             const jobs = jobsLoad();
-            if (jobs[ref]){ jobs[ref].checked = true; jobsSave(jobs); }
+            if (jobs[kC]){ jobs[kC].checked = true; jobsSave(jobs); }
             impRender(j, d);
             render();
             const n = d.rows.filter(function (x){ return String(x.state) === 'OK'; }).length;
