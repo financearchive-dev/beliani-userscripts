@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.38
+// @version      5.39
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25931,6 +25931,27 @@
         { mp: 'Castorama',      ok: false, payer: /CASTORAMA/i },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
+    // Marka, ktora ma WIECEJ NIZ JEDEN panel. Regula wyciagu niesie jeden host, bo
+    // platnik i wzorzec referencji sa dla obu rynkow wspolne — a instancje Mirakla sa
+    // dwie. Carrefour ES stoi na wlasnej (carrefoures-prod), wiec przelot chodzil zawsze
+    // do francuskiej i przy wyplacie z ES konczyl „przelot przeszedł, ale nie znalazł
+    // tego rozliczenia" — zamiast zajrzec na druga.
+    // Adresy sa ZAOBSERWOWANE, nie zgadniete: francuski z reguly wyciagu (tamtedy przelot
+    // przechodzi), hiszpanski z adresu panelu, na ktorym pracuje uzytkownik.
+    const MK_PANELE = {
+        'carrefour': ['carrefourfr.mirakl.net', 'carrefoures-prod.mirakl.net']
+    };
+    // Panele tej marki, gdy jest ich kilka. Zlecenie nalezy wtedy do KAZDEGO z nich,
+    // dopoki ktorys nie odda rozliczenia — tak samo, jak dziala to od dawna przy „NN"
+    // (pole „hosty"). Zwraca null, gdy marka ma jeden panel albo gdy host zlecenia
+    // wskazuje na cos spoza listy: wtedy nie ma podstaw go podmieniac.
+    function mkPaneleMarki(j){
+        if (!j || (j.kind || 'mirakl') !== 'mirakl') return null;
+        const l = MK_PANELE[mkNorm(j.brand || j.short || j.mp)];
+        if (!l || l.length < 2) return null;
+        const h = String(j.host || '');
+        return (!h || l.indexOf(h) >= 0) ? l : null;
+    }
     function mkDetect(payer, reason){
         for (let i = 0; i < MK_RULES.length; i++){
             const r = MK_RULES[i];
@@ -33759,6 +33780,58 @@
     // zleceniach z arkusza i dopisanych recznie jest PUSTA, wiec wszystkie takie zlecenia
     // wygladalyby jak jedno. „__k" doklada jobList; obiekt spoza niej ma zapas.
     function mkKlucz(j){ return String((j && (j.__k || j.ref)) || ''); }
+    // Klucz, pod ktorym zlecenie NAPRAWDE lezy w pamieci. Referencja nim nie jest przy
+    // wpisach recznych i z arkusza („MAN_…", „SH_…"): tam referencja jest z poczatku
+    // pusta, a dochodzi dopiero z dopasowanego rozliczenia. „jobs[j.ref]" trafia wtedy
+    // w pustke — i zapis, ktory mial trafic do zlecenia, przepada bez sladu.
+    function mkKluczRef(jobs, ref){
+        if (!ref) return '';
+        if (jobs[ref]) return String(ref);
+        const r = String(ref);
+        return Object.keys(jobs).filter(function (k){
+            return jobs[k] && String(jobs[k].ref || '') === r;
+        })[0] || '';
+    }
+    // Wplata dodana recznie albo wzieta z arkusza czeka BEZ referencji — wgrany plik
+    // rozliczenia nie ma jej czym dopasowac i zakladal obok DRUGIE zlecenie. Wpis
+    // z arkusza wisial wtedy dalej jako „czeka na dane", a przy nim stal blizniak z tym
+    // samym rozliczeniem.
+    // Szukamy takiego wpisu po TOZSAMOSCI: ten sam rodzaj, kwota wyplaty co do grosza
+    // i data w oknie wokol daty rozliczenia (przelew wplywa PO wyplacie, wiec okno jest
+    // niesymetryczne — te same liczby, co przy dopasowaniu wyplat ManoMano).
+    // Musi pasowac DOKLADNIE JEDEN. Przy kilku nie ma czego rozstrzygac i zostaje stara
+    // droga: osobne zlecenie, ktore widac na liscie.
+    const MK_DOP_WSTECZ = 10, MK_DOP_WPRZOD = 3;
+    function mkCzekajaceBezRef(jobs, kind, kwota, dataWyplaty){
+        if (kwota == null || !isFinite(kwota)) return '';
+        const d0 = mkDay(dataWyplaty);
+        const pas = Object.keys(jobs).filter(function (k){
+            const j = jobs[k];
+            if (!j || (j.kind || '') !== kind) return false;
+            if (!mkTodo(j) || j.data) return false;            // zaksiegowane albo juz z rozliczeniem
+            if (String(j.ref || '').trim()) return false;      // z referencja idzie stara droga
+            if (j.amount == null || Math.abs(j.amount - kwota) > 0.005) return false;
+            if (d0 == null) return true;
+            const x = mkDay(j.date);
+            if (x == null) return true;
+            return (x - d0) <= MK_DOP_WSTECZ * 86400000 && (d0 - x) <= MK_DOP_WPRZOD * 86400000;
+        });
+        return pas.length === 1 ? pas[0] : '';
+    }
+    function mkKluczPamieci(jobs, j){
+        if (!j) return '';
+        const k0 = mkKlucz(j);
+        if (k0 && jobs[k0]) return k0;
+        const zRef = mkKluczRef(jobs, j.ref);
+        if (zRef) return zRef;
+        // Ostatnia droga — po tozsamosci: ten sam rodzaj, ta sama kwota, ta sama data.
+        return Object.keys(jobs).filter(function (k){
+            const o = jobs[k];
+            return o && (o.kind || '') === (j.kind || '')
+                && o.amount != null && j.amount != null && Math.abs(o.amount - j.amount) < 0.005
+                && String(o.date || '') === String(j.date || '');
+        })[0] || '';
+    }
     function selOn(j){ const v = mkSel[mkKlucz(j)]; return (v === undefined) ? (j.status === 'ready') : !!v; }
     function selList(){ return jobList().filter(function (j){ return j.status === 'ready' && selOn(j); }); }
     // Paczki gotowe do zaksiegowania: zaimportowane, znany numer, jeszcze niezaksiegowane.
@@ -37966,6 +38039,9 @@
                     const r0 = String(j0.ref || '');
                     return !!r0 && (r0 === p.payRef || p.payRef.indexOf(r0) === 0);
                 })[0];
+                // Wplata czekajaca bez referencji — dopisujemy rozliczenie DO NIEJ.
+                // Bez tego plik zakladal drugie zlecenie, a wpis z arkusza wisial dalej.
+                if (!k) k = mkCzekajaceBezRef(jobs, 'mano', p.suma, p.payDate) || '';
                 if (!k){
                     k = p.payRef;
                     jobs[k] = { ref: p.payRef, date: p.payDate, dateSrc: p.payDate,
@@ -38267,6 +38343,14 @@
                 let k = Object.keys(jobs).filter(function (x){
                     return jobs[x].kind === 'amz' && String(jobs[x].ref || '') === String(p.setId);
                 })[0];
+                // Wplata czekajaca bez referencji (dodana recznie albo z arkusza) —
+                // rozliczenie dopisujemy DO NIEJ, zamiast zakladac drugie zlecenie
+                // na te same pieniadze.
+                let dopisane = '';
+                if (!k){
+                    const kk = mkCzekajaceBezRef(jobs, 'amz', p.net, p.payDate);
+                    if (kk){ k = kk; jobs[k].ref = String(p.setId); dopisane = kk; }
+                }
                 let zalozone = false;
                 if (!k){
                     k = String(p.setId);
@@ -38333,7 +38417,9 @@
                         + ' — sprawdź na banku, czy poprzedni payout w tej kwocie nie został zaksięgowany jako otrzymany.', '#c47f00');
                     return;
                 }
-                say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
+                say((zalozone ? 'Założyłem zlecenie z pliku'
+                              : (dopisane ? 'Dopisałem rozliczenie do czekającej wpłaty (dodanej ręcznie / z arkusza)'
+                                          : 'Uzupełniłem zlecenie'))
                     + ': ' + p.shop + ' · rozliczenie ' + p.setId + ' z ' + (p.payDate || '—')
                     + ' · wypłata ' + f2(p.net) + ' ' + p.cur
                     + ' · zamówień ' + Object.keys(p.ord).length + ' brutto ' + f2(p.gross)
@@ -39006,6 +39092,10 @@
                 // byc znany, inaczej zlecenie trafiloby do instancji domyslnej.
                 if (!j.ref && !j.host) return false;
                 if (host && (j.hosty || []).length > 1) return j.hosty.indexOf(host) >= 0;
+                // Marka z kilkoma panelami (Carrefour FR + ES): zlecenie nalezy do obu,
+                // dopoki ktorys nie odda rozliczenia.
+                const pan = mkPaneleMarki(j);
+                if (host && pan) return pan.indexOf(host) >= 0;
                 return host ? ((j.host || 'venteunique-prod.mirakl.net') === host) : true;
             });
             let ok = 0;
@@ -39150,6 +39240,9 @@
                     // Panel juz znany — lista przestaje byc potrzebna, a zlecenie
                     // ma pamietac TEN, z ktorego rozliczenie naprawde przyszlo.
                     if ((j.hosty || []).length > 1){ j.host = host || j.host; j.hosty = null; }
+                    // Marka z kilkoma panelami: zapamietujemy TEN, ktory oddal
+                    // rozliczenie, zeby nastepnym razem nie zaczynac od drugiego.
+                    else if (host && mkPaneleMarki(j)) j.host = host;
                     ok++;
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
@@ -39419,6 +39512,11 @@
                 // Zlecenie „NN" z kilkoma panelami nalezy do KAZDEGO z nich, dopoki
                 // ktorys nie odda rozliczenia.
                 if (host && (j.hosty || []).length > 1) return j.hosty.indexOf(host) >= 0;
+                // To samo, co w mkPass: marka z kilkoma panelami liczy sie na kazdym
+                // z nich. Obie strony musza liczyc tak samo, inaczej licznik „zostało"
+                // mowilby co innego niz przelot.
+                const panM = mkPaneleMarki(j);
+                if (host && panM) return panM.indexOf(host) >= 0;
                 return host ? (h === host) : true;
             }).length;
         }
@@ -39705,7 +39803,8 @@
                 // ma je odwiedzic po kolei.
                 const lista = ((j.hosty || []).length > 1)
                     ? j.hosty
-                    : [j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '')];
+                    : (mkPaneleMarki(j)
+                        || [j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '')]);
                 lista.forEach(function (h){ if (h && !o[h]){ o[h] = 1; out.push(h); } });
             });
             return out;
@@ -40530,7 +40629,15 @@
         // Flaga bramkujaca ksiegowanie. Zapisujemy przy zleceniu, zeby przetrwala
         // przerysowanie panelu i zamkniecie okna.
         const jobs = jobsLoad();
-        if (jobs[job.ref]){ jobs[job.ref].typChecked = true; jobsSave(jobs); }
+        // Klucz, a nie referencja. Przy wplacie dodanej recznie albo wzietej z arkusza
+        // zlecenie lezy pod „MAN_…"/„SH_…", a referencja dochodzi mu dopiero z rozliczenia
+        // — „jobs[job.ref]" bylo wtedy undefined, flaga nie zapisywala sie nigdzie
+        // i ksiegowanie nie odblokowywalo sie po sprawdzeniu typow. Wygladalo to tak,
+        // jakby sprawdzenie nic nie dalo.
+        const kluczT = mkKluczPamieci(jobs, job);
+        if (kluczT){ jobs[kluczT].typChecked = true; jobsSave(jobs); }
+        else say('UWAGA: sprawdziłem typy, ale nie odnalazłem tego zlecenia w pamięci modułu '
+               + '— odśwież stronę i sprawdź typy jeszcze raz.', '#c47f00');
         amzTypRender(job.ref);
         function ile(s){ return lista.filter(function (x){ return x.st === s; }).length; }
         say('Typ klienta: sprawdzonych ' + lista.length + ', do poprawy ' + ile('zle')
@@ -40538,12 +40645,20 @@
             + (ile('konta') ? (', z innym kontem sprzedaży ' + ile('konta')) : '')
             + (ile('blad') ? (', nie sprawdzonych ' + ile('blad')) : '')
             + '. Teraz możesz księgować.', ile('zle') ? '#c00' : '#0a7a2f');
-        try { impRender(jobsLoad()[job.ref] || job, d); } catch (e){}
+        try {
+            const jobs2 = jobsLoad();
+            const k2 = mkKluczPamieci(jobs2, job);
+            impRender(k2 ? jobs2[k2] : job, d);
+        } catch (e){}
     }
     // tylkoTe — gdy podane, sprawdzamy WYLACZNIE te numery i doklejamy wynik do
     // poprzedniego przebiegu. Sluzy ponowieniu pozycji, ktore padly na sieci.
     async function amzTypCheck(ref, btn, tylkoTe){
-        const j = jobsLoad()[ref], p = typDane(j);
+        // Po REFERENCJI, ale przez klucz: przy wpisach recznych i z arkusza referencja
+        // nie jest kluczem, wiec jobs[ref] oddawalo undefined i ponowne sprawdzenie
+        // konczylo sie „to zlecenie nie ma danych z raportu".
+        const jobsC = jobsLoad();
+        const j = jobsC[mkKluczRef(jobsC, ref)] || jobsC[ref], p = typDane(j);
         if (!p){ say('To zlecenie nie ma danych z raportu marketplace’u.', '#c47f00'); return; }
         if (typeof window.__TM_CUSTOMER_TYPE !== 'object' || !window.__TM_CUSTOMER_TYPE){
             say('Nie widzę odczytu typu klienta — odśwież stronę prologistics i spróbuj ponownie.', '#c47f00');
@@ -41325,7 +41440,14 @@
             };
         });
         const tr = box.querySelector('#mk-typ-run');
-        if (tr) tr.onclick = function(){ amzTypZPaczki(jobsLoad()[mkKlucz(job)] || job, d, tr); };
+        if (tr) tr.onclick = function(){
+            // Klucz wedruje RAZEM ze zleceniem — tak samo jak w impCheck. Obiekt wziety
+            // wprost z pamieci „__k" nie ma, a bez niego zapis flagi po sprawdzeniu
+            // typow szukalby zlecenia po referencji.
+            const jj = jobsLoad()[mkKlucz(job)] || job;
+            jj.__k = mkKlucz(job);
+            amzTypZPaczki(jj, d, tr);
+        };
         const ts = box.querySelector('#mk-tol-set');
         if (ts) ts.onclick = function(){
             const v = Number(String(box.querySelector('#mk-tol').value || '').replace(',', '.'));
