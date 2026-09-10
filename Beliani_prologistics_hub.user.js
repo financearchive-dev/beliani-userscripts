@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.37
+// @version      5.38
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -24682,7 +24682,12 @@
     }
     function mkShort(j){
         const shop = (j.data && j.data.shop) || j.shop || '';
-        const cc = String(shop).match(/\b([A-Z]{2})\s*$/);
+        // Kraj bierzemy takze z ETYKIETY celu („ManoMano DE"), gdy nazwy sklepu jeszcze
+        // nie znamy — przy wplacie dodanej recznie i wzietej z arkusza poda ja dopiero
+        // panel. Marka zostaje ta sama, dokladamy sam kod kraju, wiec nazwa nie jest
+        // skladana z niczego nowego.
+        const cc = String(shop).match(/\b([A-Z]{2})\s*$/)
+                || String((j.zArkusza && j.zArkusza.market) || j.label || '').match(/\b([A-Z]{2})\s*$/);
         const s = j.brand || j.short || j.mp || '';
         // Bez marki nie zostawiamy samego kodu kraju („FR"), tylko pelna nazwe sklepu —
         // od v3.84 ta funkcja rysuje tez kolumne Marketplace na liscie zlecen.
@@ -30746,7 +30751,11 @@
     // jest puste, wiec mmKraj nie ma czego czytac. Rynek stoi wtedy w NAZWIE SKLEPU
     // („ManoMano ES”), bo tak nazywa sie cel wybrany przy dodawaniu wplaty.
     function mmKrajZeZlecenia(j){
-        const zrodla = [j && j.shop, j && j.label, j && j.short, j && j.mp];
+        // Kolejnosc od najpewniejszego: nazwa sklepu z panelu, etykieta wybranego celu
+        // („ManoMano DE" — jedyne miejsce z krajem przy celach z listy paneli), etykieta
+        // z arkusza, a na koncu nazwy ogolne, ktore kraju zwykle nie niosa.
+        const zrodla = [j && j.shop, j && j.label,
+                        j && j.zArkusza && j.zArkusza.market, j && j.short, j && j.mp];
         for (let i = 0; i < zrodla.length; i++){
             const m = String(zrodla[i] || '').toUpperCase().match(/\b([A-Z]{2})\s*$/);
             const k = m ? m[1].toLowerCase() : '';
@@ -37581,8 +37590,13 @@
                 return;
             }
             const k = 'MAN_' + w.short + '_' + data + '_' + kwota.toFixed(2);
+            // ETYKIETA CELU idzie do zlecenia razem z reszta. Cele z listy paneli maja
+            // pusty „shop" (nazwe sklepu poda dopiero panel), a kraj stoi WYLACZNIE
+            // w etykiecie — „ManoMano DE". Bez przepisania go tutaj kraj ginal w chwili
+            // dodania wplaty i przelot nie wiedzial, na ktory rynek isc.
             jobs[k] = { ref: '', date: data, amount: r2(kwota), cur: w.cur, mp: w.mp, brand: w.brand,
-                        short: w.short, host: w.host || '', kind: w.kind, shop: w.shop, docs: null,
+                        short: w.short, host: w.host || '', kind: w.kind, shop: w.shop,
+                        label: w.label || '', docs: null,
                         payer: '', txId: '', status: 'new', msg: '', manual: true, manualAt: new Date().toISOString().slice(0, 10) };
             jobsSave(jobs); render();
             if (manAmt) manAmt.value = '';
@@ -37724,7 +37738,9 @@
                 if (jobs[k]) return;
                 jobs[k] = { ref: '', date: r.data, amount: r2(Number(r.kwota)), cur: w.cur || 'EUR',
                             mp: w.mp, brand: w.brand || '', short: w.short || '', host: w.host || '',
-                            kind: w.kind, shop: w.shop, docs: null, payer: '', txId: '',
+                            // Etykieta celu — przy celach z listy paneli to jedyne miejsce,
+                            // w ktorym stoi kraj („ManoMano DE"); „shop" jest wtedy pusty.
+                            kind: w.kind, shop: w.shop, label: w.label || '', docs: null, payer: '', txId: '',
                             // Kilka paneli do sprawdzenia po kolei (tylko przy „NN").
                             hosty: (w.hosty && w.hosty.length > 1) ? w.hosty.slice() : null,
                             status: 'new', msg: '', manual: true,
