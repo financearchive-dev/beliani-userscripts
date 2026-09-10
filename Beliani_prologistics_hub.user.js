@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.34
+// @version      5.37
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -13,6 +13,8 @@
 // @match        https://clientes.eupago.pt/*
 // @match        https://seller.octopia.com/*
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
+// @match        https://my.clearhaus.com/*
+// @match        https://manage.quickpay.net/*
 // @connect      sellerhub.bricobravo.com
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -49,6 +51,9 @@
 // @connect      googleapis.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @connect      merchant.clearhaus.com
+// @connect      manage.quickpay.net
+// @connect      api.quickpay.net
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @resource     xlsxsrc https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -95,6 +100,10 @@
     // Panel eupago — wchodzimy tam WYLACZNIE po to, zeby przeczytac token sesji
     // z sessionStorage; ten jest per domena, wiec z prologistics go nie widac.
     const onEupago  = () => /(^|\.)eupago\.pt$/i.test(H);
+    // Clearhaus rozlicza MobilePay, QuickPay tlumaczy numer zamowienia na numer
+    // platnosci. Oba panele daja HUB-owi tylko sesje — niczego tam nie klikamy.
+    const onClearhaus = () => /(^|\.)clearhaus\.com$/i.test(H);
+    const onQuickpay  = () => /(^|\.)quickpay\.net$/i.test(H);
 
     const HUB = 'beliani_hub_';
     // Moduly, ktore maja byc DOMYSLNIE WYLACZONE. Dopisanie tu id znaczy: nie uruchamiaj
@@ -4144,10 +4153,6 @@
             return {
                 orderNumber: item.orderNumber, amount: item.amount, accountNum, bookingDate: rowDate,
                 source: item.source || '', isGoodwill: !!item.isGoodwill, auftragNumber: item.auftragNumber || '',
-                // Rodzaj pozycji („Goodwill", „SAFE-T Reimbursement", „REVERSAL_REIMBURSEMENT")
-                // musi dojechac az do ksiegowania: decyduje nie tylko o tym, czy pozycja
-                // scala sie ze zwrotem, ale i o tym, czy wolno rozbic ja na artykuly.
-                kind: item.kind || '',
                 dupTotal: dupCount.get(k), dupIndex: idx,
                 loading: true, error: null, selected: false, booked: false, skipped: false
             };
@@ -6223,20 +6228,7 @@
                     throw new Error('Strona ticketu nie wyrenderowała się poprawnie (brak Auftrag Details / broken items / textarea / przycisku Update). Sprawdź ticket ręcznie.');
                 }
 
-                // CLAIM IDZIE NA JEDNĄ POZYCJĘ, nie rozbija się na artykuły.
-                // Goodwill, SAFE-T i REVERSAL_REIMBURSEMENT to jedno zdarzenie na CAŁYM
-                // zamówieniu — decyzja Amazona, a nie zwrot za konkretny produkt. Przy
-                // zaznaczonych pozycjach z credit note prologistics dzieli wpisaną kwotę
-                // po artykułach i robi osobny refund na każdy: SAFE-T 101.72 na tickecie
-                // z dwoma pozycjami wychodził jako 50.86 + 50.86. Suma się zgadza, ale
-                // czyta się to jak zwrot za produkty, którego nie było.
-                // Mechanizm jest ten sam, którym księguje się nieopłacone pobranie (1088)
-                // i z tego samego powodu — patrz komentarz przy fillTicket.
-                // Zwykły zwrot zostaje BEZ zmian: tam rozbicie na artykuły jest właściwe.
-                const jestClaim = !!String(row.kind || '').trim();
-                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx,
-                                                    { total: row.dupTotal || 1, index: row.dupIndex || 1 },
-                                                    jestClaim ? { pierwszaPozycja: true } : null);
+                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
 
                 // v3.25: jeśli fillTicket zwrócił sukces (nie noSolution), to znaczy że
                 // Update został kliknięty. W następnej iteracji pre-check potencjalnie
@@ -30750,6 +30742,65 @@
             return j[k].kind === 'mano' && mkTodo(j[k]);
         }).length;
     }
+    // Zlecenie dodane recznie albo wziete z arkusza NIE MA referencji z przelewu — pole
+    // jest puste, wiec mmKraj nie ma czego czytac. Rynek stoi wtedy w NAZWIE SKLEPU
+    // („ManoMano ES”), bo tak nazywa sie cel wybrany przy dodawaniu wplaty.
+    function mmKrajZeZlecenia(j){
+        const zrodla = [j && j.shop, j && j.label, j && j.short, j && j.mp];
+        for (let i = 0; i < zrodla.length; i++){
+            const m = String(zrodla[i] || '').toUpperCase().match(/\b([A-Z]{2})\s*$/);
+            const k = m ? m[1].toLowerCase() : '';
+            if (k && MK_MM_KONTRAKT[k]) return k;
+        }
+        return '';
+    }
+    // Okno dat przy szukaniu bez referencji. Te same liczby, co przy cyklach Mirakla
+    // (mkMatchCycle): wyplata powstaje PRZED przelewem, wiec okno jest niesymetryczne.
+    const MM_WSTECZ = 10, MM_WPRZOD = 3;
+    function mmDataZRef(ref){
+        const m = String(ref || '').match(/^MANOMANO-[A-Z]{2}-(\d{4})(\d{2})(\d{2})-/i);
+        return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
+    }
+    // Bez referencji rozstrzyga KWOTA — to samo swiadectwo, ktore przy zwyklej sciezce
+    // jest czwartym potwierdzeniem (suma z rozliczenia = kwota z wyciagu). Prefiksowego
+    // dopasowania tu NIE MA i byc nie moze: pusty napis pasuje do kazdej wyplaty, wiec
+    // przy jednej wyplacie w panelu wzieloby ja bez zadnego dowodu. Kandydatow zawezamy
+    // data z referencji — stoi w niej wprost — zeby nie sciagac szescdziesieciu plikow.
+    async function mmPoKwocie(j, kontrakt, lista){
+        if (j.amount == null || !isFinite(j.amount))
+            throw new Error('to zlecenie nie ma ani referencji, ani kwoty — nie mam po czym poznać wypłaty');
+        const d0 = mkDay(j.date);
+        if (d0 == null)
+            throw new Error('to zlecenie nie ma referencji, a jego daty („' + (j.date || '—')
+                + '”) nie umiem odczytać — nie mam po czym zawęzić wypłat');
+        const blisko = (lista || []).filter(function (d){
+            const x = mkDay(mmDataZRef(d.ref));
+            return x != null && (d0 - x) <= MM_WSTECZ * 86400000 && (x - d0) <= MM_WPRZOD * 86400000;
+        });
+        if (!blisko.length)
+            throw new Error('zlecenie bez referencji — w panelu nie ma wypłaty z okna od ' + MM_WSTECZ
+                + ' dni przed ' + (j.date || '?') + ' do ' + MM_WPRZOD + ' dni po. Panel ma '
+                + (lista || []).length + ' wypłat, najnowsze: '
+                + (lista || []).slice(0, 3).map(function (d){ return d.ref; }).join(', '));
+        const widziane = [], traf = [];
+        for (let i = 0; i < blisko.length; i++){
+            const pl = await mmPlik(kontrakt, blisko[i].uuid);
+            const pp = mkParseMano(pl.text);
+            if (pp.err){ widziane.push(blisko[i].ref + ' — ' + pp.err); continue; }
+            widziane.push(blisko[i].ref + ' = ' + f2(pp.suma));
+            if (eq(pp.suma, j.amount))
+                traf.push({ ref: blisko[i].ref, uuid: blisko[i].uuid, p: pp, nazwa: pl.nazwa });
+        }
+        if (!traf.length)
+            throw new Error('zlecenie bez referencji — szukałem wypłaty na ' + f2(j.amount)
+                + ', a w oknie dat są: ' + widziane.join(' · ')
+                + '. Dopisz referencję albo sprawdź kwotę.');
+        if (traf.length > 1)
+            throw new Error('kwota ' + f2(j.amount) + ' pasuje do ' + traf.length + ' wypłat ('
+                + traf.map(function (t){ return t.ref; }).join(', ')
+                + ') — nie zgaduję, którą wziąć; dopisz referencję');
+        return traf[0];
+    }
     // Jedno przejscie po czekajacych zleceniach ManoMano. Liste dokumentow pobieramy RAZ
     // NA KONTRAKT i dopasowujemy do niej wszystkie zlecenia z tego rynku — inaczej przy
     // czterech wyplatach z jednego rynku poszlyby cztery takie same zapytania.
@@ -30770,32 +30821,54 @@
         for (let i = 0; i < todo.length; i++){
             const j = jobs[todo[i]];
             try {
-                const kraj = mmKraj(j.ref);
+                // Rynek: z referencji, a gdy jej nie ma (wpis reczny albo z arkusza) —
+                // z nazwy sklepu. Dawniej bylo tu samo mmKraj(j.ref), wiec kazde zlecenie
+                // bez referencji konczylo sie komunikatem „nie znam numeru kontraktu dla
+                // rynku ?" — a kontrakty sa w skrypcie od dawna i uzupelniac nie bylo czego.
+                const kraj = mmKraj(j.ref) || mmKrajZeZlecenia(j);
+                if (!kraj) throw new Error('nie wiem, z którego rynku jest ta wpłata: zlecenie nie ma '
+                    + 'referencji „MANOMANO-XX-…”, a nazwa sklepu („' + (j.shop || j.mp || '—')
+                    + '”) nie mówi o kraju. Wybierz cel z krajem, np. „ManoMano ES”.');
                 const kontrakt = MK_MM_KONTRAKT[kraj];
-                if (!kontrakt) throw new Error('nie znam numeru kontraktu dla rynku „' + (kraj || '?')
+                if (!kontrakt) throw new Error('nie znam numeru kontraktu dla rynku „' + kraj
                     + '" — uzupełnij MK_MM_KONTRAKT w skrypcie');
-                say('ManoMano ' + kraj.toUpperCase() + ' — szukam ' + j.ref + '…');
+                const maRef = !!String(j.ref || '').trim();
+                say('ManoMano ' + kraj.toUpperCase() + ' — ' + (maRef ? ('szukam ' + j.ref + '…')
+                    : ('bez referencji, szukam wypłaty na ' + f2(j.amount) + '…')));
                 if (!listy[kontrakt]) listy[kontrakt] = await mmLista(kontrakt);
-                // Referencja z wyciagu jest UCIETA do trzech cyfr numeru kontraktu, wiec
-                // dopasowanie idzie po prefiksie — tak samo jak przy wgrywanym pliku.
-                const kand = listy[kontrakt].filter(function (d){ return d.ref.indexOf(String(j.ref).toUpperCase()) === 0; });
-                if (!kand.length) throw new Error('w panelu nie ma wypłaty zaczynającej się od ' + j.ref
-                    + ' (widzę ' + listy[kontrakt].length + ' wypłat, najnowsze: '
-                    + listy[kontrakt].slice(0, 3).map(function (d){ return d.ref; }).join(', ') + ')');
-                if (kand.length > 1) throw new Error('do ' + j.ref + ' pasuje ' + kand.length
-                    + ' wypłat: ' + kand.map(function (d){ return d.ref; }).join(', ')
-                    + ' — nie zgaduję, którą wziąć');
-                const plik = await mmPlik(kontrakt, kand[0].uuid);
+                let wyb;
+                if (maRef){
+                    // Referencja z wyciagu jest UCIETA do trzech cyfr numeru kontraktu, wiec
+                    // dopasowanie idzie po prefiksie — tak samo jak przy wgrywanym pliku.
+                    const kand = listy[kontrakt].filter(function (d){ return d.ref.indexOf(String(j.ref).toUpperCase()) === 0; });
+                    if (!kand.length) throw new Error('w panelu nie ma wypłaty zaczynającej się od ' + j.ref
+                        + ' (widzę ' + listy[kontrakt].length + ' wypłat, najnowsze: '
+                        + listy[kontrakt].slice(0, 3).map(function (d){ return d.ref; }).join(', ') + ')');
+                    if (kand.length > 1) throw new Error('do ' + j.ref + ' pasuje ' + kand.length
+                        + ' wypłat: ' + kand.map(function (d){ return d.ref; }).join(', ')
+                        + ' — nie zgaduję, którą wziąć');
+                    const plik = await mmPlik(kontrakt, kand[0].uuid);
+                    const p0 = mkParseMano(plik.text);
+                    if (p0.err) throw new Error(p0.err);
+                    wyb = { ref: kand[0].ref, uuid: kand[0].uuid, p: p0, nazwa: plik.nazwa };
+                } else {
+                    wyb = await mmPoKwocie(j, kontrakt, listy[kontrakt]);
+                }
                 // Potwierdzenie drugie: nazwa pliku z naglowka.
-                if (plik.nazwa && plik.nazwa.toUpperCase().indexOf(kand[0].ref) < 0)
-                    throw new Error('pobrany plik nazywa się „' + plik.nazwa + '", a prosiłem o ' + kand[0].ref);
-                const p = mkParseMano(plik.text);
-                if (p.err) throw new Error(p.err);
+                if (wyb.nazwa && wyb.nazwa.toUpperCase().indexOf(wyb.ref) < 0)
+                    throw new Error('pobrany plik nazywa się „' + wyb.nazwa + '", a prosiłem o ' + wyb.ref);
+                const p = wyb.p;
                 // Potwierdzenie trzecie: referencja ZE SRODKA pliku.
-                if (String(j.ref).toUpperCase().length && p.payRef.toUpperCase().indexOf(String(j.ref).toUpperCase()) !== 0)
+                if (maRef && p.payRef.toUpperCase().indexOf(String(j.ref).toUpperCase()) !== 0)
                     throw new Error('w pobranym pliku stoi ' + p.payRef + ', a przelew mówi ' + j.ref);
+                // Bez referencji trzecim potwierdzeniem jest RYNEK: plik ma mowic o tym
+                // samym kraju, co sklep zlecenia. Inaczej zgodna kwota z cudzego rynku
+                // wystarczylaby, zeby zaksiegowac nie te wyplate.
+                if (!maRef && String(p.kraj || '').toLowerCase() !== kraj)
+                    throw new Error('pobrany plik jest z rynku ' + String(p.kraj || '?').toUpperCase()
+                        + ', a zlecenie ze sklepu „' + (j.shop || '—') + '”');
                 // Czwarte potwierdzenie — suma kontrolna do wyciagu — robi manoZastosuj.
-                manoZastosuj(j, p, 'panel ManoMano');
+                manoZastosuj(j, p, maRef ? 'panel ManoMano' : 'panel ManoMano (po kwocie i dacie)');
                 ok++;
             } catch (e){
                 j.status = 'err';
@@ -33744,13 +33817,7 @@
         // w zapytaniu miedzydomenowym. Mowimy to ZANIM ktos kliknie i zobaczy 404.
         if (onProlo){
             const vh = {};
-            // Warunek ten sam, co w vtexPass: numer z przelewu ALBO sama kwota. Dotad
-            // stalo tu samo „j.ref" i zlecenie z arkusza nie dawalo nawet tego baneru —
-            // z arkusza OBI milczalo wszedzie.
-            jobs.forEach(function (j){
-                if (mkTodo(j) && j.kind === 'vtex' && j.host && (j.ref || j.amount != null))
-                    vh[j.host] = (vh[j.host] || 0) + 1;
-            });
+            jobs.forEach(function (j){ if (mkTodo(j) && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
             Object.keys(vh).forEach(function (host){
                 h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
                   +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
@@ -39076,28 +39143,18 @@
             try { await shDopiszSklep(jobs); } catch (e){}
             return ok;
         }
-        // Przejscie dla VTEX. Gdy zlecenie przyszlo z wyciagu, referencja z przelewu rowna
-        // sie nazwie raportu i nie ma tu zadnego zgadywania — albo trafiamy dokladnie,
-        // albo wcale. Okno dat jest szerokie wstecz, bo data w referencji to dzien
-        // rozliczenia, a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
-        //
-        // ZLECENIE BEZ NUMERU (z arkusza albo dopisane recznie) dotad wypadalo juz
-        // w filtrze i przelot konczyl sie na „return 0", zanim wyslal jedno zapytanie.
-        // Z zewnatrz wygladalo to na zerwana sesje z panelem — i tak tez brzmial
-        // komunikat, chociaz z sesja bylo wszystko w porzadku. Teraz takie zlecenie
-        // dopasowujemy PO KWOCIE: netto raportu (to samo, ktore i tak sprawdzamy przy
-        // dopasowaniu po nazwie) musi rownac sie kwocie z wyciagu. Tak samo dopasowuje
-        // sie Galaxus i Wayfair.
-        //
-        // Czy przelot w ogole DOTARL do panelu — bez tego przy kazdym zerze szedl ten
-        // sam komunikat o sesji, takze wtedy, gdy panel odpowiedzial normalnie, tylko
-        // nic nie pasowalo.
-        let vtexDotarl = false;
+        // Przejscie dla VTEX. Referencja z przelewu rowna sie nazwie raportu, wiec nie ma
+        // tu zadnego zgadywania po dacie — albo trafiamy dokladnie, albo wcale.
+        // Okno dat jest szerokie wstecz, bo data w referencji to dzien rozliczenia,
+        // a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
         async function vtexPass(jobs, host){
+            // Wpis dodany recznie albo wziety z arkusza NIE MA referencji z przelewu.
+            // Warunek „jobs[k].ref" wyrzucal go stad po cichu — zlecenie nie dostawalo
+            // nawet komunikatu, wygladalo na czekajace w nieskonczonosc. Wpuszczamy je,
+            // o ile ma kwote: nizej rozstrzyga ona zamiast nazwy raportu.
             const todo = Object.keys(jobs).filter(function (k){
-                const j = jobs[k];
-                return mkTodo(j) && j.kind === 'vtex' && (j.host || '') === host
-                    && (j.ref || j.amount != null);
+                return mkTodo(jobs[k]) && jobs[k].kind === 'vtex' && (jobs[k].host || '') === host
+                    && (jobs[k].ref || jobs[k].amount != null);
             });
             if (!todo.length) return 0;
             let from = '9999-12-31', to = '0000-01-01';
@@ -39108,10 +39165,8 @@
             });
             say(host + ' — pobieram raporty ' + from + ' … ' + to + '…');
             let reps = null, fromCache = false;
-            vtexDotarl = false;
             try {
                 reps = await vtexReports(host, from, to);
-                vtexDotarl = true;
                 if (location.hostname === host) vtexCacheSave(host, reps);   // odkladamy na potem
             } catch (e){
                 // Zapas: zestawienia odlozone przy ostatniej wizycie na stronie OBI.
@@ -39129,33 +39184,11 @@
             }
             void fromCache;
 
-            // Data rozliczenia siedzi w NAZWIE raportu („PODE-RRRRMMDD-N") — to ta sama
-            // data, ktora przy dopasowaniu po nazwie wyznacza okno. Sluzy tylko do tego,
-            // zeby przy kilku kandydatach powiedziec, ktory jest najblizszy wplywu.
-            function vtexDataRap(nazwa){
-                const m = String(nazwa || '').match(/(\d{4})(\d{2})(\d{2})/);
-                return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
-            }
-            // Netto raportu liczymy TYLKO wtedy, gdy jest po co: przy zleceniu bez numeru.
-            // Przy dopasowaniu po nazwie parsujemy jeden raport, a nie sto — jsonData
-            // kazdego z nich to osobny JSON i przeliczanie wszystkich na zapas kosztuje.
-            let nettoRap = null;
-            function vtexNetta(){
-                if (nettoRap) return nettoRap;
-                nettoRap = reps.map(function (r){
-                    let net = null;
-                    try { net = vtexAgg(vtexRows(r)).net; } catch (e){ net = null; }
-                    const nm = String(r.payoutReportFileName || '');
-                    return { rep: r, nazwa: nm, net: net, data: vtexDataRap(nm) };
-                });
-                return nettoRap;
-            }
-
-            let ok = 0, nieJednozn = 0;
+            let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                let rep = null;
-                if (j.ref){
+                let rep;
+                if (String(j.ref || '').trim()){
                     // Porownujemy takze po sklejeniu spacji i bez wielkosci liter — nazwa
                     // raportu bywa zapisana inaczej niz referencja w wyciagu.
                     const want = j.ref.replace(/\s+/g, '').toUpperCase();
@@ -39164,36 +39197,27 @@
                     })[0];
                     if (!rep){ j.msg = 'nie znalazłem raportu o nazwie ' + j.ref; jobsSave(jobs); continue; }
                 } else {
-                    // Bez numeru — po kwocie. Jednoznaczne albo wcale: przy kilku raportach
-                    // o tej samej kwocie NIE wybieramy sami, bo pomylka znaczy tu cudzy cykl
-                    // w ksiegach. Mowimy, ktore to raporty i ktory jest najblizszy daty
-                    // wplywu, zeby czlowiek rozstrzygnal jednym spojrzeniem.
-                    const kand = vtexNetta().filter(function (x){ return x.net != null && eq(x.net, j.amount); });
-                    if (!kand.length){
-                        j.msg = 'w okresie ' + from + ' … ' + to + ' nie ma raportu na ' + f2(j.amount)
-                              + ' ' + (j.cur || '') + ' — zlecenie jest bez numeru z przelewu, więc szukam po kwocie';
+                    // Bez referencji rozstrzyga NETTO z raportu — to samo swiadectwo, ktore
+                    // przy zwyklej sciezce jest kontrola kwoty pare linijek nizej. Raporty
+                    // sa juz pobrane z okna dat wokol wplaty, wiec nic wiecej nie sciagamy.
+                    // Musi pasowac DOKLADNIE JEDEN: przy dwoch nie ma czego rozstrzygnac.
+                    const traf = reps.filter(function (r){
+                        try { return eq(vtexAgg(vtexRows(r)).net, j.amount); } catch (e){ return false; }
+                    });
+                    if (!traf.length){
+                        j.msg = 'zlecenie bez referencji — w raportach z okresu ' + from + ' … ' + to
+                              + ' nie ma netto ' + f2(j.amount) + ' (raportów: ' + reps.length
+                              + '). Dopisz referencję albo sprawdź kwotę.';
                         jobsSave(jobs); continue;
                     }
-                    if (kand.length > 1){
-                        const dz = mkDay(j.date);
-                        const opis = kand.slice().sort(function (a, b){
-                            const da = mkDay(a.data), db = mkDay(b.data);
-                            if (da == null || db == null || dz == null) return 0;
-                            return Math.abs(da - dz) - Math.abs(db - dz);
-                        }).map(function (x){ return x.nazwa + (x.data ? (' z ' + x.data) : ''); });
-                        nieJednozn++;
-                        j.msg = 'kwocie ' + f2(j.amount) + ' odpowiada więcej niż jeden raport ('
-                              + kand.length + ') — nie zgaduję. '
-                              + 'Najbliższy dacie wpływu: ' + opis[0] + '. Pozostałe: ' + opis.slice(1).join(', ')
-                              + '. Wpisz właściwy numer w wyciągu albo załóż zlecenie z numerem.';
+                    if (traf.length > 1){
+                        j.msg = 'zlecenie bez referencji — netto ' + f2(j.amount) + ' pasuje do '
+                              + traf.length + ' raportów: '
+                              + traf.map(function (r){ return String(r.payoutReportFileName || r.id); }).join(', ')
+                              + ' — nie zgaduję, który wziąć; dopisz referencję.';
                         jobsSave(jobs); continue;
                     }
-                    rep = kand[0].rep;
-                    // Numer zapisujemy przy zleceniu — tak samo robi eBay po rozpoznaniu
-                    // wyplaty. Dzieki temu widac, KTORY raport wszedl, a powtorny przelot
-                    // idzie juz pewna droga po nazwie.
-                    j.ref = kand[0].nazwa;
-                    j.refSkad = 'po kwocie';
+                    rep = traf[0];
                 }
                 try {
                     const rows = vtexRows(rep);
@@ -39210,6 +39234,13 @@
                     const bad = [];
                     // Obciazenie zwrotne to nie zwyczajny zwrot — warto je zobaczyc osobno.
                     j.note = a.cbs.length ? ('obciążenia zwrotne: ' + a.cbs.join(', ')) : '';
+                    // Skad wzielo sie to dopasowanie — przy zleceniu bez referencji jedynym
+                    // swiadectwem jest kwota, wiec musi to byc widoczne, a nie domyslne.
+                    if (!String(j.ref || '').trim()){
+                        const skad = 'raport „' + String(rep.payoutReportFileName || rep.id)
+                                   + '" dopasowany po kwocie (zlecenie bez referencji)';
+                        j.note = j.note ? (j.note + '; ' + skad) : skad;
+                    }
                     if (Object.keys(a.unknown).length) bad.push('nierozpoznane pozycje w raporcie');
                     if (!eq(a.net, j.amount)) bad.push('netto z raportu ' + f2(a.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
                     j.status = bad.length ? 'partial' : 'ready';
@@ -39218,20 +39249,14 @@
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
             }
-            // Zdanie musi pasowac do tego, CZEGO szukalismy. Przy zleceniu bez numeru
-            // szukamy po kwocie i „zaden nie ma nazwy z przelewu" bylo wtedy nieprawda.
-            if (!ok){
-                const bylyNr = todo.some(function (k){ return !!jobs[k].ref; });
-                // Niejednoznaczne to NIE to samo co „nic nie pasuje" — przy pierwszym
-                // trzeba wybrac raport, przy drugim szukac gdzie indziej.
-                say(nieJednozn
-                    ? ('OBI: raportów w tym okresie ' + reps.length + ', a przy ' + nieJednozn
-                       + ' zleceniu kwota pasuje do kilku naraz — nie wybieram sam. Szczegóły przy zleceniach.')
-                    : ('OBI: raportów w tym okresie ' + reps.length + ', ale żaden nie pasuje'
-                       + (bylyNr ? ' nazwą z przelewu' : ' kwotą z wyciągu')
-                       + '. Widziane nazwy: ' + names.slice(0, 6).join(', ')
-                       + (names.length > 6 ? ' …' : '') + '. Szczegóły przy zleceniach.'), '#c47f00');
-            }
+            // Podsumowanie ma mowic o TYM, czego naprawde szukalismy. Przy zleceniach bez
+            // referencji zdanie „żaden nie ma nazwy z przelewu" bylo nie na temat —
+            // nazwy nikt tam nie porownywal, bo nie bylo z czym.
+            const zRef = todo.some(function (k){ return String((jobs[k] || {}).ref || '').trim(); });
+            if (!ok) say('OBI: raportów w tym okresie ' + reps.length + ', ale '
+                + (zRef ? 'żaden nie ma nazwy z przelewu' : 'żaden nie zgadza się kwotą')
+                + '. Widziane nazwy: '
+                + names.slice(0, 6).join(', ') + (names.length > 6 ? ' …' : ''), '#c47f00');
             return ok;
         }
 
@@ -39381,15 +39406,9 @@
                 return host ? (h === host) : true;
             }).length;
         }
-        // Licznik BEZ wymogu numeru z przelewu. Stalo tu „&& jobs[k].ref", a licznik
-        // bramkuje wywolanie przelotu — wiec zlecenie z arkusza albo dopisane recznie
-        // nigdy nie doczekalo sie galxPass. Sam przelot numeru nie potrzebuje: dopasowuje
-        // po kwocie wyplaty (referencji, czyli UUID, w pliku i tak nie ma). Galaxus stoi
-        // zreszta na liscie recznego dodawania wlasnie dlatego, ze dopasowanie po kwocie
-        // jest przy nim normalna droga — warunek przeczyl temu, po co ta lista powstala.
         function galxLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'galx' && mkTodo(jobs[k]);
+                return jobs[k].kind === 'galx' && mkTodo(jobs[k]) && jobs[k].ref;
             }).length;
         }
         // Zlecenia eBaya, ktorym brakuje ROZPOZNANIA wyplaty. Inaczej niz przy Galaxusie
@@ -39652,11 +39671,9 @@
                         + ' i czy wypłata jest już widoczna w panelu.', false, true);
             return ile;
         }
-        // Bez wymogu numeru — z tego samego powodu co przy galxLeft. wayfPass i tak szuka
-        // po kwocie, nie po numerze (tak stoi w komentarzu przy liscie recznego dodawania).
         function wayfLeft(jobs){
             return Object.keys(jobs).filter(function (k){
-                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]);
+                return jobs[k].kind === 'wayf' && mkTodo(jobs[k]) && jobs[k].ref;
             }).length;
         }
         // Ktore platformy wystepuja wsrod czekajacych zlecen — osobno Mirakl (sklepy
@@ -39886,14 +39903,8 @@
                 try {
                     const got = await vtexPass(jobsLoad(), vhosts[vi]);
                     ok += got;
-                    // O sesji mowimy TYLKO wtedy, gdy panel naprawde nie odpowiedzial.
-                    // Dotad to zdanie szlo przy kazdym zerze — takze wtedy, gdy panel
-                    // odpowiedzial normalnie, a zlecenie po prostu nie pasowalo do zadnego
-                    // raportu. Czlowiek szedl wtedy klikac w panelu i dostawal to samo.
                     if (!got && mkHostsOf(jobsLoad(), 'vtex').indexOf(vhosts[vi]) >= 0)
-                        problem.push(vtexDotarl
-                            ? (mkPanelUrl(vhosts[vi]) + ': panel odpowiedział, ale nie dopasowałem rozliczenia — powód stoi przy zleceniu')
-                            : ('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa'));
+                        problem.push('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
                 } catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
@@ -45232,33 +45243,50 @@
     }
 
     // ---------- lista Sprawdzania ----------
-    // Kazda pozycja to osobne uzgodnienie. PayPal jest pierwszy; kolejne dokladamy
-    // tutaj, bez ruszania reszty modulu.
+    // Rodziny uzgodnien. Pozycji zrobilo sie tyle, ze jedna plaska lista kazala
+    // szukac wzrokiem, co jest operatorem platnosci, a co platforma sprzedazowa.
+    // Ekran pierwszy pokazuje wiec dwie rodziny, ekran drugi — ich zawartosc.
+    const SAL_GRUPY = [
+        { id: 'fp', nazwa: 'Formy płatności',
+          opis: 'operatorzy płatności i wyciąg z rachunku bankowego' },
+        { id: 'mp', nazwa: 'Marketplaces',
+          opis: 'rozliczenia platform sprzedażowych' }
+    ];
+    // Kazda pozycja to osobne uzgodnienie. Kolejne dokladamy tutaj, bez ruszania
+    // reszty modulu — trzeba tylko wskazac rodzine w polu `grupa`. Kolejnosci nie
+    // ustawiamy recznie: oba ekrany sortuja alfabetycznie po nazwie operatora.
     const SAL_LISTA = [
-        { id: 'paypal', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
+        { id: 'paypal', grupa: 'fp', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
         // Saferpay parujemy po Transaction ID — obie strony go niosa. Przy okazji
         // sprawdzamy terminal: cztery sa reczne i tam zdarza sie zly wybor.
-        { id: 'safer', nazwa: 'Saferpay ↔ Export payments',
+        { id: 'safer', grupa: 'fp', nazwa: 'Saferpay ↔ Export payments',
           opis: 'eksport z Saferpaya kontra zestawienie z prologistics · parowanie po Transaction ID · sprawdza też wybór terminala', gotowe: true },
-        { id: 'bank', nazwa: 'Wyciąg bankowy ↔ Export payments',
+        // Wyciag bankowy to nie operator, ale forma zaplaty jak kazda inna: przelew.
+        // Dlatego siedzi w tej samej rodzinie, a nie w osobnej.
+        { id: 'bank', grupa: 'fp', nazwa: 'Wyciąg bankowy ↔ Export payments',
           opis: 'wyciąg z banku kontra zestawienie z prologistics · parowanie po numerze auftraga', gotowe: true },
         // v3.92: Amazon jest inny niz PayPal i bank — po jednej stronie nie stoi operator
         // platnosci, tylko rozliczenie marketplace'u, i sprawdzamy nie tylko CZY cos jest
         // w ksiedze, ale takze NA JAKIM koncie. Reszta mechaniki jest ta sama: zestawienie
         // dociagamy z prologistics tym samym mostem co PayPal.
-        { id: 'amazon', nazwa: 'Amazon ↔ Export payments',
+        { id: 'amazon', grupa: 'mp', nazwa: 'Amazon ↔ Export payments',
           opis: 'rozliczenie Amazona kontra zestawienie z prologistics · sprawdza też konta sprzedaży', gotowe: true },
-        { id: 'mano', nazwa: 'ManoMano ↔ Export payments',
+        { id: 'mano', grupa: 'mp', nazwa: 'ManoMano ↔ Export payments',
           opis: 'rozliczenie ManoMano kontra zestawienie z prologistics · łączy po numerze zamówienia z kolumny „Fulfillment number"', gotowe: true },
         // Allegro rozni sie od poprzednich tym, ze „rozliczenie" to nie jeden plik, tylko
         // TRZY: operacje, raporty zamowien i billing — te same, ktore idą do importu.
-        { id: 'alle', nazwa: 'Allegro ↔ Export payments',
+        { id: 'alle', grupa: 'mp', nazwa: 'Allegro ↔ Export payments',
           opis: 'operacje Allegro kontra zestawienie z prologistics · te same pliki co do importu · sprawdza też konta sprzedaży B2B/B2C', gotowe: true },
         // EuPago jest pierwszym, ktory ZESTAWIENIE bierze sam z panelu operatora,
         // a nie z wrzuconego pliku: plik MOVS i tak powstaje w przegladarce
         // z danych, ktore panel oddaje w JSON-ie.
-        { id: 'eupago', nazwa: 'EuPago ↔ Export payments',
-          opis: 'zestawienia wypłat prosto z panelu eupago kontra zestawienie z prologistics · saldo per zamówienie, nie wiersz po wierszu', gotowe: true }
+        { id: 'eupago', grupa: 'fp', nazwa: 'EuPago ↔ Export payments',
+          opis: 'zestawienia wypłat prosto z panelu eupago kontra zestawienie z prologistics · saldo per zamówienie, nie wiersz po wierszu', gotowe: true },
+        // MobilePay jest pierwszym, ktory potrzebuje TRZECIEGO systemu: Clearhaus niesie
+        // numer zamowienia z QuickPaya, prologistics — numer platnosci z QuickPaya, i nic
+        // ich wprost nie laczy. Panel QuickPaya tlumaczy jedno na drugie.
+        { id: 'mobilepay', grupa: 'fp', nazwa: 'MobilePay ↔ Export payments',
+          opis: 'rozliczenia Clearhausa kontra zestawienie z prologistics · numery tłumaczy panel QuickPaya · konto 1431 DKK', gotowe: true }
     ];
     // Konta PayPal, ktore uzgadniamy. Numery sa stale, ale ETYKIETY czytamy z zywego
     // export.php — dzieki temu zmiana nazwy konta w prologistics widac tu od razu,
@@ -45342,7 +45370,8 @@
     // pokazuje wszystkie — wczesniej wczytanie pliku i pobieranie z prologistics
     // kasowaly sobie komunikaty i wygladalo, jakby jedno wylaczalo drugie.
     const SAL_KANAL = {};
-    const SAL_ETY = { pl: 'prologistics', eu: 'eupago', plik: 'plik' };
+    const SAL_ETY = { pl: 'prologistics', eu: 'eupago', plik: 'plik',
+                      ch: 'Clearhaus', qp: 'QuickPay' };
     let SAL_STAT_EL = null;
     // Kazdy ekran rysuje swoj wiersz od nowa, wiec zakonczone komunikaty poprzedniego
     // nie sa juz jego. Trwajaca robote zostawiamy — nadal chodzi i trzeba o niej wiedziec.
@@ -45404,14 +45433,66 @@
         salStanRysuj();
     }
 
+    // Nazwa samego operatora — bez ogona „↔ Export payments". Po niej sortujemy
+    // i ja wypisujemy w podpisie rodziny. Pole `krotka` jest opcjonalne: gdy go nie
+    // ma, wystarczy nazwa uciata na strzalce.
+    function salKrotka(x){
+        return String((x && (x.krotka || x.nazwa)) || '').split('↔')[0].trim();
+    }
+    // Pozycje jednej rodziny, alfabetycznie. `filter` oddaje nowa tablice, wiec
+    // `sort` nie przestawia SAL_LISTA — kolejnosc zrodla zostaje nietknieta.
+    function salWgGrupy(g){
+        return SAL_LISTA.filter(function (x){ return x.grupa === g; })
+            .sort(function (a, b){ return salKrotka(a).localeCompare(salKrotka(b), 'pl'); });
+    }
+    // Ostatnio otwarta rodzina. Tu wraca „← lista" z ekranu uzgodnienia — inaczej
+    // powrot ladowalby o poziom za wysoko i trzeba by klikac rodzine drugi raz.
+    let SAL_GRUPA = null;
+
+    function salWstecz(){
+        if (SAL_GRUPA) salRysujGrupe(SAL_GRUPA); else salRysujListe();
+    }
+
+    // ---------- ekran 1: rodziny ----------
     function salRysujListe(){
         const p = salPanel();
+        SAL_GRUPA = null;
         p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
             + '<div style="font-weight:700;color:#750000">Salda <span style="font-weight:400;font-size:11px;opacity:.6">'
             + salEsc(SAL_VER) + ' · sprawdzanie</span></div>'
             + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888;line-height:1">×</button></div>'
             + '<div style="color:#555;margin-bottom:8px">Wybierz, co sprawdzamy.</div>'
-            + SAL_LISTA.map(function (x){
+            + SAL_GRUPY.map(function (g){
+                const poz = salWgGrupy(g.id);
+                return '<div class="sal-grp" data-id="' + salEsc(g.id) + '" style="border:1px solid #DBD9D7;'
+                    + 'border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#fff">'
+                    + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
+                    + '<div style="font-weight:700;color:#333">' + salEsc(g.nazwa) + '</div>'
+                    + '<div style="font-size:11px;color:#888;white-space:nowrap">' + poz.length + ' poz. →</div></div>'
+                    + '<div style="font-size:11px;color:#888">' + salEsc(g.opis) + '</div>'
+                    + '<div style="font-size:11px;color:#aaa;margin-top:3px">'
+                    + salEsc(poz.map(salKrotka).join(' · ')) + '</div></div>';
+            }).join('')
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-top:6px"></div>';
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelectorAll('.sal-grp').forEach(function (d){
+            d.onclick = function (){ salRysujGrupe(d.getAttribute('data-id')); };
+        });
+    }
+
+    // ---------- ekran 2: pozycje jednej rodziny ----------
+    function salRysujGrupe(gid){
+        const p = salPanel();
+        const g = SAL_GRUPY.filter(function (y){ return y.id === gid; })[0];
+        if (!g){ salRysujListe(); return; }
+        SAL_GRUPA = g.id;
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · ' + salEsc(g.nazwa)
+            + ' <span style="font-weight:400;font-size:11px;opacity:.6">' + salEsc(SAL_VER) + '</span></div>'
+            + '<div><button id="sal-grpback" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← rodzaje</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888;line-height:1">×</button></div></div>'
+            + '<div style="color:#555;margin-bottom:8px">' + salEsc(g.opis) + '.</div>'
+            + salWgGrupy(g.id).map(function (x){
                 return '<div class="sal-poz" data-id="' + salEsc(x.id) + '" style="border:1px solid '
                     + (x.gotowe ? '#DBD9D7' : '#eee') + ';border-radius:8px;padding:8px 10px;margin-bottom:6px;'
                     + 'cursor:' + (x.gotowe ? 'pointer' : 'default') + ';background:' + (x.gotowe ? '#fff' : '#fafafa') + '">'
@@ -45420,6 +45501,7 @@
             }).join('')
             + '<div id="sal-status" style="font-size:11px;color:#666;margin-top:6px"></div>';
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-grpback').onclick = function (){ salRysujListe(); };
         p.querySelectorAll('.sal-poz').forEach(function (d){
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
             if (x && x.gotowe) d.onclick = function (){
@@ -45428,9 +45510,2587 @@
                     : (x.id === 'mano' ? salRysujMM
                     : (x.id === 'alle' ? salRysujAlle
                     : (x.id === 'eupago' ? salRysujEu
-                    : (x.id === 'safer' ? salRysujSP : salRysujPP))))))();
+                    : (x.id === 'safer' ? salRysujSP
+                    : (x.id === 'mobilepay' ? salRysujMP : salRysujPP)))))))();
             };
         });
+    }
+
+
+    // ================= MOBILEPAY (Clearhaus) ↔ Export payments =================
+    // Trzy systemy zamiast dwoch. Clearhaus w kolumnie `reference` niesie numer
+    // ZAMOWIENIA z QuickPaya (14 cyfr), prologistics w kolumnie Comment — numer
+    // PLATNOSCI z QuickPaya (9 cyfr). To dwa rozne numery tej samej transakcji.
+    // Pelny opis mechaniki, pulapek liczbowych i drog parowania — w komentarzu
+    // nad mpRef ponizej.
+    var MP_KONTO = '1431';          // MobilePay DKK — konto rozliczeniowe w prologistics
+    var MP_TOL_S = 600;             // okno drogi „zegar": +-10 min od znacznika z reference
+    var MP_GR = 0.005;              // tolerancja groszowa przy porownywaniu kwot
+
+    function r2(n){ return Math.round((Number(n) || 0) * 100) / 100; }
+    function f2(n){ return (Number(n) || 0).toFixed(2); }
+    function txt(v){ return v == null ? '' : String(v).trim(); }
+
+    // Kwota z komorki. Pliki obu stron trzymaja liczby raz jako liczbe, raz jako napis
+    // z przecinkiem — a przecinek bywa separatorem tysiecy, nie dziesietnym.
+    function mpKwota(v){
+        if (v == null || v === '') return null;
+        if (typeof v === 'number') return isFinite(v) ? r2(v) : null;
+        var s = String(v).replace(/[\s ]/g, '');
+        if (/,\d{1,2}$/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
+        else s = s.replace(/,/g, '');
+        var n = parseFloat(s);
+        return isFinite(n) ? r2(n) : null;
+    }
+
+    // Chwila z komorki. Clearhaus oddaje „2026-08-03 22:21:10" (UTC), prologistics
+    // to samo, ale w czasie lokalnym. Roznicy NIE zasypujemy tutaj — robi to mpUzgodnij,
+    // bo tylko tam wiadomo, ktora strona jest ktora.
+    function mpChwila(v){
+        if (v == null || v === '') return null;
+        if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+        var s = String(v).trim();
+        var m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(s);
+        if (m) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+        m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+        if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+        var d = new Date(s);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    function mpDzien(d){
+        if (!d) return '';
+        return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2)
+             + '-' + ('0' + d.getDate()).slice(-2);
+    }
+
+    /* ---------- kolumna `reference` z Clearhausa ----------
+       Trzy postacie, i tylko pierwsza z nich wymaga QuickPaya:
+         '20260803094637' -> zamowienie (i zarazem znacznik czasu)
+         '15336367-1', '15317254', '15209706-' -> numer auftraga, opcjonalnie z sufiksem
+       Sufiks '-1' oznacza kolejna wplate do tego samego zlecenia, a koncowy myslnik
+       w '15209706-' to urwana taka sama koncowka. Parser na sztywne 14 cyfr wywalilby
+       sie na obu.                                                                        */
+    function mpRef(v){
+        var s = txt(v);
+        if (!s) return { rodzaj: 'brak', surowy: '' };
+        if (/^\d{14}$/.test(s)){
+            var rok = +s.slice(0, 4), mies = +s.slice(4, 6), dz = +s.slice(6, 8);
+            var g = +s.slice(8, 10), mi = +s.slice(10, 12), se = +s.slice(12, 14);
+            if (rok >= 2000 && rok <= 2100 && mies >= 1 && mies <= 12 && dz >= 1 && dz <= 31
+                && g <= 23 && mi <= 59 && se <= 59)
+                return { rodzaj: 'zamowienie', surowy: s, order: s,
+                         czas: new Date(rok, mies - 1, dz, g, mi, se) };
+            return { rodzaj: 'zamowienie', surowy: s, order: s, czas: null };
+        }
+        var m = /^(\d{6,9})\s*-?\s*(\d*)$/.exec(s);
+        if (m) return { rodzaj: 'auftrag', surowy: s, auf: m[1], podnr: m[2] || '' };
+        return { rodzaj: 'nieznany', surowy: s };
+    }
+
+    /* ---------- rozliczenie Clearhausa: arkusz „Transactions" ---------- */
+    function mpZClearhaus(aoa, nazwa){
+        if (!aoa || !aoa.length) return { err: (nazwa || 'plik') + ': pusty arkusz' };
+        var h = (aoa[0] || []).map(function (x){ return txt(x).toLowerCase(); });
+        var ix = {}; h.forEach(function (n, i){ if (n && ix[n] == null) ix[n] = i; });
+        var wymagane = ['type', 'reference', 'amount', 'processed_at',
+                        'settlement_amount_gross', 'settlement_fees'];
+        var brak = wymagane.filter(function (k){ return ix[k] == null; });
+        if (brak.length)
+            return { err: (nazwa || 'plik')
+                + ': to nie wygląda na rozliczenie Clearhausa — brak kolumn: ' + brak.join(', ') };
+        var poz = [];
+        for (var i = 1; i < aoa.length; i++){
+            var r = aoa[i] || [];
+            var typ = txt(r[ix['type']]).toLowerCase();
+            if (!typ) continue;
+            poz.push({
+                typ: typ,
+                ref: mpRef(r[ix['reference']]),
+                kwota: mpKwota(r[ix['amount']]),
+                brutto: mpKwota(r[ix['settlement_amount_gross']]),
+                oplata: mpKwota(r[ix['settlement_fees']]),
+                czas: mpChwila(r[ix['processed_at']]),
+                id: ix['id'] != null ? txt(r[ix['id']]) : '',
+                wyplata: ix['settlement_payout_reference_number'] != null
+                    ? txt(r[ix['settlement_payout_reference_number']]) : '',
+                waluta: ix['currency'] != null ? txt(r[ix['currency']]) : '',
+                plik: nazwa || ''
+            });
+        }
+        return { poz: poz };
+    }
+
+    // Podsumowanie rozliczenia — stad bierzemy kwote przelewu i oplate za przelew,
+    // ktorej w transakcjach NIE MA.
+    function mpZPodsumowania(aoa, nazwa){
+        var o = { plik: nazwa || '' };
+        for (var i = 0; i < (aoa || []).length; i++){
+            var r = aoa[i] || [];
+            for (var j = 0; j < r.length; j++){
+                var k = txt(r[j]).toLowerCase();
+                if (!k) continue;
+                var v = null;
+                for (var q = j + 1; q < r.length; q++) if (txt(r[q]) !== '') { v = r[q]; break; }
+                if (k === 'sales' && o.sprzedaz == null) o.sprzedaz = mpKwota(v);
+                else if (k === 'refunds' && o.zwroty == null) o.zwroty = mpKwota(v);
+                else if (k === 'net' && o.netto == null) o.netto = mpKwota(v);
+                else if (k === 'wire transfer') o.przelewOplata = mpKwota(v);
+                else if (k === 'payout on'){ o.dataWyplaty = mpChwila(v); o.kwotaWyplaty = mpKwota(v); }
+                else if (k === 'reference number') o.numerWyplaty = txt(v);
+                else if (k === 'currency') o.waluta = txt(v);
+                else if (k === 'account') o.konto = txt(v);
+                else if (k === 'start date') o.od = mpChwila(v);
+                else if (k === 'end date') o.doo = mpChwila(v);
+            }
+        }
+        // „Payout on" ma date w jednej komorce i kwote w nastepnej — kwote bierzemy
+        // osobnym przejsciem, bo powyzsza petla zatrzymuje sie na pierwszej niepustej.
+        for (var a = 0; a < (aoa || []).length; a++){
+            var w = aoa[a] || [];
+            for (var b = 0; b < w.length; b++){
+                if (txt(w[b]).toLowerCase() === 'payout on'){
+                    var poDacie = [];
+                    for (var c = b + 1; c < w.length; c++) if (txt(w[c]) !== '') poDacie.push(w[c]);
+                    if (poDacie.length >= 2) o.kwotaWyplaty = mpKwota(poDacie[1]);
+                }
+            }
+        }
+        return o;
+    }
+
+    /* ---------- rozliczenie Clearhausa z API (HAL+JSON) ----------
+       Panel oddaje HAL, a tablice siedza pod prefiksem z „curie": nie `settlements`,
+       tylko `_embedded['ch:settlements']`. Bez tego lista jest niby-pusta przy HTTP 200.  */
+    function mpHalLista(j, nazwa){
+        if (!j) return [];
+        var e = j._embedded || j;
+        if (Array.isArray(e)) return e;
+        var k = ['ch:' + nazwa, nazwa, 'items'];
+        for (var i = 0; i < k.length; i++) if (Array.isArray(e[k[i]])) return e[k[i]];
+        // Gdy nazwa nie trafiona — bierzemy pierwsza tablice, jaka tam jest.
+        var kl = Object.keys(e);
+        for (var q = 0; q < kl.length; q++) if (Array.isArray(e[kl[q]])) return e[kl[q]];
+        return [];
+    }
+    function mpHalLink(o, rel){
+        var l = o && o._links;
+        if (!l) return '';
+        var w = l['ch:' + rel] || l[rel];
+        return (w && w.href) || '';
+    }
+    /* Link w HAL-u bywa SZABLONEM adresu (RFC 6570), a nie gotowym adresem:
+           https://merchant.clearhaus.com/settlements/<uuid>/transactions{?query,page,per_page}
+       Klamry wyliczaja pola, ktore serwer w tym miejscu przyjmuje. Doklejenie do takiego
+       linku wlasnego „&per_page=50" wysyla klamry w adresie doslownie i konczy sie 404:
+           …/transactions{?query,page,per_page}&per_page=50
+           {"title":"Not Found","status":404,…}
+       Stad ta funkcja: usuwa klamry i dokleja TYLKO te pola, ktore szablon wymienia.
+       Pole spoza listy jest pomijane swiadomie — skoro serwer go w tym miejscu nie
+       oglasza, to zgadywanie, ze i tak zadziala, juz raz nas kosztowalo wersje.       */
+    function mpHalWzor(href, par){
+        var h = String(href || '');
+        // Pusty link zostaje pusty: to on konczy petle stronicowania. Doklejenie do niego
+        // parametrow zrobiloby z niczego adres wzgledny i petla nigdy by nie stanela.
+        if (!h) return '';
+        var m = /\{[?&]([^}]*)\}/.exec(h);
+        var pola = null;
+        if (m){
+            pola = m[1].split(',').map(function (x){ return x.trim(); });
+            h = h.slice(0, m.index) + h.slice(m.index + m[0].length);
+        }
+        var cz = [];
+        Object.keys(par || {}).forEach(function (k){
+            var v = par[k];
+            if (v == null || v === '') return;
+            if (pola && pola.indexOf(k) < 0) return;
+            cz.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+        });
+        if (!cz.length) return h;
+        return h + (h.indexOf('?') >= 0 ? '&' : '?') + cz.join('&');
+    }
+
+    // Jedno rozliczenie z API sprowadzone do tego samego ksztaltu, co arkusz „Settlement".
+    function mpRozliczenieZJson(s){
+        var p = s.period || {}, sm = s.summary || {}, fe = s.fees || {};
+        return {
+            id: s.id, zamkniete: !!s.settled, waluta: s.currency || '',
+            od: mpChwila(p.start_date || p.start), doo: mpChwila(p.end_date || p.end),
+            sprzedaz: sm.sales != null ? mpKwota(sm.sales) : null,
+            zwroty: sm.refunds != null ? mpKwota(sm.refunds) : null,
+            netto: sm.net != null ? mpKwota(sm.net) : null,
+            przelewOplata: fe.wire_transfer != null ? mpKwota(fe.wire_transfer) : null,
+            oplatySuma: sm.fees != null ? mpKwota(sm.fees) : null,
+            chargebacki: sm.chargebacks != null ? mpKwota(sm.chargebacks) : null,
+            hrefTransakcje: mpHalLink(s, 'transactions'),
+            href: mpHalLink(s, 'self'),
+            surowe: s
+        };
+    }
+    function mpRozliczeniaZJson(j){
+        return mpHalLista(j, 'settlements').map(mpRozliczenieZJson);
+    }
+
+    /* Transakcje z API. Nazwy pol sa te same, co naglowki w eksporcie xlsx (Clearhaus
+       wypisuje je wprost), ale czesc bywa zagniezdzona — dlatego kazde pole szukamy
+       takze o poziom nizej.                                                            */
+    function mpPole(o, sciezki){
+        for (var i = 0; i < sciezki.length; i++){
+            var cz = sciezki[i].split('.'), v = o, ok = true;
+            for (var q = 0; q < cz.length; q++){
+                if (v == null || typeof v !== 'object' || !(cz[q] in v)) { ok = false; break; }
+                v = v[cz[q]];
+            }
+            if (ok && v != null) return v;
+        }
+        return null;
+    }
+    function mpTransakcjeZJson(j, nazwa){
+        return mpHalLista(j, 'transactions').map(function (t){
+            return {
+                typ: String(mpPole(t, ['type']) || '').toLowerCase(),
+                ref: mpRef(mpPole(t, ['reference'])),
+                kwota: mpKwota(mpPole(t, ['amount'])),
+                brutto: mpKwota(mpPole(t, ['settlement_amount_gross', 'settlement.amount_gross',
+                                          'settlement.gross'])),
+                oplata: mpKwota(mpPole(t, ['settlement_fees', 'settlement.fees', 'fees'])),
+                czas: mpChwila(mpPole(t, ['processed_at', 'created_at'])),
+                id: String(mpPole(t, ['id']) || ''),
+                wyplata: String(mpPole(t, ['settlement_payout_reference_number',
+                                           'settlement.payout_reference_number']) || ''),
+                waluta: String(mpPole(t, ['currency', 'settlement_currency']) || ''),
+                plik: nazwa || 'API'
+            };
+        }).filter(function (x){ return x.typ; });
+    }
+
+    /* Skala kwot. API bywa w jednostkach glownych, bywa w setnych — i tego NIE wolno
+       zgadywac przy pieniadzach. Sprawdzamy na sobie: suma z transakcji ma sie zgadzac
+       z podsumowaniem albo wprost, albo po podzieleniu przez 100. Gdy ani jedno, ani
+       drugie — mowimy, ze nie wiemy, zamiast wybierac.                                 */
+    function mpSkala(trans, rozl){
+        if (!rozl || rozl.sprzedaz == null) return { mnoznik: 1, pewne: false, powod: 'brak podsumowania' };
+        var suma = r2(trans.filter(function (x){ return x.typ === 'capture'; })
+            .reduce(function (s, x){ return s + (x.brutto || 0); }, 0));
+        if (!suma) return { mnoznik: 1, pewne: false, powod: 'brak transakcji sprzedaży' };
+        if (Math.abs(suma - rozl.sprzedaz) < 0.5) return { mnoznik: 1, pewne: true };
+        if (Math.abs(suma - rozl.sprzedaz * 100) < 50) return { mnoznik: 0.01, pewne: true };
+        if (Math.abs(suma * 100 - rozl.sprzedaz) < 50) return { mnoznik: 100, pewne: true };
+        return { mnoznik: 1, pewne: false,
+                 powod: 'suma z transakcji ' + f2(suma) + ' nie pasuje do podsumowania '
+                      + f2(rozl.sprzedaz) + ' ani wprost, ani w setnych' };
+    }
+    /* Skala przy KILKU rozliczeniach naraz.
+       Bledna wersja porownywala sume WSZYSTKICH pobranych transakcji z podsumowaniem
+       PIERWSZEGO rozliczenia. Przy jednym tygodniu to przechodzilo, przy kilku dalo
+       472 052 441 do 86 976 850 — stosunek 5,43 — i modul odmowil liczenia, tylko
+       z diagnoza wskazujaca na jednostke zamiast na moj blad.
+       Liczymy wiec kazde rozliczenie OSOBNO, po jego wlasnych transakcjach, i zadamy,
+       zeby wszystkie wskazaly ten sam mnoznik. Przy okazji wychodzi rzecz, ktorej stara
+       wersja nie widziala: rozliczenie, ktorego transakcji w ogole nie pobralismy.      */
+    function mpSkalaWielu(trans, lista){
+        var L = [].concat(lista || []).filter(Boolean);
+        if (!L.length) return { mnoznik: 1, pewne: false, powod: 'brak rozliczeń do sprawdzenia' };
+        var per = [], zle = [];
+        L.forEach(function (s){
+            var krotki = String(s.id || '').slice(0, 8);
+            var moje = trans.filter(function (x){ return x.plik === s.id; });
+            if (!moje.length){ zle.push(krotki + ': nie pobrano ani jednej transakcji'); return; }
+            var w = mpSkala(moje, s);
+            if (!w.pewne){ zle.push(krotki + ': ' + (w.powod || 'nie wiem')); return; }
+            per.push({ id: s.id, krotki: krotki, mnoznik: w.mnoznik, ile: moje.length });
+        });
+        if (!per.length)
+            return { mnoznik: 1, pewne: false,
+                     powod: zle.join(' · ') || 'nie ma czego porównać' };
+        var m = per[0].mnoznik;
+        if (per.filter(function (x){ return x.mnoznik !== m; }).length)
+            return { mnoznik: 1, pewne: false,
+                     powod: 'rozliczenia nie zgadzają się co do jednostki kwot: '
+                          + per.map(function (x){ return x.krotki + ' → ×' + x.mnoznik; }).join(', ') };
+        return { mnoznik: m, pewne: true, sprawdzone: per.length, per: per,
+                 powod: zle.length ? ('pominięte: ' + zle.join(' · ')) : '' };
+    }
+
+    /* Jednostka kwot API wzgledem KSIEGI.
+       Zgodnosc transakcji z podsumowaniem mowi tylko tyle, ze pobralismy komplet — obie
+       strony ida z tego samego API i moga byc w setnych OBIE naraz. Dopiero ksiega
+       prologistics jest w koronach na pewno, wiec to ona jest kotwica.
+       Sumy nigdy nie zgodza sie co do grosza (inne okresy, przesuniecie capture'ow), ale
+       rzedy wielkosci roznia sie o 100 — i to wystarczy, zeby rozstrzygnac bez zgadywania.
+       Gdy iloraz nie wpada w zaden przedzial, NIE wybieramy nic i mowimy dlaczego.       */
+    function mpSumaCapture(trans){
+        return r2((trans || []).filter(function (x){ return x.typ === 'capture'; })
+            .reduce(function (s, x){ return s + (x.brutto || 0); }, 0));
+    }
+    // Ksiega ZAWEZONA do okresu rozliczenia. Bez tego porownujemy tydzien Clearhausa
+    // z miesiacem ksiegi i iloraz odjezdza od jednosci na tyle, ze przedzialy musialyby
+    // byc szerokie — a wtedy przestaja cokolwiek rozstrzygac.
+    function mpSumaKsiegi(poz, od, doo){
+        var a = od ? mpDzien(od) : '', b = doo ? mpDzien(doo) : '';
+        return r2((poz || []).filter(function (x){
+            if (x.kierunek !== 'wpl') return false;
+            if (!a && !b) return true;
+            var d = x.czas ? mpDzien(x.czas) : '';
+            if (!d) return false;
+            if (a && d < a) return false;
+            if (b && d > b) return false;
+            return true;
+        }).reduce(function (s, x){ return s + (x.kwota || 0); }, 0));
+    }
+    function mpJednostkaZKsiegi(sumaCh, sumaPl){
+        if (!sumaCh || !sumaPl)
+            return { mnoznik: 1, pewne: false, powod: 'jedna ze stron jest pusta' };
+        var il = sumaCh / sumaPl;
+        // Przedzialy z wyraznymi przerwami miedzy soba. Iloraz, ktory wpada w przerwe,
+        // NIE jest przypisywany do blizszego brzegu — wtedy mowimy, ze nie wiemy.
+        if (il > 0.2  && il < 5)       return { mnoznik: 1,    pewne: true, iloraz: il };
+        if (il > 20   && il < 500)     return { mnoznik: 0.01, pewne: true, iloraz: il };
+        if (il > 0.002 && il < 0.05)   return { mnoznik: 100,  pewne: true, iloraz: il };
+        return { mnoznik: 1, pewne: false, iloraz: il,
+                 powod: 'suma z Clearhausa ' + f2(sumaCh) + ' i suma z księgi ' + f2(sumaPl)
+                      + ' mają się do siebie jak ' + (Math.round(il * 1000) / 1000)
+                      + ' — to nie jest ani ta sama jednostka, ani setne. '
+                      + 'Sprawdź, czy zakres dat po obu stronach jest ten sam' };
+    }
+    function mpPrzeskalujPodsum(lista, m){
+        if (m === 1) return lista;
+        (lista || []).forEach(function (s){
+            ['sprzedaz', 'zwroty', 'netto', 'przelewOplata', 'oplatySuma', 'chargebacki']
+                .forEach(function (k){ if (s[k] != null) s[k] = r2(s[k] * m); });
+        });
+        return lista;
+    }
+
+    function mpPrzeskaluj(trans, m){
+        if (m === 1) return trans;
+        trans.forEach(function (x){
+            ['kwota', 'brutto', 'oplata'].forEach(function (k){
+                if (x[k] != null) x[k] = r2(x[k] * m);
+            });
+        });
+        return trans;
+    }
+
+    /* ---------- ksiega: „Export payments" z prologistics, konto 1431 ----------
+       Wlasny czytnik, bo wspolny parser marketplace'ow nie oddaje kolumny Comment,
+       a to w niej siedzi 9-cyfrowy numer platnosci QuickPaya.                        */
+    function mpZExportu(aoa, nazwa){
+        if (!aoa || !aoa.length) return { err: (nazwa || 'plik') + ': pusty arkusz' };
+        var h = (aoa[0] || []).map(function (x){ return txt(x).toLowerCase(); });
+        var ix = {}; h.forEach(function (n, i){ if (n && ix[n] == null) ix[n] = i; });
+        var brak = ['auftrag number', 'debit', 'credit', 'amount', 'comment']
+            .filter(function (k){ return ix[k] == null; });
+        if (brak.length)
+            return { err: (nazwa || 'plik')
+                + ': to nie wygląda na „Export payments" — brak kolumn: ' + brak.join(', ') };
+        var poz = [];
+        for (var i = 1; i < aoa.length; i++){
+            var r = aoa[i] || [];
+            var deb = txt(r[ix['debit']]).replace(/\.0+$/, '');
+            var cre = txt(r[ix['credit']]).replace(/\.0+$/, '');
+            if (!deb && !cre) continue;
+            var auf = txt(r[ix['auftrag number']]);
+            // Comment bywa liczba (noty kredytowe wczytuja sie jako float) — wtedy
+            // numer platnosci jest cala trescia komorki.
+            var com = r[ix['comment']];
+            var comS = (typeof com === 'number' && isFinite(com))
+                ? String(Math.round(com)) : txt(com);
+            var m9 = /(?:^|\s)(\d{9})(?:\s|$)/.exec(comS);
+            var nota = /^CREDIT\s+(\d+)\s+TICKET\s+(\d+)/i.exec(auf);
+            poz.push({
+                auf: auf,
+                // Uwaga: w „CREDIT 10639353 TICKET 613269" pierwsza liczba to numer
+                // FAKTURY, nie auftraga. Traktowanie jej jak auftraga daje ciche pudlo.
+                aufNr: nota ? '' : ((/(\d{6,9})/.exec(auf) || [])[1] || ''),
+                faktura: nota ? nota[1] : '',
+                // Numer faktury z wlasnej kolumny — na wierszu sprzedazy to jedyny slad
+                // laczacy auftrag z nota kredytowa wystawiona do niego.
+                fakturaNr: ix['invoice number'] != null
+                    ? txt(r[ix['invoice number']]).replace(/\.0+$/, '') : '',
+                ticket: nota ? nota[2] : '',
+                nota: !!nota,
+                deb: deb, cre: cre,
+                kwota: mpKwota(r[ix['amount']]),
+                com: comS,
+                id9: m9 ? m9[1] : (
+                    /^\d{9}$/.test(txt(r[ix['transaction id']]))
+                        ? txt(r[ix['transaction id']]) : ''),
+                czas: ix['payment date'] != null ? mpChwila(r[ix['payment date']]) : null,
+                kierunek: deb === MP_KONTO ? 'wpl' : (cre === MP_KONTO ? 'wyp' : 'obce'),
+                plik: nazwa || ''
+            });
+        }
+        return { poz: poz };
+    }
+
+    /* ---------- parowanie z obustronna jednoznacznoscia ----------
+       Laczymy tylko wtedy, gdy A widzi dokladnie jednego kandydata i ten kandydat
+       widzi dokladnie jedno A. Inaczej zostawiamy oba bez pary i mowimy o tym wprost. */
+    function mpParuj(A, B, pasuje){
+        var wolneA = A.filter(function (a){ return !a._zajete; });
+        var kandA = wolneA.map(function (a){
+            var l = [];
+            for (var i = 0; i < B.length; i++) if (!B[i]._zajete && pasuje(a, B[i])) l.push(i);
+            return l;
+        });
+        var ileB = {};
+        kandA.forEach(function (l){ l.forEach(function (i){ ileB[i] = (ileB[i] || 0) + 1; }); });
+        var pary = [];
+        for (var k = 0; k < wolneA.length; k++){
+            if (wolneA[k]._zajete) continue;
+            if (kandA[k].length !== 1) continue;
+            var i2 = kandA[k][0];
+            if (ileB[i2] !== 1 || B[i2]._zajete) continue;
+            wolneA[k]._zajete = true; B[i2]._zajete = true;
+            pary.push({ a: wolneA[k], b: B[i2] });
+        }
+        return pary;
+    }
+
+    // Przesuniecie czasu miedzy strona Clearhausa a ksiega. Bierzemy MEDIANE roznic dla
+    // wplat, ktore i tak paruja sie po kwocie jednoznacznie — mediana znosi ogony.
+    //
+    // KARMIMY TO AUTORYZACJAMI, nigdy capture'ami. Autoryzacja dzieje sie w tej samej
+    // sekundzie co zaplata klienta, wiec roznica to czysta roznica zegarow (+2 h: Clearhaus
+    // liczy w UTC, prologistics lokalnie). Capture przychodzi dopiero przy wysylce, kilka
+    // godzin do kilkunastu dni pozniej — policzone z niego „przesuniecie" wyszlo −7,67 h
+    // i nie znaczylo nic poza srednim opoznieniem magazynu.
+    function mpPrzesuniecie(chWpl, plWpl){
+        var wg = {};
+        plWpl.forEach(function (b){
+            if (b.czas && b.kwota != null) (wg[b.kwota] = wg[b.kwota] || []).push(b);
+        });
+        var d = [];
+        chWpl.forEach(function (a){
+            if (!a.czas || a.kwota == null) return;
+            var l = wg[a.kwota];
+            if (!l || l.length !== 1) return;
+            d.push((l[0].czas.getTime() - a.czas.getTime()) / 3600000);
+        });
+        if (!d.length) return 0;
+        d.sort(function (x, y){ return x - y; });
+        return Math.round(d[Math.floor(d.length / 2)] * 100) / 100;
+    }
+
+    /* ---------- uzgodnienie ----------
+       qpIndex: { '20260803094637': '609642361', ... } — z panelu QuickPaya. Moze byc
+       pusty; wtedy droga 2 odpada i zostaje zegar, o czym raport mowi wprost.          */
+    /* Kilka rozliczen naraz (tryb miesieczny). Wyplata jest tygodniowa, ale ksieguje sie
+       miesiacami, wiec podsumowania sklejamy w jedno, zachowujac rozbicie na wyplaty —
+       inaczej nie dalo by sie powiedziec, ktora wyplata pokryla ktora pozycje.          */
+    function mpZlozPodsumowania(lista){
+        var L = [].concat(lista || []).filter(Boolean);
+        if (!L.length) return null;
+        if (L.length === 1) return L[0];
+        var o = { wyplaty: L, waluta: L[0].waluta, konto: L[0].konto };
+        ['sprzedaz', 'zwroty', 'netto', 'przelewOplata'].forEach(function (k){
+            var maja = L.filter(function (x){ return x[k] != null; });
+            o[k] = maja.length ? r2(maja.reduce(function (s, x){ return s + x[k]; }, 0)) : null;
+        });
+        L.forEach(function (x){
+            if (x.od && (!o.od || x.od < o.od)) o.od = x.od;
+            if (x.doo && (!o.doo || x.doo > o.doo)) o.doo = x.doo;
+            if (x.dataWyplaty && (!o.dataWyplaty || x.dataWyplaty > o.dataWyplaty))
+                o.dataWyplaty = x.dataWyplaty;
+        });
+        o.numerWyplaty = L.map(function (x){ return x.numerWyplaty; })
+            .filter(Boolean).join(', ');
+        return o;
+    }
+
+    function mpUzgodnij(ch, pl, qpIndex, podsum, opcje){
+        opcje = opcje || {};
+        if (Array.isArray(podsum)) podsum = mpZlozPodsumowania(podsum);
+        var tol = opcje.tolerancjaS != null ? opcje.tolerancjaS : MP_TOL_S;
+        // Znaczniki z POPRZEDNIEGO przebiegu musza zniknac. Do funkcji wchodza te same
+        // obiekty wierszy — przy drugim klknieciu „Sprawdz" (choćby z inna data) flagi
+        // zostawione za pierwszym razem zafalszowaly saldo i wyczyscily sekcje uzgodnionych.
+        (ch || []).forEach(function (a){ a._zajete = false; });
+        (pl || []).forEach(function (b){ b._zajete = false; b._saldo = false; b._wyplata = null; });
+        var idx = qpIndex || {};
+        var maIdx = Object.keys(idx).length > 0;
+
+        // Do wyplaty wchodza wylacznie capture i refund. Autoryzacje niosa sama oplate.
+        var wpl = ch.filter(function (x){ return x.typ === 'capture'; });
+        var zwr = ch.filter(function (x){ return x.typ === 'refund'; });
+        var aut = ch.filter(function (x){ return x.typ === 'authorization'; });
+
+        var plWpl = pl.filter(function (x){ return x.kierunek === 'wpl'; });
+        var plWyp = pl.filter(function (x){ return x.kierunek === 'wyp'; });
+
+        [].concat(wpl, zwr, plWpl, plWyp).forEach(function (x){ x._zajete = false; x.jak = ''; });
+
+        /* WYPLATY I TO, CZY JUZ WPLYNELY.
+           Rozliczenie w Clearhausie nie znaczy, ze pieniadze sa u nas: wyplata za okres
+           konczacy sie 31.08 wplywa 3 wrzesnia. Na koniec sierpnia jest to naleznosc.
+           Poslizg jest nastawny, bo to fakt o umowie, a nie o danych; domyslne trzy dni
+           zmierzono na pieciu kolejnych rozliczeniach z zeszytu.
+           Gdy podsumowanie niesie prawdziwa date wyplaty (arkusz „Settlement" ma pole
+           „Payout on"), bierzemy ja i zadnego poslizgu nie doliczamy.
+           Liczymy to PRZED parowaniem, bo dzien wyplaty jest jedna z dat, pod ktorymi
+           ksiegowa zapisuje zaleglosc.                                                   */
+        var poslizgW = opcje.poslizgWyplatyDni != null ? opcje.poslizgWyplatyDni : 3;
+        // Bez podanego konca okresu NIE ORZEKAMY, czy wyplata wplynela. Podstawienie tu
+        // konca okresu rozliczenia byloby bledne: wyplata z definicji przychodzi PO nim,
+        // wiec kazde rozliczenie wygladaloby na niewyplacone i cale zestawienie stawaloby
+        // sie saldem. Ekran zawsze podaje date z pola „do".
+        var koniecOkresu = opcje.koniec || '';
+        var wyplaty = ((podsum && podsum.wyplaty) || (podsum ? [podsum] : []))
+            .map(function (w){
+                var d = w.dataWyplaty ? new Date(w.dataWyplaty.getTime())
+                      : (w.doo ? new Date(w.doo.getTime() + poslizgW * 86400000) : null);
+                return { id: w.id, numerWyplaty: w.numerWyplaty, od: w.od, doo: w.doo,
+                         dataWyplaty: d, zmierzona: !!w.dataWyplaty,
+                         // Brak daty odniesienia = nie twierdzimy, ze czegos nie ma.
+                         wplynela: !koniecOkresu || !d || mpDzien(d) <= koniecOkresu };
+            });
+        var wgWyplat = {};
+        wyplaty.forEach(function (w){ if (w.id) wgWyplat[w.id] = w; });
+
+        /* MOMENT ZAPLATY KLIENTA. Trzy zrodla poza samym `reference`:
+           - `created_at` rekordu QuickPaya (podawany w opcje.qpCzas, klucz = numer
+             zamowienia, czyli to, co stoi w reference — takze wtedy, gdy jest to numer
+             auftraga z linku MobilePay),
+           - AUTORYZACJA o tym samym reference: Clearhaus zapisuje ja w chwili zaplaty,
+           - dopiero na koncu capture, ktory przychodzi przy wysylce.                     */
+        var autDnia = {};
+        aut.forEach(function (x){
+            var k = x.ref && x.ref.surowy;
+            if (!k || !x.czas) return;
+            if (!autDnia[k] || x.czas < autDnia[k]) autDnia[k] = x.czas;
+        });
+        var qpCzas = opcje.qpCzas || {};
+        function czasZQp(a){
+            if (!a.ref) return null;
+            // TYLKO dokladny klucz. „15613544" i „15613544-" to w QuickPayu dwie rozne
+            // platnosci tego samego auftraga — jedna nieoplacona.
+            var kl = [a.ref.surowy, a.ref.order];
+            for (var i = 0; i < kl.length; i++){
+                if (!kl[i]) continue;
+                var t = qpCzas[kl[i]];
+                if (t) return (t instanceof Date) ? t : mpChwila(t);
+            }
+            return null;
+        }
+        function czasZaplaty(a){
+            if (a.ref && a.ref.czas) return a.ref.czas;
+            var q = czasZQp(a);
+            if (q) return q;
+            var au = a.ref && autDnia[a.ref.surowy];
+            return au || null;
+        }
+
+        var pary = [];
+        // `pewne` mowi, czy para powstala po TOZSAMOSCI (numer), czy po domysle (kwota,
+        // zegar, dzien). Tylko z pewnych wolno wyciagac wnioski o numerach — inaczej
+        // pomylka jednej drogi staje sie „faktem" dla nastepnej.
+        function zapisz(lista, jak, pewne){
+            lista.forEach(function (p){
+                p.a.jak = jak; p.b.jak = jak; p.pewne = !!pewne; pary.push(p);
+            });
+        }
+
+        // --- droga 1: reference niesie numer auftraga wprost ---
+        // Numer w polu reference bywa numerem TICKETU, nie auftraga — wtedy w ksiedze
+        // stoi „CREDIT <faktura> TICKET <ten numer>". Zmierzone: reference 665657
+        // wskazywalo wprost CREDIT 11425591 TICKET 665657, a bez tego dopasowania
+        // pozycja szla do „kilku kandydatow".
+        function ticketZ(b){
+            var m = /TICKET\s+(\d{3,})/i.exec(String((b && b.auf) || ''));
+            return m ? m[1] : '';
+        }
+        // Auftrag -> faktura, zbudowane z wierszy sprzedazy. Nota kredytowa nie niesie
+        // numeru auftraga, ale niesie numer faktury — i to po nim je zwiazemy.
+        var fakturaZAuf = {};
+        pl.forEach(function (b){
+            if (b.nota || !b.aufNr || !b.fakturaNr) return;
+            if (fakturaZAuf[b.aufNr] == null) fakturaZAuf[b.aufNr] = b.fakturaNr;
+            else if (fakturaZAuf[b.aufNr] !== b.fakturaNr) fakturaZAuf[b.aufNr] = '';  // niejednoznaczne
+        });
+        function poAuftragu(chL, plL){
+            return mpParuj(chL.filter(function (x){ return x.ref.rodzaj === 'auftrag'; }), plL,
+                function (a, b){
+                    if (a.ref.auf && ticketZ(b) === a.ref.auf) return true;
+                    // Nota kredytowa wystawiona do tego auftraga — po numerze faktury.
+                    if (a.ref.auf && b.nota && b.faktura
+                        && fakturaZAuf[a.ref.auf] && b.faktura === fakturaZAuf[a.ref.auf])
+                        return true;
+                    return !!b.aufNr && a.ref.auf === b.aufNr
+                        && Math.abs((a.kwota || 0) - (b.kwota || 0)) < MP_GR;
+                });
+        }
+        zapisz(poAuftragu(wpl, plWpl), 'auftrag', true);
+        zapisz(poAuftragu(zwr, plWyp), 'auftrag', true);
+
+        // --- droga 2: przez indeks QuickPaya (zamowienie -> platnosc) ---
+        // Zwroty tez tedy ida: prologistics zapisuje przy zwrocie numer PIERWOTNEJ
+        // wplaty, a Clearhaus przy zwrocie podaje reference pierwotnego zamowienia —
+        // wiec obie strony niosa tu te sama tozsamosc. Kwota musi sie zgadzac, bo
+        // jedna platnosc bywa zwracana w kilku czesciach.
+        function poQuickPay(chL, plL){
+            return mpParuj(chL.filter(function (x){
+                    return x.ref.rodzaj === 'zamowienie' && idx[x.ref.order];
+                }), plL,
+                function (a, b){
+                    return !!b.id9 && String(idx[a.ref.order]) === b.id9
+                        && Math.abs((a.kwota || 0) - (b.kwota || 0)) < MP_GR;
+                });
+        }
+        if (maIdx){
+            zapisz(poQuickPay(wpl, plWpl), 'quickpay', true);
+            zapisz(poQuickPay(zwr, plWyp), 'quickpay', true);
+        }
+
+        /* --- droga 2c: pozycje NIEROZROZNIALNE ---
+           Zdarza sie, ze kilka transakcji Clearhausa i kilka wierszy ksiegi maja te sama
+           kwote I ten sam numer platnosci (klient placil dwa razy, ksiegowanie poszlo
+           dwoma wierszami). Parowanie zada jednoznacznosci i odmawia — ale tutaj wybor
+           NICZEGO nie zmienia: kazde przyporzadkowanie daje te same liczby. Laczymy je
+           wiec po kolei i oznaczamy osobna droga, zeby bylo widac, ze to nie byl wybor.
+           Warunek jest scisly: rowna liczba pozycji po obu stronach.                     */
+        // Numer platnosci wspolny dla wszystkich wierszy danego auftraga — druga droga
+        // do klucza, gdy reference niesie auftrag zamiast numeru zamowienia.
+        var platnoscZAuf = {};
+        pl.forEach(function (b){
+            if (!b.aufNr || !b.id9) return;
+            if (platnoscZAuf[b.aufNr] == null) platnoscZAuf[b.aufNr] = b.id9;
+            else if (platnoscZAuf[b.aufNr] !== b.id9) platnoscZAuf[b.aufNr] = '';   // rozne
+        });
+        function kluczCh(a){
+            if (a.ref && a.ref.rodzaj === 'zamowienie' && idx[a.ref.order])
+                return String(idx[a.ref.order]);
+            if (a.ref && a.ref.rodzaj === 'auftrag' && a.ref.auf && platnoscZAuf[a.ref.auf])
+                return String(platnoscZAuf[a.ref.auf]);
+            return '';
+        }
+        function nierozroznialne(chL, plL){
+            var wgCh = {}, wgPl = {};
+            chL.forEach(function (a){
+                if (a._zajete) return;
+                var nr = kluczCh(a);
+                if (!nr) return;
+                var k = nr + '|' + r2(a.kwota || 0);
+                (wgCh[k] = wgCh[k] || []).push(a);
+            });
+            plL.forEach(function (b){
+                if (b._zajete || !b.id9) return;
+                var k = b.id9 + '|' + r2(b.kwota || 0);
+                (wgPl[k] = wgPl[k] || []).push(b);
+            });
+            var pary2 = [];
+            Object.keys(wgCh).forEach(function (k){
+                var A = wgCh[k], B = wgPl[k];
+                if (!B || A.length < 2 || A.length !== B.length) return;
+                for (var i = 0; i < A.length; i++){
+                    A[i]._zajete = true; B[i]._zajete = true;
+                    pary2.push({ a: A[i], b: B[i] });
+                }
+            });
+            return pary2;
+        }
+        if (maIdx){
+            zapisz(nierozroznialne(wpl, plWpl), 'nierozroznialne', true);
+            zapisz(nierozroznialne(zwr, plWyp), 'nierozroznialne', true);
+        }
+
+        /* --- droga 2b: rozbita nota kredytowa po NUMERZE PLATNOSCI ---
+           Zwrot ksiegowany w tickecie jest rozbijany NA PRODUKTY, wiec jednej pozycji
+           Clearhausa odpowiada kilka wierszy ksiegi i po kwocie nie zgodzi sie ZADEN
+           z nich osobno. Droga „suma grupy" (nizej) laczy je po numerze noty, ale potrafi
+           utknac, gdy dwa zwroty maja te sama kwote — zmierzone na sierpniu 2026.
+           Numer platnosci jest tu twardy: kazdy wiersz rozbitej noty niesie ten sam,
+           a indeks QuickPaya podaje go dla zamowienia z pola reference.                  */
+        function grupujPo(lista, pole){
+            var g = {};
+            lista.forEach(function (b){
+                if (b._zajete) return;
+                var k = b[pole];
+                if (!k) return;
+                (g[k] = g[k] || []).push(b);
+            });
+            return Object.keys(g).map(function (k){
+                return { klucz: k, poz: g[k], _zajete: false,
+                         kwota: r2(g[k].reduce(function (s, x){ return s + (x.kwota || 0); }, 0)) };
+            }).filter(function (g2){ return g2.poz.length > 1; });
+        }
+        function zapiszGrupy(lista, jak, pewne){
+            lista.forEach(function (p){
+                p.a.jak = jak;
+                p.b.poz.forEach(function (x){ x._zajete = true; x.jak = jak; });
+                pary.push({ a: p.a, b: p.b.poz[0], grupa: p.b.poz, pewne: !!pewne });
+            });
+        }
+        if (maIdx){
+            zapiszGrupy(mpParuj(zwr, grupujPo(plWyp, 'id9'), function (a, g){
+                return a.ref.rodzaj === 'zamowienie'
+                    && String(idx[a.ref.order] || '') === String(g.klucz)
+                    && Math.abs((a.kwota || 0) - g.kwota) < MP_GR;
+            }), 'grupa', true);
+        }
+
+        // --- droga 3 (awaryjna): znacznik czasu z reference ---
+        // Przesuniecie zegarow liczymy z AUTORYZACJI (patrz mpPrzesuniecie). Sluzy tylko
+        // do kontroli — samo parowanie idzie po znaczniku z reference, ktory jest juz
+        // w czasie lokalnym, wiec zadnej korekty nie wymaga.
+        var przes = opcje.przesuniecieH != null ? opcje.przesuniecieH : mpPrzesuniecie(aut, plWpl);
+        zapisz(mpParuj(wpl.filter(function (x){
+                return x.ref.rodzaj === 'zamowienie' && x.ref.czas;
+            }), plWpl,
+            function (a, b){
+                if (!b.czas) return false;
+                if (Math.abs((a.kwota || 0) - (b.kwota || 0)) >= MP_GR) return false;
+                return Math.abs((b.czas.getTime() - a.ref.czas.getTime()) / 1000) <= tol;
+            }), 'zegar');
+
+        // --- zwroty: kwota + dzien ---
+        // Nota kredytowa nie ma godziny (zawsze 00:00:00), wiec po czasie sie nie da.
+        zapisz(mpParuj(zwr, plWyp, function (a, b){
+            if (Math.abs((a.kwota || 0) - (b.kwota || 0)) >= MP_GR) return false;
+            if (!a.czas || !b.czas) return true;
+            return Math.abs(b.czas.getTime() - a.czas.getTime()) <= 4 * 86400000;
+        }), 'kwota');
+
+        // Jeden zwrot Clearhausa potrafi w ksiedze zejsc na kilka pozycji (nota kredytowa
+        // rozbita na kilka linii). Wtedy pojedynczy wiersz nigdy nie bedzie rowny — dopiero
+        // SUMA grupy o tym samym numerze w kolumnie „Auftrag number".
+        var grList = grupujPo(plWyp, 'auf');
+        zapiszGrupy(mpParuj(zwr, grList, function (a, g){
+            return Math.abs((a.kwota || 0) - g.kwota) < MP_GR;
+        }), 'grupa');
+
+        /* --- droga 3a: NUMER PLATNOSCI Z JUZ SPAROWANEGO WIERSZA ---
+           Jeden numer platnosci potrafi stac w ksiedze na kilku wierszach (wplata i zwrot
+           tego samego zamowienia, rozbita nota). Gdy CHOC JEDEN z nich juz sie sparowal,
+           wiemy, do ktorego zamowienia ten numer nalezy — i mozemy tym zwiazac pozostale.
+           To nie jest domysl, tylko wniosek z pary, ktora juz zrobilismy; dziala takze tam,
+           gdzie indeks QuickPaya nie siega. Zmierzone: auftrag 15337676, numer 608572194 —
+           zwrot sparowal sie po numerze, a wplata nie miala jak, bo zamowienie
+           20260731043502 jest starsze niz indeks.                                        */
+        var zamowienieZNumeru = {};
+        pary.forEach(function (p){
+            // TYLKO z par zrobionych po tozsamosci. Para po kwocie albo po zegarze bywa
+            // trafna, ale nie jest dowodem — a stad wyprowadzamy nastepne dopasowania.
+            if (!p.pewne) return;
+            if (!p.a.ref || p.a.ref.rodzaj !== 'zamowienie' || !p.a.ref.order) return;
+            (p.grupa || [p.b]).forEach(function (b){
+                if (!b.id9) return;
+                var m = zamowienieZNumeru[b.id9];
+                if (m === undefined) zamowienieZNumeru[b.id9] = String(p.a.ref.order);
+                else if (m !== String(p.a.ref.order)) zamowienieZNumeru[b.id9] = '';  // sprzeczne
+            });
+        });
+        function poNumerzeZPary(a, b){
+            if (!b.id9 || !a.ref || a.ref.rodzaj !== 'zamowienie') return false;
+            if (Math.abs((a.kwota || 0) - (b.kwota || 0)) >= MP_GR) return false;
+            return zamowienieZNumeru[b.id9] === String(a.ref.order);
+        }
+        zapisz(mpParuj(wpl, plWpl, poNumerzeZPary), 'zpary', true);
+        zapisz(mpParuj(zwr, plWyp, poNumerzeZPary), 'zpary', true);
+
+        /* --- droga 3b: DZIEN ZAPLATY ---
+           Ksiega zapisuje wplate z data zaplaty, ale ta data zalezy od tego, kto ksiegowal:
+           automat bierze chwile AUTORYZACJI, a czlowiek ksiegujacy recznie — dzien, w ktorym
+           pieniadze doszly, czyli CAPTURE. Zmierzone na sierpniu 2026: auftrag 15518005
+           (2418,00) zaksiegowany recznie 14.08, choc klient zaplacil 12.08; auftrag 15297645
+           (300,00) zaksiegowany 20.08, choc capture przyszedl 21.08. Droga „zegar" nie miala
+           szans: porownuje sam znacznik z reference i to z tolerancja 600 sekund.
+           Dopuszczamy wiec kazdy z trzech dni, a o bezpieczenstwo dba mpParuj — laczy tylko
+           wtedy, gdy po obu stronach jest DOKLADNIE jeden kandydat.                        */
+        function dniZaplaty(a){
+            var d = [];
+            if (a.ref && a.ref.czas) d.push(mpDzien(a.ref.czas));
+            var q = czasZQp(a);
+            if (q) d.push(mpDzien(q));
+            var au = a.ref && autDnia[a.ref.surowy];
+            if (au) d.push(mpDzien(au));
+            if (a.czas) d.push(mpDzien(a.czas));
+            // Zaleglosc douzupelniana RECZNIE dostaje date dnia, w ktorym ksiegowa widzi
+            // pieniadze na wyciagu, czyli dzien WYPLATY rozliczenia. Zmierzone na sierpniu
+            // 2026: auftragi 15326871 (1509,00) i 15337676 (2769,00) zaksiegowane 06.08,
+            // czyli w dniu wyplaty rozliczenia a264b665 (28.07-03.08). Godzina zostaje
+            // oryginalna, bo prologistics przy przeksiegowaniu zmienia sama date.
+            var w = (wyplaty.length === 1) ? wyplaty[0] : wgWyplat[a.plik];
+            if (w && w.dataWyplaty) d.push(mpDzien(w.dataWyplaty));
+            return d;
+        }
+        zapisz(mpParuj(wpl, plWpl, function (a, b){
+            if (Math.abs((a.kwota || 0) - (b.kwota || 0)) >= MP_GR) return false;
+            if (!b.czas) return false;
+            return dniZaplaty(a).indexOf(mpDzien(b.czas)) >= 0;
+        }), 'dzien');
+
+
+        /* --- droga 3c: PARTIA — kilka transakcji Clearhausa na jeden wiersz ksiegi ---
+           Odwrotnosc rozbitej noty. Klient placi dwa razy (zamowienie + doplata z linku
+           MobilePay), przy anulowaniu MobilePay zwraca OBIE kwoty osobno, a prologistics
+           ksieguje jeden wiersz na sume. Zmierzone: auftrag 15484335 — zwroty 3199,00
+           (zamowienie 20260816210700) i 50,00 (reference = numer auftraga) kontra jeden
+           wiersz -3249,00 z numerem platnosci 611981323.
+           Wiazanie jest twarde, nie po kwocie: KAZDA transakcja grupy musi wskazywac ten
+           sam auftrag co wiersz ksiegi — numerem auftraga w reference albo numerem
+           platnosci. Suma grupy sprawdzana jest dopiero na koncu.                        */
+        function wskazujeNa(a, b){
+            if (a.ref.rodzaj === 'auftrag' && a.ref.auf && b.aufNr && a.ref.auf === b.aufNr)
+                return true;
+            if (a.ref.rodzaj !== 'zamowienie' || !b.id9) return false;
+            var nr = idx[a.ref.order];
+            if (nr && String(nr) === b.id9) return true;
+            return zamowienieZNumeru[b.id9] === String(a.ref.order);
+        }
+        // Zwraca { g: [transakcje], pewne: bool } albo null. `pewne` mowi, czy CALA grupa
+        // stoi na numerach — czy tez ostatnia noge domknelismy kwota (patrz nizej).
+        function domkniecieKwota(b, chL){
+            var wolne = chL.filter(function (a){ return !a._zajete; });
+            var zakotw = wolne.filter(function (a){ return wskazujeNa(a, b); });
+            if (!zakotw.length) return null;
+            var suma = r2(zakotw.reduce(function (su, a){ return su + (a.kwota || 0); }, 0));
+            // wariant mocny: wszystkie nogi wskazuja ten auftrag i suma sie zgadza
+            if (zakotw.length > 1 && Math.abs(suma - (b.kwota || 0)) < MP_GR)
+                return { g: zakotw, pewne: true };
+            if (zakotw.length !== 1) return null;
+            // wariant slabszy: jedna noga twarda, brakujaca kwote domykamy JEDNOZNACZNIE
+            var a0 = zakotw[0], brak = r2((b.kwota || 0) - suma);
+            if (brak <= 0) return null;
+            var dop = wolne.filter(function (a){
+                if (a === a0 || Math.abs((a.kwota || 0) - brak) >= MP_GR) return false;
+                if (!a.czas || !a0.czas) return false;
+                return Math.abs(a.czas.getTime() - a0.czas.getTime()) <= 86400000;
+            });
+            if (dop.length !== 1) return null;
+            return { g: [a0, dop[0]], pewne: false };
+        }
+        [[plWpl, wpl], [plWyp, zwr]].forEach(function (para){
+            var plL = para[0], chL = para[1];
+            // Grupy liczymy dla WSZYSTKICH wolnych wierszy naraz, zeby moc odmowic, gdy
+            // ta sama transakcja pasuje do dwoch wierszy — tak samo jak mpParuj.
+            var propozycje = [];
+            plL.forEach(function (b){
+                if (b._zajete) return;
+                var w = domkniecieKwota(b, chL);
+                if (!w || w.g.length < 2) return;
+                propozycje.push({ b: b, g: w.g, pewne: w.pewne });
+            });
+            var ile = {};
+            propozycje.forEach(function (p){ p.g.forEach(function (a){
+                ile[a.id || a.ref.surowy] = (ile[a.id || a.ref.surowy] || 0) + 1; }); });
+            propozycje.forEach(function (p){
+                if (p.b._zajete) return;
+                if (p.g.some(function (a){ return a._zajete
+                        || ile[a.id || a.ref.surowy] !== 1; })) return;
+                p.b._zajete = true; p.b.jak = 'partia';
+                p.g.forEach(function (a){ a._zajete = true; a.jak = 'partia'; });
+                pary.push({ a: p.g[0], b: p.b, grupaA: p.g, pewne: !!p.pewne });
+            });
+        });
+
+        /* --- co zostalo, i DLACZEGO ---
+           „Bez pary" to nie jedna sprawa, tylko trzy rozne, i czlowiek robi z nimi co
+           innego. Zeszyt uzywa na nie osobnych slow („unknown payment", „not found"),
+           wiec modul tez musi je rozroznic, a nie wrzucic do jednego worka.            */
+        var chBez = [].concat(wpl, zwr).filter(function (x){ return !x._zajete; });
+        var plBez = [].concat(plWpl, plWyp).filter(function (x){ return !x._zajete; });
+
+        // OKNO FAKTYCZNIE POBRANEJ KSIEGI. Nie mylic z okresem rozliczenia: uzytkownik
+        // wybiera zakres dat, a rozliczenie Clearhausa siega poza niego — wyplata za
+        // sierpien zaczyna sie 28 lipca. Capture'y z tych kilku dni maja swoje wiersze
+        // ksiegi w lipcu, ktorego nikt nie pobral. Bez tego rozroznienia 307 takich pozycji
+        // ladowalo w „nie ma w ksiedze" i wygladalo na 600 tysiecy brakow w ksiegowaniu.
+        var ksOd = null, ksDoo = null;
+        pl.forEach(function (b){
+            if (!b.czas) return;
+            if (ksOd == null || b.czas < ksOd) ksOd = b.czas;
+            if (ksDoo == null || b.czas > ksDoo) ksDoo = b.czas;
+        });
+        // Chwila, w ktorej ta transakcja POWINNA byla trafic do ksiegi: znacznik czasu
+        // z reference, a gdy go nie ma — moment capture'u.
+        function kiedyWKsiedze(a){
+            // ZWROT trafia do ksiegi w chwili zwrotu, nie w chwili pierwotnego zamowienia:
+            // nota za zamowienie z lipca bywa ksiegowana w sierpniu i nalezy do SIERPNIA.
+            // Wplata odwrotnie — ksiega zapisuje ja z data zaplaty, czyli ze znacznika
+            // z pola reference.
+            if (a.typ === 'refund') return a.czas || (a.ref && a.ref.czas) || null;
+            // WPLATA: chwila zaplaty klienta, a nie capture. Capture przychodzi przy
+            // wysylce i potrafi przeskoczyc na nastepny miesiac — wtedy pozycja z konca
+            // poprzedniego wygladala na brak ksiegowania w tym.
+            return czasZaplaty(a) || a.czas || null;
+        }
+        function pozaKsiega(a){
+            if (ksOd == null || ksDoo == null) return false;
+            var t = kiedyWKsiedze(a);
+            if (!t) return false;
+            var d = mpDzien(t);
+            return d < mpDzien(ksOd) || d > mpDzien(ksDoo);
+        }
+
+        // Grupy, ktore po parowaniu zostaly wolne — do nazwania powodu, a nie do parowania.
+        var wolneGrupy = grupujPo(plWyp, 'auf');
+        function grupaNaKwote(k){
+            return wolneGrupy.filter(function (g){ return Math.abs((k || 0) - g.kwota) < MP_GR; });
+        }
+
+        // Czy dopytanie QuickPaya o numer platnosci moze tu cokolwiek zmienic. Miara jest
+        // jedna: czy po drugiej stronie stoi NIESPAROWANY wiersz ksiegi o tej samej kwocie
+        // i w te sama strone. Bez tego pytamy albo o wszystko (388 zapytan), albo po
+        // powodzie — a powod „z innego miesiaca" wyklucza wlasnie te pozycje, dla ktorych
+        // zaleglosc z poprzedniego miesiaca zaksiegowano w tym.
+        var wolneKwoty = { wpl: {}, wyp: {} };
+        plBez.forEach(function (b){
+            var m = wolneKwoty[b.kierunek];
+            if (!m) return;
+            var k = r2(b.kwota || 0);
+            m[k] = (m[k] || 0) + 1;
+        });
+
+        // Ktore numery auftragow w ogole wystepuja w eksporcie — do odroznienia „nie ma
+        // czego dopasowac" od „kandydat zajety przez inna transakcje".
+        var aufWEksporcie = {};
+        pl.forEach(function (b){ if (b.aufNr) aufWEksporcie[b.aufNr] = 1; });
+
+        chBez.forEach(function (a){
+            // Numer platnosci znamy z indeksu takze wtedy, gdy w ksiedze nic nie stoi —
+            // i to wlasnie po nim czlowiek znajdzie auftrag w wyszukiwarce prologistics.
+            // Numer platnosci takze dla linkow MobilePay: tam kluczem indeksu jest samo
+            // `reference` (numer auftraga, czasem z myslnikiem), a nie numer zamowienia.
+            // Bez tego czlowiek szukal w QuickPayu numeru bez myslnika i trafial na inny,
+            // nieoplacony rekord tego samego auftraga.
+            if (a.ref){
+                if (a.ref.rodzaj === 'zamowienie' && idx[a.ref.order])
+                    a.platnosc = String(idx[a.ref.order]);
+                else if (idx[a.ref.surowy]) a.platnosc = String(idx[a.ref.surowy]);
+            }
+            a.wartoPytac = !!wolneKwoty[a.typ === 'refund' ? 'wyp' : 'wpl'][r2(a.kwota || 0)];
+            var strona = a.typ === 'refund' ? plWyp : plWpl;
+            // Kandydatow liczymy w TYM SAMYM oknie, w ktorym szukalo parowanie. Inaczej
+            // raport pokazuje przy kwocie 279 szesc pozycji z dziesieciu dni i wyglada
+            // to na chaos, podczas gdy naprawde konkurowaly dwie.
+            var kand = strona.filter(function (b){
+                if (Math.abs((a.kwota || 0) - (b.kwota || 0)) >= MP_GR) return false;
+                if (!b.czas) return true;
+                if (a.typ === 'refund') return !a.czas || Math.abs(b.czas - a.czas) <= 4 * 86400000;
+                if (a.ref.czas) return Math.abs(b.czas - a.ref.czas) / 1000 <= tol;
+                return true;
+            });
+            var wolne = kand.filter(function (b){ return !b._zajete; });
+            // Poza oknem: ta sama kwota jest w ksiedze, tylko zegar sie nie zgadza.
+            // To CO INNEGO niz brak i czlowiek robi z tym co innego, wiec nie mieszamy.
+            var poKwocie = strona.filter(function (b){
+                return Math.abs((a.kwota || 0) - (b.kwota || 0)) < MP_GR && !b._zajete;
+            });
+            // NAJPIERW pytanie, czy ta pozycja w ogole nalezy do uzgadnianego okresu.
+            // Postawione dalej, przepuszczalo lipcowe zamowienia do galezi „kwota jest",
+            // ktora pokazywala im jako kandydatow przypadkowe wiersze z 31 sierpnia.
+            if (pozaKsiega(a)){
+                a.powod = 'z innego miesiąca';
+                a.opis = 'zapłata za to zamówienie wypada '
+                       + (kiedyWKsiedze(a) ? mpDzien(kiedyWKsiedze(a)) : 'poza okresem')
+                       + ', a uzgadniasz ' + mpDzien(ksOd) + ' – ' + mpDzien(ksDoo)
+                       + '. Wiersza księgi dla niej w tym eksporcie po prostu nie ma — '
+                       + 'należy do uzgodnienia tamtego miesiąca.';
+            } else if (wolne.length > 1){
+                a.powod = 'kilku kandydatów';
+                a.kandydaci = wolne.slice(0, 6);
+                a.opis = 'w księdze konkuruje ' + wolne.length + ' pozycji na tę samą kwotę '
+                       + 'w tym samym czasie — wybór byłby zgadywaniem. Rozstrzyga numer płatności z QuickPaya.';
+            } else if (a.ref.rodzaj === 'auftrag' && a.ref.auf && !aufWEksporcie[a.ref.auf]){
+                // Numeru auftraga nie ma w pliku ANI RAZU — nie ma czego dopasowywac,
+                // a „kandydat juz zajety" kazaloby szukac dwoch bijacych sie pozycji.
+                a.powod = 'auftraga nie ma w eksporcie';
+                var kz = kiedyWKsiedze(a);
+                a.opis = 'zapłata z ' + (kz ? mpDzien(kz) : 'tego okresu') + ' za auftrag '
+                       + a.ref.auf + ', a tego auftraga nie ma w eksporcie ani razu. '
+                       + 'Miesiąc się zgadza, więc to nie jest pozycja z innego uzgodnienia '
+                       + '— po prostu nie zostało zaksięgowane. Numer płatności otwiera '
+                       + 'wyszukiwarkę prologistics.';
+            } else if (wolne.length === 1){
+                a.powod = 'kandydat już zajęty';
+                a.opis = 'jedyna pasująca pozycja została sparowana z inną transakcją rozliczenia '
+                       + '(dwie transakcje biją się o ten sam wiersz księgi) — obejrzeć obie.';
+            } else if (poKwocie.length){
+                a.powod = 'kwota jest, czas się nie zgadza';
+                a.kandydaci = poKwocie.slice(0, 6);
+                a.opis = 'w księdze jest ta kwota, ale poza oknem czasowym — może to inna transakcja, '
+                       + 'a może ta sama zaksięgowana z opóźnieniem. Bez numeru z QuickPaya nie rozstrzygnę.';
+            } else if (a.typ === 'refund' && grupaNaKwote(a.kwota).length){
+                // Nota w ksiedze JEST — rozbita na pozycje, ktorych suma to dokladnie ta
+                // kwota. Nie sparowala sie, bo konkuruje o nia wiecej niz jeden zwrot.
+                // Nazwanie tego „brakiem w ksiedze" bylo nieprawda i wysylalo czlowieka
+                // szukac czegos, co lezy na wierzchu.
+                a.powod = 'rozbita nota — kilku kandydatów';
+                a.kandydaci = grupaNaKwote(a.kwota).map(function (g){ return g.poz[0]; }).slice(0, 4);
+                a.opis = 'w księdze jest nota rozbita na pozycje, których suma to dokładnie ta '
+                       + 'kwota (' + grupaNaKwote(a.kwota).map(function (g){
+                             return g.poz.map(function (x){ return f2(x.kwota); }).join(' + '); }).join(' | ')
+                       + '), ale konkuruje o nią więcej niż jeden zwrot na tę samą kwotę. '
+                       + 'Numer płatności z QuickPaya rozstrzyga to jednoznacznie — wczytaj indeks.';
+            } else {
+                a.powod = 'nie ma w księdze';
+                a.opis = 'Clearhaus pobrał pieniądze, a w prologistics nie ma pod tą kwotą nic. '
+                       + 'To jest „unknown payment" z zeszytu — znaleźć zamówienie albo zaksięgować na konto techniczne.';
+            }
+        });
+
+        // Wyplaty policzone wyzej, przed drogami parowania — droga „dzien" potrzebuje
+        // dnia wyplaty jako jednej z dopuszczalnych dat ksiegowania.
+        // Pozycja sparowana z rozliczeniem, ktorego wyplata jeszcze nie wplynela, jest
+        // czescia salda — mimo ze wiemy dokladnie, ktora wyplata ja pokryje.
+        pary.forEach(function (x){
+            // Przy jednym rozliczeniu nie ma czego dopasowywac — pokrywa wszystko.
+            // Przy kilku wiazemy po identyfikatorze, ktory transakcja niesie w polu `plik`.
+            var w = (wyplaty.length === 1) ? wyplaty[0] : wgWyplat[x.a && x.a.plik];
+            if (!w || w.wplynela) return;
+            (x.grupa || [x.b]).forEach(function (b){ b._saldo = true; b._wyplata = w; });
+        });
+
+        // Okno rozliczenia. Wiersz ksiegi spoza tego okna nie jest bledem: albo pokryla go
+        // wczesniejsza wyplata, albo dopiero czeka na najblizsza. Bez tego rozroznienia
+        // raport krzyczalby o setkach pozycji, ktore sa w porzadku.
+        var od = (podsum && podsum.od) || null, doo = (podsum && podsum.doo) || null;
+        if (!od || !doo){
+            var czasy = [].concat(wpl, zwr, aut).map(function (x){ return x.czas; })
+                .filter(Boolean).sort(function (a, b){ return a - b; });
+            if (czasy.length){ od = od || czasy[0]; doo = doo || czasy[czasy.length - 1]; }
+        }
+        /* Do wyplaty wchodzi CAPTURE, nie zaplata klienta — a capture przychodzi dopiero
+           przy wysylce. Wiersz ksiegi z ostatnich dni okresu moze wiec czekac na capture
+           i wejsc dopiero do nastepnej wyplaty; nazwanie go brakiem byloby falszywym
+           alarmem. Ile dokladnie wynosi ten poslizg, NIE zgadujemy — mierzymy go na
+           parach, ktore juz mamy (w tygodniu 28.07-03.08 wyszlo 0-3 dni, mediana 0).    */
+        var luki = pary.filter(function (p){ return p.a.typ === 'capture' && p.a.czas && p.b.czas; })
+            .map(function (p){ return (p.a.czas.getTime() - p.b.czas.getTime()) / 86400000; })
+            .filter(function (d){ return d >= 0; })
+            .sort(function (x, y){ return x - y; });
+        var poslizgDni = luki.length ? Math.ceil(luki[luki.length - 1]) : 3;
+        var granica = doo ? (doo.getTime() + 86400000 - poslizgDni * 86400000) : null;
+
+        plBez.forEach(function (b){
+            if (!b.czas || !od || !doo){ b.powod = 'w okresie'; return; }
+            if (b.czas.getTime() > doo.getTime() + 86400000){
+                b.powod = 'jeszcze nie wypłacone';
+                b.opis = 'zaksięgowane po końcu tego rozliczenia — wejdzie do jednej z następnych wypłat. '
+                       + 'To jest właśnie saldo w drodze.';
+            } else if (granica != null && b.czas.getTime() >= granica){
+                b.powod = 'czeka na capture';
+                b.opis = 'zaksięgowane na styku okresu. Do wypłaty wchodzi capture, a ten w tych danych '
+                       + 'potrafi przyjść do ' + poslizgDni + ' dni później — więc ta pozycja najpewniej '
+                       + 'trafi do następnego rozliczenia. Nie jest to brak.';
+            } else if (b.czas.getTime() < od.getTime()){
+                b.powod = 'przed okresem';
+                b.opis = 'zaksięgowane przed początkiem tego rozliczenia — najpewniej pokryła je '
+                       + 'wcześniejsza wypłata. Żeby to potwierdzić, trzeba wczytać także tamto rozliczenie.';
+            } else {
+                b.powod = 'w okresie';
+                b.opis = 'zaksięgowane w środku okresu rozliczenia i mimo to nie ma go w rozliczeniu — '
+                       + 'to jest ta pozycja, którą naprawdę warto obejrzeć.';
+            }
+        });
+
+        /* PRZEKSIEGOWANIE W KSIEDZE — dwie nogi, ktore sie znosza.
+           Zwrot zaksiegowany najpierw na auftragu, a potem przeniesiony do ticketu zostawia
+           w eksporcie DWA wiersze: wyplyw z 1431 na auftragu i wplyw na 1431 na nocie
+           kredytowej. Ta sama faktura, ta sama kwota, ten sam dzien, przeciwny kierunek —
+           na koncie nie rusza sie nic, wiec Clearhaus nie ma czego pokazac. Bez tego
+           rozpoznania obie nogi stoja w „w ksiedze, a nie w rozliczeniu" i wygladaja
+           na braki. Zmierzone na sierpniu 2026: faktury 9962656, 9980103, 10212414, 10300656. */
+        var wgFaktury = {};
+        plBez.forEach(function (b){
+            var f = b.fakturaNr || b.faktura || '';
+            if (!f || !b.czas) return;
+            var k = f + '|' + r2(b.kwota || 0) + '|' + mpDzien(b.czas);
+            (wgFaktury[k] = wgFaktury[k] || []).push(b);
+        });
+        Object.keys(wgFaktury).forEach(function (k){
+            var L = wgFaktury[k];
+            var we = L.filter(function (x){ return x.kierunek === 'wpl'; });
+            var wy = L.filter(function (x){ return x.kierunek === 'wyp'; });
+            if (!we.length || we.length !== wy.length) return;
+            L.forEach(function (b){
+                b.powod = 'przeksięgowanie w księdze';
+                b.opis = 'druga noga tego samego zapisu stoi obok: ta sama faktura, ta sama kwota, '
+                       + 'ten sam dzień, przeciwny kierunek. Zwrot zaksięgowano najpierw na '
+                       + 'auftragu, a potem przeniesiono do ticketu — na koncie ' + MP_KONTO
+                       + ' nie ruszyło się nic, więc Clearhaus nie ma tu czego pokazać.';
+            });
+        });
+        function ile(l, p){ return l.filter(function (x){ return x.powod === p; }).length; }
+
+        // Kontrola kwoty wyplaty. Liczymy z transakcji i porownujemy z podsumowaniem;
+        // roznica powinna byc rowna oplacie za przelew, ktorej w transakcjach nie ma.
+        function suma(l, f){ return r2(l.reduce(function (s, x){ return s + (f(x) || 0); }, 0)); }
+        var sprzedaz = suma(wpl, function (x){ return x.brutto; });
+        var zwroty = suma(zwr, function (x){ return x.brutto; });
+        var oplTr = suma([].concat(wpl, zwr, aut), function (x){ return x.oplata; });
+        var przelewOplata = (podsum && podsum.przelewOplata != null) ? podsum.przelewOplata : null;
+        var netto = r2(sprzedaz + zwroty + oplTr + (przelewOplata || 0));
+
+        var wynik = {
+            konto: MP_KONTO,
+            podsumowanie: podsum || null,
+            maIndeksQuickPay: maIdx,
+            przesuniecieH: przes,
+            liczby: {
+                clearhaus: { wplaty: wpl.length, zwroty: zwr.length, autoryzacje: aut.length },
+                prolo: { wplaty: plWpl.length, wyplaty: plWyp.length },
+                sprzedaz: sprzedaz, zwrotyKwota: zwroty, oplaty: oplTr,
+                przelewOplata: przelewOplata, netto: netto,
+                nettoZPodsumowania: podsum ? podsum.netto : null,
+                rozjazdWyplaty: (podsum && podsum.netto != null) ? r2(netto - podsum.netto) : null
+            },
+            pary: pary,
+            wgDrogi: pary.reduce(function (m, p){ m[p.a.jak] = (m[p.a.jak] || 0) + 1; return m; }, {}),
+            chBezPary: chBez,
+            plBezPary: plBez,
+            okres: { od: od, doo: doo },
+            oknoKsiegi: { od: ksOd, doo: ksDoo },
+            powody: {
+                clearhaus: {
+                    'nie ma w księdze': ile(chBez, 'nie ma w księdze'),
+                    'rozbita nota — kilku kandydatów': ile(chBez, 'rozbita nota — kilku kandydatów'),
+                    'z innego miesiąca': ile(chBez, 'z innego miesiąca'),
+                    'kilku kandydatów': ile(chBez, 'kilku kandydatów'),
+                    'kwota jest, czas się nie zgadza': ile(chBez, 'kwota jest, czas się nie zgadza'),
+                    'kandydat już zajęty': ile(chBez, 'kandydat już zajęty'),
+                    'auftraga nie ma w eksporcie': ile(chBez, 'auftraga nie ma w eksporcie')
+                },
+                prolo: {
+                    'jeszcze nie wypłacone': ile(plBez, 'jeszcze nie wypłacone'),
+                    'czeka na capture': ile(plBez, 'czeka na capture'),
+                    'przed okresem': ile(plBez, 'przed okresem'),
+                    'w okresie': ile(plBez, 'w okresie'),
+                    'przeksięgowanie w księdze': ile(plBez, 'przeksięgowanie w księdze')
+                }
+            },
+            poslizgCaptureDni: poslizgDni,
+            // Saldo w drodze: co jest w ksiedze, a jeszcze nie wyplacone. Licza sie obie
+            // postacie oczekiwania — i po koncu okresu, i to na jego styku.
+            wyplaty: wyplaty,
+            poslizgWyplatyDni: poslizgW,
+            koniecOkresu: koniecOkresu,
+            // Saldo to WSZYSTKO, czego nie pokryla wyplata otrzymana do konca okresu:
+            // pozycje bez pokrycia ORAZ pozycje pokryte wyplata, ktora dopiero nadejdzie.
+            saldoPozycje: (function (){
+                var L = [];
+                pary.forEach(function (x){
+                    (x.grupa || [x.b]).forEach(function (b){
+                        if (b._saldo) L.push({ b: b, a: x.a, wyplata: b._wyplata,
+                                               powod: 'wypłata jeszcze nie wpłynęła' });
+                    });
+                });
+                plBez.forEach(function (b){
+                    if (b.powod === 'jeszcze nie wypłacone' || b.powod === 'czeka na capture')
+                        L.push({ b: b, a: null, wyplata: null, powod: b.powod });
+                });
+                return L;
+            })(),
+            saldoWDrodze: 0
+        };
+        wynik.saldoWDrodze = r2(wynik.saldoPozycje.reduce(function (a, x){
+            return a + (x.b.kierunek === 'wpl' ? 1 : -1) * (x.b.kwota || 0); }, 0));
+        return wynik;
+    }
+
+    /* ---------- wypis ----------
+       Raport ma odpowiadac na trzy pytania w tej kolejnosci: czy wyplata sie zgadza,
+       czego brakuje w ksiedze, i ile jeszcze wisi w drodze. Pozycje bez pary nie ida
+       do jednego worka — kazda dostaje powod, bo z kazdym powodem robi sie co innego. */
+    function mpOpisRefu(a){
+        if (a.ref.rodzaj === 'auftrag') return 'auftrag ' + a.ref.auf;
+        if (a.ref.rodzaj === 'zamowienie')
+            return a.ref.surowy + (a.ref.czas ? (' (' + mpDzien(a.ref.czas) + ' '
+                + ('0' + a.ref.czas.getHours()).slice(-2) + ':'
+                + ('0' + a.ref.czas.getMinutes()).slice(-2) + ')') : '');
+        return a.ref.surowy || '—';
+    }
+
+    function mpTekst(r){
+        var L = [];
+        var p = r.podsumowanie || {};
+        L.push('MobilePay ↔ Export payments — konto ' + r.konto
+            + (p.waluta ? (' · ' + p.waluta) : ''));
+        if (p.od && p.doo) L.push('Rozliczenie ' + mpDzien(p.od) + ' – ' + mpDzien(p.doo)
+            + (p.wyplaty ? (' · ' + p.wyplaty.length + ' wypłaty') : '')
+            + (p.numerWyplaty ? (' · wypłata ' + p.numerWyplaty) : '')
+            + (p.dataWyplaty && !p.wyplaty ? (' z ' + mpDzien(p.dataWyplaty)) : ''));
+        // Daty wyplat bierzemy z WYLICZONYCH — podsumowanie ich nie niesie, bo API
+        // Clearhausa daty wyplaty nie oddaje, i naglowek pokazywal wtedy „?".
+        if (p.wyplaty) p.wyplaty.forEach(function (w, iw){
+            var wy = (r.wyplaty || [])[iw];
+            L.push('   ' + (w.numerWyplaty || '—') + '  '
+                + (w.od ? mpDzien(w.od) : '?') + ' – ' + (w.doo ? mpDzien(w.doo) : '?')
+                + '  → ' + ((wy && wy.dataWyplaty) ? mpDzien(wy.dataWyplaty) : '?')
+                + (wy ? (wy.wplynela ? '  wpłynęła' : '  jeszcze nie') : '')
+                + '  ' + f2(w.netto));
+        });
+        L.push('');
+
+        L.push('KONTROLA WYPŁATY');
+        L.push('  sprzedaż (capture)      ' + f2(r.liczby.sprzedaz));
+        L.push('  zwroty (refund)         ' + f2(r.liczby.zwrotyKwota));
+        L.push('  opłaty z transakcji     ' + f2(r.liczby.oplaty));
+        if (r.liczby.przelewOplata != null)
+            L.push('  opłata za przelew       ' + f2(r.liczby.przelewOplata)
+                + '   (nie ma jej w transakcjach, tylko w podsumowaniu)');
+        L.push('  ─────────────────────────────────');
+        L.push('  policzone               ' + f2(r.liczby.netto));
+        if (r.liczby.nettoZPodsumowania != null){
+            L.push('  z podsumowania          ' + f2(r.liczby.nettoZPodsumowania));
+            L.push(r.liczby.rozjazdWyplaty === 0
+                ? '  → zgadza się co do grosza'
+                : '  → ROZJAZD ' + f2(r.liczby.rozjazdWyplaty) + ' — nie księgować, aż się wyjaśni');
+        }
+        L.push('');
+
+        L.push('CO Z CZYM SPAROWANE');
+        L.push('  Clearhaus: ' + r.liczby.clearhaus.wplaty + ' wpłat, '
+            + r.liczby.clearhaus.zwroty + ' zwrotów, '
+            + r.liczby.clearhaus.autoryzacje + ' autoryzacji (te nie niosą pieniędzy)');
+        L.push('  księga:    ' + r.liczby.prolo.wplaty + ' wpłat, '
+            + r.liczby.prolo.wyplaty + ' wypływów na koncie ' + r.konto);
+        var drogi = { auftrag: 'numer auftraga wprost z rozliczenia',
+                      quickpay: 'numer płatności z QuickPaya',
+                      zegar: 'znacznik czasu z rozliczenia (domysł)',
+                      nierozroznialne: 'ten sam numer płatności, pozycje nierozróżnialne',
+                      zpary: 'numer płatności z już sparowanego wiersza',
+                      partia: 'kilka zwrotów Clearhausa na jeden wiersz księgi',
+                      dzien: 'kwota i dzień zapłaty (autoryzacja, capture albo dzień wypłaty)',
+                      kwota: 'kwota i dzień',
+                      grupa: 'suma rozbitej noty kredytowej' };
+        Object.keys(r.wgDrogi).forEach(function (k){
+            L.push('  ' + String(r.wgDrogi[k]).padStart(5) + ' × ' + (drogi[k] || k));
+        });
+        if (!r.maIndeksQuickPay)
+            L.push('  ! bez indeksu QuickPaya — wiersze oznaczone „domysł" opierają się na czasie,');
+        L.push('  zegary rozjeżdżają się o ' + r.przesuniecieH + ' h (Clearhaus liczy w UTC)');
+        L.push('');
+
+        function sekcja(tytul, lista, wiersz){
+            if (!lista.length) return;
+            L.push(tytul + ' (' + lista.length + ')');
+            lista.forEach(function (x){ L.push('  ' + wiersz(x)); });
+            L.push('');
+        }
+        var chB = r.chBezPary;
+        sekcja('NIE MA W KSIĘDZE — Clearhaus pobrał, prologistics nie księgował',
+            chB.filter(function (x){ return x.powod === 'nie ma w księdze'; }),
+            function (x){ return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+                + '  ' + mpOpisRefu(x); });
+        // Osobno i PRZED reszta, bo to nie jest problem ksiegowy, tylko za waski zakres dat.
+        var pozaL = chB.filter(function (x){ return x.powod === 'z innego miesiąca'; });
+        if (pozaL.length){
+            var ok2 = r.oknoKsiegi || {};
+            L.push('Z INNEGO MIESIĄCA — nie należą do tego uzgodnienia (' + pozaL.length + ')');
+            L.push('  ' + f2(pozaL.reduce(function (a, x){ return a + (x.kwota || 0); }, 0))
+                + ' — zapłaty za te zamówienia wypadają poza zakresem, w którym pobrano księgę'
+                + (ok2.od ? (' (' + mpDzien(ok2.od) + ' – ' + mpDzien(ok2.doo) + ')') : '') + '.');
+            L.push('  Wypłata za miesiąc zaczyna się jeszcze w poprzednim, więc rozliczenie niesie');
+            L.push('  takie pozycje. Należą do uzgodnienia tamtego miesiąca — tu ich nie liczę.');
+            L.push('');
+        }
+        sekcja('KILKU KANDYDATÓW — nie zgaduję, który to',
+            chB.filter(function (x){ return x.powod === 'kilku kandydatów'; }),
+            function (x){ return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+                + '  ' + mpOpisRefu(x) + '  → w księdze: '
+                + (x.kandydaci || []).map(function (b){ return b.auf; }).join(' | '); });
+        sekcja('KWOTA JEST, CZAS SIĘ NIE ZGADZA — bez numeru nie rozstrzygnę',
+            chB.filter(function (x){ return x.powod === 'kwota jest, czas się nie zgadza'; }),
+            function (x){ return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+                + '  ' + mpOpisRefu(x) + '  → w księdze: '
+                + (x.kandydaci || []).map(function (b){
+                      return b.auf + (b.czas ? (' z ' + mpDzien(b.czas)) : ''); }).join(' | '); });
+        sekcja('KANDYDAT JUŻ ZAJĘTY — obejrzeć obie pozycje',
+            chB.filter(function (x){ return x.powod === 'kandydat już zajęty'; }),
+            function (x){ return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+                + '  ' + mpOpisRefu(x); });
+        sekcja('W KSIĘDZE, A NIE W ROZLICZENIU — to warto obejrzeć',
+            r.plBezPary.filter(function (x){ return x.powod === 'w okresie'; }),
+            function (x){ return (x.kierunek === 'wpl' ? 'wpłata ' : 'wypływ ') + f2(x.kwota)
+                + '  ' + x.auf + (x.id9 ? ('  płatność ' + x.id9) : '')
+                + (x.czas ? ('  ' + mpDzien(x.czas)) : ''); });
+
+        /* WOREK NA RESZTE. Kazda pozycja bez pary ma byc w tekscie DOKLADNIE raz.
+           Lista powodow wypisanych wyzej jest zamknieta, wiec nowy powod w rdzeniu
+           znikalby bez sladu — tak wlasnie przepadalo osiem przeksiegowan.              */
+        var wypisanyCh = { 'nie ma w księdze': 1, 'z innego miesiąca': 1, 'kilku kandydatów': 1,
+                           'kwota jest, czas się nie zgadza': 1, 'kandydat już zajęty': 1 };
+        sekcja('POZOSTAŁE POZYCJE ROZLICZENIA — powód przy każdej',
+            chB.filter(function (x){ return !wypisanyCh[x.powod]; }),
+            function (x){ return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+                + '  ' + mpOpisRefu(x) + '  → ' + (x.powod || '?'); });
+        // Wiersze ksiegi „czeka na capture", „jeszcze nie wyplacone" i „przed okresem"
+        // sa juz podsumowane w sekcji salda — tu tylko to, czego nigdzie indziej nie ma.
+        var wSaldzieJuz = { 'w okresie': 1, 'czeka na capture': 1,
+                            'jeszcze nie wypłacone': 1, 'przed okresem': 1 };
+        sekcja('POZOSTAŁE WIERSZE KSIĘGI — bez pary, ale to nie braki',
+            r.plBezPary.filter(function (x){ return !wSaldzieJuz[x.powod]; }),
+            function (x){ return (x.kierunek === 'wpl' ? 'wpłata ' : 'wypływ ') + f2(x.kwota)
+                + '  ' + x.auf + (x.id9 ? ('  płatność ' + x.id9) : '')
+                + (x.czas ? ('  ' + mpDzien(x.czas)) : '') + '  → ' + (x.powod || '?'); });
+
+        L.push('SALDO NA KONIEC OKRESU' + (r.koniecOkresu ? (' (' + r.koniecOkresu + ')') : ''));
+        L.push('  ' + f2(r.saldoWDrodze) + ' — należne nam: zaksięgowane, a nie pokryte'
+            + ' wypłatą otrzymaną do końca okresu.');
+        // Rozbicie na dwa powody, bo to dwie rozne rzeczy i co innego sie z nimi robi.
+        var zWyplata = (r.saldoPozycje || []).filter(function (x){ return !!x.wyplata; });
+        var bezPokr  = (r.saldoPozycje || []).filter(function (x){ return !x.wyplata; });
+        function suma(L2){ return r2(L2.reduce(function (a, x){
+            return a + (x.b.kierunek === 'wpl' ? 1 : -1) * (x.b.kwota || 0); }, 0)); }
+        if (zWyplata.length)
+            L.push('    ' + f2(suma(zWyplata)) + '  w ' + zWyplata.length
+                + ' pozycjach — rozliczenie zamknięte, ale wypłata wpływa dopiero później');
+        if (bezPokr.length)
+            L.push('    ' + f2(suma(bezPokr)) + '  w ' + bezPokr.length
+                + ' pozycjach — jeszcze bez rozliczenia ('
+                + r.powody.prolo['czeka na capture'] + ' czeka na capture, capture przychodzi do '
+                + r.poslizgCaptureDni + ' dni po zapłacie)');
+        (r.wyplaty || []).forEach(function (w){
+            L.push('    ' + (w.numerWyplaty || '—') + '  okres '
+                + (w.od ? mpDzien(w.od) : '?') + ' – ' + (w.doo ? mpDzien(w.doo) : '?')
+                + '  → wypłata ' + (w.dataWyplaty ? mpDzien(w.dataWyplaty) : '?')
+                + (w.zmierzona ? '' : ' (koniec okresu + ' + r.poslizgWyplatyDni + ' dni)')
+                + '  ' + (w.wplynela ? 'wpłynęła' : 'JESZCZE NIE — to jest saldo'));
+        });
+        L.push('  ' + r.powody.prolo['przed okresem'] + ' pozycji sprzed okresu pomijam — '
+            + 'pokryły je wcześniejsze wypłaty; żeby to potwierdzić, wczytaj także tamte rozliczenia.');
+        return L.join('\n');
+    }
+
+    /* ---------- tabele surowe ----------
+       Do skoroszytu, w ktorym kazda strona ma wlasna zakladke. Chodzi o to, zeby dalo sie
+       sprawdzic KAZDA liczbe u zrodla, zamiast wierzyc uzgodnieniu na slowo.               */
+    function mpTabelaTransakcji(trans){
+        var w = [['rozliczenie', 'typ', 'reference', 'numer zamówienia', 'auftrag z reference',
+                  'kwota', 'brutto rozliczenia', 'opłata', 'waluta', 'czas (Clearhaus)',
+                  'id transakcji', 'numer wypłaty']];
+        (trans || []).forEach(function (t){
+            w.push([t.plik || '', t.typ || '', t.ref ? t.ref.surowy : '',
+                    (t.ref && t.ref.rodzaj === 'zamowienie') ? t.ref.order : '',
+                    (t.ref && t.ref.rodzaj === 'auftrag') ? t.ref.auf : '',
+                    t.kwota != null ? t.kwota : '', t.brutto != null ? t.brutto : '',
+                    t.oplata != null ? t.oplata : '', t.waluta || '',
+                    t.czas ? mpDzien(t.czas) : '', t.id || '', t.wyplata || '']);
+        });
+        return w;
+    }
+    function mpTabelaRozliczen(rozl){
+        var w = [['rozliczenie', 'zamknięte', 'okres od', 'okres do', 'waluta', 'sprzedaż',
+                  'zwroty', 'opłaty', 'chargebacki', 'opłata za przelew', 'netto (wypłata)']];
+        (rozl || []).forEach(function (s){
+            w.push([s.id || '', s.zamkniete ? 'tak' : 'nie',
+                    s.od ? mpDzien(s.od) : '', s.doo ? mpDzien(s.doo) : '', s.waluta || '',
+                    s.sprzedaz, s.zwroty, s.oplatySuma, s.chargebacki, s.przelewOplata, s.netto]);
+        });
+        return w;
+    }
+    // Tabela z listy zwyklych obiektow — uzywana do surowych rekordow QuickPaya, ktorych
+    // ksztaltu nie znamy z gory. Kolumny bierzemy z SUMY kluczy, zeby nie zgubic pola,
+    // ktore pojawia sie dopiero w dalszych rekordach. Zagniezdzone wartosci ida jako JSON,
+    // bo lepszy skrocony JSON w komorce niz ciche „[object Object]".
+    function mpTabelaObiektow(lista, maxKol){
+        var L = [].concat(lista || []).filter(function (x){ return x && typeof x === 'object'; });
+        if (!L.length) return [['(brak danych)']];
+        var kol = [], znane = {};
+        L.forEach(function (o){
+            Object.keys(o).forEach(function (k){
+                if (!znane[k] && kol.length < (maxKol || 40)){ znane[k] = 1; kol.push(k); }
+            });
+        });
+        var w = [kol.slice()];
+        L.forEach(function (o){
+            w.push(kol.map(function (k){
+                var v = o[k];
+                if (v == null) return '';
+                if (typeof v === 'object'){
+                    try { return JSON.stringify(v).slice(0, 500); } catch (e){ return '(obiekt)'; }
+                }
+                return (typeof v === 'number' || typeof v === 'boolean') ? v : String(v);
+            }));
+        });
+        return w;
+    }
+    // Indeks QuickPaya jako tabela dwukolumnowa — na wypadek, gdy surowych rekordow nie ma
+    // (stara wersja mostu oddawala sama mape).
+    function mpTabelaIndeksu(mapa){
+        var w = [['numer zamówienia (QuickPay)', 'numer płatności (QuickPay)']];
+        Object.keys(mapa || {}).sort().forEach(function (k){ w.push([k, mapa[k]]); });
+        return w.length > 1 ? w : [['(indeks pusty)']];
+    }
+
+    /* ---------- arkusz wyjsciowy ----------
+       Zastepuje reczny zeszyt: kolumny obu stron obok siebie, zeby przy kazdej pozycji
+       bylo widac numer auftraga, numer platnosci QuickPaya i numer zamowienia z Clearhausa.
+       Wspolny zapisywacz modulu robi skoroszyt JEDNOARKUSZOWY, wiec wszystko idzie
+       w jedna zakladke, rozdzielone kolumna „sekcja".
+
+       Kolejnosc sekcji jest kolejnoscia pracy, nie alfabetem:
+         1. SALDO           — klient zaplacil, MobilePay jeszcze nie wyplacil. To jest
+                              nasza naleznosc i to jest odpowiedz na pytanie „ile nam wisza".
+         2. NIE ZAKSIEGOWANE— Clearhaus pobral, a w ksiedze tego nie ma. Tu brakuje ksiegowania.
+         3. DO WYJASNIENIA  — jest po obu stronach, ale nie da sie jednoznacznie sparowac.
+         4. UZGODNIONE      — reszta, z data wyplaty, ktora te pozycje pokryla.               */
+    var MP_KOL = ['sekcja', 'auftrag', 'numer płatności', 'numer zamówienia', 'kwota',
+                  'rodzaj', 'data księgi', 'data Clearhaus', 'rozliczenie', 'data wypłaty',
+                  'status', 'co z tym zrobić'];
+    function mpArkuszSaldo(r){
+        var p = r.podsumowanie || {};
+        var dataW = p.dataWyplaty ? mpDzien(p.dataWyplaty) : '';
+        var drogi = { auftrag: 'numer auftraga', quickpay: 'QuickPay', zegar: 'czas (domysł)',
+                      nierozroznialne: 'numer płatności (pozycje nierozróżnialne)',
+                      zpary: 'numer płatności z pary', partia: 'kilka transakcji na jeden wiersz',
+                      dzien: 'kwota i dzień zapłaty',
+                      kwota: 'kwota i dzień', grupa: 'suma noty' };
+        // Data wyplaty PER ROZLICZENIE. Przy miesiacu jest ich piec, kazde z wlasnym
+        // okresem i wlasna wyplata — wpisanie wszedzie konca polaczonego okresu robilo
+        // z tej kolumny ozdobe. Transakcja niesie pelne id rozliczenia w polu `plik`.
+        // Daty wyplat bierzemy z WYLICZONYCH (r.wyplaty), bo API ich nie oddaje i licza sie
+        // z poslizgu wzgledem konca okresu. Koniec okresu sam w sobie data wyplaty NIE JEST.
+        var wgRozl = {};
+        (r.wyplaty || []).forEach(function (w){ if (w && w.id) wgRozl[w.id] = w; });
+        function wyplataZa(a){
+            var w = wgRozl[a && a.plik];
+            return (w && w.dataWyplaty) ? mpDzien(w.dataWyplaty) : dataW;
+        }
+        var out = [];
+        function pusty(){ var x = []; while (x.length < MP_KOL.length) x.push(''); return x; }
+        function tytul(t, suma){
+            var x = pusty();
+            x[0] = t;
+            if (suma != null){ x[4] = suma; x[5] = p.waluta || ''; }
+            out.push(x);
+        }
+        function naglowek(){ out.push(MP_KOL.slice()); }
+        function wiersz(o){
+            return [o.sekcja || '', o.auf || '', o.id9 || '', o.zam || '',
+                    o.kwota != null ? o.kwota : '', o.rodzaj || '',
+                    o.dataKs || '', o.dataCh || '', o.rozl || '', o.dataW || '',
+                    o.status || '', o.rada || ''];
+        }
+        // Ksiega: rodzaj i numery. „wypływ" to zwrot albo obciazenie po naszej stronie.
+        function zKsiegi(b, sekcja, status, rada, zam, dataW2){
+            return wiersz({ sekcja: sekcja, auf: b.auf, id9: b.id9, zam: zam || '',
+                            kwota: b.kwota, rodzaj: b.kierunek === 'wpl' ? 'wpłata' : 'wypływ',
+                            dataKs: b.czas ? mpDzien(b.czas) : '', dataW: dataW2 || '',
+                            status: status, rada: rada || b.opis || '' });
+        }
+
+        // --- 1. saldo: zaplacone przez klienta, jeszcze nie wyplacone przez MobilePay ---
+        var saldo = r.saldoPozycje || [];
+        tytul('SALDO — należne nam na koniec okresu'
+            + (r.koniecOkresu ? (' (' + r.koniecOkresu + ')') : ''), r.saldoWDrodze);
+        naglowek();
+        saldo.forEach(function (x){
+            var b = x.b, w = x.wyplata;
+            out.push(wiersz({ sekcja: 'SALDO', auf: b.auf, id9: b.id9,
+                zam: x.a && x.a.ref ? x.a.ref.surowy : '',
+                kwota: b.kwota, rodzaj: b.kierunek === 'wpl' ? 'wpłata' : 'wypływ',
+                dataKs: b.czas ? mpDzien(b.czas) : '',
+                dataCh: (x.a && x.a.czas) ? mpDzien(x.a.czas) : '',
+                rozl: (x.a && x.a.plik) || '',
+                dataW: (w && w.dataWyplaty) ? mpDzien(w.dataWyplaty) : '',
+                status: x.powod,
+                rada: w
+                    ? ('rozliczenie zamknięte, wypłata dopiero ' + mpDzien(w.dataWyplaty)
+                       + (w.zmierzona ? '' : ' (koniec okresu + ' + r.poslizgWyplatyDni + ' dni)'))
+                    : (x.powod === 'czeka na capture'
+                        ? ('capture przychodzi do ' + r.poslizgCaptureDni + ' dni od zapłaty')
+                        : 'wejdzie do następnej wypłaty') }));
+        });
+        if (!saldo.length) out.push(wiersz({ sekcja: 'SALDO', status: 'nie ma nic w drodze' }));
+        out.push([]);
+
+        // --- 2. nie zaksiegowane: Clearhaus pobral, ksiega milczy ---
+        var brak = r.chBezPary.filter(function (a){ return a.powod === 'nie ma w księdze'; });
+        tytul('NIE ZAKSIĘGOWANE — Clearhaus pobrał, w prologistics tego nie ma',
+              r2(brak.reduce(function (s, a){ return s + (a.kwota || 0); }, 0)));
+        naglowek();
+        brak.forEach(function (a){
+            out.push(wiersz({ sekcja: 'NIE ZAKSIĘGOWANE',
+                auf: a.ref.rodzaj === 'auftrag' ? a.ref.auf : '',
+                id9: a.platnosc || '',
+                zam: a.ref.surowy, kwota: a.kwota,
+                rodzaj: a.typ === 'refund' ? 'zwrot' : 'wpłata',
+                dataCh: a.czas ? mpDzien(a.czas) : '', rozl: a.plik || '',
+                dataW: wyplataZa(a),
+                status: a.powod, rada: a.opis || 'zaksięgować albo wyjaśnić z magazynem' }));
+        });
+        if (!brak.length) out.push(wiersz({ sekcja: 'NIE ZAKSIĘGOWANE', status: 'wszystko zaksięgowane' }));
+        out.push([]);
+
+        // --- 2b. poza pobranym zakresem ksiegi: to NIE jest brak ksiegowania ---
+        // Wyplata za sierpien zaczyna sie 28 lipca, wiec capture'y z konca lipca maja swoje
+        // wiersze w ksiedze lipcowej, ktorej nikt nie pobral. Mieszanie ich z prawdziwymi
+        // brakami raz juz zrobilo z 307 pozycji rzekome 600 tysiecy do wyjasnienia.
+        var poza = r.chBezPary.filter(function (a){ return a.powod === 'z innego miesiąca'; });
+        if (poza.length){
+            var ok = r.oknoKsiegi || {};
+            tytul('Z INNEGO MIESIĄCA — nie należą do tego uzgodnienia'
+                + (ok.od ? (' (uzgadniasz ' + mpDzien(ok.od) + ' – ' + mpDzien(ok.doo) + ')') : ''),
+                r2(poza.reduce(function (s2, a){ return s2 + (a.kwota || 0); }, 0)));
+            naglowek();
+            poza.forEach(function (a){
+                out.push(wiersz({ sekcja: 'INNY MIESIĄC',
+                    auf: a.ref.rodzaj === 'auftrag' ? a.ref.auf : '',
+                id9: a.platnosc || '',
+                    zam: a.ref.surowy, kwota: a.kwota,
+                    rodzaj: a.typ === 'refund' ? 'zwrot' : 'wpłata',
+                    dataKs: (a.ref && a.ref.czas) ? mpDzien(a.ref.czas) : '',
+                    dataCh: a.czas ? mpDzien(a.czas) : '', rozl: a.plik || '',
+                    status: a.powod, rada: a.opis || '' }));
+            });
+            out.push([]);
+        }
+
+        // --- 3. do wyjasnienia: jest po obu stronach, ale para nie jest jednoznaczna ---
+        tytul('DO WYJAŚNIENIA — nie parują się jednoznacznie');
+        naglowek();
+        r.chBezPary.filter(function (a){
+            return a.powod !== 'nie ma w księdze' && a.powod !== 'z innego miesiąca'; })
+            .forEach(function (a){
+                out.push(wiersz({ sekcja: 'DO WYJAŚNIENIA',
+                    auf: a.ref.rodzaj === 'auftrag' ? a.ref.auf : '',
+                id9: a.platnosc || '',
+                    zam: a.ref.surowy, kwota: a.kwota,
+                    rodzaj: a.typ === 'refund' ? 'zwrot' : 'wpłata',
+                    dataCh: a.czas ? mpDzien(a.czas) : '', rozl: a.plik || '',
+                    status: a.powod, rada: a.opis || '' }));
+            });
+        r.plBezPary.filter(function (b){ return b.powod === 'w okresie'; }).forEach(function (b){
+            out.push(zKsiegi(b, 'DO WYJAŚNIENIA', 'w księdze, a nie w rozliczeniu',
+                'sprawdzić, czy MobilePay w ogóle to pobrał'));
+        });
+        out.push([]);
+
+        // --- 3b. reszta ksiegi bez pary: to nie sa braki, ale musza byc widoczne ---
+        // Bez tej sekcji wiersze „przed okresem", „czeka na capture" i przeksiegowania
+        // nie trafialy do pliku w ogole — na sierpniu 2026 znikalo w ten sposob 287 pozycji,
+        // a plik ma sluzyc do sprawdzenia kazdej liczby.
+        // Bez wierszy, ktore stoja juz w sekcji SALDO — inaczej te same pozycje
+        // wchodza do pliku dwa razy, a obie sekcje niosa sume.
+        var juzWSaldzie = [];
+        (r.saldoPozycje || []).forEach(function (x){ juzWSaldzie.push(x.b); });
+        var resztaKs = r.plBezPary.filter(function (b){
+            return b.powod !== 'w okresie' && juzWSaldzie.indexOf(b) < 0;
+        });
+        if (resztaKs.length){
+            tytul('POZOSTAŁE WIERSZE KSIĘGI — bez pary, ale to nie braki',
+                r2(resztaKs.reduce(function (s2, b){
+                    return s2 + (b.kierunek === 'wpl' ? 1 : -1) * (b.kwota || 0); }, 0)));
+            naglowek();
+            resztaKs.forEach(function (b){
+                out.push(zKsiegi(b, 'POZOSTAŁE KSIĘGI', b.powod, b.opis || ''));
+            });
+            out.push([]);
+        }
+
+        // --- 4. uzgodnione: z data wyplaty, ktora pozycje pokryla ---
+        tytul('UZGODNIONE — pokryte ' + ((p.wyplaty && p.wyplaty.length > 1)
+            ? (p.wyplaty.length + ' wypłatami — data przy każdym wierszu')
+            : ('wypłatą' + (dataW ? (' z ' + dataW) : ''))));
+        naglowek();
+        r.pary.forEach(function (x){
+            // Rozbita nota kredytowa wchodzi KAZDYM wierszem osobno: inaczej przy
+            // przepisywaniu daty wyplaty czesc pozycji zostalaby nietknieta.
+            (x.grupa || [x.b]).forEach(function (b){
+                if (b._saldo) return;          // te stoja wyzej, w sekcji SALDO
+                out.push(wiersz({ sekcja: 'uzgodnione', auf: b.auf, id9: b.id9,
+                    zam: (x.grupaA || [x.a]).map(function (a){ return a.ref.surowy; }).join(' + '),
+                    kwota: b.kwota,
+                    rodzaj: b.kierunek === 'wpl' ? 'wpłata' : 'wypływ',
+                    dataKs: b.czas ? mpDzien(b.czas) : '',
+                    dataCh: x.a.czas ? mpDzien(x.a.czas) : '',
+                    rozl: x.a.plik || '', dataW: wyplataZa(x.a),
+                    status: 'pokryte', rada: drogi[x.a.jak] || x.a.jak }));
+            });
+        });
+        return out;
+    }
+
+    /* ---------- transport: Clearhaus ----------
+       Panel my.clearhaus.com rozmawia z merchant.clearhaus.com przez OAuth2 Bearer.
+       Token lezy WYLACZNIE w pamieci panelu — oba schowki przegladarki sa puste — wiec
+       przechwytuje go osobny modul „Clearhaus — sesja panelu" i zostawia w GM-magazynie.
+       Stad wolamy juz wprost przez GM_xmlhttpRequest: userscriptu CORS nie dotyczy,
+       liczy sie tylko naglowek.
+
+       Ksztalt zapytania NIE JEST tu zgadniety. Kazdy uzyty adres ma potwierdzenie
+       odpowiedzia 200 w ruchu panelu:
+         GET /settlements?per_page=50                            (lista rozliczen)
+         GET /settlements/<uuid>/transactions?per_page=50        (transakcje jednego)
+       Stronicowanie idzie WYLACZNIE za _links.next z ciala odpowiedzi — naglowka Link
+       Clearhaus nie wysyla w ogole, a wlasnorecznie sklejane &page=N raz juz oddalo 404.
+       Wartosci per_page inne niz zaobserwowane (2, 50) sa nieprzetestowane; 50 to jedyna
+       wysoka, ktora widzielismy z 200, wiec przy niej zostajemy.                        */
+    const MP_CH_TOK = 'tm_ch_token_v1';
+    const MP_CH_API = 'https://merchant.clearhaus.com';
+    const MP_CH_STR = '/settlements?per_page=50';
+    function mpChToken(){
+        let o = null;
+        try { o = JSON.parse(GM_getValue(MP_CH_TOK, 'null')); } catch (e){ o = null; }
+        if (!o || !o.tok) return '';
+        if (o.exp && o.exp < Date.now()) return '';
+        return o.tok;
+    }
+    function mpChBrak(){
+        return 'HUB nie ma sesji Clearhausa. Otwórz my.clearhaus.com, zaloguj się i kliknij '
+             + '„Settlements" — moduł „Clearhaus — sesja panelu" przechwyci token. Token żyje '
+             + 'kilka godzin, więc czasem trzeba to powtórzyć.';
+    }
+    function mpChUrl(u){ return /^https?:/i.test(u) ? u : (MP_CH_API + u); }
+
+    // Oddaje surowy wynik ZAWSZE, takze przy 404 — razem z adresem, ktory naprawde poszedl,
+    // i poczatkiem ciala. Komunikat „HTTP 404" bez tych dwoch rzeczy kosztowal nas cala rundę
+    // zgadywania, wiec tego bledu nie powtarzamy.
+    function mpChSurowy(url){
+        const tok = mpChToken();
+        if (!tok) return Promise.resolve({ blad: mpChBrak(), url: mpChUrl(url) });
+        return new Promise(function (ok){
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: mpChUrl(url),
+                // Panel wysyla dokladnie taki Accept — nie rozszerzamy go na wlasna reke.
+                headers: { 'Authorization': tok, 'Accept': 'application/hal+json' },
+                timeout: 60000,
+                onload: function (r){
+                    const m = /content-type:\s*([^\r\n]+)/i.exec(r.responseHeaders || '');
+                    ok({ status: r.status, url: mpChUrl(url), koncowy: r.finalUrl || '',
+                         ct: m ? m[1].trim() : '',
+                         tekst: String(r.responseText || '') });
+                },
+                onerror: function (){ ok({ blad: 'zapytanie nie doszło', url: mpChUrl(url) }); },
+                ontimeout: function (){ ok({ blad: 'brak odpowiedzi przez 60 s', url: mpChUrl(url) }); }
+            });
+        });
+    }
+    async function mpChGet(url){
+        const r = await mpChSurowy(url);
+        if (r.blad) throw new Error(r.blad + ' · ' + r.url);
+        if (r.status === 401 || r.status === 403)
+            throw new Error('Clearhaus odrzucił sesję (' + r.status + '). ' + mpChBrak());
+        if (r.status < 200 || r.status >= 300)
+            throw new Error('HTTP ' + r.status + ' na ' + r.url
+                + (r.ct ? (' · ' + r.ct) : '') + ' · ' + r.tekst.slice(0, 160));
+        try { return JSON.parse(r.tekst); }
+        catch (e){ throw new Error('Clearhaus oddał nie-JSON na ' + r.url + ': '
+            + r.tekst.slice(0, 160)); }
+    }
+
+    // Macierz diagnostyczna Clearhausa: cztery postacie adresu, kazda z surowym statusem.
+    // Sluzy do jednego — rozstrzygniecia, czy 404 bral sie z adresu, czy z czegos innego.
+    async function mpChDiag(){
+        const co = ['/settlements?per_page=50', '/settlements?per_page=25',
+                    '/settlements?per_page=50&page=1', '/settlements'];
+        const w = [];
+        for (let i = 0; i < co.length; i++){
+            const r = await mpChSurowy(co[i]);
+            w.push({ adres: co[i], status: r.blad ? ('błąd: ' + r.blad) : r.status,
+                     ct: r.ct || '', dlugosc: (r.tekst || '').length,
+                     poczatek: (r.tekst || '').slice(0, 120) });
+        }
+        return w;
+    }
+
+    // Rozliczenia zachodzace na zadany zakres. Lista idzie od najnowszych, wiec schodzimy
+    // w dol i przestajemy, gdy okres jest starszy niz „od". Kolejne strony bierzemy
+    // z _links.next — adres podaje sam serwer.
+    async function mpChRozliczenia(od, doo, postep){
+        const wynik = [];
+        let adres = MP_CH_STR, stron = 0;
+        while (adres && stron < 60){
+            const j = await mpChGet(adres);
+            const lista = mpRozliczeniaZJson(j);
+            if (!lista.length) break;
+            stron++;
+            let zaStare = false;
+            lista.forEach(function (s){
+                const a = s.od ? mpDzien(s.od) : '', b = s.doo ? mpDzien(s.doo) : a;
+                if (a && a > doo) return;                     // jeszcze za nowe
+                if (b && b < od){ zaStare = true; return; }   // juz za stare
+                // Biezacy, niezamkniety okres nie jest wyplata — braloby sie z niego
+                // „brakujace" pozycje, ktore po prostu jeszcze nie zostaly wyplacone.
+                if (!s.zamkniete) return;
+                wynik.push(s);
+            });
+            if (postep) postep(wynik.length, stron);
+            if (zaStare) break;
+            adres = mpHalWzor(mpHalLink(j, 'next'), {});
+        }
+        return wynik;
+    }
+    async function mpChTransakcje(rozl, postep){
+        const poz = [];
+        for (let i = 0; i < rozl.length; i++){
+            const s = rozl[i];
+            const baza = s.hrefTransakcje || (MP_CH_API + '/settlements/' + s.id + '/transactions');
+            // Link do transakcji przychodzi jako SZABLON: …/transactions{?query,page,per_page}.
+            // Doklejenie parametru wprost wysyla klamry w adresie i konczy sie 404 —
+            // dlatego kazdy adres z HAL-a przechodzi przez mpHalWzor.
+            let adres = mpHalWzor(baza, { per_page: 50 }), stron = 0;
+            while (adres && stron < 400){
+                const j = await mpChGet(adres);
+                const l = mpTransakcjeZJson(j, s.id);
+                if (!l.length) break;
+                stron++;
+                l.forEach(function (x){ poz.push(x); });
+                if (postep) postep(i + 1, rozl.length, poz.length);
+                adres = mpHalWzor(mpHalLink(j, 'next'), {});
+            }
+        }
+        return poz;
+    }
+    // Rozliczenie z API -> podsumowanie w ukladzie, ktorego oczekuje mpUzgodnij.
+    function mpPodsumZRozliczen(rozl){
+        return rozl.map(function (s){
+            return { id: s.id, numerWyplaty: String(s.id || '').slice(0, 8), od: s.od, doo: s.doo,
+                     sprzedaz: s.sprzedaz, zwroty: s.zwroty,
+                     netto: s.netto, przelewOplata: s.przelewOplata, waluta: s.waluta,
+                     konto: MP_KONTO };
+        });
+    }
+
+    /* ---------- transport: QuickPay ----------
+       Most do karty panelu — po drugiej stronie stoi modul „QuickPay — most do panelu".
+       Jedno zlecenie naraz, odpowiedz kasowana zaraz po odbiorze (potrafi wazyc setki kB). */
+    const MP_QP_Z = 'tm_qp_zlec', MP_QP_O = 'tm_qp_odp';
+    let mpQpNr = 0;
+    function mpQpZlec(zlec, ileMs){
+        const id = 'q' + Date.now().toString(36) + '-' + (++mpQpNr);
+        try {
+            GM_setValue(MP_QP_O, '');
+            GM_setValue(MP_QP_Z, JSON.stringify(Object.assign({ id: id, kiedy: Date.now() }, zlec)));
+        } catch (e){
+            return Promise.reject(new Error('nie mam gdzie zostawić zlecenia dla karty QuickPaya'));
+        }
+        return new Promise(function (ok, zle){
+            const start = Date.now(), limit = ileMs || 180000;
+            const zegar = setInterval(function (){
+                let o = null;
+                try { o = JSON.parse(GM_getValue(MP_QP_O, '') || 'null'); } catch (e){ o = null; }
+                if (o && o.id === id){
+                    clearInterval(zegar);
+                    try { GM_setValue(MP_QP_O, ''); GM_setValue(MP_QP_Z, ''); } catch (e){}
+                    if (o.ok) ok(o.dane); else zle(new Error('karta QuickPaya nie pobrała: ' + o.blad));
+                    return;
+                }
+                if (Date.now() - start > limit){
+                    clearInterval(zegar);
+                    zle(new Error('karta QuickPaya nie odpowiedziała w ' + Math.round(limit / 1000)
+                        + ' s. Otwórz manage.quickpay.net, zaloguj się i zostaw tę kartę otwartą — '
+                        + 'HUB pobiera przez nią, bo z prologistics QuickPay oddaje 404.'));
+                }
+            }, 400);
+        });
+    }
+
+    /* ---------- ekran ---------- */
+    let SAL_MP = null;          // { rozliczenia, transakcje, skala }
+    let SAL_MP_EXP = null;      // wiersze Export payments konta 1431
+    let SAL_MP_EXP_RAW = null;  // surowe arkusze z prologistics, bez obrobki
+    let SAL_MP_QP_REK = null;   // surowe rekordy platnosci z QuickPaya
+    let SAL_MP_QP = null;       // indeks zamowienie -> platnosc
+    let SAL_MP_R = null;        // ostatnie uzgodnienie
+    let SAL_MP_WYNIK = '';
+
+    /* Chwila zaplaty klienta wprost z QuickPaya: `created_at` rekordu platnosci pod
+       kluczem `order_id`. Potrzebne tam, gdzie `reference` nie niesie znacznika czasu —
+       czyli przy platnosciach z linku MobilePay, gdzie referencja to numer auftraga.
+       Bez tego moment zaplaty podmienial capture, ktory przychodzi przy wysylce i potrafi
+       przeskoczyc na nastepny miesiac (auftrag 15585705: zaplata 31.08, capture 01.09).  */
+    function mpCzasyQp(){
+        const m = {};
+        (SAL_MP_QP_REK || []).forEach(function (p){
+            const o = p && (p.order_id != null ? p.order_id : p.orderId);
+            const c = p && (p.created_at || p.createdAt);
+            if (o == null || !c) return;
+            const k = String(o);
+            if (m[k] == null) m[k] = c;      // lista idzie od najnowszych — pierwszy wygrywa
+        });
+        return m;
+    }
+
+    function salMpInfo(){
+        const e = salPanel().querySelector('#sal-mpinfo');
+        if (!e) return;
+        const cz = [];
+        cz.push(SAL_MP_EXP ? ('prologistics: ' + SAL_MP_EXP.length + ' wierszy')
+                           : 'prologistics: nie pobrane');
+        cz.push(SAL_MP ? ('Clearhaus: ' + SAL_MP.rozliczenia.length + ' rozliczeń, '
+                          + SAL_MP.transakcje.length + ' transakcji')
+                       : 'Clearhaus: nie pobrane');
+        cz.push(SAL_MP_QP ? ('QuickPay: ' + Object.keys(SAL_MP_QP).length + ' zamówień')
+                          : 'QuickPay: nie pobrany (parowanie pójdzie po zegarze)');
+        e.textContent = cz.join(' · ');
+    }
+
+    async function salMpExport(b){
+        const p = salPanel();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ salKoniec('pl', 'uzupełnij zakres dat', '#c47f00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            salKoniec('pl', 'moduł Export payments jest wyłączony w launcherze', '#c00'); return; }
+        b.disabled = true;
+        salPraca('pl', 'zaczynam…');
+        try {
+            const wynik = await window.__TM_EXPORT_FETCH([MP_KONTO], od, doo, 'excel',
+                function (i, n, nazwa, etap){ salPraca('pl', nazwa + (etap ? (' · ' + etap) : '')); });
+            const rows = [], zle = [], surowe = [];
+            wynik.forEach(function (x){
+                if (x.blad){ zle.push(x.nazwa + ': ' + x.blad); return; }
+                if (!x.buf){ zle.push(x.nazwa + ': brak ruchu w tym zakresie'); return; }
+                const aoa = slXls(x.buf);
+                // Surowy arkusz zostaje NIETKNIETY — do zakladki „Export payments".
+                // Uzgodnienie da sie sprawdzic tylko wtedy, gdy widac zrodlo.
+                surowe.push({ nazwa: x.nazwa || MP_KONTO, aoa: aoa });
+                const r = mpZExportu(aoa, x.nazwa || MP_KONTO);
+                if (r.err){ zle.push(r.err); return; }
+                r.poz.forEach(function (y){ rows.push(y); });
+            });
+            SAL_MP_EXP = rows;
+            SAL_MP_EXP_RAW = surowe;
+            salMpInfo();
+            salKoniec('pl', rows.length
+                    ? (rows.length + ' wierszy' + (zle.length ? (' · problemy: ' + zle.join('; ')) : ''))
+                    : ('nie wczytałem ani jednego wiersza. ' + zle.join('; ')),
+                   rows.length ? (zle.length ? '#c47f00' : '#0a7a2f') : '#c00');
+        } catch (e){
+            salKoniec('pl', 'nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    async function salMpClearhaus(b){
+        const p = salPanel();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ salKoniec('ch', 'uzupełnij zakres dat', '#c47f00'); return; }
+        b.disabled = true;
+        salPraca('ch', 'szukam rozliczeń…');
+        try {
+            const rozl = await mpChRozliczenia(od, doo, function (ile, str){
+                salPraca('ch', 'rozliczeń: ' + ile + ' (strona ' + str + ')');
+            });
+            if (!rozl.length){
+                salKoniec('ch', 'w tym zakresie nie ma zamkniętych rozliczeń — bieżący okres '
+                    + 'nie jest jeszcze wypłatą', '#c47f00');
+                return;
+            }
+            const tr = await mpChTransakcje(rozl, function (i, n, ile){
+                salPraca('ch', 'rozliczenie ' + i + '/' + n + ' · transakcji: ' + ile);
+            });
+            // Jednostke kwot sprawdzamy na sobie, zamiast zakladac: suma transakcji ma
+            // wyjsc na sprzedaz z podsumowania. Przy pieniadzach „chyba w koronach" to
+            // za malo, wiec gdy nie wychodzi — nie liczymy dalej.
+            // Kazde rozliczenie sprawdzamy JEGO WLASNYMI transakcjami. Porownywanie sumy
+            // wszystkich pobranych transakcji z podsumowaniem pierwszego rozliczenia dawalo
+            // bzdurny stosunek, gdy w zakresie bylo ich kilka — i falszywa diagnoze.
+            const sk = mpSkalaWielu(tr, rozl);
+            if (!sk.pewne){
+                salKoniec('ch', 'suma transakcji nie zgadza się z podsumowaniem: ' + sk.powod
+                    + ' — przerywam, żeby nie podać złych liczb', '#c00');
+                return;
+            }
+            mpPrzeskaluj(tr, sk.mnoznik);
+            SAL_MP = { rozliczenia: rozl, transakcje: tr, skala: sk };
+            salMpInfo();
+            salKoniec('ch', rozl.length + ' rozliczeń, ' + tr.length + ' transakcji'
+                + (sk.mnoznik === 1 ? '' : ' · kwoty przeliczone z setnych'), '#0a7a2f');
+        } catch (e){
+            salKoniec('ch', 'nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    async function salMpQuickPay(b){
+        const p = salPanel();
+        const od = p.querySelector('#sal-od').value, doo = p.querySelector('#sal-do').value;
+        if (!od || !doo){ salKoniec('qp', 'uzupełnij zakres dat', '#c47f00'); return; }
+        b.disabled = true;
+        salPraca('qp', 'proszę kartę panelu o indeks…');
+        try {
+            // Indeks budujemy hurtem: jedno zlecenie, a panel przechodzi liste platnosci
+            // wstecz az do poczatku okresu. Pytanie o kazde zamowienie osobno to przy
+            // tygodniu okolo 600 zapytan — tedy jest ich kilkanascie.
+            // Wyplata za miesiac zaczyna sie jeszcze w poprzednim, wiec indeks musi
+            // siegac do poczatku NAJSTARSZEGO rozliczenia, a nie do poczatku zakresu.
+            let odIdx = od;
+            ((SAL_MP && SAL_MP.rozliczenia) || []).forEach(function (s2){
+                const d = s2.od ? mpDzien(s2.od) : '';
+                if (d && d < odIdx) odIdx = d;
+            });
+            if (odIdx !== od) salPraca('qp', 'schodzę do ' + odIdx + ' — tak sięga najstarsze rozliczenie');
+            const w = await mpQpZlec({ rodzaj: 'indeks', od: odIdx }, 600000);
+            SAL_MP_QP = (w && w.mapa) || {};
+            SAL_MP_QP_REK = (w && w.rekordy) || null;
+            salMpInfo();
+            salKoniec('qp', Object.keys(SAL_MP_QP).length + ' zamówień w indeksie · '
+                + (w.stron || 0) + ' stron, ' + (w.widziane || 0) + ' płatności, '
+                + 'najstarsza ' + (w.najstarsza || '?')
+                + (w.wersja ? (' · API ' + w.wersja) : '')
+                + (w.naStrone ? (' · po ' + w.naStrone + ' na stronę') : '')
+                + (w.droga ? (' · ' + w.droga) : ''), '#0a7a2f');
+        } catch (e){
+            salKoniec('qp', String((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    async function salMpPorownaj(b){
+        if (!SAL_MP){ salSay('Najpierw pobierz rozliczenia z Clearhausa.', '#c47f00'); return; }
+        if (!SAL_MP_EXP){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        b.disabled = true;
+        try {
+            // Jednostka kwot. Zgodnosc transakcji z podsumowaniem nie rozstrzyga jej wcale,
+            // bo obie strony ida z tego samego API i moga byc w setnych OBIE. Kotwica jest
+            // ksiega prologistics — ta jest w koronach na pewno.
+            const podsum = mpPodsumZRozliczen(SAL_MP.rozliczenia);
+            const ps0 = mpZlozPodsumowania(podsum) || {};
+            const jed = mpJednostkaZKsiegi(mpSumaCapture(SAL_MP.transakcje),
+                                           mpSumaKsiegi(SAL_MP_EXP, ps0.od, ps0.doo));
+            if (!jed.pewne){
+                salSay('Nie rozstrzygam jednostki kwot: ' + jed.powod + '.', '#c00');
+                return;
+            }
+            if (jed.mnoznik !== 1 && !SAL_MP.jednostka){
+                mpPrzeskaluj(SAL_MP.transakcje, jed.mnoznik);
+                // Rozliczenia skalujemy TAK SAMO — inaczej zakladka Clearhausa pokazuje
+                // transakcje w koronach, a podsumowania w setnych (sprzedaz 86 976 850
+                // zamiast 869 768,50) i nie da sie ich porownac wzrokiem.
+                mpPrzeskalujPodsum(SAL_MP.rozliczenia, jed.mnoznik);
+                // `podsum` powstal PRZED przeskalowaniem rozliczen, wiec skalujemy go tu —
+                // i tylko tu. Skalowanie go poza ta galezia dzielilo przy drugim klknieciu
+                // „Sprawdz" przez 100 po raz drugi i netto wychodzilo sto razy za male.
+                mpPrzeskalujPodsum(podsum, jed.mnoznik);
+                SAL_MP.jednostka = jed.mnoznik;
+            }
+
+            // Koniec zakresu rozstrzyga, ktora wyplata zdazyla wplynac — a to decyduje
+            // o saldzie. Bez tego ostatnie rozliczenie miesiaca wygladalo na pokryte.
+            const r = mpUzgodnij(SAL_MP.transakcje, SAL_MP_EXP, SAL_MP_QP, podsum,
+                                 { koniec: salPanel().querySelector('#sal-do').value,
+                                   qpCzas: mpCzasyQp() });
+            SAL_MP_R = r;
+            // Odcisk danych, z ktorych ten wynik powstal — zapis skoroszytu go sprawdza.
+            SAL_MP_R._zrodlo = mpOdcisk();
+            // Do schowka idzie tekst, na ekran karty — jak przy Amazonie.
+            SAL_MP_WYNIK = mpTekst(r);
+            const p = salPanel(), el = p.querySelector('#sal-mpwynik');
+            if (el){
+                el.style.cssText = 'margin-top:4px;max-height:520px;overflow:auto';
+                el.innerHTML = mpRender(r);
+            }
+            ['#sal-mpxlsx', '#sal-mpwsz', '#sal-mpkopiuj'].forEach(function (s){
+                const g = p.querySelector(s); if (g) g.style.display = '';
+            });
+            const brak = r.powody.clearhaus['nie ma w księdze'] || 0;
+            const inny = r.powody.clearhaus['z innego miesiąca'] || 0;
+            const spor = r.chBezPary.length + (r.powody.prolo['w okresie'] || 0)
+                       - brak - inny;
+            // Pozycje, ktorych numeru nie ma w indeksie, dopytujemy od razu — bez proszenia
+            // czlowieka o osobne klikniecie. Raz na komplet danych, zeby nie krecic sie
+            // w kolko, i tylko gdy most w ogole odpowiada.
+            if (!SAL_MP._dopytane && SAL_MP_QP && Object.keys(SAL_MP_QP).length){
+                SAL_MP._dopytane = true;
+                const ile = await salMpDopytaj();
+                if (ile){ b.disabled = false; return salMpPorownaj(b); }
+            }
+            salSay((brak ? (brak + ' transakcji MobilePay bez śladu w prologistics')
+                         : 'Wszystkie transakcje MobilePay są w prologistics')
+                   + (spor ? (' · ' + spor + ' do obejrzenia') : '')
+                   + ' · saldo ' + f2(r.saldoWDrodze),
+                   brak ? '#c00' : (spor ? '#c47f00' : '#0a7a2f'));
+        } catch (e){
+            salSay('nie policzyłem: ' + ((e && e.message) || e), '#c00');
+        } finally { b.disabled = false; }
+    }
+
+    function salMpXlsx(){
+        if (!mpZgodneDane()) return;
+        // slXlsxBlob zapisuje jedna zakladke, wiec obie tabele ida w jednej,
+        // z kolumna „sekcja" — sporne na gorze, bo tylko one wymagaja pracy.
+        const blob = slXlsxBlob('MobilePay', mpArkuszSaldo(SAL_MP_R));
+        const ps = SAL_MP_R.podsumowanie || {};
+        const nazwa = 'mobilepay-' + (ps.od ? mpDzien(ps.od) : 'okres')
+            + (ps.doo ? ('_' + mpDzien(ps.doo)) : '') + '.xlsx';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nazwa;
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + nazwa, '#0a7a2f');
+    }
+
+    // Diagnostyka obu paneli. Powstala z konkretnej wpadki: ten sam adres QuickPaya
+    // oddal 200 wolany przez panel i 404 wolany przez most — a jedyne, co zostalo
+    // w reku, to napis „HTTP 404" bez adresu, bez naglowkow i bez ciala. Ten guzik
+    // zdejmuje pomiar zamiast pozwalac na kolejna hipoteze.
+    function salMpDiagTekst(ch, qp){
+        const L = [];
+        L.push('DIAGNOSTYKA — surowe odpowiedzi, bez interpretacji');
+        L.push('');
+        L.push('CLEARHAUS (przez GM_xmlhttpRequest, z tej karty)');
+        if (!ch || ch.blad) L.push('  ' + ((ch && ch.blad) || 'nie sprawdzone'));
+        else ch.forEach(function (r){
+            L.push('  ' + String(r.status) + '  ' + r.adres
+                + '   ' + r.dlugosc + ' B' + (r.ct ? ('  ' + r.ct) : ''));
+            if (String(r.status) !== '200' && r.poczatek) L.push('        ' + r.poczatek);
+        });
+        L.push('');
+        L.push('QUICKPAY (z karty panelu, przez most)');
+        if (!qp || qp.blad) L.push('  ' + ((qp && qp.blad) || 'nie sprawdzone'));
+        else {
+            L.push('  karta stoi na: ' + qp.gdzie);
+            L.push('  service worker strony: ' + qp.serviceWorker);
+            L.push('  wersja API podsłuchana u panelu: ' + qp.wersjaZPanelu);
+            L.push('  ostatni adres, który wołał sam panel: ' + qp.adresPanelu);
+            L.push('');
+            if (qp.zapamietany)
+                L.push('  zapamiętany sposób: ' + qp.zapamietany.droga
+                    + ' → ' + qp.zapamietany.host);
+            L.push('');
+            L.push('  CO PANEL NAPRAWDĘ DOSTAJE (nagrane z jego własnego ruchu)');
+            if (!qp.nagrane || !qp.nagrane.length)
+                L.push('    nic nie nagrane — panel nie wołał listy płatności, odkąd moduł wstał.');
+            (qp.nagrane || []).forEach(function (n){
+                L.push('    ' + String(n.status) + '  ' + n.czym + '  ' + n.dlugosc + ' B');
+                L.push('        ' + n.url);
+                if (n.naglowki && n.naglowki.length)
+                    L.push('        nagłówki: ' + n.naglowki.join(' | '));
+                if (n.link) L.push('        Link: ' + n.link);
+                if (n.poczatek) L.push('        ' + n.poczatek);
+            });
+            if (qp.ksztaltRekordu)
+                L.push('  pola rekordu płatności z żywej odpowiedzi: '
+                    + qp.ksztaltRekordu.join(', '));
+            L.push('');
+            (qp.proby || []).forEach(function (r){
+                L.push('  ' + String(r.status) + '  ' + r.droga + ' → ' + r.host
+                    + ' · ' + r.wersja
+                    + (r.dlugosc != null ? ('  ' + r.dlugosc + ' B') : '')
+                    + (r.ct ? ('  ' + r.ct) : ''));
+                L.push('        ' + r.adres);
+                if (r.link) L.push('        Link: ' + r.link);
+                if (String(r.status) !== '200' && r.poczatek) L.push('        ' + r.poczatek);
+            });
+            if (qp.dziala)
+                L.push('  → DZIAŁA: ' + qp.dziala.droga + ' → ' + qp.dziala.host
+                    + ', wersja ' + qp.dziala.wersja);
+        }
+        L.push('');
+        L.push('Czego szukamy: wiersza ze statusem 200. Wersja API albo postać adresu,');
+        L.push('przy której wychodzi 200, jest odpowiedzią — reszta to ślepe uliczki.');
+        return L.join('\n');
+    }
+    async function salMpDiag(b){
+        b.disabled = true;
+        salPraca('ch', 'sprawdzam warianty…');
+        let ch = null, qp = null;
+        try { ch = await mpChDiag(); }
+        catch (e){ ch = { blad: String((e && e.message) || e) }; }
+        salKoniec('ch', 'sprawdzone', '#666');
+        salPraca('qp', 'proszę kartę panelu o pomiar…');
+        try { qp = await mpQpZlec({ rodzaj: 'diagnoza' }, 120000); }
+        catch (e){ qp = { blad: String((e && e.message) || e) }; }
+        salKoniec('qp', 'sprawdzone', '#666');
+        SAL_MP_WYNIK = salMpDiagTekst(ch, qp);
+        const p = salPanel(), el = p.querySelector('#sal-mpwynik');
+        if (el){
+            el.textContent = SAL_MP_WYNIK;
+            el.style.cssText = 'white-space:pre-wrap;font:11px/1.5 ui-monospace,Consolas,monospace;'
+                + 'background:#fafafa;border:1px solid #e6e6e6;border-radius:8px;padding:10px;'
+                + 'margin-top:8px;max-height:420px;overflow:auto';
+        }
+        const g = p.querySelector('#sal-mpkopiuj'); if (g) g.style.display = '';
+        salSay('Pomiar gotowy — skopiuj wynik i wklej mi go.', '#c47f00');
+        b.disabled = false;
+    }
+
+    /* ---------- skoroszyt czterozakladkowy ----------
+       Wspolny slXlsxBlob zapisuje jedna zakladke, a tu potrzebne sa cztery: kazda strona
+       osobno, zeby dalo sie sprawdzic liczbe u zrodla zamiast wierzyc uzgodnieniu.
+       Do wielu zakladek uzywamy biblioteki XLSX, ktora skrypt i tak wciaga (@require).
+       Gdyby jej nie bylo, nie udajemy, ze sie udalo — mowimy wprost i zapisujemy
+       jednozakladkowe saldo, ktore dziala zawsze.                                        */
+    function mpXlsxLib(){
+        try { if (typeof XLSX !== 'undefined' && XLSX && XLSX.utils) return XLSX; } catch (e){}
+        try { if (window.XLSX && window.XLSX.utils) return window.XLSX; } catch (e){}
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX
+                  && unsafeWindow.XLSX.utils) return unsafeWindow.XLSX; } catch (e){}
+        return null;
+    }
+    function mpSkoroszytBlob(arkusze){
+        const X = mpXlsxLib();
+        if (!X) return null;
+        const wb = X.utils.book_new();
+        arkusze.forEach(function (a){
+            const ws = X.utils.aoa_to_sheet(a.wiersze && a.wiersze.length ? a.wiersze : [['(pusto)']]);
+            // Nazwa zakladki: Excel nie przyjmie dluzszej niz 31 znakow ani ze znakami :\\/?*[]
+            X.utils.book_append_sheet(wb, ws,
+                String(a.nazwa).replace(/[:\\\/?*\[\]]/g, '-').slice(0, 31));
+        });
+        const buf = X.write(wb, { bookType: 'xlsx', type: 'array' });
+        return new Blob([buf],
+            { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    }
+    function mpZapisz(blob, nazwa){
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nazwa;
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    }
+    /* Odcisk wczytanych danych. Sluzy do jednego: zeby nie zapisac pliku, w ktorym
+       zakladki sa z jednego okresu, a saldo z innego.                                    */
+    function mpOdcisk(){
+        return [((SAL_MP_EXP || []).length),
+                ((SAL_MP_EXP_RAW || []).map(function (x){ return x.nazwa; }).join('|')),
+                (((SAL_MP && SAL_MP.transakcje) || []).length),
+                (((SAL_MP && SAL_MP.rozliczenia) || []).map(function (x){ return x.id; }).join('|'))
+               ].join(' # ');
+    }
+    // Zwraca true, gdy wolno zapisywac. Inaczej mowi, co jest nie tak, i nie zapisuje.
+    function mpZgodneDane(){
+        if (!SAL_MP_R) { salSay('Najpierw kliknij „Sprawdź".', '#c47f00'); return false; }
+        if (SAL_MP_R._zrodlo && SAL_MP_R._zrodlo !== mpOdcisk()){
+            salSay('Wczytane dane nie są tymi, z których policzone jest ostatnie uzgodnienie. '
+                 + 'Kliknij „Sprawdź" i zapisz ponownie — inaczej w jednym pliku byłyby '
+                 + 'zakładki z jednego okresu i saldo z innego.', '#c00');
+            return false;
+        }
+        return true;
+    }
+
+    function mpNazwaPliku(przedrostek){
+        const ps = (SAL_MP_R && SAL_MP_R.podsumowanie) || {};
+        return przedrostek + '-' + (ps.od ? mpDzien(ps.od) : 'okres')
+             + (ps.doo ? ('_' + mpDzien(ps.doo)) : '') + '.xlsx';
+    }
+
+    // Cztery zakladki: kazda strona surowo + gotowe saldo. Sluzy do sprawdzania, skad
+    // wzielo sie kazde uzgodnienie — i do pokazania komus, kto nie ma dostepu do paneli.
+    function salMpXlsxWszystko(){
+        if (!mpZgodneDane()) return;
+        if (!mpXlsxLib()){
+            salSay('Nie ma biblioteki XLSX, więc czterech zakładek nie zapiszę. '
+                 + 'Odśwież stronę; jeśli to nie pomoże, użyj „Saldo i uzgodnienie (XLSX)" '
+                 + '— to jedna zakładka, ale zapisuje się zawsze.', '#c00');
+            return;
+        }
+        // 1. Export payments — DOKLADNIE to, co przyszlo z prologistics, bez obrobki.
+        const expWiersze = [];
+        (SAL_MP_EXP_RAW || []).forEach(function (x, i){
+            if (i) expWiersze.push([]);
+            expWiersze.push(['plik: ' + x.nazwa]);
+            (x.aoa || []).forEach(function (w){ expWiersze.push(w); });
+        });
+        // 2. QuickPay — surowe rekordy platnosci, a gdy ich nie ma, sam indeks.
+        const qpWiersze = (SAL_MP_QP_REK && SAL_MP_QP_REK.length)
+            ? mpTabelaObiektow(SAL_MP_QP_REK)
+            : mpTabelaIndeksu(SAL_MP_QP);
+        // 3. Clearhaus — transakcje, a nad nimi podsumowania rozliczen.
+        const chWiersze = [];
+        mpTabelaRozliczen((SAL_MP && SAL_MP.rozliczenia) || []).forEach(function (w){ chWiersze.push(w); });
+        chWiersze.push([]);
+        mpTabelaTransakcji((SAL_MP && SAL_MP.transakcje) || []).forEach(function (w){ chWiersze.push(w); });
+
+        const blob = mpSkoroszytBlob([
+            { nazwa: 'Export payments', wiersze: expWiersze.length ? expWiersze
+                : [['(nie pobrano zestawienia z prologistics)']] },
+            { nazwa: 'QuickPay', wiersze: qpWiersze },
+            { nazwa: 'Clearhaus', wiersze: chWiersze },
+            { nazwa: 'Saldo', wiersze: mpArkuszSaldo(SAL_MP_R) }
+        ]);
+        if (!blob){ salSay('Nie udało się złożyć skoroszytu.', '#c00'); return; }
+        const nazwa = mpNazwaPliku('mobilepay-wszystko');
+        mpZapisz(blob, nazwa);
+        salSay('Zapisane: ' + nazwa + ' — cztery zakładki.', '#0a7a2f');
+    }
+
+    /* ---------- wynik na ekranie ----------
+       Uklad wzorowany na ekranie Amazona (knRender): biale karty z kolorowa ramka,
+       tytul w kolorze wagi sprawy, tresc monospace'em. Kolory znacza to samo, co tam:
+         #c00     — brak, czyli cos, czego w ksiegach NIE MA
+         #c47f00  — jest, ale nie da sie rozstrzygnac albo czeka
+         #0a7a2f  — zgadza sie
+         #5b21b6  — do wgladu, nie do poprawiania
+
+       KOLEJNOSC SEKCJI JEST KOLEJNOSCIA WAZNOSCI i odpowiada sposobowi sprawdzania:
+         1. MobilePay kontra ksiega — czy KAZDA transakcja Clearhausa ma slad w prologistics.
+            To jest wlasciwa kontrola kompletnosci i dlatego stoi pierwsza.
+         2. To, czego rozstrzygnac nie umiem — z powodem przy kazdej pozycji.
+         3. Dopiero potem pieniadze: za co nam nie zaplacili i ile wynosi saldo.
+         4. Na koncu kontrola arytmetyki wyplaty i statystyka parowania.                  */
+    function mpLink(auf){
+        const t = String(auf == null ? '' : auf).trim();
+        if (!t) return '';
+        // Sam numer nie wystarczy — auction.php bez „txnid" nie otwiera auftragu.
+        // Czesc po ukosniku („15040035 / 3") to wlasnie txnid; bez niej prologistics
+        // uzywa 3 dla zwyklego auftragu sprzedazy.
+        const a = t.match(/^(\d{5,})\s*(?:\/\s*(\d+))?$/);
+        if (a)
+            return '<a href="https://www.prologistics.info/auction.php?number=' + a[1]
+                 + '&txnid=' + (a[2] || '3') + '" target="_blank" style="color:#5b21b6">'
+                 + salEsc(t) + '</a>';
+        const c = t.match(/TICKET\s+(\d{3,})/i);
+        if (c)
+            return '<a href="https://www.prologistics.info/rma.php?rma_id=' + c[1]
+                 + '" target="_blank" style="color:#5b21b6">' + salEsc(t) + '</a>';
+        return salEsc(t);
+    }
+    /* Odnosnik do wyszukiwarki prologistics po NUMERZE PLATNOSCI. Kryterium „payment
+       comment" to w formularzu pole payment_comment (wlaczane przez radio_88), a adres
+       /search.php?what=payment_comment&payment_comment=<nr> jest ta sama droga, ktorej
+       uzywa Bank Import — czyli sprawdzona, nie zgadnieta. Jedno klikniecie pokazuje
+       auftrag, w ktorym ta platnosc powinna byc zaksiegowana.                            */
+    function mpLinkPlatnosc(nr){
+        const t = String(nr == null ? '' : nr).trim();
+        if (!t) return '';
+        return '<a href="https://www.prologistics.info/search.php?what=payment_comment'
+             + '&payment_comment=' + encodeURIComponent(t) + '" target="_blank" '
+             + 'title="Szukaj auftraga po numerze płatności" style="color:#5b21b6">'
+             + salEsc(t) + '</a>';
+    }
+    function mpSek(tytul, kol, tresc, wstep){
+        return '<div style="margin-top:8px;padding:6px 8px;background:#fff;border:1px solid '
+             + kol + ';border-radius:6px"><div style="font-size:11px;font-weight:700;color:'
+             + kol + ';margin-bottom:3px">' + tytul + '</div>'
+             + (wstep ? ('<div style="font-size:10px;color:#666;margin-bottom:3px">' + wstep + '</div>') : '')
+             + tresc + '</div>';
+    }
+    const MP_MONO = 'font:10px/1.5 monospace;color:#374151';
+    function mpLista(tab, maxWys){
+        return '<div style="' + MP_MONO + (maxWys ? (';max-height:' + maxWys + 'px;overflow:auto') : '')
+             + '">' + tab.join('<br>') + '</div>';
+    }
+    function mpOpisCh(x){
+        return (x.typ === 'refund' ? 'zwrot ' : 'wpłata ') + f2(x.kwota)
+             + '  ' + ((x.ref && x.ref.rodzaj === 'auftrag')
+                   ? ('auftrag ' + mpLink(x.ref.auf))
+                   : ('zamówienie <b>' + salEsc(x.ref ? x.ref.surowy : '') + '</b>'))
+             + ((x.ref && x.ref.rodzaj === 'auftrag' && x.ref.surowy !== x.ref.auf)
+                   ? (' <span style="color:#888">(w rozliczeniu: ' + salEsc(x.ref.surowy) + ')</span>')
+                   : '')
+             + (x.platnosc ? ('  płatność ' + mpLinkPlatnosc(x.platnosc)) : '')
+             + (x.czas ? ('  ' + mpDzien(x.czas)) : '');
+    }
+    function mpOpisPl(b){
+        return (b.kierunek === 'wpl' ? 'wpłata ' : 'wypływ ') + f2(b.kwota)
+             + '  ' + mpLink(b.auf)
+             + (b.id9 ? ('  płatność ' + mpLinkPlatnosc(b.id9)) : '')
+             + (b.czas ? ('  ' + mpDzien(b.czas)) : '');
+    }
+
+    function mpRender(r){
+        const p = r.podsumowanie || {};
+        const wal = salEsc(p.waluta || 'DKK');
+        const chB = r.chBezPary || [], plB = r.plBezPary || [];
+        const powod = function (n){ return chB.filter(function (x){ return x.powod === n; }); };
+        // Kazda pozycja ma sie pokazac DOKLADNIE raz. Zamiast listy nazw kategorii, ktora
+        // rozjezdza sie przy pierwszym przemianowaniu, notujemy to, co juz wypisalismy.
+        const wypisane = new Set();
+        const wez = function (n){
+            const l = powod(n);
+            l.forEach(function (x){ wypisane.add(x); });
+            return l;
+        };
+
+        let h = '<div style="font-size:11px;color:#374151">'
+              + 'Rozliczeń <b>' + ((p.wyplaty && p.wyplaty.length) || 1) + '</b>'
+              + (p.od ? (' · okres ' + mpDzien(p.od) + ' – ' + mpDzien(p.doo)) : '')
+              + ' · transakcji Clearhausa <b>' + (r.liczby.clearhaus.wplaty + r.liczby.clearhaus.zwroty) + '</b>'
+              + ' · wierszy księgi <b>' + (r.liczby.prolo.wplaty + r.liczby.prolo.wyplaty) + '</b>'
+              + ' · sparowanych <b>' + r.pary.length + '</b></div>';
+
+        // --- 1. KONTROLA KOMPLETNOSCI: MobilePay -> ksiega ---
+        const brak = wez('nie ma w księdze');
+        const sumaBrak = r2(brak.reduce(function (s, x){ return s + (x.kwota || 0); }, 0));
+        if (brak.length)
+            h += mpSek('❌ Nie zaksięgowane — ' + brak.length + ' na ' + f2(sumaBrak) + ' ' + wal, '#c00',
+                mpLista(brak.map(function (x){
+                    return mpOpisCh(x) + '  <span style="color:#888">rozliczenie '
+                         + salEsc(String(x.plik || '').slice(0, 8)) + '</span>'; }), 220),
+                'Clearhaus pobrał pieniądze, a w prologistics nie ma pod tą kwotą nic. '
+                + 'Numer płatności jest odnośnikiem — otwiera wyszukiwarkę prologistics po '
+                + 'kryterium „payment comment" i pokazuje auftrag, w którym ta płatność '
+                + 'powinna być zaksięgowana. Jeśli nic nie znajdzie, to jest „unknown payment" '
+                + 'z zeszytu: znaleźć zamówienie albo zaksięgować na konto techniczne.');
+        else {
+            // Zielono TYLKO wtedy, gdy nie zostalo nic do rozstrzygniecia. Wczesniej ten
+            // napis zapalal sie mimo setek pozycji bez pary i mowil nieprawde.
+            const zostalo = chB.length - powod('z innego miesiąca').length;
+            h += zostalo
+                ? mpSek('◻ Żadna transakcja MobilePay nie zaginęła', '#5b21b6',
+                    '<div style="' + MP_MONO + '">Każda ma odpowiednik w prologistics co do kwoty, '
+                    + 'ale ' + zostalo + ' z nich nie umiem przypisać jednoznacznie — patrz niżej.</div>')
+                : mpSek('✔ Każda transakcja MobilePay ma ślad w prologistics', '#0a7a2f',
+                    '<div style="' + MP_MONO + '">'
+                    + (r.liczby.clearhaus.wplaty + r.liczby.clearhaus.zwroty)
+                    + ' transakcji sprawdzonych, wszystkie sparowane.</div>');
+        }
+
+        // --- 2. czego nie rozstrzygam ---
+        const poza = wez('z innego miesiąca');
+        if (poza.length){
+            const ok = r.oknoKsiegi || {};
+            h += mpSek('⚠ Z innego miesiąca — ' + poza.length + ' na '
+                     + f2(r2(poza.reduce(function (s, x){ return s + (x.kwota || 0); }, 0))) + ' ' + wal, '#c47f00',
+                mpLista(poza.slice(0, 40).map(mpOpisCh).concat(
+                    poza.length > 40 ? ['<span style="color:#888">… i ' + (poza.length - 40) + ' dalszych</span>'] : []), 160),
+                'To NIE są braki księgowania ani zadanie na teraz. Wypłata za miesiąc zaczyna '
+                + 'się jeszcze w poprzednim, więc rozliczenie niesie transakcje, których wiersz '
+                + 'księgi wypada poza uzgadnianym okresem'
+                + (ok.od ? (' (' + mpDzien(ok.od) + ' – ' + mpDzien(ok.doo) + ')') : '')
+                + '. Policzysz je, robiąc tamten miesiąc — <b>zakresu tutaj nie zmieniaj</b>.');
+        }
+        const spor = chB.filter(function (x){ return !wypisane.has(x); });
+        if (spor.length)
+            h += mpSek('⚠ Nie rozstrzygam — ' + spor.length + ' pozycji', '#c47f00',
+                mpLista(spor.map(function (x){
+                    return mpOpisCh(x) + '<br>&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#888">'
+                         + salEsc(x.powod) + '</span>'
+                         + ((x.kandydaci || []).length
+                            ? ('  →  ' + x.kandydaci.slice(0, 4).map(function (b){
+                                   return mpLink(b.auf) + ' ' + f2(b.kwota); }).join(' | '))
+                            : ''); }), 220),
+                (spor.some(function (x){ return x.powod === 'auftraga nie ma w eksporcie'; })
+                   ? 'Część z nich to zapłaty, których auftraga nie ma jeszcze w eksporcie —'
+                     + ' te po prostu czekają na zaksięgowanie, powód stoi przy każdej. '
+                   : '')
+                + 'Tam, gdzie kwota jest po obu stronach, wybór byłby zgadywaniem. Rozstrzyga numer '
+                + 'płatności — a te pozycje go nie mają: '
+                + (r.maIndeksQuickPay
+                   ? 'ich zamówienia są starsze niż indeks pobrany z panelu (QuickPay oddaje '
+                     + 'listę wstecz po dacie, a capture bywa za zamówienie sprzed miesięcy). '
+                     + 'Moduł dopytał już panel o każde z nich z osobna — te, które zostały, '
+                     + 'panel odesłał bez wyniku.'
+                   : 'nie pobrano indeksu QuickPaya — pobierz go, to większość z nich zniknie.'));
+        const wKsiedze = plB.filter(function (b){ return b.powod === 'w okresie'; });
+        if (wKsiedze.length)
+            h += mpSek('⚠ W księdze, a nie w rozliczeniu — ' + wKsiedze.length + ' na '
+                     + f2(r2(wKsiedze.reduce(function (s, b){
+                           return s + (b.kierunek === 'wpl' ? 1 : -1) * (b.kwota || 0); }, 0))) + ' ' + wal, '#c47f00',
+                mpLista(wKsiedze.map(mpOpisPl), 180),
+                'Zaksięgowane w okresie rozliczenia, a Clearhaus tego nie pobrał. '
+                + 'Sprawdzić, czy płatność w ogóle doszła.');
+
+        const przeks = plB.filter(function (b){ return b.powod === 'przeksięgowanie w księdze'; });
+        if (przeks.length)
+            h += mpSek('↔ Przeksięgowania w księdze — ' + przeks.length
+                     + ' wierszy, razem 0.00 ' + wal, '#5b21b6',
+                mpLista(przeks.map(mpOpisPl), 140),
+                'Zwrot zaksięgowany najpierw na auftragu, a potem przeniesiony do ticketu '
+                + 'zostawia dwa wiersze: wypływ na auftragu i wpływ na nocie kredytowej — '
+                + 'ta sama faktura, ta sama kwota, ten sam dzień. Na koncie nie rusza się nic, '
+                + 'więc Clearhaus nie ma tu czego pokazać. To nie są braki.');
+
+        // --- 3. pieniadze: saldo ---
+        const zWyp = (r.saldoPozycje || []).filter(function (x){ return !!x.wyplata; });
+        const bezWyp = (r.saldoPozycje || []).filter(function (x){ return !x.wyplata; });
+        const suma = function (L){ return r2(L.reduce(function (a, x){
+            return a + (x.b.kierunek === 'wpl' ? 1 : -1) * (x.b.kwota || 0); }, 0)); };
+        h += mpSek('💰 Saldo na koniec okresu' + (r.koniecOkresu ? (' (' + salEsc(r.koniecOkresu) + ')') : '')
+                 + ' — <b>' + f2(r.saldoWDrodze) + ' ' + wal + '</b>', '#5b21b6',
+            '<div style="' + MP_MONO + '">'
+            + (zWyp.length ? (f2(suma(zWyp)) + '  w ' + zWyp.length
+                + ' pozycjach — rozliczenie zamknięte, wypłata wpływa dopiero później<br>') : '')
+            + (bezWyp.length ? (f2(suma(bezWyp)) + '  w ' + bezWyp.length
+                + ' pozycjach — jeszcze bez rozliczenia, czeka na capture<br>') : '')
+            + (r.wyplaty || []).map(function (w){
+                  return '<span style="color:' + (w.wplynela ? '#0a7a2f' : '#c47f00') + '">'
+                       + salEsc(w.numerWyplaty || '—') + '  okres '
+                       + (w.od ? mpDzien(w.od) : '?') + ' – ' + (w.doo ? mpDzien(w.doo) : '?')
+                       + '  → wypłata ' + (w.dataWyplaty ? mpDzien(w.dataWyplaty) : '?')
+                       + (w.zmierzona ? '' : ' <span style="color:#888">(koniec okresu + '
+                          + r.poslizgWyplatyDni + ' dni)</span>')
+                       + '  ' + (w.wplynela ? 'wpłynęła' : '<b>jeszcze nie — to jest saldo</b>')
+                       + '</span>'; }).join('<br>')
+            + '</div>',
+            'Saldo to wszystko, czego nie pokryła wypłata otrzymana do końca okresu — '
+            + 'razem z pozycjami, o których wiadomo, która wypłata je pokryje, tylko '
+            + 'jeszcze nie wpłynęła.');
+
+        // --- 4. kontrola arytmetyki i statystyka ---
+        const l = r.liczby;
+        // Brak podsumowania to nie rozjazd — nie ma z czym porownac, wiec ani zielono,
+        // ani czerwono.
+        const maPodsum = l.nettoZPodsumowania != null;
+        const zgodne = maPodsum && l.rozjazdWyplaty === 0;
+        h += mpSek((!maPodsum ? '◻' : (zgodne ? '✔' : '❌')) + ' Kontrola wypłaty'
+                 + (!maPodsum ? ' — brak podsumowania do porównania'
+                              : (zgodne ? ' — zgadza się co do grosza' : ' — ROZJAZD')),
+            !maPodsum ? '#5b21b6' : (zgodne ? '#0a7a2f' : '#c00'),
+            '<div style="' + MP_MONO + '">'
+            + 'sprzedaż (capture)&nbsp;&nbsp;&nbsp;' + f2(l.sprzedaz) + '<br>'
+            + 'zwroty (refund)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + f2(l.zwrotyKwota) + '<br>'
+            + 'opłaty z transakcji&nbsp;&nbsp;' + f2(l.oplaty) + '<br>'
+            + (l.przelewOplata != null
+               ? ('opłata za przelew&nbsp;&nbsp;&nbsp;&nbsp;' + f2(l.przelewOplata)
+                  + ' <span style="color:#888">(tylko w podsumowaniu)</span><br>') : '')
+            + '<b>policzone&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + f2(l.netto) + '</b>'
+            + (l.nettoZPodsumowania != null
+               ? ('<br>z podsumowania&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + f2(l.nettoZPodsumowania)
+                  + (zgodne ? '' : '  <b style="color:#c00">rozjazd ' + f2(l.rozjazdWyplaty) + '</b>')) : '')
+            + '</div>');
+
+        const drogi = { auftrag: 'numer auftraga z rozliczenia', quickpay: 'numer płatności QuickPay',
+                        nierozroznialne: 'numer płatności — pozycje nierozróżnialne',
+                        zegar: 'znacznik czasu (domysł)', kwota: 'kwota i dzień',
+                        zpary: 'numer płatności z już sparowanego wiersza',
+                        partia: 'kilka transakcji na jeden wiersz księgi',
+                        dzien: 'kwota i dzień zapłaty',
+                        grupa: 'suma rozbitej noty' };
+        h += mpSek('ℹ️ Co z czym sparowane', '#5b21b6',
+            '<div style="' + MP_MONO + '">'
+            + Object.keys(r.wgDrogi || {}).map(function (k){
+                  return String(r.wgDrogi[k]).padStart(5, ' ').replace(/ /g, '&nbsp;')
+                       + ' × ' + salEsc(drogi[k] || k); }).join('<br>')
+            + (r.maIndeksQuickPay ? '' :
+               '<br><span style="color:#c47f00">bez indeksu QuickPaya — pary „domysł" '
+               + 'opierają się na czasie, zegary rozjeżdżają się o ' + r.przesuniecieH + ' h</span>')
+            + '</div>');
+        return h;
+    }
+
+    /* ---------- dopytanie QuickPaya o pojedyncze zamowienia ----------
+       Indeks hurtowy schodzi wstecz PO DACIE i na tym polega jego granica: capture
+       z sierpnia potrafi dotyczyc zamowienia ze stycznia, a takiego numeru w indeksie
+       za sierpien nie bedzie. Zmierzone na miesiacu 2026-08: z 85 pozycji spornych
+       75 mialo zamowienie spoza indeksu (lipiec, a nawet marzec i styczen), a tylko
+       6 bylo w indeksie i mimo to sie nie sparowalo.
+
+       Dlatego druga droga: pytamy panel o KAZDE brakujace zamowienie z osobna. To jest
+       dokladnie to, do czego numer sluzy — QuickPay tlumaczy numer zamowienia na numer
+       platnosci, a ten stoi juz wprost w kolumnie Comment w prologistics. Kilkadziesiat
+       zapytan zamiast tysiecy, bo pytamy tylko o to, czego zabraklo.                     */
+    // Zwraca liczbe DOPYTANYCH numerow. Wolane samo z „Sprawdz" — bez guzika, bo skoro
+    // modul i tak pobiera te numery, nie ma po co prosic czlowieka o osobne klikniecie.
+    async function salMpDopytaj(cichy){
+        if (!SAL_MP_R) return 0;
+        // Pytamy tylko tam, gdzie numer moze zmienic wynik. Rdzen wystawia na to flage
+        // `wartoPytac`: po drugiej stronie stoi NIESPAROWANY wiersz ksiegi o tej samej
+        // kwocie i w te sama strone. Filtrowanie po samym POWODZIE bylo błędne w dwie
+        // strony — pytalo o 388 pozycji, a potem wykluczalo „z innego miesiaca", czyli
+        // wlasnie zaleglosci z lipca zaksiegowane w sierpniu (auftrag 15326871).
+        // Numer sluzy takze do WYSZUKANIA auftraga w prologistics, nie tylko do parowania —
+        // przy „nie ma w ksiedze" po drugiej stronie nie ma czego dopasowac, a numer i tak
+        // jest jedynym punktem zaczepienia dla czlowieka.
+        const WARTE_PYTANIA = {
+            'nie ma w księdze': 1,
+            // Rozbita nota nie zgadza sie ZADNYM pojedynczym wierszem, tylko suma grupy,
+            // wiec wartoPytac (liczone po kwotach pojedynczych wierszy) zawsze da tu falsz.
+            // Numer platnosci jest jedyna droga do tej pary — droga „suma noty po numerze".
+            'rozbita nota — kilku kandydatów': 1
+        };
+        const widziane = {}, brak = [];
+        (SAL_MP_R.chBezPary || []).forEach(function (x){
+            if (!x.wartoPytac && !WARTE_PYTANIA[x.powod]) return;
+            if (!x.ref || x.ref.rodzaj !== 'zamowienie') return;
+            const o = String(x.ref.order || '');
+            if (!o || widziane[o]) return;
+            if (SAL_MP_QP && SAL_MP_QP[o]) return;      // ten numer juz znamy
+            widziane[o] = 1;
+            brak.push(o);
+        });
+        if (!brak.length) return 0;
+        salPraca('qp', 'dopytuję o ' + brak.length + ' zamówień…');
+        let znalezione = 0, puste = 0, przerwane = '';
+        SAL_MP_QP = SAL_MP_QP || {};
+        try {
+            for (let i = 0; i < brak.length; i++){
+                const o = brak[i];
+                let w = null;
+                try { w = await mpQpZlec({ rodzaj: 'order', order: o }, 60000); }
+                catch (e){ przerwane = String((e && e.message) || e); break; }
+                const l = (w && w.lista) || [];
+                // Bierzemy rekord o TYM numerze zamowienia; gdy panel odda jeden wynik
+                // bez powtorzenia numeru, bierzemy pierwszy — ale nigdy na slepo kilku.
+                const rek = l.filter(function (x){ return String(x.order_id) === o; })[0]
+                          || (l.length === 1 ? l[0] : null);
+                if (rek && rek.id != null){ SAL_MP_QP[o] = String(rek.id); znalezione++; }
+                else puste++;
+                if (i % 5 === 0 || i === brak.length - 1)
+                    salPraca('qp', 'dopytuję ' + (i + 1) + '/' + brak.length
+                        + ' · znalezione ' + znalezione);
+            }
+            salMpInfo();
+            salKoniec('qp', przerwane
+                ? ('przerwane po ' + znalezione + ' z ' + brak.length + ': ' + przerwane)
+                : (znalezione + ' numerów płatności dopytanych'
+                   + (puste ? (' · ' + puste + ' bez odpowiedzi z panelu') : '')),
+                przerwane ? '#c00' : (znalezione ? '#0a7a2f' : '#c47f00'));
+            return znalezione;
+        } catch (e){
+            salKoniec('qp', 'dopytywanie przerwane: ' + ((e && e.message) || e), '#c00');
+            return 0;
+        }
+    }
+
+    // Uklad ekranu jak przy Amazonie: naglowek, zdanie o tym CO sprawdzam, a potem
+    // zrodla w osobnych ramkach — kazde z wlasnym tytulem i wlasnym stanem. Guziki
+    // wyniku na dole, wynik pod nimi.
+    async function salRysujMP(){
+        const p = salPanel(), u = salUst();
+        const gz = 'padding:5px 14px;border:1px solid #750000;background:#fff;color:#750000;'
+                 + 'border-radius:6px;font-weight:700;cursor:pointer';
+        const ramka = 'border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px';
+        p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · MobilePay ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam, czy <b>każda '
+            + 'transakcja MobilePay ma płatność w prologistics</b> na koncie <b>' + MP_KONTO + '</b> '
+            + '(MobilePay DKK), a potem liczę, za co nam jeszcze nie zapłacili i ile wynosi saldo. '
+            + 'Między stronami stoi QuickPay: Clearhaus niesie numer zamówienia, prologistics numer '
+            + 'płatności — dlatego trzy źródła, nie dwa. Zakres to miesiąc, który uzgadniasz — '
+            + 'dokładnie ten i nic poza nim. Wypłata za miesiąc zaczyna się jeszcze w poprzednim, '
+            + 'więc rozliczenie niesie też transakcje z tamtego miesiąca; odkładam je osobno, '
+            + 'bo należą do tamtego uzgodnienia.</div>'
+
+            + '<div style="' + ramka + '">'
+            + '<div style="font-weight:700;margin-bottom:4px">Zakres <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— ta sama data rządzi księgą, rozliczeniami i tym, która wypłata zdążyła wpłynąć</span></div>'
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+            + '<label>od <input type="date" id="sal-od" value="' + salEsc(u.od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="sal-do" value="' + salEsc(u.do) + '" style="font-size:12px;width:130px"></label>'
+            + '</div></div>'
+
+            + '<div style="' + ramka + '">'
+            + '<div style="font-weight:700;margin-bottom:4px">Źródła <span style="font-weight:400;color:#888;font-size:11px">'
+            + '— pobieram sam z paneli; QuickPay wymaga otwartej karty po odświeżeniu (F5)</span></div>'
+            + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+            + '<button id="sal-mppl" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ prologistics</button>'
+            + '<button id="sal-mpch" style="' + gz + '">⬇ Clearhaus</button>'
+            + '<button id="sal-mpqp" style="' + gz + '">⬇ QuickPay</button>'
+            + '<button id="sal-mpdiag" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px" '
+            + 'title="Odpytuje oba panele wariantami i pokazuje surowe statusy. Do użycia, gdy pobieranie zwraca błąd.">🔧 Diagnostyka</button>'
+            + '</div>'
+            + '<div id="sal-mpinfo" style="font-size:11px;color:#888;margin-top:6px">Nic jeszcze nie pobrane.</div>'
+            + '</div>'
+
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<button id="sal-mpspr" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Sprawdź</button>'
+            + '<button id="sal-mpxlsx" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Jedna zakładka: saldo, pozycje niezaksięgowane, sporne i uzgodnione — z numerem auftraga, numerem płatności QuickPaya i numerem zamówienia z Clearhausa w jednym wierszu">📗 Saldo (XLSX)</button>'
+            + '<button id="sal-mpwsz" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Cztery zakładki: Export payments prosto z prologistics, płatności z QuickPaya, transakcje i rozliczenia z Clearhausa oraz gotowe saldo">📚 Wszystko (4 zakładki)</button>'
+            + '<button id="sal-mpkopiuj" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
+            + '</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="sal-mpwynik"></div>';
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
+        p.querySelector('#sal-mppl').onclick = function (){ salMpExport(this); };
+        p.querySelector('#sal-mpch').onclick = function (){ salMpClearhaus(this); };
+        p.querySelector('#sal-mpqp').onclick = function (){ salMpQuickPay(this); };
+        p.querySelector('#sal-mpdiag').onclick = function (){ salMpDiag(this); };
+        p.querySelector('#sal-mpspr').onclick = function (){ salMpPorownaj(this); };
+        p.querySelector('#sal-mpxlsx').onclick = function (){ salMpXlsx(); };
+        p.querySelector('#sal-mpwsz').onclick = function (){ salMpXlsxWszystko(); };
+        p.querySelector('#sal-mpkopiuj').onclick = function (){
+            try { GM_setClipboard(SAL_MP_WYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
+            catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
+        };
+        const zapisz = function (){
+            const o = salUst();
+            o.od = p.querySelector('#sal-od').value; o.do = p.querySelector('#sal-do').value;
+            salZapisz(o);
+        };
+        p.querySelector('#sal-od').onchange = zapisz;
+        p.querySelector('#sal-do').onchange = zapisz;
+        salMpInfo();
     }
 
     // ================= SAFERPAY ↔ Export payments =================
@@ -46380,7 +49040,7 @@
             + '<span id="sal-status" style="font-size:11px;color:#666"></span></div>'
             + '<div id="sal-spraport" style="margin-top:10px"></div>';
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         const zapisz = function (){
             const o = salUst();
             o.od = p.querySelector('#sal-od').value;
@@ -47663,7 +50323,7 @@
             + '<div id="sal-awynik"></div>';
 
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
         p.querySelector('#sal-famz').onchange = function (){ salWczytajAmz(this.files); };
         p.querySelector('#sal-axlsx').onclick = function (){ salAmzXlsx(); };
@@ -47909,7 +50569,7 @@
             + '<div id="sal-mwynik"></div>';
 
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
         p.querySelector('#sal-fmm').onchange = function (){ salWczytajMM(this.files); };
         p.querySelector('#sal-mporownaj').onclick = function (){ salPorownajMM(this); };
@@ -47921,7 +50581,7 @@
             const o = salUst();
             o.od = p.querySelector('#sal-od').value;
             o.do = p.querySelector('#sal-do').value;
-            salUstZapisz(o);
+            salZapisz(o);
         };
         p.querySelector('#sal-od').onchange = zapiszUst;
         p.querySelector('#sal-do').onchange = zapiszUst;
@@ -48079,7 +50739,7 @@
             + '<div id="sal-alwynik"></div>';
 
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         p.querySelector('#sal-apobierz').onclick = function (){ salPobierzAmzExp(this); };
         p.querySelector('#sal-falle').onchange = function (){ salWczytajAlle(this.files); };
         p.querySelector('#sal-alporownaj').onclick = function (){ salPorownajAlle(this); };
@@ -48094,7 +50754,7 @@
             const o = salUst();
             o.od = p.querySelector('#sal-od').value;
             o.do = p.querySelector('#sal-do').value;
-            salUstZapisz(o);
+            salZapisz(o);
         };
         p.querySelector('#sal-od').onchange = zapiszUst;
         p.querySelector('#sal-do').onchange = zapiszUst;
@@ -49103,7 +51763,7 @@
             + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
             + '<div id="sal-euwynik"></div>';
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         p.querySelector('#sal-eupobierz').onclick = function (){ salEuExport(this); };
         p.querySelector('#sal-eueu').onclick = function (){ salEuPanel(this); };
         p.querySelector('#sal-euporownaj').onclick = function (){ salEuPorownaj(this); };
@@ -49115,7 +51775,7 @@
         const zapisz = function (){
             const o = salUst();
             o.od = p.querySelector('#sal-od').value; o.do = p.querySelector('#sal-do').value;
-            salUstZapisz(o);
+            salZapisz(o);
         };
         p.querySelector('#sal-od').onchange = zapisz;
         p.querySelector('#sal-do').onchange = zapisz;
@@ -49291,7 +51951,7 @@
             + '<div id="sal-raport" style="margin-top:10px"></div>';
 
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         const zapiszUst = function (){
             const o = salUst();
             o.od = p.querySelector('#sal-od').value;
@@ -49794,7 +52454,7 @@
             + '<div id="sal-raport" style="margin-top:10px"></div>';
 
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
-        p.querySelector('#sal-back').onclick = function (){ salRysujListe(); };
+        p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         const zapisz = function (){
             const o = salUst();
             o.bod = p.querySelector('#sal-od').value;
@@ -52781,6 +55441,34 @@
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy przypisywaniu auftragu');
         return r.text();
     }
+    // Zmiana statusu Z KONTROLA ZAPISU. bkStan melduje wylacznie kod HTTP, a odmowe
+    // prologistics moze oddac takze jako 200 z komunikatem w ciele — wiec po zapisie
+    // czytamy paczke jeszcze raz i patrzymy na TEN wiersz. Ten sam chwyt („policz przed,
+    // policz po") stoi w Depozytach przy bookOrder. Swieza paczke oddajemy wyzej, zeby
+    // ekran rysowal sie z tego, co system NAPRAWDE ma, a nie z tego, co wyslalismy.
+    async function bkStanZKontrola(impId, rowId, stan){
+        await bkStan(impId, rowId, stan);
+        var d = await bkPaczka(impId);
+        var w = d.rows.filter(function (x){ return String(x.id) === String(rowId); })[0];
+        var teraz = w ? String(w.state == null ? '' : w.state).trim() : '';
+        return { d: d, wiersz: w || null, jest: !!w, stan: teraz,
+                 ok: !!w && teraz.toUpperCase() === String(stan).trim().toUpperCase() };
+    }
+    // Male mapy trzymane PRZY ZLECENIU, a nie w pamieci modulu: przezywaja odswiezenie
+    // strony. Tak zapisane sa „bookedIds" (co juz zaksiegowano z tego panelu),
+    // „recznieOk" (ktory wiersz przestawil czlowiek) i „zaksAuf" (ktora wplata poszla
+    // wprost na auftrag). Ulotna pamiec BK_NF ginie po F5 — a wlasnie po F5 najlatwiej
+    // zaksiegowac te same pieniadze drugi raz.
+    function jobMapa(pole){
+        var o = job() || {}, m = o[pole];
+        return (m && typeof m === 'object') ? m : {};
+    }
+    function jobMapaZapisz(pole, klucz, wpis){
+        var o = job(); if (!o) return;
+        var m = (o[pole] && typeof o[pole] === 'object') ? o[pole] : {};
+        if (wpis) m[String(klucz)] = wpis; else delete m[String(klucz)];
+        o[pole] = m; jobZapisz(o);
+    }
     // Numer auftragu z tresci wiersza. Tylko postaci JEDNOZNACZNE — sama osmiocyfrowka
     // w wyciagu bywa numerem referencyjnym banku, a nie zamowienia. To podpowiedz do
     // pola, nie decyzja: wysyla ja dopiero klikniecie.
@@ -53449,6 +56137,14 @@
     function po_kolor(st){ return (st && st.odbiteBlad) ? '#c47f00' : '#0a7a2f'; }
     // Numer transakcji -> co o nim wiadomo. Trzymane poza zleceniem, bo to tylko odczyt.
     var BK_NF = {};
+    // Czy ta wplata poszla juz WPROST na auftrag (guzikiem „Zaksięguj tutaj"). Pytamy obu
+    // pamieci: ulotnej BK_NF i trwalej przy zleceniu, bo pierwsza ginie po odswiezeniu.
+    function bkZaks(j, nr){
+        var st = BK_NF[nr];
+        if (st && st.zaks) return { num: st.zaks };
+        var t = ((j && j.zaksAuf) || {})[nr];
+        return (t && t.num) ? t : null;
+    }
     async function bkSzukajNf(lista, btn, gotowe){
         btn.disabled = true;
         var idx = 0, zrobione = 0, wToku = 0;
@@ -53622,10 +56318,16 @@
     // z niego bierze sie data platnosci tego numeru — a bez daty nie ma czego ksiegowac.
     function bkNfKom(j, nr, kwota){
         var st = BK_NF[nr];
-        if (!st) return '<span style="color:#888">—</span>';
-        if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu '
-                          + '<a href="/auction.php?number=' + esc(st.zaks) + '&txnid=3" target="_blank"'
-                          + ' style="color:#0a7a2f">' + esc(st.zaks) + '</a></span>'
+        // Zaksiegowanie wprost na auftragu pamieta takze zlecenie — bez tego po
+        // odswiezeniu strony kolumna znowu pokazywalaby kreske przy wplacie, ktora
+        // juz poszla, i nic nie ostrzegloby przed ksiegowaniem jej drugi raz.
+        var trw = bkZaks(j, nr);
+        if (!st && !trw) return '<span style="color:#888">—</span>';
+        if (!st) st = {};
+        var zaks = st.zaks || (trw && trw.num) || '';
+        if (zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu '
+                          + '<a href="/auction.php?number=' + esc(zaks) + '&txnid=3" target="_blank"'
+                          + ' style="color:#0a7a2f">' + esc(zaks) + '</a></span>'
                           + (st.odbite ? ('<div style="font-size:10px;color:#0a7a2f">↪ komentarz „'
                                           + esc(st.odbite) + '" odbity na ' + esc(BK_CS) + '</div>') : '')
                           + (st.odbiteBlad ? ('<div style="font-size:10px;color:#c00">↪ komentarza NIE odbiłem: '
@@ -53640,7 +56342,7 @@
         // Wyszukiwarka nie zna numeru: najczesciej dlatego, ze WCZESNIEJSZA proba zaplaty
         // na eupago zostala anulowana — w auftragu jest po niej tabelka, ale tego numeru
         // w nim nie ma. Wtedy szuka sie po otwartej kwocie i dacie.
-        if (st.stan === 'brak' || !st.kand.length)
+        if (st.stan === 'brak' || !(st.kand || []).length)
             return '<span style="color:#c00">wyszukiwarka nie zna tego numeru</span>' + poKwocie;
         var lnk = function (n){
             return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank">' + esc(n) + '</a>';
@@ -54007,24 +56709,35 @@
               +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', '))
               +  (seen.length > 12 ? (' … +' + (seen.length - 12)) : '') + '</div></div>';
         }
-        var tab = function (tytul, kolor, lista, opis){
-            var t = '<div style="margin:6px 0"><b style="font-size:11px;color:' + kolor + '">' + tytul + ' (' + lista.length + ')</b>'
+        // „kol" to DODATKOWA kolumna na koncu wiersza: { naglowek, cel(x) }. Bez niej
+        // tabela wyglada dokladnie tak, jak wygladala — kubelki CHECK niczego nie zauwaza.
+        // Pusty „tytul" znaczy, ze naglowek stoi juz wyzej (np. w <summary> zwinietej listy).
+        var tab = function (tytul, kolor, lista, opis, kol){
+            var t = '<div style="margin:6px 0">'
+                  + (tytul ? ('<b style="font-size:11px;color:' + kolor + '">' + tytul + ' (' + lista.length + ')</b>') : '')
                   + (opis ? ('<div style="font-size:10px;color:#888;margin-top:2px">' + opis + '</div>') : '')
                   + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
                   + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer w pliku</td>'
                   + '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
                   + '<td style="padding:1px 6px;text-align:right">Open amount</td>'
                   + '<td style="padding:1px 6px;text-align:right">Różnica</td>'
-                  + '<td style="padding:1px 6px">Auftrag</td></tr>';
+                  + '<td style="padding:1px 6px">Auftrag</td>'
+                  + (kol ? ('<td style="padding:1px 6px">' + kol.naglowek + '</td>') : '')
+                  + '</tr>';
             lista.forEach(function (x){
                 var a = bkNum(x.amount), o = bkNum(x.open_amount);
                 var df = (a != null && o != null) ? r2(a - o) : null;
                 var au = bkAukcja(x);
+                // Zero na czerwono klamalo: przy wierszu OK roznica 0.00 to nie usterka,
+                // tylko zgodnosc co do grosza.
+                var kolRoz = (df == null) ? '#888' : (Math.abs(df) < 0.005 ? '#0a7a2f' : '#c00');
                 t += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:#c00">' + (df == null ? '—' : f2(df)) + '</td>'
-                  +  '<td style="padding:2px 6px">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td></tr>';
+                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolRoz + '">' + (df == null ? '—' : f2(df)) + '</td>'
+                  +  '<td style="padding:2px 6px">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
+                  +  (kol ? ('<td style="padding:2px 6px;white-space:nowrap">' + kol.cel(x) + '</td>') : '')
+                  +  '</tr>';
             });
             return t + '</table></div></div>';
         };
@@ -54101,6 +56814,12 @@
                 // Data platnosci pochodzi z PLIKU (kolumna Payment Date przy tym numerze) —
                 // paczka importu daty nie oddaje.
                 var iso = ((j && j.daty) || {})[nr] || '';
+                // Numer auftragu, ktory JUZ stoi przy tym wierszu paczki — wpisany
+                // guzikiem „przypisz" albo doklejony wczesniej. Dopiero on daje prawo
+                // do „ustaw OK": status przestawia sie na czyms, a nie w powietrzu.
+                var auNf = bkAukcja(x);
+                var juzAuf = bkZaks(j, nr);
+                var znane = (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1');
                 h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
                   +  (nr ? esc(nr) : '<span style="color:#c00">brak numeru w paczce</span>') + '</td>'
                   +  '<td style="padding:2px 6px;white-space:nowrap">'
@@ -54114,10 +56833,31 @@
                   // przy wierszu w prologistics. Numer podpowiadany z treści, nigdy
                   // wysyłany bez kliknięcia.
                   +  '<td style="padding:2px 6px;white-space:nowrap">'
-                  +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="' + esc(bkAufZTekstu(nr)) + '" '
+                  // W polu stoi numer JUZ przypisany do wiersza, a dopiero gdy go nie ma —
+                  // podpowiedz z tresci. Inaczej podpowiedz nadpisywalaby na ekranie to,
+                  // co naprawde siedzi w paczce.
+                  +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="'
+                  +  esc(auNf ? auNf.label : bkAufZTekstu(nr)) + '" '
                   +  'placeholder="15629079/3" style="width:96px;font-size:10px">'
                   +  ' <button class="bk-auf-set" data-row="' + esc(x.id) + '" style="padding:2px 7px;border:none;'
                   +  'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">przypisz</button>'
+                  // Status na OK — to samo, co reczna zmiana w prologistics. Sam guzik
+                  // NIC nie ksieguje: wraca tylko wiersz na liste „Zaksięguj OK".
+                  +  (auNf
+                        ? (' <button class="bk-nf-ok" data-row="' + esc(x.id) + '" data-num="' + esc(auNf.num)
+                           + '" data-lab="' + esc(auNf.label) + '"'
+                           + ' data-amt="' + esc(a == null ? '' : String(a)) + '" data-nr="' + esc(nr) + '"'
+                           + ' data-imp="' + (znane ? '1' : '0') + '"'
+                           + ' title="Przestawia status tego wiersza na OK — to samo, co ręczna zmiana statusu '
+                           + 'w prologistics. Wiersz wraca na listę do zaksięgowania; samo księgowanie to osobny przycisk."'
+                           + ' style="padding:2px 7px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;'
+                           + 'cursor:pointer;font-size:10px">✔ ustaw OK</button>'
+                           + (juzAuf ? ('<div style="font-size:9px;color:#c00;white-space:normal;max-width:190px">'
+                                        + '⚠ ta wpłata poszła już wprost na auftrag ' + esc(juzAuf.num)
+                                        + ' — ustawienie OK i zaksięgowanie paczki zaksięguje ją drugi raz</div>') : '')
+                           + (znane ? '<div style="font-size:9px;color:#c2410c">⚠ prologistics zna już tę płatność</div>' : ''))
+                        : ' <span style="font-size:9px;color:#888" title="Status przestawia się na czymś, nie w '
+                          + 'powietrzu — najpierw wpisz numer auftragu i kliknij „przypisz”.">— najpierw przypisz</span>')
                   +  '</td>'
                   +  '<td style="padding:2px 6px">' + bkNfKom(j, nr, a) + '</td></tr>';
             });
@@ -54135,14 +56875,63 @@
               +  '</div>';
         }
 
-        var moge = ok.length > 0 && !j.booked;
+        // Ksiegowanie bierze WYLACZNIE wiersze, ktorych z tego panelu jeszcze nie
+        // ksiegowalismy. Wczesniej „booked" wylaczalo guzik na stale — a wiersz naprawiony
+        // PO zaksiegowaniu paczki (czyli dokladnie ten, o ktory chodzi w przestawianiu
+        // NOT FOUND na OK) zostawal wtedy bez drogi do ksiegowania. Zaksiegowane id-y
+        // pamieta zlecenie; przy starym zleceniu, ktore ich nie zna, zostaje dawne
+        // zachowanie: paczka zaksiegowana = guzik wylaczony.
+        var zaksId = jobMapa('bookedIds');
+        var znaId  = Object.keys(zaksId).length > 0;
+        var doKs   = (j.booked && !znaId) ? [] : ok.filter(function (x){ return !zaksId[String(x.id)]; });
+        var znaneKs = doKs.filter(function (x){
+            return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; }).length;
+
+        // Lista OK — to, co pojdzie guzikiem nizej. Wczesniej OK bylo w panelu wylacznie
+        // liczba, wiec wiersz przestawiony recznie z NOT FOUND znikal z oczu tuz przed
+        // zaksiegowaniem. Kolumna „Status" mowi, skad ten OK sie wzial.
+        if (ok.length){
+            var recOk = jobMapa('recznieOk');
+            var kolOk = { naglowek: 'Status', cel: function (x){
+                var id = String(x.id), w = recOk[id];
+                var t = w ? ('<span style="color:#0a7a2f">przestawione ręcznie z ' + esc(w.z || 'NOT FOUND') + '</span>')
+                          : '<span style="color:#888">z importu</span>';
+                if (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1')
+                    t += ' <b style="color:#c2410c" title="Prologistics zna już tę płatność — '
+                       + 'sprawdź, czy nie księgujesz drugi raz.">znane</b>';
+                if (zaksId[id]) return t + ' <b style="color:#5b21b6">✔ zaksięgowane</b>';
+                if (w) t += ' <button class="bk-ok-cof" data-row="' + esc(id) + '" data-z="' + esc(w.z || 'NOT FOUND') + '"'
+                          + ' data-nr="' + esc(x.payment_descr == null ? '' : x.payment_descr) + '"'
+                          + ' title="Cofa status na poprzedni. Numeru auftragu to nie zdejmuje."'
+                          + ' style="margin-left:4px;padding:1px 6px;border:1px solid #c00;border-radius:5px;'
+                          + 'background:#fff;color:#c00;cursor:pointer;font-size:9px">↩ cofnij</button>';
+                return t;
+            } };
+            var opisOk = 'To pójdzie przyciskiem niżej („' + esc(BK_BLOCK_OPIS) + '"). Wiersz przestawiony '
+                       + 'ręcznie można cofnąć — dopóki nie został zaksięgowany.';
+            // Przy duzej paczce tabela zepchnelaby guzik ksiegowania daleko w dol, wiec
+            // od 30 wierszy zwija sie pod jedna linijke. Liczba jest widoczna zawsze.
+            if (ok.length > 30)
+                h += '<details style="margin:6px 0"><summary style="font-size:11px;color:#0a7a2f;cursor:pointer;'
+                  +  'font-weight:700">OK — do zaksięgowania (' + ok.length + ')</summary>'
+                  +  tab('', '#0a7a2f', ok, opisOk, kolOk) + '</details>';
+            else h += tab('OK — do zaksięgowania', '#0a7a2f', ok, opisOk, kolOk);
+        }
+
+        var moge = doKs.length > 0;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           +  '<button id="bk-ksieguj"' + (moge ? '' : ' disabled')
           +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (moge ? '#5b21b6' : '#c7c7c7')
           +  ';color:#fff;font-weight:700;cursor:' + (moge ? 'pointer' : 'default') + ';font-size:12px">'
-          +  (j.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>'
+          +  (moge ? ('▶ Zaksięguj OK (' + doKs.length + ')')
+                   : (j.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : '▶ Zaksięguj OK (0)')) + '</button>'
           +  '<span style="font-size:10px;color:#888">Odpowiada przyciskowi „' + esc(BK_BLOCK_OPIS)
           +  '". CHECK i NOT FOUND zostają nietknięte.</span>'
+          +  (moge && j.booked
+                ? ('<span style="font-size:10px;color:#c47f00">Paczka była już księgowana — te '
+                   + doKs.length + ' pozycji doszły później.</span>') : '')
+          +  (znaneKs ? ('<span style="font-size:10px;color:#c2410c">⚠ ' + znaneKs
+                         + ' z nich prologistics już zna</span>') : '')
           +  '<span id="bk-ksieguj-msg" style="font-size:11px;color:#666"></span></div>';
         box.innerHTML = h;
 
@@ -54223,6 +57012,88 @@
                 }
             };
         });
+        // NOT FOUND -> OK. Nic nie ksieguje: przestawia status wiersza, zeby wrocil na
+        // liste „Zaksięguj OK". Przed pytaniem czytamy auftrag i pokazujemy, co na nim
+        // widac — to sprawdzenie, a nie blokada: decyzje podejmuje czlowiek.
+        box.querySelectorAll('.bk-nf-ok').forEach(function (b){
+            b.onclick = async function (){
+                var rid = b.getAttribute('data-row'), num = b.getAttribute('data-num');
+                var lab = b.getAttribute('data-lab') || num, nr = b.getAttribute('data-nr') || '';
+                var kw = Number(b.getAttribute('data-amt'));
+                var znaneW = b.getAttribute('data-imp') === '1';
+                var juz = bkZaks(j, nr);
+                b.disabled = true; b.textContent = 'czytam auftrag…';
+                var a = null;
+                try { a = await bkCzytajAuftrag(num); }
+                catch (e){ a = { ok: false, err: (e && e.message) || String(e) }; }
+                var uw = [];
+                if (juz) uw.push('TA WPŁATA JEST JUŻ ZAKSIĘGOWANA wprost na auftragu ' + juz.num
+                               + ' — zaksięgowanie paczki zaksięguje ją DRUGI RAZ');
+                if (znaneW) uw.push('prologistics zna już tę płatność (była wczytana wcześniej)');
+                if (a && a.deleted === true) uw.push('auftrag jest SKASOWANY');
+                if (!a || (!a.ok && a.deleted !== true)) uw.push('auftragu nie odczytałem: ' + ((a && a.err) || '?'));
+                if (a && a.open == null) uw.push('nie odczytałem open amount — nie wiem, czy jest na czym księgować');
+                else if (a && isFinite(kw) && a.open + 0.005 < kw)
+                    uw.push('open amount ' + f2(a.open) + ' NIE pokrywa wpłaty ' + f2(kw) + ' — wyjdzie nadpłata');
+                if (!confirm('Ustawić status OK na wierszu ' + (nr || rid) + '?\n\n'
+                    + 'Auftrag przypisany do wiersza: ' + lab + '\n'
+                    + 'Wpłata: ' + (isFinite(kw) ? f2(kw) : '?') + '\n'
+                    + 'Open amount na auftragu: ' + (a && a.open != null ? f2(a.open) : '—') + '\n'
+                    + (uw.length ? ('\nUWAGA:\n  • ' + uw.join('\n  • ') + '\n') : '')
+                    + '\nOdpowiada to ręcznej zmianie statusu w prologistics. Sam status NIC nie księguje '
+                    + '— wiersz wraca tylko na listę „' + BK_BLOCK_OPIS + '".')){
+                    b.disabled = false; b.textContent = '✔ ustaw OK'; return;
+                }
+                b.textContent = 'ustawiam…';
+                try {
+                    var r = await bkStanZKontrola(j.impId, rid, 'OK');
+                    if (r.ok){
+                        jobMapaZapisz('recznieOk', rid, { z: 'NOT FOUND', auf: lab, nr: nr });
+                        say('Wiersz ' + esc(nr || rid) + ' ma status OK — wrócił na listę do zaksięgowania.', '#0a7a2f');
+                    } else {
+                        say('Prologistics NIE przyjęło zmiany statusu — wiersz ' + esc(nr || rid) + ' ma nadal „'
+                          + esc(r.jest ? (r.stan || 'pusty status') : 'nie ma go już w paczce')
+                          + '". Zmień status ręcznie w prologistics.', '#c00');
+                    }
+                    rysujPaczke(job() || j, r.d);
+                } catch (e){
+                    say('Nie ustawiłem statusu: ' + esc((e && e.message) || e), '#c00');
+                    b.disabled = false; b.textContent = '✔ ustaw OK';
+                }
+            };
+        });
+        // Droga powrotna. To JEDYNE miejsce, w ktorym HUB wysyla status inny niz „OK" —
+        // a tego zapisu nikt jeszcze nie widzial na zywym panelu. Dlatego odsylamy
+        // DOKLADNIE ten napis, ktory sam system podal przy tym wierszu, i po zapisie
+        // sprawdzamy, czy wszedl. Jesli nie wszedl — mowimy to wprost, zamiast meldowac
+        // sukces, ktorego nie bylo.
+        box.querySelectorAll('.bk-ok-cof').forEach(function (b){
+            b.onclick = async function (){
+                var rid = b.getAttribute('data-row'), z = b.getAttribute('data-z') || 'NOT FOUND';
+                var nr = b.getAttribute('data-nr') || rid;
+                if (!confirm('Cofnąć status wiersza ' + nr + ' z OK na ' + z + '?\n\n'
+                    + 'Wiersz zniknie z listy do zaksięgowania. Przypisanego numeru auftragu to NIE zdejmuje, '
+                    + 'a jeśli wpłata została już zaksięgowana — zmiana statusu tego nie cofa.\n\n'
+                    + 'Zapisu statusu innego niż OK HUB nie widział jeszcze na żywym panelu: jeśli '
+                    + 'prologistics go nie przyjmie, powiem to wprost.')) return;
+                b.disabled = true; b.textContent = 'cofam…';
+                try {
+                    var r = await bkStanZKontrola(j.impId, rid, z);
+                    if (r.ok){
+                        jobMapaZapisz('recznieOk', rid, null);
+                        say('Wiersz ' + esc(nr) + ' ma z powrotem status ' + esc(z) + '.', '#0a7a2f');
+                    } else {
+                        say('Prologistics NIE przyjęło cofnięcia — wiersz ' + esc(nr) + ' ma nadal „'
+                          + esc(r.jest ? (r.stan || 'pusty status') : 'nie ma go już w paczce')
+                          + '". Zmień status ręcznie w prologistics.', '#c00');
+                    }
+                    rysujPaczke(job() || j, r.d);
+                } catch (e){
+                    say('Nie cofnąłem statusu: ' + esc((e && e.message) || e), '#c00');
+                    b.disabled = false; b.textContent = '↩ cofnij';
+                }
+            };
+        });
         box.querySelectorAll('.bk-eu-st').forEach(function (b){
             b.onclick = function (){
                 bkEuStatusy(b.getAttribute('data-nr'), b, function (){ rysujPaczke(j, d); });
@@ -54265,6 +57136,10 @@
                 if (r.ok){
                     var st2 = BK_NF[nr] || (BK_NF[nr] = {});
                     st2.zaks = num;
+                    // Slad NA TRWALE, przy zleceniu. Pamiec modulu ginie po odswiezeniu
+                    // strony, a wtedy nic juz nie mowilo, ze ta wplata poszla na auftrag —
+                    // i latwo bylo przestawic wiersz na OK, czyli zaksiegowac ja drugi raz.
+                    jobMapaZapisz('zaksAuf', nr, { num: num, kwota: kw, iso: iso, konto: konto });
                     var dop = '';
                     if (skasowany){
                         b.textContent = 'odbijam komentarz…';
@@ -54292,13 +57167,19 @@
         var bb = $('#bk-ksieguj');
         if (bb) bb.onclick = async function (){
             var m = $('#bk-ksieguj-msg');
-            if (!confirm('Zaksięgować ' + ok.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
+            if (!confirm('Zaksięgować ' + doKs.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
                 + 'Paczka ' + j.impId + ' · ' + (j.nazwa || '') + '\n'
+                + (znaneKs ? ('⚠ ' + znaneKs + ' z nich prologistics już zna (były wczytane wcześniej)\n') : '')
                 + 'Odpowiada to przyciskowi „' + BK_BLOCK_OPIS + '".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
             bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
             try {
-                await bkKsieguj(j.impId, ok.map(function (x){ return x.id; }));
-                var o = job() || j; o.booked = true; jobZapisz(o);
+                await bkKsieguj(j.impId, doKs.map(function (x){ return x.id; }));
+                // Ktore id-y poszly — zeby drugie klikniecie nie zaksiegowalo ich znowu,
+                // a wiersz naprawiony pozniej mial jeszcze droge do ksiegowania.
+                var o = job() || j; o.booked = true;
+                var mId = (o.bookedIds && typeof o.bookedIds === 'object') ? o.bookedIds : {};
+                doKs.forEach(function (x){ mId[String(x.id)] = 1; });
+                o.bookedIds = mId; jobZapisz(o);
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
                 await sprawdz();
             } catch (e){
@@ -54560,7 +57441,9 @@
             return String(d.textContent || '');
         } catch (e){ return String((span && span.textContent) || ''); }
     }
-    function czytajKomentarze(d, zrodlo){
+    // „strona" to numer ticketu albo auftragu, z ktorego komentarz pochodzi.
+    // Potrzebny przy potwierdzeniu: dokument i odbicie ida TAM, gdzie stala prosba.
+    function czytajKomentarze(d, zrodlo, strona){
         var out = [];
         d.querySelectorAll('tr.comment-row').forEach(function (tr){
             var span = tr.querySelector('span.commentText');
@@ -54571,6 +57454,7 @@
             out.push({
                 nr: out.length,
                 zrodlo: zrodlo || 'ticket',
+                strona: String(strona == null ? '' : strona),
                 data: tds[0] ? flat(tds[0].textContent) : '',
                 autor: a ? flat(a.textContent) : (aut ? flat(aut.textContent) : ''),
                 autorId: (aut && aut.getAttribute('data-user')) || '',
@@ -54757,6 +57641,40 @@
         return bezKwoty;
     }
 
+    // ===== Prosba o POTWIERDZENIE zwrotu =====
+    // To NIE jest prosba o zwrot. Ktos — agent w imieniu klienta albo sam klient —
+    // prosi o DOWOD, ze pieniadze wyszly. Przychodzi zwykle do sprawy, w ktorej zwrot
+    // JUZ sie odbyl, czyli do wiersza konczacego sie stanem „zablokowane". Dlatego
+    // szukamy jej osobno i niezaleznie od tego, czy zwrot jest jeszcze do zrobienia.
+    //
+    // Dwa sita, bo samo „confirmation" pada w ticketach bez przerwy — potwierdzenie
+    // zamowienia, adresu, terminu dostawy. Zwrot nazwany WPROST wystarcza sam; luzne
+    // slowo liczy sie dopiero razem ze slowem o zwrocie w TYM SAMYM komentarzu.
+    var ZW_POTW_WPROST = /proof\s+of\s+(?:the\s+)?(?:refund|payment|return)|refund\s+(?:proof|confirmation|receipt|slip)|confirmation\s+of\s+(?:the\s+)?refund|comprovativ\w*\s+d\w*\s+(?:reembolso|devolu\w+|pagamento)|comprovante\s+d\w*\s+(?:reembolso|estorno)|potwierdzeni\w*\s+zwrotu|dow[oó]d\s+zwrotu|justificativ\w*\s+d\w*\s+reembolso/i;
+    var ZW_POTW_SLOWO = /proof|confirm\w*|comprovativ\w*|comprovante|receipt|potwierdzeni\w*|dow[oó]d|justificativ\w*/i;
+    // Nasz wlasny wpis po wyslaniu potwierdzenia. Niesie slowa „refund" i „confirmation",
+    // wiec bez tego znaku wpadalby we wlasne sito i prosba nigdy by nie gasla.
+    var ZW_POTW_ZNAK = 'Refund confirmation attached';
+
+    function czyProsbaOPotwierdzenie(t){
+        var s = String(t == null ? '' : t);
+        if (ZW_POTW_WPROST.test(s)) return true;
+        return ZW_POTW_SLOWO.test(s) && ZW_OZWROCIE.test(s);
+    }
+    // Od NAJNOWSZEGO komentarza. Gdy po drodze trafimy najpierw na nasz wlasny wpis,
+    // znaczy to, ze potwierdzenie juz poszlo — prosby nie zglaszamy drugi raz.
+    function znajdzProsbeOPotwierdzenie(kom){
+        for (var i = (kom || []).length - 1; i >= 0; i--){
+            var k = kom[i], t = String(k.tekst || '');
+            if (t.indexOf(ZW_POTW_ZNAK) >= 0) return null;
+            if (!czyProsbaOPotwierdzenie(t)) continue;
+            return { autor: k.autor || '', autorId: k.autorId || '', data: k.data || '',
+                     zrodlo: k.zrodlo || '', strona: k.strona || '',
+                     tekst: flat(t).slice(0, 400) };
+        }
+        return null;
+    }
+
     // ===== Strony prologistics =====
     var CACHE = {};
     function pamiec(k, robota){ if (!CACHE[k]) CACHE[k] = robota(); return CACHE[k]; }
@@ -54773,7 +57691,8 @@
         var d = dom(html);
         if (!d.querySelector('tr.comment-row') && !d.getElementById('auftrag_details'))
             return { ok: false, err: 'ticket ' + rma + ': strona nie wygląda na ticket' };
-        return { ok: true, kom: czytajKomentarze(d, 'ticket'), aufy: aufyZeStrony(d) };
+        return { ok: true, kom: czytajKomentarze(d, 'ticket', rma), aufy: aufyZeStrony(d),
+                 sekcje: sekcjeDokumentow(html) };
     }
     function czytajTicketC(rma){ return pamiec('t' + rma, function (){ return czytajTicket(rma); }); }
 
@@ -54946,6 +57865,36 @@
         return m ? m[1] : '';
     }
 
+    // ===== Sekcje dokumentow na stronie =====
+    // Strona auftragu i strona ticketu to ciag sekcji: <b>ETYKIETA:</b> i zaraz za nia
+    // odnosnik „add new" do load_docs.php?...&type=N. Numer sekcji CZYTAMY ze strony —
+    // zgadniety wsadzilby dokument nie tam, gdzie trzeba. Ikona podmiany przy kazdym
+    // pliku prowadzi pod ten sam adres i ten sam typ, wiec typy zliczamy raz.
+    function unent(s){
+        return String(s == null ? '' : s)
+            .replace(/&nbsp;/gi, ' ').replace(/&quot;/gi, '"').replace(/&#0*39;/g, "'")
+            .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&amp;/gi, '&');
+    }
+    // Etykieta stoi TUZ przed odnosnikiem — bierzemy ostatnia z krotkiego odcinka,
+    // zeby nie zlapac naglowka innej sekcji z gory strony.
+    function etykietaSekcji(html, doPozycji){
+        var kawalek = html.slice(Math.max(0, doPozycji - 1500), doPozycji);
+        var re = /<(?:b|strong)[^>]*>([^<]{1,60})<\/(?:b|strong)>/gi, m, ost = '';
+        while ((m = re.exec(kawalek)) !== null) ost = m[1];
+        return flat(unent(ost)).replace(/[:\s]+$/, '');
+    }
+    function sekcjeDokumentow(html){
+        var s = String(html || ''), out = [], widz = {};
+        var re = /load_docs\.php\?[^"'<>\s]*\btype=(\d+)/gi, m;
+        while ((m = re.exec(s)) !== null){
+            if (widz[m[1]]) continue;
+            widz[m[1]] = 1;
+            out.push({ typ: m[1], href: '/' + unent(m[0]).replace(/^\/+/, ''),
+                       etykieta: etykietaSekcji(s, m.index) || ('typ ' + m[1]) });
+        }
+        return out;
+    }
+
     async function czytajAuftrag(num){
         var html = '';
         try {
@@ -54957,7 +57906,8 @@
             html = await res.text();
         } catch (e){ return { ok: false, err: 'nie otwarłem auftragu ' + num }; }
         var d = dom(html);
-        return { ok: true, num: num, eu: euTabela(d), kom: czytajKomentarze(d, 'auftrag'),
+        return { ok: true, num: num, eu: euTabela(d), kom: czytajKomentarze(d, 'auftrag', num),
+                 sekcje: sekcjeDokumentow(html),
                  open: openAmount(d), tool: refundTool(d), deleted: usuniety(d, html),
                  wyplaty: platnosciAuftragu(d),
                  objId: objIdAuftragu(d, html),
@@ -55076,6 +58026,121 @@
         }
         return '';
     }
+    // ===== eupago: wyszukiwarka po identyfikatorze =====
+    // Panel ma nad tabela pole „Identificador". Szukajac nim, wysyla filtr W ADRESIE
+    // (identifier=…), a cialo zostawia zwyklym zapytaniem DataTables z PUSTYM
+    // search[value] — inaczej niz przy archiwum, gdzie filtruje wlasnie search[value].
+    // Adres i uklad ciala przepisane z zaobserwowanego zapytania panelu (HTTP 200);
+    // niczego tu nie skladamy „z glowy" — zgadywana sciezka API to dwa razy 404.
+    var EU_KOL = [
+        ['', '', false, false],              ['', '', false, false],
+        ['estado', '', false, false],        ['entidade', '', false, false],
+        ['referencia', '', true, false],     ['nome_servico', '', false, false],
+        ['valor', 'amount', false, true],    ['retencao', '', false, false],
+        ['iva', '', false, false],           ['nome_canal', '', false, false],
+        ['identificador', '', true, false],  ['data', 'date', false, true],
+        ['hora', '', true, true],            ['', '', false, false]
+    ];
+    function euBodyDT(){
+        var b = ['draw=1'];
+        EU_KOL.forEach(function (k, i){
+            var p = 'columns%5B' + i + '%5D%5B';
+            b.push(p + 'data%5D=' + encodeURIComponent(k[0]));
+            b.push(p + 'name%5D=' + encodeURIComponent(k[1]));
+            b.push(p + 'searchable%5D=' + (k[2] ? 'true' : 'false'));
+            b.push(p + 'orderable%5D=' + (k[3] ? 'true' : 'false'));
+            b.push(p + 'search%5D%5Bvalue%5D=');
+            b.push(p + 'search%5D%5Bregex%5D=false');
+        });
+        b.push('order%5B0%5D%5Bcolumn%5D=11', 'order%5B0%5D%5Bdir%5D=desc');
+        b.push('order%5B1%5D%5Bcolumn%5D=12', 'order%5B1%5D%5Bdir%5D=desc');
+        b.push('start=0', 'length=25', 'search%5Bvalue%5D=', 'search%5Bregex%5D=false');
+        return b.join('&');
+    }
+    // Zakres dat panel wysyla zawsze. Bierzemy okno wokol daty wplaty, a gdy jej nie
+    // znamy — od poczatku biezacego roku, tak jak panel przy pustym filtrze.
+    function euOkno(dataISO){
+        var koniec = dzisISO();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dataISO || '')))
+            return { od: koniec.slice(0, 4) + '-01-01', az: koniec };
+        var d = new Date(dataISO + 'T12:00:00');
+        d.setDate(d.getDate() - 7);
+        return { od: d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()),
+                 az: koniec };
+    }
+    // Po zwrocie eupago zaklada OSOBNY wiersz z tym samym identyfikatorem: platnosc
+    // (estado=paga) i zwrot (estado=reembolsada, wlasna referencia, wlasne refundID).
+    // Sortowanie idzie po dacie malejaco, wiec „pierwszy z brzegu” to zawsze zwrot —
+    // dlatego rozdzielamy je tutaj, zamiast opisywac potem zwrot etykietami platnosci.
+    async function euPoIdent(ident, dataISO){
+        var o = euOkno(dataISO);
+        var url = EU_URL + '?status=&start_date=' + o.od + '&end_date=' + o.az
+                + '&value=&identifier=' + encodeURIComponent(ident) + '&service=&channel=';
+        dz('eupago: szukam po identyfikatorze', ident, o.od, '→', o.az);
+        var lista = await euZapytaj(url, euBodyDT());
+        var t = String(ident || '').toLowerCase();
+        var moje = lista.filter(function (w){
+            return String((w && w.identificador) || '').toLowerCase() === t;
+        });
+        // Filtr siedzi w adresie, wiec pojedynczy oddany wiersz JEST tym szukanym.
+        if (!moje.length && lista.length === 1) moje = lista.slice(0);
+        var platnosc = null, zwrot = null;
+        moje.forEach(function (w){
+            var st = String(w.estado || '').toLowerCase();
+            if (st === 'reembolsada' || w.refundID != null){ if (!zwrot) zwrot = w; }
+            else if (!platnosc) platnosc = w;
+        });
+        dz('eupago: oddal wierszy', lista.length, 'naszych=' + moje.length,
+           'platnosc=' + (platnosc ? 'tak' : 'nie'),
+           'zwrot=' + (zwrot ? ('tak, refundID=' + zwrot.refundID
+                                + ' directRefund=' + zwrot.directRefund) : 'nie'));
+        return { platnosc: platnosc, zwrot: zwrot, lista: moje };
+    }
+
+    // Plik comprovativo lezy na panelu klientow, nie w API. Adres przepisany z kodu
+    // panelu (listagem.js): url_server + '/reembolsos/comprovativo/' + refundID,
+    // gdzie url_server = https://clientes.eupago.pt/clientes.
+    var EU_KLIENCI = 'https://clientes.eupago.pt/clientes';
+    // Ale plik istnieje TYLKO przy directRefund == 0. Zwrot puszczony przez
+    // /management/v1.02/refund/ konczy sie jako „reembolso direto” (directRefund == 1)
+    // i wtedy eupago nie wystawia dokumentu — panel sklada go sobie w przegladarce
+    // przez html2pdf, wiec nie ma czego pobierac. Sprawdzone na wierszach zwrotow
+    // 169718 i 169720, ktore HUB zrobil sam: oba maja directRefund = 1.
+    function euMaPlik(z){
+        return !!(z && z.refundID != null && String(z.refundID) !== ''
+                  && String(z.directRefund) === '0');
+    }
+    function euComprovativo(refundID){
+        var url = EU_KLIENCI + '/reembolsos/comprovativo/' + encodeURIComponent(refundID);
+        return new Promise(function (ok, zle){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 120000, anonymous: false,
+                responseType: 'arraybuffer',
+                headers: { 'accept': 'application/pdf,*/*', 'cache-control': 'no-cache' },
+                onload: function (r){
+                    var hh = String(r.responseHeaders || '').toLowerCase();
+                    var i = hh.indexOf('content-type:');
+                    var typ = i < 0 ? '' : hh.slice(i + 13).split(String.fromCharCode(10))[0].split(';')[0].trim();
+                    dz('eupago comprovativo', refundID, 'HTTP', r.status, typ || '(bez typu)');
+                    if (r.status < 200 || r.status >= 300){ zle(new Error('comprovativo: HTTP ' + r.status)); return; }
+                    var buf = r.response;
+                    // Gdy menedzer zignoruje responseType, dostajemy tekst. Nie udajemy
+                    // wtedy, ze mamy PDF — lepiej zlozyc wlasny dokument niz zalaczyc HTML.
+                    if (!buf || typeof buf === 'string' || buf.byteLength == null)
+                        zle(new Error('comprovativo przyszlo jako tekst, nie plik'));
+                    else if (buf.byteLength < 400)
+                        zle(new Error('comprovativo ma ' + buf.byteLength + ' bajtow — to nie jest PDF'));
+                    else if (typ && typ.indexOf('pdf') < 0 && typ.indexOf('octet-stream') < 0)
+                        zle(new Error('comprovativo ma typ ' + typ));
+                    else ok(new Blob([buf], { type: 'application/pdf' }));
+                },
+                onerror: function (){ zle(new Error('nie połączyłem się z eupago po comprovativo')); },
+                ontimeout: function (){ zle(new Error('eupago nie oddało comprovativo w 120 s')); }
+            });
+        });
+    }
+
     var EU_STANY = { paga: 'Paid', pendente: 'Pending', expirada: 'Expired', cancelada: 'Cancelled',
                      devolvida: 'Returned', reembolsada: 'Refunded', transferida: 'Transferred',
                      'em processamento': 'Processing', chargeback: 'Chargeback' };
@@ -55100,7 +58165,8 @@
     // ===== Most: operacje na pieniadzach wykonuje karta panelu eupago =====
     var opNr = 0;
     var OP_NAZWY = { unarchive: 'odarchiwizowanie', archive: 'archiwizacja',
-                     detail: 'szczegóły płatności', refund: 'zwrot' };
+                     detail: 'szczegóły płatności', refund: 'zwrot',
+                     comprovativo: 'comprovativo składane przez panel' };
     // Zlecenie wykonuje KARTA PANELU eupago. Gdy jej nie ma, nic sie nie dzieje —
     // a puste „w toku…" wyglada wtedy jak zawieszenie. Dlatego odliczamy na glos.
     function mostem(op, dane, ile){
@@ -55302,6 +58368,11 @@
                      + '  kwota=' + f2(r.tool[0].kwota)
                      + '  iban=' + (maskIban(r.tool[0].iban) || '—')
                      + '  zatwierdzil=' + (r.tool[0].zatwierdzil || '—'));
+            if (r.potw)
+                L.push('     potwierdzenie: prosił=' + (r.potw.autor || '—')
+                     + ' [' + (r.potw.autorId || '—') + ']  ' + (r.potw.data || '—')
+                     + '  z=' + (r.potw.zrodlo || '—') + ' ' + (r.potw.strona || '—')
+                     + '  wysłane=' + String(!!r.potwWyslane));
             L.push('     deleted=' + String(r.deleted) + '  status=' + (r.st || '—'));
             L.push('     uwagi: ' + (r.msg || '—'));
             L.push('');
@@ -55409,7 +58480,12 @@
             r.rma = (naj && naj.rma) || tks[0] || '';
             if (naj) return { pr: naj.pr, skad: naj.skad, aufy: [r.nr], zrodloAuf: r.nr,
                               tickety: tks, kom: wszystkie };
-            return { aufy: [r.nr], zrodloAuf: r.nr, tickety: tks,
+            // kom leci TAKZE tedy. Prosbe o zwrot szukamy wsrod komentarzy finance,
+            // ale prosbe o potwierdzenie — wsrod wszystkich (agent i klient tez o nie
+            // prosza). Brak komentarza finance nie znaczy, ze nie ma o co pytac,
+            // a bez tego pola znajdzProsbeOPotwierdzenie dostaje undefined i cicho
+            // zwraca null, wiec pasek potwierdzenia nie pojawia sie nigdy.
+            return { aufy: [r.nr], zrodloAuf: r.nr, tickety: tks, kom: wszystkie,
                      err: 'brak komentarza finance — ani w auftragu, ani w '
                         + (tks.length ? ('jego ' + tks.length + ' ticketach') : 'żadnym tickecie (auftrag ich nie ma)') };
         }
@@ -55433,7 +58509,8 @@
             }
             if (naj2) return { pr: naj2.pr, skad: naj2.skad, aufy: t.aufy,
                                zrodloAuf: naj2.auf || (t.aufy || [])[0] || '', kom: wsz2 };
-            return { aufy: t.aufy, zrodloAuf: (t.aufy || [])[0] || '',
+            // kom jak wyzej — komplet komentarzy jest potrzebny takze bez prosby finance.
+            return { aufy: t.aufy, zrodloAuf: (t.aufy || [])[0] || '', kom: wsz2,
                      err: 'brak komentarza finance — ani w tickecie, ani w jego auftragach' };
         }
         // Numer nie byl w temacie podpisany i ticketem nie jest — probujemy auftragu.
@@ -55529,6 +58606,373 @@
             body: body });
         if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?'));
         return r.text();
+    }
+
+    // ===== Potwierdzenie zwrotu: plik, zalacznik, odbicie =====
+
+    // Odbicie NA TICKECIE. Ten sam adres, co przy auftragu, tylko obiektem jest „rma",
+    // a obj_id to wprost numer ticketu — tak samo robi to strona ticketu.
+    async function odbijTicket(rmaId, login, tekst){
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var body = 'fn=reassignComment&username=' + enc(login)
+                 + '&obj=rma&obj_id=' + enc(rmaId)
+                 + '&comment=' + enc(tekst) + '&field=responsible';
+        var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                       'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: body });
+        if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?'));
+        return r.text();
+    }
+
+    // --- PDF skladany na miejscu ---
+    // HUB nie ma zaladowanej zadnej biblioteki PDF, a @require to strefa wspolna —
+    // wiec jednostronicowy dokument skladamy sami. Uklad minimalny: katalog, jedna
+    // strona, dwa kroje Helvetiki, jeden strumien tekstu.
+    // Tresc idzie PO ANGIELSKU i w kodowaniu WinAnsi: Helvetica nie ma w nim polskich
+    // znakow, wiec „ł" wyszloby jako smiec. Znaki spoza zakresu zamieniamy na
+    // przyblizenia, zamiast je gubic.
+    var ZW_PDF_MAPA = { 'ą':'a','ć':'c','ę':'e','ł':'l','ń':'n','ó':'o','ś':'s','ź':'z','ż':'z',
+                        'Ą':'A','Ć':'C','Ę':'E','Ł':'L','Ń':'N','Ó':'O','Ś':'S','Ź':'Z','Ż':'Z',
+                        '€':' EUR','–':'-','—':'-','„':'"','”':'"','’':"'",'…':'...' };
+    function pdfZnaki(s){
+        var t = String(s == null ? '' : s), out = '';
+        for (var i = 0; i < t.length; i++){
+            var c = t.charAt(i);
+            if (ZW_PDF_MAPA[c] != null){ out += ZW_PDF_MAPA[c]; continue; }
+            out += (t.charCodeAt(i) < 256) ? c : '?';
+        }
+        return out;
+    }
+    function pdfTekst(s){ return pdfZnaki(s).replace(/([\\()])/g, '\\$1'); }
+    function pdfJednaStrona(tytul, linie){
+        var t = 'BT\n/F2 15 Tf 1 0 0 1 56 780 Tm (' + pdfTekst(tytul) + ') Tj\n';
+        var y = 744;
+        (linie || []).forEach(function (l){
+            if (!l){ y -= 10; return; }
+            t += (l.mocno ? '/F2' : '/F1') + ' 10 Tf 1 0 0 1 56 ' + y + ' Tm ('
+               + pdfTekst(l.etyk || '') + ') Tj\n';
+            if (l.wart != null && l.wart !== '')
+                t += '/F1 10 Tf 1 0 0 1 220 ' + y + ' Tm (' + pdfTekst(l.wart) + ') Tj\n';
+            y -= 16;
+        });
+        t += 'ET';
+        var ob = [];
+        ob[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+        ob[2] = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>';
+        ob[3] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842]'
+              + ' /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>';
+        ob[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>';
+        ob[5] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>';
+        ob[6] = '<< /Length ' + t.length + ' >>\nstream\n' + t + '\nendstream';
+        var s = '%PDF-1.4\n', poz = [];
+        for (var i = 1; i <= 6; i++){ poz[i] = s.length; s += i + ' 0 obj\n' + ob[i] + '\nendobj\n'; }
+        var xref = s.length;
+        s += 'xref\n0 7\n0000000000 65535 f \n';
+        for (var j = 1; j <= 6; j++) s += ('0000000000' + poz[j]).slice(-10) + ' 00000 n \n';
+        s += 'trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF';
+        // Kazdy znak miesci sie w jednym bajcie, wiec dlugosc w znakach = dlugosc
+        // w bajtach i przesuniecia z xref zgadzaja sie z zapisanym plikiem.
+        var buf = new Uint8Array(s.length);
+        for (var k = 0; k < s.length; k++) buf[k] = s.charCodeAt(k) & 0xFF;
+        return new Blob([buf], { type: 'application/pdf' });
+    }
+
+    function potwNazwaPliku(r){
+        return 'Refund-confirmation-' + (r.euRef || r.token || r.nr || 'eupago') + '.pdf';
+    }
+    // Dokument opisuje rekord platnosci z eupago i MOWI TO WPROST w stopce. Nie udaje
+    // pisma eupago — jest naszym potwierdzeniem opartym o ich dane.
+    // Dokument opisuje DWA rekordy z eupago: platnosc i — gdy juz jest — zwrot.
+    // Kazde pole jest podpisane tym, czym naprawde jest; wczesniej dane zwrotu
+    // trafialyby pod etykiety „Payment…”, bo wyszukiwarka oddaje zwrot jako pierwszy.
+    function potwZDanych(r, e, z){
+        var linie = [
+            { etyk: 'Prepared from the eupago payment record.' },
+            null,
+            { etyk: 'Order (Auftrag)',  wart: String(r.auf || r.nr || '') },
+            { etyk: 'Ticket',           wart: String(r.rma || '') },
+            { etyk: 'Refunded amount',  wart: (r.kwota != null) ? (f2(r.kwota) + ' EUR') : '', mocno: true },
+            null,
+            { etyk: 'eupago reference', wart: String((e && e.referencia) || r.euRef || '') },
+            { etyk: 'Identifier',       wart: String((e && e.identificador) || (z && z.identificador) || r.token || '') },
+            { etyk: 'Payment date',     wart: String((e && e.data) || r.platData || '')
+                                            + ((e && e.hora) ? (' ' + e.hora) : '') },
+            { etyk: 'Payment amount',   wart: (e && e.valor != null && e.valor !== '')
+                                            ? String(e.valor) : f2(r.platKwota) },
+            { etyk: 'Payment status',   wart: stanPL((e && e.estado) || r.estado) },
+            { etyk: 'Service',          wart: String((e && e.nome_servico) || r.serwis || '') },
+            { etyk: 'Channel',          wart: String((e && e.nome_canal) || '') }
+        ];
+        if (z) linie = linie.concat([
+            null,
+            { etyk: 'Refund reference', wart: String(z.referencia || '') },
+            { etyk: 'Refund date',      wart: String(z.data || '') + (z.hora ? (' ' + z.hora) : '') },
+            { etyk: 'Refund amount',    wart: (z.valor != null && z.valor !== '') ? (String(z.valor) + ' EUR') : '' },
+            { etyk: 'Refund ID',        wart: String(z.refundID != null ? z.refundID : ''), mocno: true }
+        ]);
+        else linie = linie.concat([
+            { etyk: 'Refund ID',        wart: String(r.refundID || '') }
+        ]);
+        return pdfJednaStrona('REFUND CONFIRMATION', linie.concat([
+            null,
+            { etyk: 'Issued ' + dzisISO() + ' by Beliani finance (HUB ' + ZW_VER + ').' },
+            { etyk: 'Source: eupago backoffice payment record. Not a document issued by eupago.' }
+        ]));
+    }
+    // Plik potwierdzenia. Gdy eupago naprawde ma comprovativo (zwrot z directRefund
+    // rownym 0) — bierzemy ICH plik. Przy zwrocie bezposrednim takiego pliku nie ma
+    // i nie bedzie, wiec skladamy wlasny dokument z tych samych danych. Nieudane
+    // pobranie nie moze zablokowac odpowiedzi klientowi: schodzimy na wlasny PDF
+    // i zapisujemy powod w wierszu.
+    async function potwPlik(r, e, z){
+        // Bez wiersza zwrotu w eupago nie ma czego potwierdzac. Wczesniej dokument
+        // powstawal takze wtedy — i mowil „REFUND CONFIRMATION" o zwrocie, ktorego
+        // jeszcze nie bylo.
+        if (!z) throw new Error('eupago nie pokazuje jeszcze zwrotu dla tej płatności '
+                              + '— potwierdzenia nie wystawiam');
+        // Dokument sklada PANEL, swoim szablonem. My tylko podajemy piec wartosci,
+        // ktore czyta jego uchwyt, i odbieramy gotowy plik.
+        var w = await mostem('comprovativo', {
+            reference:  z.referencia,
+            amount:     z.valor,
+            refund_id:  z.refundID,
+            trans_date: z.data,
+            trans_time: z.hora
+        }, 90000);
+        var b64 = String((w && w.b64) || '');
+        if (b64.indexOf('JVBERi0') !== 0)
+            throw new Error('karta panelu oddała coś, co nie jest PDF-em');
+        var sur = atob(b64);
+        var baj = new Uint8Array(sur.length);
+        for (var i = 0; i < sur.length; i++) baj[i] = sur.charCodeAt(i);
+        // Druga kontrola, juz na bajtach: %PDF-. Pierwsza byla po stronie panelu.
+        if (!(baj[0] === 0x25 && baj[1] === 0x50 && baj[2] === 0x44 && baj[3] === 0x46))
+            throw new Error('plik z panelu nie zaczyna się od %PDF');
+        if (baj.length < 400)
+            throw new Error('comprovativo z panelu ma ' + baj.length + ' bajtów — to nie jest dokument');
+        dz('comprovativo z panelu eupago', z.refundID, baj.length, 'bajtow');
+        return new File([baj], String(w.nazwa || ('Comprovativo de Reembolso Direto - '
+                                                  + z.refundID + '.pdf')),
+                        { type: 'application/pdf' });
+    }
+
+    // Formularz dodawania dokumentu CZYTAMY ZE STRONY, zamiast skladac wlasny zestaw
+    // pol. Sekcje roznia sie ukrytymi polami (auftrag ma number i txnid, ticket rma_id),
+    // a zrzut sieciowy pokazuje z multiparta tylko rozmiar — nazw pol z niego nie widac.
+    // Odczytany formularz jest jedynym zrodlem, ktore ich nie zgaduje.
+    async function formularzDokumentu(href){
+        var res = await fetch(href, { credentials: 'same-origin' });
+        dz('GET load_docs.php (formularz)', href, 'HTTP', res && res.status);
+        if (!res || !res.ok) throw new Error('strona dodawania dokumentu: HTTP ' + (res ? res.status : '?'));
+        // Surowy HTML zostaje — po wyslaniu porownujemy z nim strone sekcji.
+        var html = await res.text();
+        var d = dom(html);
+        // Nazwane przed bezimiennym: na stronie auftragu stoi 13 pol pliku, z czego
+        // 12 nie ma atrybutu name (to podmiana pojedynczych dokumentow) i nic by nie
+        // wyslaly. Nazwane jest jedno — newpicfn[] — i o nie chodzi.
+        var plik = d.querySelector('input[type="file"][name]') || d.querySelector('input[type="file"]');
+        if (!plik) throw new Error('na stronie dodawania nie ma pola pliku — formularz musiał się zmienić');
+        var f = plik.closest('form');
+        if (!f) throw new Error('pole pliku nie stoi w żadnym formularzu');
+        var pola = [];
+        f.querySelectorAll('input, select, textarea, button').forEach(function (el){
+            var n = el.getAttribute('name');
+            if (!n) return;
+            var tag = String(el.tagName || '').toLowerCase();
+            var t = String(el.getAttribute('type') || (tag === 'button' ? 'submit' : '')).toLowerCase();
+            if (t === 'file' || t === 'button' || t === 'image' || t === 'reset') return;
+            if ((t === 'checkbox' || t === 'radio') && !el.checked) return;
+            // Guzik zapisu TEZ jest polem formularza: bez niego PHP nie wchodzi
+            // w galaz dodawania i odpowiada strona, jakby nic nie przyszlo.
+            pola.push([n, el.value == null ? '' : String(el.value)]);
+        });
+        // Puste action znaczy „wyslij pod adres BIEZACEJ strony". Tak wyglada formularz
+        // wysylki na auftragu — zaobserwowany na zywo:
+        //   <form method="post" action="" enctype="multipart/form-data">
+        //     <input type="file" name="newpicfn[]" multiple>
+        //     <button type="submit">Upload</button>   <- bez atrybutu name
+        //   </form>
+        // Zadnych pol ukrytych: number i txnid ida z query stringa adresu. Wczesniej
+        // puste action zamienialo sie na 'load_docs.php' i plik szedl pod zly adres.
+        var akcja = f.getAttribute('action');
+        if (akcja == null || akcja === '') akcja = href;
+        else if (!/^https?:/i.test(akcja) && akcja.charAt(0) !== '/') akcja = '/' + akcja.replace(/^\.?\//, '');
+        return { akcja: akcja, plikPole: plik.getAttribute('name') || 'newpicfn[1]', pola: pola,
+                 html: html };
+    }
+    // Liczba wierszy tabel na stronie. -1 = nie udalo sie policzyc (wtedy nie blokujemy).
+    // Liczymy wszystkie <tr>, a nie wiersze konkretnej tabeli: ukladu listy dokumentow
+    // nie mamy nigdzie zaobserwowanego, a zapisany dokument dodaje wiersz niezaleznie
+    // od tego, w ktorej tabeli stoi.
+    function liczWierszy(html){
+        if (html == null) return -1;
+        try { return dom(html).querySelectorAll('tr').length; } catch (e){ return -1; }
+    }
+    async function dolaczDokument(href, plik){
+        var f = await formularzDokumentu(href);
+        var fd = new FormData();
+        f.pola.forEach(function (p){ fd.append(p[0], p[1]); });
+        fd.append(f.plikPole, plik, plik.name);
+        dz('POST load_docs.php', f.akcja, 'pól=' + f.pola.length, 'pole pliku=' + f.plikPole, plik.name);
+        var res = await fetch(f.akcja, { method: 'POST', body: fd, credentials: 'same-origin' });
+        if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+        var odp = String(await res.text());
+        // Tresc odpowiedzi do dziennika. Nie opieramy na niej kontroli — nie mamy jej
+        // nigdzie zaobserwowanej — ale niech bedzie z czego zbudowac mocniejsza.
+        dz('odpowiedz load_docs.php', odp.length + ' znakow', odp.slice(0, 300));
+
+        // Samo 200 NIE dowodzi, ze plik wszedl. PHP na odrzucony plik (limit rozmiaru,
+        // filtr typu, brak uprawnien do sekcji) odpowiada normalna strona ze statusem
+        // 200 — to samo zachowanie, ktore opisano wyzej przy guziku zapisu. Bez kontroli
+        // konczy sie to najgorzej, jak mozna: HUB oglasza sukces, dopisuje ZW_POTW_ZNAK,
+        // a ten znak na stale gasi prosbe, choc w tickecie nie ma zadnego pliku.
+        //
+        // Porownanie CALEJ strony odpada: dwa pobrania tego samego adresu pod rzad
+        // roznia sie (sprawdzone w konsoli — 94 865 znakow, a === b false). Strona
+        // niesie cos zmiennego, wiec „identyczna co do bajtu" nie zaszloby nigdy.
+        //
+        // Liczymy WIERSZE. Zmienny token nie dodaje <tr>, a zapisany dokument dodaje.
+        // Ten sam chwyt stoi w module Bank Import: „POST zwrocil OK, ale liczba wierszy
+        // w tabeli Payments sie nie zmienila". Wiecej wierszy = doszlo; tyle samo albo
+        // mniej = nie doszlo; nie da sie policzyc = nie blokujemy.
+        var poHtml = null;
+        try {
+            var r2 = await fetch(href, { credentials: 'same-origin' });
+            if (r2 && r2.ok) poHtml = await r2.text();
+        } catch (e){ poHtml = null; }
+
+        if (poHtml == null){
+            dz('sekcji po wyslaniu nie odczytalem — zapis niepotwierdzony');
+            return { odp: odp.slice(0, 200), potwierdzony: false };
+        }
+
+        // Dwa NIEZALEZNE swiadectwa, ze plik wszedl. Blokujemy dopiero, gdy nie ma
+        // zadnego — falszywy alarm jest tu gorszy niz jego brak, bo kaze uzytkownikowi
+        // wyslac dokument drugi raz, a pierwszy juz lezy w tickecie.
+        //   (1) przybyl wiersz — licznik <tr> jest stabilny miedzy pobraniami
+        //       (sprawdzone: trzy pobrania z rzedu daly 16, 16, 16), wiec wzrost
+        //       oznacza cos nowego na stronie, a nie zmienna zawartosc;
+        //   (2) w tresci sekcji widac nazwe pliku. Dziala, o ile prologistics nie
+        //       zmienia nazwy przy zapisie — dlatego to tylko drugie swiadectwo,
+        //       nie jedyne.
+        var przed = liczWierszy(f.html);
+        var po    = liczWierszy(poHtml);
+        var przybyloWierszy = (przed >= 0 && po >= 0 && po > przed);
+        var widacNazwe = (poHtml.indexOf(plik.name) !== -1);
+        dz('kontrola zapisu', 'wierszy ' + przed + ' → ' + po,
+           'nazwa pliku widoczna: ' + (widacNazwe ? 'tak' : 'nie'));
+
+        // CELOWO nie rzucamy bledu, tylko meldujemy niepewnosc. Nie mamy jeszcze ani
+        // jednej zaobserwowanej sekcji, w ktorej LEZY dokument: auftrag 18831 nie ma
+        // zalacznikow w zadnej z 12 sekcji (wszedzie 16 wierszy, zero linkow do plikow),
+        // wiec nie wiadomo, czy wpis dokumentu w ogole jest wierszem tabeli — ani czy
+        // lista nie jest doladowywana JavaScriptem PO zaladowaniu strony. Gdyby byla,
+        // oba swiadectwa milczalyby zawsze i twarda blokada odrzucalaby KAZDY poprawny
+        // zapis. Do czasu pierwszej obserwacji lepiej ostrzec, niz sklamac w druga strone.
+        // Po potwierdzeniu na zywym przypadku zamienic to na throw.
+        return { odp: odp.slice(0, 200),
+                 potwierdzony: (przybyloWierszy || widacNazwe),
+                 przed: przed, po: po, nazwaWidoczna: widacNazwe };
+    }
+
+    // Miejsce, w ktorym stala prosba — TAM ma trafic dokument i TAM odbijamy.
+    // Sekcje czytamy ze strony; wybor uzytkownika ma pierwszenstwo nad podpowiedzia.
+    async function potwCel(r){
+        var zTicketu = !!(r.potw && r.potw.zrodlo === 'ticket');
+        var nr = (r.potw && r.potw.strona) || (zTicketu ? r.rma : r.auf);
+        if (!nr) throw new Error('nie wiem, na której stronie stała prośba');
+        var str = zTicketu ? await czytajTicketC(nr) : await czytajAuftragC(nr);
+        if (!str || !str.ok)
+            throw new Error('nie otworzyłem ' + (zTicketu ? ('ticketu ' + nr) : ('auftragu ' + nr)));
+        var sekcje = str.sekcje || [];
+        var wyb = null;
+        if (r.potwSekcja)
+            wyb = sekcje.filter(function (x){ return x.typ === r.potwSekcja; })[0] || null;
+        if (!wyb)
+            wyb = sekcje.filter(function (x){ return /refund|payment|confirm|bank|finance/i.test(x.etykieta); })[0] || null;
+        if (!wyb) wyb = sekcje[0] || null;
+        // AUFTRAG NIE MA SEKCJI load_docs.php. Sprawdzone na zywej stronie auftragu
+        // z widocznym zalacznikiem: ani w pobranym HTML-u, ani w DOM nie ma ANI JEDNEGO
+        // odnosnika load_docs.php?...type=N. Takie odnosniki stoja wylacznie na stronach
+        // ORDEROW (load_docs.php?op_order_id=...&type=N). Na auftragu dokumenty wisza pod
+        // doc.php?number=...&doc_id=..., a wysyla sie je formularzem stojacym na samej
+        // stronie auftragu. Bez tej galezi sekcje sa puste i cala sciezka auftragowa
+        // konczyla sie komunikatem „nie znalazlem sekcji dokumentow — dolacz recznie".
+        if (!wyb && !zTicketu)
+            wyb = { typ: '', etykieta: 'dokumenty auftragu',
+                    href: '/auction.php?number=' + encodeURIComponent(nr) + '&txnid=3' };
+        return { rodzaj: zTicketu ? 'ticket' : 'auftrag', nr: String(nr),
+                 objId: str.objId || '', sekcje: sekcje, sekcja: wyb,
+                 opis: (zTicketu ? 'ticketu ' : 'auftragu ') + nr };
+    }
+    // Odbijamy na TEGO, KTO PROSIL O POTWIERDZENIE — a to zwykle kto inny niz osoba
+    // proszaca o sam zwrot: zwrot zamawia finanse, o dowod pyta agent prowadzacy klienta.
+    function potwKomu(r){
+        var p = r.potw || {};
+        if (p.autorId) return { id: p.autorId, nazwa: p.autor || p.autorId };
+        var os = p.autor ? pracownikPoNazwie(p.autor) : null;
+        if (os && os.id) return { id: os.id, nazwa: os.name || p.autor };
+        return r.odbicie || { id: r.prosilId || '', nazwa: r.prosil || '' };
+    }
+
+    // Cala droga po jednym kliknieciu: platnosc z wyszukiwarki eupago → plik →
+    // zalacznik tam, gdzie stala prosba → odbicie na proszacego. Kolejnosc ma
+    // znaczenie: odbicie idzie NA KONCU, zeby proszacy dostal sprawe dopiero
+    // z gotowym dokumentem, a nie z pusta obietnica.
+    async function wyslijPotwierdzenie(r, tryb){
+        if (!r.potw) throw new Error('nie ma prośby o potwierdzenie');
+        if (!r.token) throw new Error('nie znam identyfikatora płatności — bez niego nie ma czego szukać w eupago');
+        r.potwKrok = 'szukam płatności w eupago'; render();
+        var wynik = await euPoIdent(r.token, r.platData);
+        var e = wynik.platnosc, z = wynik.zwrot;
+        if (!e && !z) throw new Error('eupago nie zna płatności o identyfikatorze ' + r.token);
+        r.potwEu = e || z;
+        r.potwZwrot = z || null;
+        if (!r.euRef) r.euRef = String((e && e.referencia) || '');
+        if (!r.estado) r.estado = String((e && e.estado) || '');
+        r.potwKrok = 'składam potwierdzenie'; render();
+        var plik = await potwPlik(r, e, z);
+        if (tryb === 'pobierz'){
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(plik);
+            a.download = plik.name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+            r.potwKrok = '';
+            return 'zapisane na dysk: ' + plik.name;
+        }
+        var cel = await potwCel(r);
+        r.potwSekcje = cel.sekcje;
+        if (!cel.sekcja)
+            throw new Error('na stronie ' + cel.opis + ' nie znalazłem sekcji dokumentów — dołącz ręcznie');
+        r.potwKrok = 'dołączam dokument'; render();
+        var wynDol = await dolaczDokument(cel.sekcja.href, plik);
+        dopisz(r, 'potwierdzenie dołączone do ' + cel.opis + ' (sekcja „' + cel.sekcja.etykieta + '")');
+        // Samo 200 z load_docs.php nie dowodzi zapisu — patrz komentarz w dolaczDokument.
+        // Dopoki nie umiemy tego rozstrzygnac na pewno, mowimy o tym wprost, zamiast
+        // meldowac sukces, ktorego nie sprawdzilismy.
+        if (!wynDol || !wynDol.potwierdzony)
+            dopisz(r, 'UWAGA: nie potwierdziłem, że plik naprawdę wszedł (wierszy sekcji '
+                    + (wynDol ? (wynDol.przed + ' → ' + wynDol.po) : '?')
+                    + ', nazwy pliku nie widać) — zajrzyj do załączników w ' + cel.opis);
+        var kto = potwKomu(r);
+        var tekst = ZW_POTW_ZNAK + ' — eupago ' + (r.euRef || r.token)
+                  + (r.kwota != null ? (', ' + f2(r.kwota) + ' EUR') : '')
+                  + (r.platData ? (', ' + r.platData) : '');
+        if (!kto.id){
+            r.potwKrok = '';
+            dopisz(r, 'nie wiem, na kogo odbić — odbicie zrób ręcznie');
+            return 'dołączone do ' + cel.opis + ', ale bez odbicia';
+        }
+        r.potwKrok = 'odbijam na ' + (kto.nazwa || kto.id); render();
+        if (cel.rodzaj === 'ticket') await odbijTicket(cel.nr, kto.id, tekst);
+        else if (cel.objId) await odbijAuftrag(cel.objId, kto.id, tekst);
+        else { r.potwKrok = ''; dopisz(r, 'auftrag bez obj_id — odbicie zrób ręcznie');
+               return 'dołączone do ' + cel.opis + ', ale bez odbicia'; }
+        r.potwWyslane = true; r.potwKrok = '';
+        dopisz(r, 'odbite na „' + (kto.nazwa || kto.id) + '"');
+        return 'dołączone do ' + cel.opis + ' i odbite na „' + (kto.nazwa || kto.id) + '"';
     }
 
     // Zapis po zwrocie. Miejsce idzie za miejscem prosby: z auftragu — w auftragu,
@@ -55729,6 +59173,12 @@
         r.prosbaKom = pr ? pr.kom : null;
         r.odbicie = doOdbicia(u.kom, r.prosilId, r.prosil);
         r.ibanKom = ibanZKomentarzy(u.kom);
+        // Prosba o POTWIERDZENIE zwrotu. Szukamy jej TU, przed wszystkimi wyjsciami
+        // z tej funkcji: przychodzi najczesciej do sprawy juz zwroconej, czyli do
+        // wiersza, ktory za chwile skonczy stanem „zablokowane".
+        r.potw = znajdzProsbeOPotwierdzenie(u.kom);
+        if (r.potw) dz('prośba o potwierdzenie', r.nr, r.potw.autor || '—',
+                       r.potw.data || '—', 'z ' + (r.potw.zrodlo || '?') + ' ' + (r.potw.strona || '?'));
 
         // Uprawnienie osoby proszacej. Bez prosby nie ma kogo szukac — inaczej
         // dopisywalibysmy „nie znalazlem osoby »«" przy kazdym takim wierszu.
@@ -56218,6 +59668,86 @@
         return '<span style="color:#888">—</span>';
     }
 
+    // Pasek prosby o potwierdzenie — pod wierszem, przez cala szerokosc tabeli.
+    // Osobno, bo to inna sprawa niz zwrot: wiersz bywa „zablokowany, bo juz zwrocone",
+    // a wlasnie wtedy potwierdzenie trzeba wyslac.
+    function wierszPotwierdzenia(r, i){
+        if (!r.potw) return '';
+        var h = '<tr style="background:' + (r.potwWyslane ? '#ecfdf5' : '#eff6ff') + '">'
+              + '<td colspan="9" style="' + TD + '">'
+              + '<div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">'
+              + '<div style="flex:1;min-width:320px;font-size:12px;color:#1e3a8a">'
+              + '<b>📄 Prośba o potwierdzenie zwrotu</b> — ' + esc(r.potw.autor || '—')
+              + (r.potw.data ? (' · ' + esc(r.potw.data)) : '')
+              + (r.potw.zrodlo ? (' · ' + esc(r.potw.zrodlo) + ' ' + esc(r.potw.strona || '')) : '')
+              + '<div style="font-size:11px;color:#475569;margin-top:2px">„'
+              + esc(flat(r.potw.tekst).slice(0, 220)) + '"</div>';
+        if (r.potwKrok)
+            h += '<div style="font-size:11px;color:#c47f00;margin-top:3px">⏳ ' + esc(r.potwKrok) + '…</div>';
+        if (r.potwWyslane)
+            h += '<div style="font-size:11px;color:#16a34a;font-weight:bold;margin-top:3px">'
+               + '✔ potwierdzenie dołączone i odbite</div>';
+        h += '</div><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">';
+        // Lista sekcji pojawia sie po pierwszym „Dołącz i odbij" — wtedy strona jest
+        // przeczytana i wiadomo, co na niej naprawde jest. Zla podpowiedz = anuluj,
+        // wybierz z listy, kliknij drugi raz.
+        if (r.potwSekcje && r.potwSekcje.length)
+            h += '<select class="zwr-psek" data-i="' + i + '" '
+               + 'title="Sekcja dokumentów na stronie, do której trafi plik" '
+               + 'style="padding:4px 6px;border:1px solid #1e3a8a;border-radius:5px;font-size:11px">'
+               + r.potwSekcje.map(function (x){
+                     return '<option value="' + att(x.typ) + '"'
+                          + (x.typ === r.potwSekcja ? ' selected' : '') + '>' + esc(x.etykieta) + '</option>';
+                 }).join('')
+               + '</select>';
+        h += '<button class="zwr-ppob" data-i="' + i + '" '
+           + 'title="Znajduje płatność w wyszukiwarce eupago po identyfikatorze, składa potwierdzenie i zapisuje je na dysk. Do prologistics nic nie idzie." '
+           + 'style="padding:6px 10px;background:#fff;color:#1e3a8a;border:1px solid #1e3a8a;'
+           + 'border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">⬇ Pobierz</button>'
+           + '<button class="zwr-psend" data-i="' + i + '" '
+           + 'title="Dołącza potwierdzenie do tej samej strony, na której stała prośba, i odbija ją na osobę, która prosiła." '
+           + 'style="padding:6px 10px;background:#1e3a8a;color:#fff;border:none;'
+           + 'border-radius:5px;cursor:pointer;font-size:12px;font-weight:bold">📎 Dołącz i odbij</button>'
+           + '</div></div></td></tr>';
+        return h;
+    }
+
+    // Guziki paska. „Dołącz i odbij" pyta o zgode: zalacznik i odbicie widzi cale
+    // Customer Service, a cofnac tego nie ma jak.
+    var potwZajete = false;
+    async function potwKlik(i, tryb){
+        var r = S.rows[i];
+        if (!r || potwZajete) return;
+        if (tryb === 'wyslij'){
+            var opis = '';
+            try {
+                var c = await potwCel(r);
+                r.potwSekcje = c.sekcje;
+                if (!r.potwSekcja && c.sekcja) r.potwSekcja = c.sekcja.typ;
+                opis = c.opis + (c.sekcja ? (', sekcja „' + c.sekcja.etykieta + '"') : ', BEZ sekcji dokumentów');
+                render();
+            } catch (e){
+                say('Nie odczytałem sekcji dokumentów: ' + ((e && e.message) || e), '#c00');
+                return;
+            }
+            var kto = potwKomu(r);
+            if (!confirm('Dołączyć potwierdzenie do ' + opis + '\n'
+                       + 'i odbić na „' + (kto.nazwa || kto.id || '?') + '"?\n\n'
+                       + 'Jeśli sekcja jest zła — anuluj i wybierz inną z listy przy guzikach.')) return;
+        }
+        potwZajete = true;
+        try {
+            var wynik = await wyslijPotwierdzenie(r, tryb);
+            say('Potwierdzenie — ' + wynik + '.', '#16a34a');
+        } catch (e){
+            r.potwKrok = '';
+            dopisz(r, 'potwierdzenie: ' + ((e && e.message) || e));
+            say('Potwierdzenie: ' + ((e && e.message) || e), '#c00');
+        }
+        potwZajete = false;
+        render();
+    }
+
     function render(){
         var el = $('#zwr-out');
         if (!el) return;
@@ -56225,7 +59755,13 @@
             el.innerHTML = '<div style="font-size:12px;color:#888;padding:8px">Wklej wiersze ze skrzynki i kliknij „Sprawdź”.</div>';
             return;
         }
-        var h = '<div style="font-size:12px;font-weight:bold;color:#333;margin-bottom:6px">Podgląd:</div>'
+        var potwIle = S.rows.filter(function (x){ return x.potw && !x.potwWyslane; }).length;
+        var h = (potwIle ? ('<div style="margin-bottom:6px;padding:7px 9px;background:#eff6ff;'
+               + 'border:1px solid #bfdbfe;border-radius:6px;font-size:12px;color:#1e3a8a">'
+               + '<b>📄 Prośby o potwierdzenie zwrotu: ' + potwIle + '</b> — pasek pod wierszem: '
+               + '„⬇ Pobierz" zapisuje dokument na dysk, „📎 Dołącz i odbij" wysyła go tam, '
+               + 'gdzie stała prośba.</div>') : '')
+              + '<div style="font-size:12px;font-weight:bold;color:#333;margin-bottom:6px">Podgląd:</div>'
               + '<div style="overflow-x:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:6px">'
               + '<table style="width:100%;min-width:1120px;border-collapse:collapse;font-size:12px;table-layout:auto">'
               + '<thead><tr style="background:#f3f4f6">'
@@ -56330,6 +59866,7 @@
                  + '</td>'
               +  '<td style="' + TD + ';white-space:nowrap">' + stTxt(r) + '</td>'
               +  '<td style="' + TD + ';color:#555">' + esc(r.msg || '') + '</td></tr>';
+            h += wierszPotwierdzenia(r, i);
         });
         el.innerHTML = h + '</tbody></table></div>';
         el.querySelectorAll('.zwr-chk').forEach(function (c){
@@ -56382,6 +59919,17 @@
                 if (!c.checked) r.sel = false;
                 render(); odswiezGuzik();
             };
+        });
+        el.querySelectorAll('.zwr-psek').forEach(function (s){
+            s.onchange = function (){
+                S.rows[parseInt(s.getAttribute('data-i'), 10)].potwSekcja = s.value;
+            };
+        });
+        el.querySelectorAll('.zwr-ppob').forEach(function (b){
+            b.onclick = function (){ potwKlik(parseInt(b.getAttribute('data-i'), 10), 'pobierz'); };
+        });
+        el.querySelectorAll('.zwr-psend').forEach(function (b){
+            b.onclick = function (){ potwKlik(parseInt(b.getAttribute('data-i'), 10), 'wyslij'); };
         });
         odswiezGuzik();
     }
@@ -56591,6 +60139,96 @@
         return dane;
     }
 
+    // Comprovativo zwrotu BEZPOSREDNIEGO. eupago nie ma takiego pliku na serwerze:
+    // adres /reembolsos/comprovativo/<id> istnieje tylko dla directRefund = 0, a przy
+    // directRefund = 1 wisi i konczy sie 524 od Cloudflare. Panel sklada dokument sam,
+    // w przegladarce, html2pdf-em z wlasnego szablonu (listagem.js).
+    //
+    // Nie podrabiamy tego szablonu u siebie — kopia rozjechalaby sie przy pierwszej
+    // zmianie po ich stronie. Uruchamiamy ICH uchwyt: uchwyt jest delegowany na body
+    // i czyta WYLACZNIE piec atrybutow klikanego elementu, wiec wystarczy wstawic taki
+    // sam <a id="direct_refund_proof_btn"> z naszymi wartosciami i kliknac. Zmieniamy
+    // jedna rzecz: save() na outputPdf('blob'), zeby plik nie spadl na dysk uzytkownika,
+    // tylko wrocil do nas. Szablon, opcje i biblioteka zostaja ich.
+    function comprovativoPanelu(z){
+        return new Promise(function (ok, zle){
+            var J = W.jQuery || W.$;
+            if (typeof W.html2pdf !== 'function'){
+                zle(new Error('ta strona panelu nie ma html2pdf — otwórz listę Reembolsos'));
+                return;
+            }
+            if (!J){ zle(new Error('ta strona panelu nie ma jQuery')); return; }
+
+            var proto = null, staryZapis = null;
+            try {
+                proto = Object.getPrototypeOf(W.html2pdf());
+                staryZapis = proto && proto.save;
+            } catch (e){ zle(new Error('nie dosięgnąłem html2pdf: ' + e.message)); return; }
+            if (typeof staryZapis !== 'function'){
+                zle(new Error('html2pdf w tej wersji nie ma save() na prototypie — nie ruszam'));
+                return;
+            }
+
+            var a = document.createElement('a');
+            a.id = 'direct_refund_proof_btn';
+            a.href = '#!';
+            a.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+            // Nazwy atrybutow sa takie, jakie czyta uchwyt panelu — nie nasze.
+            a.setAttribute('reference',  String(z.reference  == null ? '' : z.reference));
+            a.setAttribute('amount',     String(z.amount     == null ? '' : z.amount));
+            a.setAttribute('refund_id',  String(z.refund_id  == null ? '' : z.refund_id));
+            a.setAttribute('trans_date', String(z.trans_date == null ? '' : z.trans_date));
+            a.setAttribute('trans_time', String(z.trans_time == null ? '' : z.trans_time));
+
+            var skonczone = false, budzik = 0;
+            function sprzataj(){
+                try { proto.save = staryZapis; } catch (e){}
+                try { if (a.parentNode) a.parentNode.removeChild(a); } catch (e){}
+                if (budzik) clearTimeout(budzik);
+            }
+            function padnij(msg){
+                if (skonczone) return;
+                skonczone = true; sprzataj(); zle(new Error(msg));
+            }
+
+            proto.save = function (){
+                var self = this;
+                try {
+                    return self.outputPdf('blob').then(function (blob){
+                        if (skonczone) return self;
+                        skonczone = true; sprzataj(); ok(blob);
+                        return self;
+                    }, function (e){
+                        padnij('html2pdf nie złożył dokumentu: ' + ((e && e.message) || e));
+                    });
+                } catch (e){ padnij('html2pdf nie złożył dokumentu: ' + e.message); }
+            };
+
+            // html2canvas rysuje cala strone — przy wolnej maszynie potrafi to potrwac.
+            budzik = setTimeout(function (){ padnij('panel nie złożył comprovativo w 60 s'); }, 60000);
+
+            try {
+                document.body.appendChild(a);
+                J(a).trigger('click');
+            } catch (e){ padnij('nie udało się uruchomić guzika panelu: ' + e.message); }
+        });
+    }
+
+    // Most przenosi napisy, nie pliki — wiec PDF jedzie base64. FileReader oddaje
+    // data-URL, z ktorego bierzemy sam ladunek za przecinkiem.
+    function naBase64(blob){
+        return new Promise(function (ok, zle){
+            var fr = new FileReader();
+            fr.onload = function (){
+                var t = String(fr.result || '');
+                var i = t.indexOf(',');
+                ok(i < 0 ? '' : t.slice(i + 1));
+            };
+            fr.onerror = function (){ zle(new Error('nie odczytałem pliku złożonego przez panel')); };
+            fr.readAsDataURL(blob);
+        });
+    }
+
     async function wykonaj(z){
         var us = cfg('url_server'), core = cfg('core_server');
         if (!us || !core) throw new Error('strona panelu nie wystawiła configfrontend — odśwież ją');
@@ -56636,6 +60274,20 @@
             // wysylalby puste pole, a panel raportowalby, ze wyslal IBAN.
             return { odp: (f.json && f.json.transactionStatus) || 'ok',
                      ibanWyslany: String(z.iban || '') };
+        }
+        if (z.op === 'comprovativo'){
+            var blob = await comprovativoPanelu(z);
+            if (!blob || !blob.size) throw new Error('panel oddał pusty dokument');
+            var b64 = await naBase64(blob);
+            // 'JVBERi0' to base64 z '%PDF-'. Sprawdzamy TU, w karcie panelu, zeby przez
+            // most nie pojechalo cos, co PDF-em nie jest.
+            if (b64.indexOf('JVBERi0') !== 0)
+                throw new Error('panel oddał coś, co nie zaczyna się od %PDF');
+            if (b64.length > 6000000)
+                throw new Error('comprovativo ma ' + blob.size + ' bajtów — za dużo na most');
+            return { b64: b64, bajtow: blob.size,
+                     nazwa: 'Comprovativo de Reembolso Direto - '
+                          + String(z.refund_id == null ? '' : z.refund_id) + '.pdf' };
         }
         throw new Error('nieznana operacja „' + z.op + '"');
     }
@@ -56710,10 +60362,671 @@
     }
 
 
+    // ===== Clearhaus — sesja panelu (v5.34) =====
+    // Panel my.clearhaus.com rozmawia z merchant.clearhaus.com przez OAuth2: kazde
+    // zapytanie niesie `Authorization: Bearer <JWT>`, a serwer bez niego odpowiada
+    // 401 z naglowkiem `WWW-Authenticate: Bearer realm="…"`.
+    //
+    // Tokenu NIE DA SIE odczytac: localStorage i sessionStorage sa puste, panel trzyma
+    // go wylacznie w pamieci (auth0). Trzeba go wiec PRZECHWYCIC z naglowka — dokladnie
+    // ten sam uklad, co przy ManoMano (init_mmtok), i ten sam kod, bo problem jest ten sam.
+    //
+    // Ten modul NICZEGO NIE WYSYLA i niczego nie klika. Czyta naglowek, ktory panel
+    // i tak wysyla, i oddaje go przez GM_setValue — wspolne dla wszystkich domen skryptu.
+    function init_chtok(){
+        const KLUCZ = 'tm_ch_token_v1';
+        let mam = false;
+        function chmurka(tekst, kolor, ile){
+            const d = document.createElement('div');
+            d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;background:'
+                + kolor + ';color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:7px 11px;'
+                + 'border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);cursor:pointer;max-width:300px';
+            d.textContent = tekst;
+            d.onclick = function(){ d.remove(); };
+            if (document.body) document.body.appendChild(d);
+            setTimeout(function(){ if (d.parentNode) d.remove(); }, ile);
+        }
+        function zapisz(v){
+            const t = String(v || '').trim();
+            if (!/^Bearer\s+[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) return;
+            let exp = 0;
+            try {
+                const cz = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                exp = (JSON.parse(atob(cz + '==='.slice((cz.length + 3) % 4))).exp || 0) * 1000;
+            } catch (e){ exp = 0; }
+            if (exp && exp < Date.now()) return;              // przeterminowanego nie zapisujemy
+            try { GM_setValue(KLUCZ, JSON.stringify({ tok: t, exp: exp, kiedy: Date.now() })); }
+            catch (e){ return; }
+            if (mam) return;
+            mam = true;
+            chmurka('✓ HUB ma sesję Clearhausa'
+                + (exp ? (' — ważna do ' + new Date(exp).toLocaleTimeString('pl-PL').slice(0, 5)) : '')
+                + '. Możesz wrócić do prologistics.', '#0a7a2f', 12000);
+        }
+        // Hookujemy OBIE drogi. Panel idzie przez fetch, ale biblioteki pomocnicze
+        // (Sentry, auth0) potrafia opakowac jedno w drugie — taniej podpiac sie pod obie,
+        // niz zgadywac, ktora akurat zadziala.
+        const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        try {
+            const staryFetch = W.fetch;
+            if (typeof staryFetch === 'function'){
+                W.fetch = function (wej, opc){
+                    try {
+                        let a = '';
+                        if (opc && opc.headers){
+                            const h = opc.headers;
+                            a = (typeof h.get === 'function')
+                                ? (h.get('authorization') || h.get('Authorization') || '')
+                                : (h.Authorization || h.authorization || '');
+                        }
+                        if (!a && wej && typeof wej === 'object' && wej.headers
+                            && typeof wej.headers.get === 'function') a = wej.headers.get('authorization') || '';
+                        if (a) zapisz(a);
+                    } catch (e){}
+                    return staryFetch.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        try {
+            const proto = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
+            const staryHdr = proto && proto.setRequestHeader;
+            if (typeof staryHdr === 'function'){
+                proto.setRequestHeader = function (n, v){
+                    try { if (String(n).toLowerCase() === 'authorization') zapisz(v); } catch (e){}
+                    return staryHdr.apply(this, arguments);
+                };
+            }
+        } catch (e){}
+        setTimeout(function(){
+            if (mam) return;
+            chmurka('HUB jeszcze nie widzi sesji Clearhausa — kliknij „Settlements" '
+                + 'w panelu, to wystarczy.', '#c47f00', 15000);
+        }, 20000);
+    }
+
+    // ===== QuickPay — most do panelu =====
+    // Po co most: sesja siedzi w ciasteczkach QuickPaya, wiec pytamy z karty panelu,
+    // nie z prologistics.
+    //
+    // CO JUZ ZMIERZONE (i czego wiec NIE zgadujemy):
+    //   brak naglowka wersji  -> 406 {"error":"Accept-Version http header is required"}
+    //   v11 / v12 / v13       -> 406 {"error":"Accept-Version http header value is invalid"}
+    //   v10                   -> 404 „Not Found", 13 B, zwykly tekst
+    // Czyli v10 jest jedyna wazna wersja i wersja NIE jest przyczyna. Adres tez nie:
+    // 404 dostal adres przepisany co do znaku z zapytania, ktore panel wykonal z powodzeniem.
+    // Wersje mimo to podsluchujemy u panelu, zeby nie zostac z wpisana liczba, gdy QuickPay
+    // ja podniesie.
+    //
+    // Zostaje DROGA WYWOLANIA — i tej modul nie wybiera z gory, tylko sprawdza po kolei
+    // i zapamietuje te, ktora oddala 200.
+    function init_qpmost(){
+        const Z = 'tm_qp_zlec', O = 'tm_qp_odp', W = 'tm_qp_wersja_v1';
+        // Zapytanie panelu, znak w znak. page_size=10 to jedyna wartosc, ktora panel
+        // wysyla — ale przy 45 kB na dziesiec platnosci tydzien to szescdziesiat zapytan,
+        // wiec po ustaleniu dzialajacej drogi SPRAWDZAMY, czy serwer przyjmie wiecej.
+        // Sprawdzamy, nie zakladamy: wartosc wchodzi dopiero, gdy odda 200.
+        const R_KL = 'tm_qp_rozmiar_v1';
+        function rozmiar(){
+            try { const n = parseInt(GM_getValue(R_KL, '') || '', 10);
+                  return (n > 0 && n <= 500) ? n : 10; } catch (e){ return 10; }
+        }
+        function pyt(klucz, ile){
+            return 'page_size=' + (ile || rozmiar()) + '&page_key=' + (klucz || '')
+                 + '&sort_by=id&sort_dir=desc';
+        }
+        let pracuje = false;
+        let ostatniAdres = '';           // ostatni /payments, ktory wolal SAM panel
+
+        function zapiszWersje(v, skad){
+            const t = String(v == null ? '' : v).trim();
+            if (!/^v?\d{1,3}$/i.test(t)) return;
+            let stara = '';
+            try { const o = JSON.parse(GM_getValue(W, 'null') || 'null');
+                  stara = (o && o.wersja) || ''; } catch (e){ stara = ''; }
+            if (stara === t) return;
+            try { GM_setValue(W, JSON.stringify({ wersja: t, skad: skad, kiedy: Date.now() })); }
+            catch (e){}
+        }
+        function wersja(){
+            try { const o = JSON.parse(GM_getValue(W, 'null') || 'null');
+                  return (o && o.wersja) || ''; } catch (e){ return ''; }
+        }
+        function odpowiedz(id, ok, dane, blad){
+            try { GM_setValue(O, JSON.stringify({ id: id, ok: ok, dane: dane, blad: blad || '' })); }
+            catch (e){}
+        }
+
+        /* ---------- podsluch wlasnego ruchu panelu ----------
+           Piec roznych drog wywolania dalo 404 na adresie, ktory panel wywoluje z powodzeniem.
+           Skoro imitowanie nie dziala, przestajemy imitowac: zapisujemy, co panel NAPRAWDE
+           wysyla i co NAPRAWDE dostaje.
+
+           Pierwsze pytanie, na ktore to odpowiada, jest najwazniejsze i wczesniej nikt go nie
+           postawil: czy panel DZISIAJ nadal dostaje 200? Zrzut HAR, na ktorym opieralismy sie
+           caly czas, jest starszy. Jesli panel tez dostaje teraz 404, to gonimy ducha i trzeba
+           szukac zupelnie gdzie indziej.
+
+           Drugie: KTORE naglowki panel ustawia. Zapisujemy komplet i odtwarzamy go potem
+           w wlasnym zapytaniu — zamiast wpisywac trzy, o ktorych mysle, ze wystarcza.
+
+           Trzecie: jak wyglada REKORD platnosci. Zadnego ciala odpowiedzi nie ma w zadnym
+           zrzucie, wiec nazwy pol sa dotad zgadywane. Tu przyjda z zywej odpowiedzi.
+
+           Modul NICZEGO nie wysyla i niczego nie klika — czyta to, co panel i tak robi.
+           Wartosci naglowkow zostaja w przegladarce; na ekran diagnostyki ida same nazwy,
+           a wartosci tylko dla tych nieszkodliwych.                                        */
+        const NAGL_JAWNE = ['accept', 'accept-version', 'x-requested-with', 'content-type'];
+        // Naglowki ustawiane przez przegladarke — proba ich podania konczy sie wyjatkiem.
+        const NAGL_ZAKAZANE = /^(host|connection|content-length|cookie|origin|referer|user-agent|accept-encoding|sec-|proxy-|via)/i;
+        let WZORZEC = null;              // ostatnie UDANE zapytanie panelu
+        let NAGRANE = [];                // ostatnie kilka zapytan panelu, tez nieudanych
+        let KSZTALT = null;              // pola rekordu platnosci z zywej odpowiedzi
+
+        function jawny(n, v){
+            return NAGL_JAWNE.indexOf(String(n).toLowerCase()) >= 0
+                ? String(v) : ('(wartość ukryta, ' + String(v == null ? '' : v).length + ' zn.)');
+        }
+        function zapiszNagranie(o){
+            NAGRANE.unshift(o);
+            if (NAGRANE.length > 6) NAGRANE.pop();
+            if (o.status >= 200 && o.status < 300){
+                WZORZEC = { url: o.url, naglowki: o.naglowkiPelne };
+                if (o.klucze && o.klucze.length) KSZTALT = o.klucze;
+            }
+        }
+        (function podsluch(){
+            const P = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+            function ciekawy(u){ return /\/payments(\?|$)/.test(String(u || '')); }
+            function zTresci(t){
+                try {
+                    const j = JSON.parse(t);
+                    const l = Array.isArray(j) ? j : (j && Array.isArray(j.payments) ? j.payments : null);
+                    if (l && l.length) return Object.keys(l[0]);
+                    if (j && typeof j === 'object') return ['(nie tablica) ' + Object.keys(j).slice(0, 8).join(',')];
+                } catch (e){}
+                return null;
+            }
+            try {
+                const proto = P.XMLHttpRequest && P.XMLHttpRequest.prototype;
+                if (proto && typeof proto.open === 'function'){
+                    const stary = proto.open;
+                    proto.open = function (m, u){
+                        try { this.__mpU = String(u || ''); this.__mpH = {}; } catch (e){}
+                        return stary.apply(this, arguments);
+                    };
+                }
+                if (proto && typeof proto.setRequestHeader === 'function'){
+                    const stary = proto.setRequestHeader;
+                    proto.setRequestHeader = function (n, v){
+                        try {
+                            if (this.__mpH) this.__mpH[n] = v;
+                            if (String(n).toLowerCase() === 'accept-version') zapiszWersje(v, 'XHR panelu');
+                        } catch (e){}
+                        return stary.apply(this, arguments);
+                    };
+                }
+                if (proto && typeof proto.send === 'function'){
+                    const stary = proto.send;
+                    proto.send = function (){
+                        try {
+                            const self = this;
+                            if (ciekawy(self.__mpU)){
+                                ostatniAdres = self.__mpU;
+                                self.addEventListener('loadend', function (){
+                                    try {
+                                        const t = String(self.responseText || '');
+                                        zapiszNagranie({
+                                            czym: 'XHR panelu', url: self.__mpU,
+                                            status: self.status, dlugosc: t.length,
+                                            link: (self.getResponseHeader('Link') || '').slice(0, 200),
+                                            naglowkiPelne: self.__mpH || {},
+                                            naglowki: Object.keys(self.__mpH || {}).map(function (k){
+                                                return k + ': ' + jawny(k, self.__mpH[k]); }),
+                                            klucze: zTresci(t),
+                                            poczatek: (self.status >= 200 && self.status < 300)
+                                                ? '' : t.slice(0, 120)
+                                        });
+                                    } catch (e){}
+                                });
+                            }
+                        } catch (e){}
+                        return stary.apply(this, arguments);
+                    };
+                }
+            } catch (e){}
+            try {
+                if (typeof P.fetch === 'function'){
+                    const stary = P.fetch;
+                    P.fetch = function (wej, opc){
+                        const u = (typeof wej === 'string') ? wej : (wej && wej.url);
+                        let nag = {};
+                        try {
+                            const h = (opc && opc.headers) || (wej && wej.headers);
+                            if (h && typeof h.forEach === 'function') h.forEach(function (v, k){ nag[k] = v; });
+                            else if (h) Object.keys(h).forEach(function (k){ nag[k] = h[k]; });
+                            const v = nag['accept-version'] || nag['Accept-Version'];
+                            if (v) zapiszWersje(v, 'fetch panelu');
+                        } catch (e){}
+                        const w = stary.apply(this, arguments);
+                        try {
+                            if (ciekawy(u)){
+                                ostatniAdres = String(u);
+                                w.then(function (r){
+                                    try {
+                                        r.clone().text().then(function (t){
+                                            zapiszNagranie({
+                                                czym: 'fetch panelu', url: String(u),
+                                                status: r.status, dlugosc: t.length,
+                                                link: (r.headers.get('Link') || '').slice(0, 200),
+                                                naglowkiPelne: nag,
+                                                naglowki: Object.keys(nag).map(function (k){
+                                                    return k + ': ' + jawny(k, nag[k]); }),
+                                                klucze: zTresci(t),
+                                                poczatek: r.ok ? '' : t.slice(0, 120)
+                                            });
+                                        });
+                                    } catch (e){}
+                                }).catch(function (){});
+                            }
+                        } catch (e){}
+                        return w;
+                    };
+                }
+            } catch (e){}
+        })();
+
+        // Naglowki do wlasnego zapytania: PRZEDE WSZYSTKIM te, ktore panel naprawde ustawil.
+        // Trzy wpisane z glowy zostaja tylko jako zapas, dopoki nic nie nagralismy.
+        function naglowki(v){
+            const out = {};
+            if (WZORZEC && WZORZEC.naglowki){
+                Object.keys(WZORZEC.naglowki).forEach(function (k){
+                    if (NAGL_ZAKAZANE.test(k)) return;
+                    out[k] = WZORZEC.naglowki[k];
+                });
+                if (v) out['Accept-Version'] = v;
+                return out;
+            }
+            return { 'Accept': 'application/json, text/plain, */*',
+                     'Accept-Version': v,
+                     'X-Requested-With': 'XMLHttpRequest' };
+        }
+
+        /* ---------- drogi wywolania ----------
+           Stan wiedzy po pomiarze (nie po domysle):
+             v11, v12, v13   -> 406 {"error":"Accept-Version http header value is invalid"}
+                                czyli v10 jest jedyna wazna wersja i wersja NIE jest problemem;
+             v10, XHR strony       -> 404 „Not Found", 13 B, zwykly tekst
+             v10, XHR piaskownicy  -> to samo
+           Adres byl przy tym co do znaku ten sam, ktory panel wywolal z powodzeniem.
+
+           Zostaja dwie rzeczy, ktorych zaden pomiar jeszcze nie dotknal:
+             1. fetch STRONY. Strona ma zarejestrowany service worker (ngsw), a zapytania
+                z fetcha strony ida PRZEZ niego. XHR z rozszerzenia go omija. Jesli to worker
+                doprowadza /api/payments tam, gdzie trzeba, roznica wyjdzie wlasnie tutaj.
+             2. host api.quickpay.net. Naglowek Link, ktory panel dostaje w odpowiedzi,
+                wskazuje na api.quickpay.net/payments — BEZ przedrostka /api. Byc moje
+                manage.quickpay.net/api/payments to sciezka obslugiwana po stronie klienta,
+                a prawdziwe API stoi pod innym hostem. Tam idziemy przez GM_xmlhttpRequest,
+                bo miedzy domenami przegladarka i tak nie przepusci fetcha.
+
+           Modul NIE wybiera zadnej z nich z gory. Przy pierwszym pobraniu przechodzi je po
+           kolei, zapamietuje TE, ktora oddala 200, i od tej pory uzywa tylko jej.            */
+        const HOST_PANEL = 'https://manage.quickpay.net';
+        const HOST_API   = 'https://api.quickpay.net';
+        const SPOSOB = 'tm_qp_sposob_v1';
+        const STRONA = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+
+        function pelny(u){ return /^https?:/i.test(u) ? u : (HOST_PANEL + u); }
+        function pusty(){ return { status: null, ct: '', link: '', tekst: '', ustawione: [], odrzucone: [] }; }
+
+        function przezXHR(u, nagl, swiat){
+            return new Promise(function (ok){
+                let x;
+                try {
+                    x = (swiat === 'piaskownica' || !STRONA.XMLHttpRequest)
+                        ? new XMLHttpRequest() : new STRONA.XMLHttpRequest();
+                } catch (e){ return ok({ blad: 'nie mam XHR: ' + ((e && e.message) || e) }); }
+                try { x.open('GET', u, true); }
+                catch (e){ return ok({ blad: 'open: ' + ((e && e.message) || e) }); }
+                x.withCredentials = true;
+                const ustawione = [], odrzucone = [];
+                Object.keys(nagl || {}).forEach(function (k){
+                    if (nagl[k] == null || nagl[k] === '') return;
+                    try { x.setRequestHeader(k, nagl[k]); ustawione.push(k); }
+                    catch (e){ odrzucone.push(k + ': ' + ((e && e.message) || e)); }
+                });
+                x.timeout = 45000;
+                x.onloadend = function (){
+                    ok({ status: x.status, ct: x.getResponseHeader('content-type') || '',
+                         link: x.getResponseHeader('Link') || '',
+                         tekst: String(x.responseText || ''),
+                         ustawione: ustawione, odrzucone: odrzucone });
+                };
+                x.ontimeout = function (){ ok({ blad: 'brak odpowiedzi przez 45 s' }); };
+                try { x.send(); } catch (e){ ok({ blad: 'send: ' + ((e && e.message) || e) }); }
+            });
+        }
+        // Fetch STRONY — jedyna droga, ktora przechodzi przez service workera.
+        function przezFetch(u, nagl){
+            const F = (STRONA && STRONA.fetch) ? STRONA.fetch.bind(STRONA) : fetch;
+            return F(u, { headers: nagl, credentials: 'same-origin' })
+                .then(function (r){
+                    return r.text().then(function (t){
+                        return { status: r.status, ct: r.headers.get('content-type') || '',
+                                 link: r.headers.get('Link') || '', tekst: t,
+                                 ustawione: Object.keys(nagl || {}) };
+                    });
+                })
+                .catch(function (e){ return { blad: String((e && e.message) || e) }; });
+        }
+        // GM_xmlhttpRequest — jedyna droga miedzy domenami; CORS jej nie dotyczy.
+        function przezGM(u, nagl){
+            return new Promise(function (ok){
+                let f = null;
+                try { f = GM_xmlhttpRequest; } catch (e){ f = null; }
+                if (typeof f !== 'function') return ok({ blad: 'brak GM_xmlhttpRequest' });
+                f({ method: 'GET', url: pelny(u), headers: nagl, timeout: 45000,
+                    onload: function (r){
+                        const m = /content-type:\s*([^\r\n]+)/i.exec(r.responseHeaders || '');
+                        const l = /^link:\s*([^\r\n]+)/im.exec(r.responseHeaders || '');
+                        ok({ status: r.status, ct: m ? m[1].trim() : '', link: l ? l[1].trim() : '',
+                             tekst: String(r.responseText || ''), ustawione: Object.keys(nagl || {}) });
+                    },
+                    onerror: function (){ ok({ blad: 'zapytanie nie doszło' }); },
+                    ontimeout: function (){ ok({ blad: 'brak odpowiedzi przez 45 s' }); } });
+            });
+        }
+
+        const DROGI = [
+            { id: 'fetch strony (przez service workera)', f: przezFetch, wzgledny: true },
+            { id: 'XHR strony',        f: function (u, h){ return przezXHR(u, h, 'strona'); }, wzgledny: true },
+            { id: 'XHR piaskownicy',   f: function (u, h){ return przezXHR(u, h, 'piaskownica'); }, wzgledny: true },
+            { id: 'GM_xmlhttpRequest', f: przezGM, wzgledny: false }
+        ];
+        function droga(id){
+            for (let i = 0; i < DROGI.length; i++) if (DROGI[i].id === id) return DROGI[i];
+            return null;
+        }
+
+        // Adresy do sprawdzenia. Kolejnosc jest kolejnoscia prawdopodobienstwa, ale
+        // o wyborze decyduje wylacznie odpowiedz 200, nie ta kolejnosc.
+        function kombinacje(){
+            const K = [];
+            DROGI.forEach(function (d){
+                if (d.wzgledny){
+                    K.push({ droga: d.id, host: 'panel', url: function (q){ return '/api/payments?' + q; } });
+                } else {
+                    K.push({ droga: d.id, host: 'panel',
+                             url: function (q){ return HOST_PANEL + '/api/payments?' + q; } });
+                    K.push({ droga: d.id, host: 'api.quickpay.net',
+                             url: function (q){ return HOST_API + '/payments?' + q; } });
+                }
+            });
+            return K;
+        }
+
+        // Zapamietany sposob: {droga, host}. Zyje w GM-magazynie, wiec po odswiezeniu karty
+        // nie zaczynamy od zera.
+        const KL_SPOS = SPOSOB;
+        function zapiszSposob(k){
+            try { GM_setValue(KL_SPOS, JSON.stringify({ droga: k.droga, host: k.host, kiedy: Date.now() })); }
+            catch (e){}
+        }
+        function czytajSposob(){
+            try { return JSON.parse(GM_getValue(KL_SPOS, 'null') || 'null'); } catch (e){ return null; }
+        }
+        function udane(r){ return r && !r.blad && r.status >= 200 && r.status < 300; }
+
+        /* Warunek, ktory wyjasnil cala serie 404.
+           Zmierzone: /api/payments oddaje 200 WYLACZNIE przez fetch strony, gdy strone
+           kontroluje service worker panelu (ngsw-worker.js). XHR z rozszerzenia workera
+           omija, GM_xmlhttpRequest tez — i oba dostaja 404 z serwera, bo serwer tej
+           sciezki po prostu nie ma. Worker przejmuje kontrole nad karta dopiero PO
+           przeladowaniu, wiec swiezo otwarta karta nie wystarczy.                        */
+        function workerKontroluje(){
+            try { return !!(navigator.serviceWorker && navigator.serviceWorker.controller); }
+            catch (e){ return false; }
+        }
+        function brakWorkera(){
+            return 'karta QuickPaya nie jest obsługiwana przez service workera, a to on '
+                 + 'obsługuje /api/payments — serwer tej ścieżki nie ma i oddaje 404. '
+                 + 'Wejdź na ekran Payments i naciśnij F5: worker przejmuje kontrolę nad '
+                 + 'kartą dopiero po przeładowaniu. Potem spróbuj ponownie.';
+        }
+        function brakWersji(){
+            return 'nie znam wersji API QuickPaya. Odśwież listę płatności w panelu (F5 na '
+                 + 'ekranie Payments) — podsłuch złapie nagłówek Accept-Version z zapytania, '
+                 + 'które panel i tak wysyła. Wersji nie wpisuję na sztywno, bo QuickPay ją podnosi.';
+        }
+
+        // Pierwsze pobranie przechodzi kombinacje po kolei i zapamietuje te, ktora oddala 200.
+        // Kolejne ida juz prosto. Gdy zadna nie dziala — oddajemy PELNA liste prob, zeby bylo
+        // widac, co odpowiedzialo, a nie samo „nie udalo sie".
+        async function ustalSposob(){
+            const v = wersja();
+            if (!v) throw new Error(brakWersji());
+            if (!workerKontroluje()) throw new Error(brakWorkera());
+            const zapisany = czytajSposob();
+            const lista = kombinacje();
+            if (zapisany){
+                lista.sort(function (a, b){
+                    const pa = (a.droga === zapisany.droga && a.host === zapisany.host) ? 0 : 1;
+                    const pb = (b.droga === zapisany.droga && b.host === zapisany.host) ? 0 : 1;
+                    return pa - pb;
+                });
+            }
+            const proby = [];
+            for (let i = 0; i < lista.length; i++){
+                const k = lista[i], d = droga(k.droga);
+                if (!d) continue;
+                const u = k.url(pyt('', 10));
+                const r = await d.f(u, naglowki(v));
+                if (udane(r)){
+                    zapiszSposob(k);
+                    await ustalRozmiar(k, v);
+                    return { k: k, v: v };
+                }
+                proby.push(k.droga + ' → ' + k.host + ': '
+                    + (r.blad ? r.blad : ('HTTP ' + r.status))
+                    + (r.tekst ? (' „' + String(r.tekst).slice(0, 70) + '"') : ''));
+            }
+            throw new Error('żadna droga nie oddała danych przy Accept-Version ' + v
+                + '. Próby: ' + proby.join(' · ')
+                + ' · Jeśli wszystkie mówią 404, przeładuj kartę panelu (F5) — /api/payments '
+                + 'obsługuje service worker, nie serwer.');
+        }
+
+        // Ile pozycji na strone serwer naprawde przyjmie. Schodzimy od najwiekszej;
+        // pierwsza, ktora odda 200, zostaje zapamietana. Gdy zadna poza dziesiatka nie
+        // przejdzie, zostaje dziesiatka — bo o niej wiemy na pewno, ze dziala.
+        async function ustalRozmiar(k, v){
+            if (rozmiar() !== 10) return rozmiar();
+            const d = droga(k.droga);
+            const kandydaci = [100, 50];
+            for (let i = 0; i < kandydaci.length; i++){
+                const r = await d.f(k.url(pyt('', kandydaci[i])), naglowki(v));
+                if (udane(r)){
+                    try { GM_setValue(R_KL, String(kandydaci[i])); } catch (e){}
+                    return kandydaci[i];
+                }
+            }
+            return 10;
+        }
+
+        let sposob = null;
+        async function pobierz(q){
+            if (!sposob) sposob = await ustalSposob();
+            const d = droga(sposob.k.droga), u = sposob.k.url(q);
+            const r = await d.f(u, naglowki(sposob.v));
+            if (!udane(r)){
+                // Sposob, ktory raz dzialal, przestal — sesja mogla wygasnac albo panel
+                // przelaczyl konto. Kasujemy go, zeby nastepne pobranie ustalilo od nowa.
+                sposob = null;
+                throw new Error((r.blad ? r.blad : ('HTTP ' + r.status)) + ' na ' + u
+                    + ' (' + d.id + ')' + (r.tekst ? (' · ' + String(r.tekst).slice(0, 120)) : ''));
+            }
+            let j = null;
+            try { j = JSON.parse(r.tekst); }
+            catch (e){ throw new Error('panel oddał nie-JSON: ' + String(r.tekst).slice(0, 120)); }
+            return { dane: j, link: r.link };
+        }
+
+        // Macierz diagnostyczna: DROGA x HOST, przy wersji podsluchanej u panelu oraz przy
+        // kilku sasiednich. Pokazuje surowe statusy i nic nie interpretuje.
+        async function diagnoza(){
+            const zlapana = wersja();
+            const wersje = [];
+            if (zlapana) wersje.push(zlapana);
+            ['v10', 'v11'].forEach(function (v){ if (wersje.indexOf(v) < 0) wersje.push(v); });
+            let sw = '';
+            try { sw = (navigator.serviceWorker && navigator.serviceWorker.controller
+                        && navigator.serviceWorker.controller.scriptURL) || ''; } catch (e){}
+            const w = { gdzie: location.href, serviceWorker: sw || '(brak)',
+                        wersjaZPanelu: zlapana || '(jeszcze nie złapana — odśwież listę płatności)',
+                        adresPanelu: ostatniAdres || '(panel nic nie wołał, odkąd moduł wstał)',
+                        zapamietany: czytajSposob(),
+                        // Najwazniejsze: co panel NAPRAWDE dostaje dzisiaj. Jesli tu tez
+                        // stoi 404, to zrzut HAR jest nieaktualny i gonimy ducha.
+                        nagrane: NAGRANE,
+                        ksztaltRekordu: KSZTALT,
+                        maWzorzec: !!WZORZEC,
+                        proby: [] };
+            const lista = kombinacje();
+            let mam = false;
+            for (let i = 0; i < lista.length && !mam; i++){
+                const k = lista[i], d = droga(k.droga);
+                for (let q = 0; q < wersje.length; q++){
+                    const u = k.url(pyt('', 10));
+                    const r = await d.f(u, naglowki(wersje[q]));
+                    w.proby.push({ droga: k.droga, host: k.host, wersja: wersje[q], adres: u,
+                                   status: r.blad ? ('błąd: ' + r.blad) : r.status,
+                                   ct: r.ct || '', dlugosc: (r.tekst || '').length,
+                                   link: String(r.link || '').slice(0, 160),
+                                   poczatek: String(r.tekst || '').slice(0, 120) });
+                    if (udane(r)){
+                        zapiszWersje(wersje[q], 'macierz diagnostyczna');
+                        zapiszSposob(k);
+                        w.dziala = { droga: k.droga, host: k.host, wersja: wersje[q] };
+                        mam = true;
+                        break;
+                    }
+                }
+            }
+            return w;
+        }
+
+        // Nazwy pol rekordu platnosci NIE SA potwierdzone — w zadnym zrzucie nie ma ciala
+        // odpowiedzi. Zamiast wpisac je z glowy, szukamy po kilku kandydatach, a gdy zaden
+        // nie pasuje, oddajemy KLUCZE, ktore naprawde przyszly.
+        const K_ZAM = ['order_id', 'orderId', 'order', 'ordernumber'];
+        const K_ID  = ['id', 'payment_id', 'paymentId'];
+        const K_DAT = ['created_at', 'createdAt', 'accepted_at', 'processed_at', 'updated_at'];
+        function zPola(o, klucze){
+            for (let i = 0; i < klucze.length; i++)
+                if (o && o[klucze[i]] != null && o[klucze[i]] !== '') return o[klucze[i]];
+            return null;
+        }
+
+        async function indeks(od){
+            const mapa = {};
+            let klucz = '', stron = 0, najstarsza = '', widziane = 0, ksztalt = null;
+            const rekordy = [], pomin = [];
+            const granica = String(od || '').slice(0, 10);
+            while (stron < 600){
+                const w = await pobierz(pyt(encodeURIComponent(klucz)));
+                const lista = Array.isArray(w.dane) ? w.dane
+                            : (w.dane && Array.isArray(w.dane.payments) ? w.dane.payments : null);
+                if (!lista)
+                    throw new Error('nie poznaję kształtu odpowiedzi — nie ma tablicy płatności. '
+                        + 'Klucze najwyższego poziomu: '
+                        + Object.keys(w.dane || {}).slice(0, 12).join(', '));
+                if (!lista.length) break;
+                if (!ksztalt) ksztalt = Object.keys(lista[0] || {});
+                lista.forEach(function (p2){
+                    if (rekordy.length >= 5000) return;
+                    const plaski = {};
+                    Object.keys(p2 || {}).forEach(function (k){
+                        const v = p2[k];
+                        if (v == null) return;
+                        if (typeof v === 'object'){ if (pomin.indexOf(k) < 0) pomin.push(k); return; }
+                        plaski[k] = v;
+                    });
+                    rekordy.push(plaski);
+                });
+                lista.forEach(function (p){
+                    widziane++;
+                    const o = zPola(p, K_ZAM), i = zPola(p, K_ID);
+                    if (o != null && i != null && mapa[o] == null) mapa[String(o)] = String(i);
+                    const c = String(zPola(p, K_DAT) || '').slice(0, 10);
+                    if (c && (!najstarsza || c < najstarsza)) najstarsza = c;
+                });
+                stron++;
+                if (!Object.keys(mapa).length)
+                    throw new Error('odpowiedź przyszła, ale nie widzę w niej numeru zamówienia '
+                        + 'ani numeru płatności. Pola rekordu: ' + (ksztalt || []).join(', '));
+                if (granica && najstarsza && najstarsza < granica) break;
+                // page_key z naglowka Link. Adres w Linku wskazuje api.quickpay.net, wiec
+                // bierzemy z niego sam klucz i doklejamy do adresu, ktory u nas dziala.
+                const m = /[?&]page_key=([^&>\s]*)[^>]*>\s*;\s*rel="next"/.exec(w.link || '');
+                if (!m || !m[1]) break;
+                const nowy = decodeURIComponent(m[1]);
+                if (!nowy || nowy === klucz) break;
+                klucz = nowy;
+            }
+            const s = czytajSposob() || {};
+            return { mapa: mapa, stron: stron, widziane: widziane, najstarsza: najstarsza,
+                     ksztalt: ksztalt, wersja: wersja(), droga: s.droga, host: s.host,
+                     naStrone: rozmiar(), rekordy: rekordy, polaPominiete: pomin };
+        }
+
+        async function obsluz(txt){
+            if (!txt || pracuje) return;
+            let z = null;
+            try { z = JSON.parse(txt); } catch (e){ return; }
+            if (!z || !z.id) return;
+            // Zlecenie starsze niz trzy minuty jest juz nieaktualne — zlecajacy dawno
+            // przestal czekac, a wykonanie go tylko myli.
+            if (z.kiedy && Date.now() - z.kiedy > 180000) return;
+            pracuje = true;
+            try { GM_setValue(Z, ''); } catch (e){}
+            try {
+                if (z.rodzaj === 'indeks')        odpowiedz(z.id, true, await indeks(z.od));
+                else if (z.rodzaj === 'diagnoza') odpowiedz(z.id, true, await diagnoza());
+                else if (z.rodzaj === 'order'){
+                    const w = await pobierz(pyt('') + '&order_id=' + encodeURIComponent(z.order));
+                    odpowiedz(z.id, true, { lista: Array.isArray(w.dane) ? w.dane : [] });
+                } else odpowiedz(z.id, false, null, 'nieznany rodzaj zlecenia: ' + z.rodzaj);
+            } catch (e){
+                odpowiedz(z.id, false, null, String((e && e.message) || e));
+            }
+            pracuje = false;
+        }
+
+        try { GM_addValueChangeListener(Z, function (k, s, nowa){ obsluz(nowa); }); } catch (e){}
+        function tyknij(){
+            let v = '';
+            try { v = GM_getValue(Z, '') || ''; } catch (e){ return; }
+            obsluz(v);
+        }
+        // Zegar w Web Workerze — karta w tle dlawi setInterval do jednego przebiegu
+        // na kilkadziesiat sekund, a Worker ma wlasny watek, ktorego to nie dotyczy.
+        try {
+            const kod = 'setInterval(function(){ postMessage(1); }, 700);';
+            const url = URL.createObjectURL(new Blob([kod], { type: 'text/javascript' }));
+            new Worker(url).onmessage = tyknij;
+        } catch (e){
+            setInterval(tyknij, 700);
+        }
+        tyknij();
+    }
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
         { id: 'eutok',    name: 'EuPago — sesja panelu',     test: onEupago,  init: init_eutok },
+        { id: 'chtok',    name: 'Clearhaus — sesja panelu',  test: onClearhaus, init: init_chtok },
+        { id: 'qpmost',   name: 'QuickPay — most do panelu', test: onQuickpay,  init: init_qpmost },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
