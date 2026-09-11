@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.40
+// @version      5.41
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -15,6 +15,7 @@
 // @match        https://wyszukiwarkaregon.stat.gov.pl/*
 // @match        https://my.clearhaus.com/*
 // @match        https://manage.quickpay.net/*
+// @match        https://www.saferpay.com/*
 // @connect      sellerhub.bricobravo.com
 // @connect      fxds-public-exchange-rates-api.oanda.com
 // @connect      oanda.com
@@ -104,6 +105,10 @@
     // platnosci. Oba panele daja HUB-owi tylko sesje — niczego tam nie klikamy.
     const onClearhaus = () => /(^|\.)clearhaus\.com$/i.test(H);
     const onQuickpay  = () => /(^|\.)quickpay\.net$/i.test(H);
+    // Backoffice Saferpaya. Wchodzimy tam WYLACZNIE po to, zeby karta panelu zapytala
+    // u siebie o liste transakcji: CSP panelu to `connect-src 'self'`, a sesja siedzi
+    // w jego ciasteczku, wiec z prologistics to zapytanie nie ma prawa wyjsc.
+    const onSaferpay  = () => /(^|\.)saferpay\.com$/i.test(H);
 
     const HUB = 'beliani_hub_';
     // Moduly, ktore maja byc DOMYSLNIE WYLACZONE. Dopisanie tu id znaczy: nie uruchamiaj
@@ -44631,7 +44636,129 @@
     // Kontener OLE2 w tych plikach bywa uszkodzony (xlrd wpuszcza je dopiero
     // z ignore_workbook_corruption), wiec go nie ruszamy: szukamy rekordu BOF
     // wprost w bajtach i idziemy strumieniem rekordow. Tak samo robi expXlsRows.
+    // ---------- OLE2: wyjecie strumienia „Workbook" ----------
+    /* Do 5.40 slXls szukal rekordu BOF wprost w bajtach pliku i szedl strumieniem
+       rekordow od niego. Dla eksportu z prologistics to dziala, bo tam strumien
+       „Workbook" lezy w PLIKU JEDNYM CIAGIEM. Rozliczenia Amexu tak nie wygladaja:
+       ich strumien omija sektor zajety przez tablice FAT — w pliku 022815 przeskakuje
+       z sektora 127 na 129 dokladnie w polowie. Skan po bajtach czytal wiec pierwsza
+       polowe poprawnie, a potem rozjezdzal sie na naglowku obcego sektora i konczyl:
+       z 427 wierszy arkusza wychodzilo 212, a z 194 partii Amexu — 93. Nic tego nie
+       zglaszalo, bo rozjechany strumien rekordow po prostu sie urywa.
+
+       Dlatego kontener rozbieramy naprawde: naglowek, FAT, katalog, lancuch sektorow.
+       Gdy cokolwiek w tym nie wyjdzie, oddajemy null i slXls wraca do starego skanu —
+       ta sciezka jest sprawdzona na eksporcie z prologistics i nie chcemy jej stracic.  */
+    function slOle2(bytes){
+        try {
+            if (bytes.length < 512) return null;
+            const M = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+            for (let i = 0; i < 8; i++) if (bytes[i] !== M[i]) return null;
+            const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const ssz = 1 << dv.getUint16(30, true);        // rozmiar sektora
+            const msz = 1 << dv.getUint16(32, true);        // rozmiar mini-sektora
+            if (ssz < 128 || ssz > 65536 || msz < 8) return null;
+            const nFat  = dv.getUint32(44, true);
+            const dir0  = dv.getUint32(48, true);
+            const prog  = dv.getUint32(56, true) || 4096;   // prog mini-strumienia
+            const mfat0 = dv.getUint32(60, true);
+            const dif0  = dv.getUint32(68, true);
+            const nDif  = dv.getUint32(72, true);
+            // Sektor n zaczyna sie w (n+1)*ssz — naglowek zajmuje pierwszy sektor.
+            const sek = function (n){ return (n + 1) * ssz; };
+            const jest = function (n){ return n < 0xFFFFFFFA && sek(n) + ssz <= bytes.length; };
+
+            // ---- DIFAT: 109 wpisow z naglowka, reszta w lancuchu sektorow ----
+            const difat = [];
+            for (let i = 0; i < 109; i++) difat.push(dv.getUint32(76 + 4 * i, true));
+            let d = dif0, strazDif = 0;
+            while (jest(d) && strazDif++ < 65536){
+                const o = sek(d), ile = (ssz / 4) - 1;
+                for (let i = 0; i < ile; i++) difat.push(dv.getUint32(o + 4 * i, true));
+                d = dv.getUint32(o + 4 * ile, true);
+            }
+            // ---- FAT ----
+            const fat = [];
+            for (let i = 0; i < difat.length && fat.length < nFat * (ssz / 4) + (ssz / 4); i++){
+                const s = difat[i];
+                if (!jest(s)) continue;
+                const o = sek(s);
+                for (let j = 0; j < ssz / 4; j++) fat.push(dv.getUint32(o + 4 * j, true));
+            }
+            if (!fat.length) return null;
+            // Lancuch sektorow. Straznik na dlugosci: uszkodzona FAT potrafi zapetlic.
+            const lancuch = function (s){
+                const out = [];
+                let x = s, straz = 0;
+                while (x < 0xFFFFFFFA && straz++ <= fat.length){
+                    out.push(x);
+                    x = (x < fat.length) ? fat[x] : 0xFFFFFFFE;
+                }
+                return out;
+            };
+            const sklej = function (lista, ile){
+                const out = new Uint8Array(ile);
+                let p = 0;
+                for (let i = 0; i < lista.length && p < ile; i++){
+                    if (!jest(lista[i])) break;
+                    const n = Math.min(ssz, ile - p);
+                    out.set(bytes.subarray(sek(lista[i]), sek(lista[i]) + n), p);
+                    p += n;
+                }
+                return (p >= ile) ? out : out.subarray(0, p);
+            };
+
+            // ---- katalog ----
+            let cel = null, korzen = null;
+            lancuch(dir0).forEach(function (s){
+                if (!jest(s)) return;
+                const o = sek(s);
+                for (let i = 0; i + 128 <= ssz; i += 128){
+                    const e = o + i;
+                    const nl = dv.getUint16(e + 64, true);
+                    if (nl < 4 || nl > 64) continue;
+                    let nm = '';
+                    for (let j = 0; j < (nl - 2) / 2; j++) nm += String.fromCharCode(dv.getUint16(e + 2 * j, true));
+                    const typ = bytes[e + 66];
+                    const wpis = { nazwa: nm, start: dv.getUint32(e + 116, true),
+                                   rozmiar: dv.getUint32(e + 120, true) };
+                    if (typ === 5) korzen = wpis;
+                    // Arkusz kalkulacyjny BIFF8 nazywa sie „Workbook", BIFF5 — „Book".
+                    else if (typ === 2 && !cel && (nm === 'Workbook' || nm === 'Book')) cel = wpis;
+                }
+            });
+            if (!cel || !cel.rozmiar) return null;
+            if (cel.rozmiar >= prog) return sklej(lancuch(cel.start), cel.rozmiar);
+
+            // ---- mini-strumien ----
+            // Arkusz ponizej progu jest rzadkoscia, ale gdy sie zdarzy, siedzi w mini-FAT
+            // wewnatrz strumienia korzenia i bez tej galezi oddalibysmy smieci.
+            if (!korzen) return null;
+            const mini = sklej(lancuch(korzen.start), korzen.rozmiar);
+            const mfat = [];
+            lancuch(mfat0).forEach(function (s){
+                if (!jest(s)) return;
+                const o = sek(s);
+                for (let j = 0; j < ssz / 4; j++) mfat.push(dv.getUint32(o + 4 * j, true));
+            });
+            const out = new Uint8Array(cel.rozmiar);
+            let x = cel.start, p = 0, straz = 0;
+            while (x < 0xFFFFFFFA && p < cel.rozmiar && straz++ <= mfat.length + 1){
+                const o = x * msz;
+                if (o + msz > mini.length) break;
+                const n = Math.min(msz, cel.rozmiar - p);
+                out.set(mini.subarray(o, o + n), p);
+                p += n;
+                x = (x < mfat.length) ? mfat[x] : 0xFFFFFFFE;
+            }
+            return (p >= cel.rozmiar) ? out : null;
+        } catch (e){ return null; }
+    }
     function slXls(bytes) {
+        // Najpierw probujemy wyjac strumien z kontenera. Gdy sie uda, dalszy kod ma
+        // przed soba SAM strumien „Workbook" — bez dziur po obcych sektorach.
+        const strumien = slOle2(bytes);
+        if (strumien) bytes = strumien;
         const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         let start = -1;
         for (let i = 0; i + 4 <= bytes.length; i++) {
@@ -45516,8 +45643,11 @@
         { id: 'paypal', grupa: 'fp', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
         // Saferpay parujemy po Transaction ID — obie strony go niosa. Przy okazji
         // sprawdzamy terminal: cztery sa reczne i tam zdarza sie zly wybor.
-        { id: 'safer', grupa: 'fp', nazwa: 'Saferpay ↔ Export payments',
-          opis: 'eksport z Saferpaya kontra zestawienie z prologistics · parowanie po Transaction ID · sprawdza też wybór terminala', gotowe: true },
+        // Jedna pozycja, DWA warianty: kontra ksiega prologistics albo kontra rozliczenia
+        // acquirerow. Obie zaczynaja sie od tego samego pliku, wiec sa jednym ekranem.
+        { id: 'safer', grupa: 'fp', nazwa: 'Saferpay ↔ Export payments / Amex i Worldline',
+          krotka: 'Saferpay',
+          opis: 'eksport z Saferpaya kontra zestawienie z prologistics (parowanie po Transaction ID, sprawdza też wybór terminala) albo kontra rozliczenia Amexu i Worldline\'a — czy acquirer za wszystko zapłacił', gotowe: true },
         // Wyciag bankowy to nie operator, ale forma zaplaty jak kazda inna: przelew.
         // Dlatego siedzi w tej samej rodzinie, a nie w osobnej.
         { id: 'bank', grupa: 'fp', nazwa: 'Wyciąg bankowy ↔ Export payments',
@@ -48495,6 +48625,10 @@
                        // Potrzebne, gdy nie ma ani identyfikatora, ani numeru auftraga.
                        tok: slTok([r[K['Last name (Billing address)']], r[K['Holder name']]]
                                   .filter(function (z){ return z; }).join(' ')),
+                       // Acquirera rozstrzyga PROVIDER, nie terminal — na jednym terminalu
+                       // stoja naraz Amex i Worldline. Czyta to uzgodnienie „Saferpay ↔ Amex
+                       // i Worldline"; uzgodnieniu z ksiega to pole nie przeszkadza.
+                       prov: String(r[K['Provider']] == null ? '' : r[K['Provider']]).trim(),
                        chwila: slChwila(r[K['Capture Date']]) || slChwila(r[K['Authorization Date']]) });
         }
         return { poz: poz, wybor: wybor };
@@ -48543,16 +48677,98 @@
                 const w = g[k];
                 const wpl = w.filter(function (y){ return !y.zwrot; });
                 const zwr = w.filter(function (y){ return y.zwrot; });
+                const wziete = {};
+                /* PARTNERA SZUKAMY, A NIE BIERZEMY PO KOLEI — i to jest cala roznica
+                   miedzy waluta, w ktorej przeksiegowania widac, a taka, w ktorej nie
+                   widac ich wcale.
+
+                   Przeksiegowanie ma TRZY nogi: pierwotne ksiegowanie, storno i ksiegowanie
+                   z powrotem na innym koncie VAT. Ile z nich wpadnie do jednego okresu,
+                   zalezy od tego, kiedy ksiegowa je zrobila:
+
+                     EUR, 15287136 — w pliku sa DWIE nogi (storno VAT 2248 + ponowne 2225),
+                       pierwotna zostala w poprzednim okresie. Para trafia sie sama.
+                     EUR, 15573794 — trzy nogi, ale pierwotna dzien wczesniej (26.08 kontra
+                       27.08), wiec do grupy nie wchodzi. Znowu para.
+                     RON, 15683647 — WSZYSTKIE TRZY w tej samej sekundzie 10:20:53:
+                       pierwotne (VAT 2282, +1239), storno (VAT 2282, −1239) i ponowne
+                       (VAT 2268, +1239).
+
+                   W tym ostatnim `wpl` ma dwa wiersze, a branie `wpl[0]` trafialo
+                   w PIERWOTNE ksiegowanie — to samo konto VAT co storno, wiec warunek
+                   „rozne konto VAT" odrzucal cala pare i przeksiegowanie przepadalo.
+                   Konto zmienia dopiero trzecia noga i to jej trzeba szukac.
+
+                   Sumy wychodza tak samo niezaleznie od tego, ktora z dwoch wplat zostanie
+                   w porownaniu — obie sa na te sama kwote i te sama sekunde. Znaczenie ma
+                   wylacznie to, ze para NIE MOZE zostac odrzucona, gdy w grupie jest wplata
+                   z innym kontem VAT.                                                     */
+                zwr.forEach(function (z){
+                    let p = -1;
+                    for (let i = 0; i < wpl.length; i++){
+                        if (wziete[i]) continue;
+                        if (String(wpl[i].vat || '') === String(z.vat || '')) continue;
+                        p = i; break;
+                    }
+                    // Zadna wplata w grupie nie ma innego konta VAT — to nie jest
+                    // przeksiegowanie podatku i zostaje przy zwyklym porownaniu.
+                    // Sekcja „wyglada na przeksiegowanie, ale…" powie o tym wprost.
+                    if (p < 0) return;
+                    wziete[p] = true;
+                    wpl[p].vatPrzeks = true; z.vatPrzeks = true;
+                    vatPrzeks.push({ auf: wpl[p].auf, aufTekst: wpl[p].aufTekst,
+                                     kw: Math.abs(wpl[p].kw), data: wpl[p].data,
+                                     vatZ: z.vat, vatNa: wpl[p].vat, konto: wpl[p].konto });
+                });
+            });
+        })();
+        /* PARY O KROK OD UZNANIA ZA PRZEKSIEGOWANIE.
+           Detektor wyzej wymaga CZTERECH rzeczy naraz: ten sam auftrag, ta sama kwota
+           co do grosza, ta sama SEKUNDA i INNE konto VAT. Gdy ktorakolwiek nie zajdzie,
+           para przechodzi dalej jak zwykla wplata i zwykly zwrot — i wyglada wtedy jak
+           roznica kwot po jednej stronie i zwrot bez pary po drugiej. Ta sama liczba
+           pokazuje sie wiec dwa razy jako brak, ktorego nie ma.
+
+           Nie zgadujemy, ktory warunek odpadl — NAZYWAMY go. Nie oznaczamy przy tym
+           takiej pary jako przeksiegowania: dopoki nie wiadomo, czy to ta sama sprawa,
+           ukrycie jej z sum byloby gorsze niz pokazanie. Sekcja mowi, czego zabraklo,
+           i to czlowiek rozstrzyga.
+
+           Powod praktyczny: na RON uzgodnienie nie wykrywalo przeksiegowan wcale,
+           a na EUR wykrywalo wszystkie — roznica musi siedziec w jednym z dwoch
+           ostatnich warunkow i bez tej sekcji nie da sie powiedziec, w ktorym.      */
+        const vatBlisko = [];
+        (function (){
+            const g = {};
+            pl.poz.forEach(function (y){
+                // TA SAMA SEKUNDA JEST WARUNKIEM WEJSCIA, nie rzecza do zbadania.
+                // Bez niej do jednego worka wpada kazda zwykla wplata razem ze swoim
+                // zwrotem sprzed tygodnia — na sierpniu EUR bylo tego 214 pozycji szumu
+                // przy 13 prawdziwych przeksiegowaniach. Przeksiegowanie to jedna
+                // operacja ksiegowa, wiec obie nogi maja te sama chwile; brakowac moze
+                // juz tylko zmiany konta VAT i to o niej ta sekcja mowi.
+                if (y.vatPrzeks || y.kw == null || !y.auf || !y.chwila) return;
+                const k = String(y.auf.nr) + '|' + Math.abs(Math.round(y.kw * 100))
+                        + '|' + y.chwila;
+                (g[k] = g[k] || []).push(y);
+            });
+            Object.keys(g).forEach(function (k){
+                const wpl = g[k].filter(function (y){ return !y.zwrot; });
+                const zwr = g[k].filter(function (y){ return y.zwrot; });
                 const n = Math.min(wpl.length, zwr.length);
                 for (let i = 0; i < n; i++){
-                    // KONTO VAT MUSI SIE ROZNIC. Bez tego warunku ukrywalibysmy kazde
-                    // storno, takze takie, ktore jest bledem do wyjasnienia. Rozne konto
-                    // VAT jest tym, co czyni z tej pary przeksiegowanie PODATKU.
-                    if (String(wpl[i].vat || '') === String(zwr[i].vat || '')) continue;
-                    wpl[i].vatPrzeks = true; zwr[i].vatPrzeks = true;
-                    vatPrzeks.push({ auf: wpl[i].auf, aufTekst: wpl[i].aufTekst,
-                                     kw: Math.abs(wpl[i].kw), data: wpl[i].data,
-                                     vatZ: zwr[i].vat, vatNa: wpl[i].vat, konto: wpl[i].konto });
+                    const a = wpl[i], b = zwr[i];
+                    const vatA = String(a.vat || ''), vatB = String(b.vat || '');
+                    // Inne konto VAT przy tej samej sekundzie zlapal juz detektor wyzej,
+                    // wiec tutaj zostaje dokladnie jeden powod.
+                    if (vatA !== vatB) continue;
+                    const powod = 'ta sama sekunda i ta sama kwota, ale konto VAT się NIE zmieniło'
+                              + (vatA ? (' (oba ' + vatA + ')') : ' (obie strony bez konta VAT)');
+                    vatBlisko.push({ auf: a.auf, aufTekst: a.aufTekst,
+                                     kw: Math.abs(a.kw), data: a.data, dataZwr: b.data,
+                                     vatWpl: vatA, vatZwr: vatB,
+                                     chwilaWpl: a.chwila, chwilaZwr: b.chwila,
+                                     konto: a.konto, powod: powod });
                 }
             });
         })();
@@ -48608,13 +48824,25 @@
         })();
 
         const L = {};
+        /* WIERSZ BEZ NUMERU TRANSAKCJI NIE MOZE PO PROSTU ZNIKNAC.
+           Dotad `if (!klucz) return;` wyrzucalo go z indeksu — a skoro nie byl
+           w indeksie, nie trafial ani do par, ani do „w ksiedze, a nie ma
+           w Saferpayu". W sumach liczyl sie za to dalej, bo te licza sie wprost
+           z pl.poz. Skutek: protokol pokazywal roznice i JEDNOCZESNIE wszystkie
+           kubelki na zero, a kwoty nie dalo sie znalezc nigdzie.
+           DKK, wrzesien 2026: jeden taki wiersz — 3 488,00 na auftragu 15694760/3
+           z 10.09, bez numeru i bez odpowiednika w Saferpayu. Cala „roznica sum
+           3 488,00" to byl on.
+           Wiersz bez numeru to KSIEGOWANIE RECZNE i wlasnie dlatego ma byc widoczny:
+           nikt go nie sparuje automatem, wiec musi trafic przed oczy czlowieka.   */
+        const bezNumeru = [];
         pl.poz.forEach(function (x){
             // Obie nogi przeksiegowania — VAT i miedzy auftragami — wypadaja z porownania.
             if (x.vatPrzeks || x.przeksAuf) return;
             // Najpierw wlasna kolumna „Transaction ID", potem to, co udalo sie wylowic
             // z komentarza — ta druga droga jest dla zrodel, ktore kolumny nie maja.
             const klucz = x.txid || x.id;
-            if (!klucz) return;
+            if (!klucz){ bezNumeru.push(x); return; }
             if (!L[klucz]) L[klucz] = pustyKub();
             dolacz(L[klucz], x);
         });
@@ -49246,18 +49474,84 @@
                     return zajete[kluczW(y)] || zajeteZwr[kluczW(y)]; })) return;
             tylkoPL.push({ tx: tx, y: L[tx] });
         });
+
+        /* Z „bez numeru" odsiewamy te, ktore JEDNAK znalazly pare — drogami zapasowymi,
+           ktore nie potrzebuja numeru transakcji: po numerze auftraga z „Reference
+           number", po kwocie i nazwisku, po kwocie i chwili. One buduja wlasne indeksy
+           wprost z pl.poz, wiec lapia takze wiersze, ktorych w indeksie numerow nigdy
+           nie bylo.
+           DKK, wrzesien: piec wierszy bez numeru, ale trzy z nich zlapala droga
+           „po Reference number" (Saferpay ma tam wprost numer auftraga: 15669665,
+           15667298, 15589596) i jeden zwrot droga kwotowa. Bez tego odsiewu sekcja
+           pokazywalaby 8 208,00 przy roznicy 3 488,00 i mowilaby nieprawde o czterech
+           wierszach na piec. Warunek jest ten sam, co przy tylkoPL wyzej.            */
+        const bezNr = bezNumeru.filter(function (y){
+            return !zajete[kluczW(y)] && !zajeteZwr[kluczW(y)];
+        });
         return { sp: sp, pl: pl, poza: sp.poza || [],
                  zgodne: zgodne, rozne: rozne, tylkoSP: tylkoSP,
                  tylkoPL: tylkoPL, zlyTerm: zlyTerm, nieuzywany: nieuzywany,
                  zwrotBezPary: zwrotNieznane, zwrotSpar: zwrotSpar,
                  wTicketach: wTicketach, jakIle: jakIle, zlaData: zlaData,
-                 vatPrzeks: vatPrzeks, przeksAuf: przeksAuf };
+                 vatPrzeks: vatPrzeks, vatBlisko: vatBlisko, przeksAuf: przeksAuf,
+                 bezNumeru: bezNr };
     }
 
+    /* JEDEN EKRAN, JEDNA KOLEJNOSC, JEDNO LICZENIE. Kolejnosc jest taka, jak przy stole:
+       ustawiasz okres, sciagasz ksiege z prologistics, wskazujesz (albo sciagasz) eksport
+       z Saferpaya — i to porownanie dzieje sie ZAWSZE. Kontrola acquirerow jest DODATKIEM
+       do tego samego okresu i tych samych danych, wiec jest opcja w tym samym ekranie,
+       a nie osobnym pytaniem obok. Jedno klikniecie „Porownaj" daje jeden protokol,
+       w ktorym saldo widac do konca: co mowi ksiega, co Saferpay i czy acquirer zaplacil.
+
+       Byla tu przez chwile zakladka. Zakladka kazala wybrac JEDNO z dwoch pytan i wracac
+       po drugie — a to sa dwa kroki tej samej roboty, nie dwie roboty.                   */
+    function salAcqOn(p){
+        const c = p && p.querySelector('#sal-acqon');
+        return !!(c && c.checked);
+    }
+    // Walute kontroli acquirerow bierze KONTO, bo konto ja jednoznacznie wyznacza.
+    // Przy „wszystkie konta" nie ma z czego jej wziac i wtedy — i tylko wtedy —
+    // wybiera ja czlowiek. Sama kontrola i tak idzie po WSZYSTKICH terminalach tej
+    // waluty: jedna wyplata acquirera potrafi objac kilka kont naraz.
+    function salAcqWal(p){
+        const k = salSpKonto(p);
+        if (k !== '*' && SAL_SP_KONTA[k]) return SAL_SP_KONTA[k].wal;
+        return String((p.querySelector('#sal-acqwal') || {}).value || '');
+    }
+    function salAcqPokaz(p){
+        const blok = p.querySelector('#sal-acqblok');
+        if (blok) blok.hidden = !salAcqOn(p);
+        const k = salSpKonto(p);
+        const sel = p.querySelector('#sal-acqwal');
+        const nota = p.querySelector('#sal-acqwalnota');
+        if (sel){
+            if (k !== '*' && SAL_SP_KONTA[k]){
+                // Konto rozstrzyga — lista ma pokazywac to samo i nie dawac sie przestawic,
+                // bo kontrola liczona w innej walucie niz konto nie znaczylaby nic.
+                const w = SAL_SP_KONTA[k].wal;
+                for (let i = 0; i < sel.options.length; i++)
+                    if (sel.options[i].value === w) sel.selectedIndex = i;
+                sel.disabled = true;
+                if (nota) nota.textContent = 'waluta ' + w + ' — z konta ' + k
+                    + '; biorę wszystkie terminale tej waluty, nie tylko terminale tego konta';
+            } else {
+                sel.disabled = false;
+                if (nota) nota.textContent = 'przy „wszystkie konta" walutę wybierasz sam — '
+                    + 'kontrola idzie po wszystkich terminalach tej waluty';
+            }
+        }
+    }
     async function salRysujSP(){
         const p = salPanel(), u = salUst();
         const et = await salEtykiety();
         const wyb = u.spKonto || '*';
+        const ramka = function (tytul, dopisek, srodek, atr){
+            return '<div' + (atr || '') + ' style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
+                + '<div style="font-weight:700;margin-bottom:4px">' + tytul
+                + (dopisek ? (' <span style="font-weight:400;color:#888;font-size:11px">' + dopisek + '</span>') : '')
+                + '</div>' + srodek + '</div>';
+        };
         p.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
             + '<div style="font-weight:700;color:#750000">Salda · Saferpay ↔ Export payments</div>'
             + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
@@ -49269,33 +49563,56 @@
             + '<button id="sal-sppobierz" style="padding:5px 14px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">⬇ Pobierz z prologistics</button>'
             + '</div>'
 
-            + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
-            + '<div style="font-weight:700;margin-bottom:4px">Konto Saferpay '
-            + '<span style="font-weight:400;color:#888;font-size:11px">— eksport obejmuje wszystkie '
-            + 'terminale naraz, więc zawężę go do tego konta: po walucie i terminalu</span></div>'
-            + '<select id="sal-spkonto" style="width:100%;font-size:12px;padding:4px;'
-            + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
-            + '<option value="*"' + (wyb === '*' ? ' selected' : '') + '>wszystkie konta — przegląd całości</option>'
-            + SAL_SP_LISTA.map(function (n){
-                const k = SAL_SP_KONTA[n];
-                return '<option value="' + n + '"' + (wyb === n ? ' selected' : '') + '>'
-                    + salEsc((et[n] || n) + '  ·  ' + k.wal) + '</option>';
-            }).join('')
-            + '</select>'
-            + '<div id="sal-spktore" style="font-size:10px;margin-top:4px;line-height:1.7"></div>'
-            + '</div>'
+            + ramka('Konto Saferpay',
+                '— eksport obejmuje wszystkie terminale naraz, więc zawężę go do tego konta: po walucie i terminalu',
+                '<select id="sal-spkonto" style="width:100%;font-size:12px;padding:4px;'
+                + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box">'
+                + '<option value="*"' + (wyb === '*' ? ' selected' : '') + '>wszystkie konta — przegląd całości</option>'
+                + SAL_SP_LISTA.map(function (n){
+                    const k = SAL_SP_KONTA[n];
+                    return '<option value="' + n + '"' + (wyb === n ? ' selected' : '') + '>'
+                        + salEsc((et[n] || n) + '  ·  ' + k.wal) + '</option>';
+                  }).join('')
+                + '</select>'
+                + '<div id="sal-spktore" style="font-size:10px;margin-top:4px;line-height:1.7"></div>')
 
+            // Eksport z Saferpaya: z dysku ALBO wprost z panelu. Guzik Excela oddaje to,
+            // co w pamieci, niezaleznie od tego, ktora droga przyszlo.
+            + ramka('Eksport z Saferpaya',
+                '— z dysku albo wprost z panelu; ten sam okres co wyżej',
+                '<input type="file" id="sal-fsp" accept=".xlsx,.XLSX" style="font-size:11px">'
+                + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">'
+                + '<button id="sal-sppobsp" style="padding:5px 12px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer;font-size:11px">⬇ Pobierz z Saferpaya</button>'
+                + '<button id="sal-spxlsx" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px">⬇ Excel z pobranych danych</button>'
+                + '<button id="sal-sptest" style="padding:5px 10px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px" title="sprawdza, czy karta Backoffice odpowiada">karta panelu?</button>'
+                + '</div>'
+                + '<div id="sal-spinfo" style="font-size:11px;color:#888;margin-top:4px;line-height:1.6"></div>')
+
+            // OPCJA, nie drugi ekran. Ten sam okres, ten sam eksport z Saferpaya,
+            // dolozone pliki acquirerow — i wszystko w jednym protokole.
             + '<div style="border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px">'
-            + '<div style="font-weight:700;margin-bottom:4px">Eksport z Saferpaya</div>'
-            + '<input type="file" id="sal-fsp" accept=".xlsx,.XLSX" style="font-size:11px">'
-            + '<div id="sal-spinfo" style="font-size:11px;color:#888;margin-top:4px"></div>'
-            + '</div>'
+            + '<label style="display:flex;gap:7px;align-items:flex-start;cursor:pointer">'
+            + '<input type="checkbox" id="sal-acqon"' + (u.acqOn ? ' checked' : '') + ' style="margin-top:2px">'
+            + '<span><b>Sprawdź też, czy acquirer zapłacił</b> '
+            + '<span style="color:#888;font-size:11px">— Amex i Worldline, ten sam okres. '
+            + 'Doliczy do protokołu, czego nie pokryła otrzymana wypłata.</span></span></label>'
+            + '<div id="sal-acqblok"' + (u.acqOn ? '' : ' hidden') + ' style="margin-top:8px">'
+            + ramka('Rozliczenia Amexu', '— Settlements*.xls, można kilka naraz',
+                '<input type="file" id="sal-acqfax" accept=".xls,.XLS,.xlsx,.XLSX" multiple style="font-size:11px">')
+            + ramka('Wypłaty Worldline\'a', '— *_Transaction_list_of_payout.xlsx, można kilka naraz',
+                '<input type="file" id="sal-acqfwl" accept=".xlsx,.XLSX,.xls,.XLS" multiple style="font-size:11px">')
+            + ramka('Waluta kontroli', '',
+                '<select id="sal-acqwal" style="width:100%;font-size:12px;padding:4px;'
+                + 'border:1px solid #ccc;border-radius:6px;box-sizing:border-box"></select>'
+                + '<div id="sal-acqwalnota" style="font-size:10px;color:#888;margin-top:4px"></div>')
+            + '</div></div>'
 
             + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
             + '<button id="sal-sprun" style="padding:6px 16px;border:none;border-radius:6px;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">Porównaj</button>'
             + '<button id="sal-spkop" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none">📋 Kopiuj wynik</button>'
             + '<span id="sal-status" style="font-size:11px;color:#666"></span></div>'
             + '<div id="sal-spraport" style="margin-top:10px"></div>';
+
         p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
         p.querySelector('#sal-back').onclick = function (){ salWstecz(); };
         const zapisz = function (){
@@ -49303,6 +49620,8 @@
             o.od = p.querySelector('#sal-od').value;
             o.do = p.querySelector('#sal-do').value;
             o.spKonto = salSpKonto(p);
+            o.acqOn = salAcqOn(p);
+            o.acqWal = String((p.querySelector('#sal-acqwal') || {}).value || '');
             salZapisz(o);
             // Wybor powtarzamy pod lista duzym napisem — przy dwunastu podobnych numerach
             // zwinieta lista to za malo, zeby miec pewnosc, co sie uzgadnia.
@@ -49315,28 +49634,299 @@
                        + 'border-radius:5px;padding:3px 10px">' + salEsc(opt.text.split('·')[0].trim()) + '</span>')
                     : '';
             }
+            salAcqPokaz(p);
         };
         p.querySelector('#sal-od').onchange = zapisz;
         p.querySelector('#sal-do').onchange = zapisz;
         p.querySelector('#sal-spkonto').onchange = zapisz;
-        p.querySelector('#sal-fsp').onchange = function (){ salWczytajSP(this.files); };
+        p.querySelector('#sal-acqon').onchange = zapisz;
+        p.querySelector('#sal-acqwal').onchange = zapisz;
+        p.querySelector('#sal-fsp').onchange = async function (){
+            await salWczytajSP(this.files);
+            acqOdswiezWaluty();
+            salAcqPokaz(p);
+            salSpInfo();
+        };
+        p.querySelector('#sal-acqfax').onchange = function (){ salWczytajACQ(this.files, 'ax'); };
+        p.querySelector('#sal-acqfwl').onchange = function (){ salWczytajACQ(this.files, 'wl'); };
         p.querySelector('#sal-sppobierz').onclick = function (){ salPobierzSP(this); };
+        p.querySelector('#sal-sppobsp').onclick = function (){ salPobierzSaferpay(this); };
+        p.querySelector('#sal-spxlsx').onclick = function (){ salSpXlsx(); };
+        p.querySelector('#sal-sptest').onclick = function (){ salSay(salSpDiagnoza(), '#666'); };
         p.querySelector('#sal-sprun').onclick = function (){ salPorownajSP(this); };
         p.querySelector('#sal-spkop').onclick = function (){
             try { GM_setClipboard(SAL_SPWYNIK, 'text'); salSay('Wynik skopiowany.', '#0a7a2f'); }
             catch (e){ salSay('Nie udało się skopiować.', '#c00'); }
         };
+        acqOdswiezWaluty(u.acqWal || '');
+        zapisz();
         salSpInfo();
     }
+
+    /* ---------- pobranie listy wprost z Saferpaya ----------
+       Zlecenie wykonuje KARTA saferpay.com (init_spmost), bo CSP panelu to
+       `connect-src 'self'`, a sesja siedzi w jego ciasteczku. Tu tylko wysylamy
+       dwie daty i skladamy odpowiedz.
+
+       ILE TO TRWA — mowimy, zanim zaczniemy. Strona ma 25 wierszy (zmierzone),
+       wiec sierpien to 1 817 stron i przy szesciu naraz okolo siedmiu minut.
+       Przy waskim zakresie to sekundy. Kto chce calego miesiaca na juz, nadal ma
+       pole na plik obok — eksport z panelu to jedno zapytanie.                        */
+    const SP_MOST = { z: 'tm_sp_zlec', o: 'tm_sp_odp', d: 'tm_sp_dane_', h: 'tm_sp_puls' };
+    let SAL_SP_LICZNIK = 0;
+    function salSpPuls(){
+        try {
+            const p = JSON.parse(GM_getValue(SP_MOST.h, 'null'));
+            if (!p || !p.kiedy) return null;
+            return p;
+        } catch (e){ return null; }
+    }
+    // „2026-08-01" -> „01.08.2026". Panel przyjmuje zakres wylacznie w tym zapisie.
+    function salSpData(iso){
+        const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1]) : '';
+    }
+    /* Komunikat ma MOWIC, co jest nie tak, a nie powtarzac „otwórz kartę". Karta bywa
+       otwarta, a mimo to niema — najczesciej dlatego, ze zostala wczytana PRZED
+       aktualizacja HUB-a: ScriptCat wpuszcza nowy modul dopiero przy ponownym wczytaniu
+       strony, wiec nowy `@match` na saferpay.com nie dziala na kartach juz otwartych.
+       Drugi czesty przypadek: karta stoi, ale nie widziala jeszcze zadnego zapytania
+       panelu, wiec nie ma czego powtorzyc (naglowkow z X-XSRF-TOKEN nie skladamy sami). */
+    // SAL_VER niesie „v" z przodu („v5.41"), a most odklada samo GM_info.script.version
+    // („5.41"). Porownanie napisow wychodzilo wiec ZAWSZE na nie i przy zgodnych wersjach
+    // kazalo odswiezac karte, ktora byla w porzadku. Porownujemy po obcieciu przedrostka.
+    function salWer(v){
+        return String(v == null ? '' : v).trim().replace(/^v/i, '');
+    }
+    function salSpDiagnoza(){
+        const p = salSpPuls();
+        if (!p) return 'Karta Backoffice nigdy się nie odezwała. Otwórz www.saferpay.com → '
+            + 'Journal Overview w drugiej karcie — a jeśli JEST otwarta, odśwież ją (Ctrl+F5): '
+            + 'ScriptCat wpuszcza nowy moduł dopiero przy ponownym wczytaniu strony, więc karta '
+            + 'otwarta przed aktualizacją HUB-a go nie ma.';
+        const wiek = Math.round((Date.now() - p.kiedy) / 1000);
+        if (wiek > 20) return 'Karta Backoffice odezwała się ostatnio ' + wiek + ' s temu i od tego '
+            + 'czasu milczy — odśwież ją (Ctrl+F5).';
+        if (p.ver && SAL_VER && salWer(p.ver) !== salWer(SAL_VER))
+            return 'Karta Backoffice stoi na HUB ' + p.ver + ', a tu jest ' + SAL_VER
+                 + ' — odśwież tamtą kartę.';
+        if (!p.naglowki) return 'Karta Backoffice odpowiada (HUB ' + p.ver + ', zegar ' + p.zegar
+            + '), ale nie widziała jeszcze żadnego zapytania panelu — kliknij raz „Search" '
+            + 'w Journal Overview i wróć tutaj.';
+        return 'Karta Backoffice gotowa: HUB ' + p.ver + ', zegar ' + p.zegar
+             + ', nagłówki panelu przechwycone' + (p.ukryta ? ', karta w tle' : '') + '.';
+    }
+    async function salPobierzSaferpay(b){
+        const p = salPanel();
+        const od = (p.querySelector('#sal-od') || {}).value || '';
+        const doo = (p.querySelector('#sal-do') || {}).value || '';
+        if (!od || !doo){ salKoniec('sp', 'Uzupełnij zakres dat.', '#c47f00'); return; }
+        if (od > doo){ salKoniec('sp', 'Data „od" jest późniejsza niż „do".', '#c00'); return; }
+        // Puls mowi, czy po drugiej stronie w ogole ktos stoi — i CO dokladnie jest nie tak.
+        // Bez tego czlowiek czekalby do timeoutu, nie wiedzac, ze karta jest wprawdzie
+        // otwarta, tylko wczytana przed aktualizacja HUB-a.
+        const puls = salSpPuls();
+        if (!puls || (Date.now() - puls.kiedy) > 20000 || !puls.naglowki
+            || (puls.ver && SAL_VER && salWer(puls.ver) !== salWer(SAL_VER))){
+            salKoniec('sp', salSpDiagnoza(), '#c47f00');
+            return;
+        }
+        const id = 's' + Date.now().toString(36) + (++SAL_SP_LICZNIK);
+        // Klucz odpowiedzi kasujemy PRZED zapisem zlecenia — inaczej pierwsze sondowanie
+        // zlapaloby odpowiedz z poprzedniego razu i uznalo ja za swoja.
+        try { GM_setValue(SP_MOST.o, ''); } catch (e){}
+        try { GM_setValue(SP_MOST.z, JSON.stringify({ id: id, od: salSpData(od), doo: salSpData(doo),
+                                                      kiedy: Date.now() })); }
+        catch (e){ salKoniec('sp', 'Nie udało się wysłać zlecenia: ' + ((e && e.message) || e), '#c00'); return; }
+
+        b.disabled = true;
+        salPraca('sp', 'zlecam karcie Saferpaya…');
+        const t0 = Date.now();
+        let ostatni = '';
+        try {
+            const odp = await new Promise(function (ok, zle){
+                const zegar = setInterval(function (){
+                    let v = '';
+                    try { v = GM_getValue(SP_MOST.o, '') || ''; } catch (e){ return; }
+                    let o = null;
+                    try { o = v ? JSON.parse(v) : null; } catch (e){ return; }
+                    if (!o || o.id !== id) {
+                        // Bez PIERWSZEJ odpowiedzi przez dwie minuty uznajemy, ze karty nie ma.
+                        // Pozniej juz nie przerywamy: skladanie eksportu potrafi trwac
+                        // minuty i cisza nie znaczy wtedy, ze cos padlo — postep leci
+                        // osobnym etapem i to on odmierza czas.
+                        if (!ostatni && Date.now() - t0 > 120000){
+                            clearInterval(zegar);
+                            zle(new Error('karta Saferpaya nie odezwała się przez 2 minuty'));
+                        }
+                        return;
+                    }
+                    if (o.ok === false){ clearInterval(zegar); zle(new Error(o.blad || 'panel odmówił')); return; }
+                    if (o.ok === true){ clearInterval(zegar); ok(o); return; }
+                    // Postep. „plan" niesie koszt calosci i to jest moment, w ktorym
+                    // czlowiek dowiaduje sie, na co sie pisze.
+                    if (o.etap === 'plan')
+                        ostatni = 'Do pobrania ' + o.razem + ' transakcji na ' + o.stron + ' stronach po '
+                                + o.naStronie + ' — licz na jakieś ' + Math.max(1, Math.round(o.sekund / 60))
+                                + ' min. Zostaw kartę Saferpaya otwartą.';
+                    else if (o.etap === 'ciagne')
+                        ostatni = 'Strona ' + o.strona + '/' + o.stron + ' · ' + o.ile + ' transakcji';
+                    else if (o.etap === 'zlecam') ostatni = 'zlecam panelowi złożenie eksportu…';
+                    else if (o.etap === 'skladam')
+                        ostatni = 'panel składa plik… ' + (o.sekund || 0) + ' s. Zostaw kartę Saferpaya otwartą.';
+                    else if (o.etap === 'pobieram') ostatni = 'plik gotowy po ' + (o.sekund || 0) + ' s — pobieram…';
+                    else if (o.etap && /eksport nie wyszedł/.test(o.etap))
+                        ostatni = o.etap + (o.powod ? (' (' + o.powod + ')') : '');
+                    else if (o.etap === 'start') ostatni = 'karta Saferpaya podjęła zlecenie…';
+                    if (ostatni) salPraca('sp', ostatni);
+                    // Pytluje, dopoki przychodzi postep. Twardy koniec stoi po stronie
+                    // karty (15 min na zlozenie pliku) — tu pilnujemy tylko, zeby nie
+                    // czekac w nieskonczonosc, gdy karta zamilknie na dobre.
+                    if (Date.now() - t0 > 1200000){
+                        clearInterval(zegar);
+                        zle(new Error('minęło 20 minut bez końca — przerwałem'));
+                    }
+                }, 400);
+            });
+
+            // Porcje skladamy i kasujemy od razu — kazda wazy setki kilobajtow
+            // i nie ma powodu, zeby zostawaly w GM-magazynie do nastepnego razu.
+            const czesci = [];
+            for (let i = 0; i < (odp.porcji || 0); i++){
+                const k = SP_MOST.d + id + '_' + i;
+                const v = GM_getValue(k, '');
+                try { GM_setValue(k, ''); } catch (e){}
+                if (v === '' || v == null) throw new Error('porcja ' + i + ' nie doszła');
+                czesci.push(v);
+            }
+            try { GM_setValue(SP_MOST.o, ''); GM_setValue(SP_MOST.z, ''); } catch (e){}
+            if (!czesci.length) throw new Error('panel nie oddał nic — sprawdź zakres dat');
+
+            if (odp.tryb === 'plik'){
+                // Sciezka eksportu: przyszly BAJTY pliku, wiec czytamy je dokladnie tak
+                // samo jak plik wskazany z dysku. Dzieki temu wynik jest co do pola
+                // identyczny z tym, co daje reczne wskazanie eksportu.
+                salPraca('sp', 'czytam plik z panelu (' + Math.round((odp.bajtow || 0) / 104857.6) / 10 + ' MB)…');
+                const bajty = slZB64(czesci);
+                SAL_SP = slCzytajSP(await slXlsx(bajty));
+                SAL_SP.nazwa = (odp.nazwa || 'eksport z panelu Saferpaya')
+                             + ' · ' + Math.round((odp.bajtow || 0) / 104857.6) / 10 + ' MB';
+                salKoniec('sp', 'Pobrane z Saferpaya eksportem: ' + SAL_SP.poz.length
+                    + ' transakcji w ' + (odp.sekund || '?') + ' s.', '#0a7a2f');
+            } else {
+                const surowe = [];
+                czesci.forEach(function (v){
+                    let cz = null;
+                    try { cz = JSON.parse(v); } catch (e){}
+                    if (!Array.isArray(cz)) throw new Error('porcja nie jest listą wierszy');
+                    cz.forEach(function (w){ surowe.push(w); });
+                });
+                if (!surowe.length) throw new Error('panel oddał pustą listę — sprawdź zakres dat');
+                SAL_SP = slZPanelu(surowe, od, doo);
+                salKoniec('sp', 'Pobrane z Saferpaya stronami: ' + SAL_SP.poz.length + ' transakcji.'
+                    + (odp.brakStron ? ('  UWAGA: ' + odp.brakStron + ' stron nie doszło — lista jest niepełna.') : ''),
+                    odp.brakStron ? '#c47f00' : '#0a7a2f');
+            }
+        } catch (e){
+            salKoniec('sp', 'Nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        }
+        b.disabled = false;
+        acqOdswiezWaluty();
+        salSpInfo();
+    }
+
+    // Base64 z porcji -> bajty. Po 32 kB, bo atob oddaje napis, a przepisywanie
+    // dziewieciu milionow znakow po jednym jest wolniejsze niz to trzeba.
+    function slZB64(czesci){
+        const bin = atob(czesci.join(''));
+        const b = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
+        return b;
+    }
+
+    /* Zamiana tego, co oddal panel, na pozycje w ksztalcie slCzytajSP. Kolejnosc pol
+       jest umowa z init_spmost i jest tam opisana przy funkcji `wiersz`.
+
+       ZNAK ZWROTU. W eksporcie do Excela zwrot ma „Captured merchant amount" JUZ UJEMNE.
+       Czy API robi tak samo, nie bylo widac w zaobserwowanej odpowiedzi — byly tam same
+       „Payment (Debit)". Nie zgadujemy: patrzymy, czy W TYCH DANYCH ktorykolwiek zwrot
+       przyszedl ujemny. Jesli tak — znaki juz sa i niczego nie ruszamy. Jesli ZADEN
+       nie jest ujemny, to znak trzeba dolozyc, bo inaczej zwroty powiekszalyby obrot
+       zamiast go pomniejszac. Regula rozstrzyga sie danymi, a nie zalozeniem.          */
+    function slZPanelu(surowe, od, doo){
+        const zwrot = /refund|credit/i;
+        let majaZnak = false;
+        surowe.forEach(function (w){
+            if (zwrot.test(String(w[6] || '')) && Number(w[3]) < 0) majaZnak = true;
+        });
+        const poz = [];
+        surowe.forEach(function (w){
+            const tx = String(w[0] || '');
+            if (!tx) return;
+            let kw = (w[3] == null) ? null : Number(w[3]);
+            if (kw != null && !majaZnak && zwrot.test(String(w[6] || ''))) kw = -Math.abs(kw);
+            poz.push({ tx: tx,
+                       ref: String(w[1] || '').replace(/\.0$/, ''),
+                       wal: String(w[2] || ''),
+                       kw: kw,
+                       term: String(w[4] || '').replace(/\.0$/, ''),
+                       prov: String(w[5] || ''),
+                       stan: String(w[6] || ''),
+                       data: slData(w[7]),
+                       chwila: slChwila(w[7]),
+                       opis: String(w[8] || ''),
+                       tok: slTok(String(w[9] || '')) });
+        });
+        return { poz: poz, nazwa: 'wprost z panelu Saferpaya',
+                 wybor: od + ' … ' + doo + ' · Capture Date · wszystkie terminale'
+                        + (majaZnak ? '' : ' · znak zwrotów dołożony z rodzaju transakcji') };
+    }
+
+    // Excel z tego, co wlasnie zebralismy. Ten sam generator co przy MobilePayu
+    // i eupago; kwoty ida LICZBAMI, zeby dalo sie je w Excelu zsumowac.
+    function salSpXlsx(){
+        if (!SAL_SP || !SAL_SP.poz.length){ salSay('Nie ma czego zapisać — najpierw wczytaj albo pobierz.', '#c47f00'); return; }
+        const w = [['Transaction ID', 'Reference number', 'Merchant currency', 'Captured merchant amount',
+                    'Terminal ID', 'Provider', 'State', 'Capture Date', 'Sales description', 'Holder name']];
+        SAL_SP.poz.forEach(function (x){
+            w.push([x.tx, x.ref, x.wal, (x.kw == null ? '' : x.kw), x.term, x.prov, x.stan,
+                    x.data || '', x.opis || '', '']);
+        });
+        const p = salPanel();
+        const od = (p.querySelector('#sal-od') || {}).value || '';
+        const doo = (p.querySelector('#sal-do') || {}).value || '';
+        const nazwa = 'saferpay-' + (od && doo ? (od + '_' + doo) : 'okres') + '.xlsx';
+        const blob = slXlsxBlob('Saferpay', w);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nazwa;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + nazwa + ' (' + SAL_SP.poz.length + ' wierszy)', '#0a7a2f');
+    }
+
     function salSpKonto(p){
         return String((p.querySelector('#sal-spkonto') || {}).value || '*');
     }
+    // Jeden wiersz stanu na oba warianty. Pierwsza linia jest wspolna (eksport
+    // z Saferpaya), druga mowi o tej stronie, ktora dany wariant naprawde porownuje.
     function salSpInfo(){
         const d = document.getElementById('sal-spinfo');
         if (!d) return;
-        const a = SAL_SP ? (SAL_SP.poz.length + ' transakcji' + (SAL_SP.wybor ? (' · ' + SAL_SP.wybor) : '')) : 'brak pliku';
-        const b = SAL_SPEXP ? (SAL_SPEXP.poz.length + ' wierszy z ' + SAL_SPEXP.zrodla.length + ' kont') : 'nie pobrane';
-        d.textContent = 'Saferpay: ' + a + '  ·  prologistics: ' + b;
+        const a = SAL_SP ? (SAL_SP.poz.length + ' transakcji'
+                            + (SAL_SP.nazwa ? (' · ' + SAL_SP.nazwa) : '')
+                            + (SAL_SP.wybor ? (' · ' + SAL_SP.wybor) : ''))
+                         : 'brak — wskaż plik';
+        const b = 'prologistics: ' + (SAL_SPEXP ? (SAL_SPEXP.poz.length + ' wierszy z ' + SAL_SPEXP.zrodla.length + ' kont') : 'nie pobrane');
+        // Trzecia linia pojawia sie dopiero, gdy sa pliki acquirerow — pusta nie niesie
+        // niczego, a ekran i tak ma ich dosc.
+        const c = (SAL_ACQ_AX || SAL_ACQ_WL)
+            ? ('Amex: ' + (SAL_ACQ_AX ? (SAL_ACQ_AX.sub.length + ' partii z ' + SAL_ACQ_AX.pliki.length + ' plików') : 'brak')
+               + '  ·  Worldline: ' + (SAL_ACQ_WL ? (SAL_ACQ_WL.poz.length + ' wierszy z ' + SAL_ACQ_WL.pliki.length + ' plików') : 'brak'))
+            : '';
+        d.innerHTML = 'Saferpay: ' + salEsc(a) + '<br>' + salEsc(b)
+            + (c ? ('<br>' + salEsc(c)) : '');
     }
     async function salWczytajSP(files){
         const f = files && files[0];
@@ -49459,33 +50049,70 @@
         }
         await Promise.all([robotnik(), robotnik(), robotnik()]);
     }
+    /* JEDNO liczenie, jeden protokol. Porownanie z ksiega idzie zawsze, kontrola
+       acquirerow dokleja sie pod nim, gdy jest zaznaczona. Nie ma tu dwoch trybow —
+       jest jedna robota, ktora czasem ma dodatkowy krok.                               */
     async function salPorownajSP(b){
-        if (!SAL_SP){ salSay('Wskaż eksport z Saferpaya.', '#c47f00'); return; }
-        if (!SAL_SPEXP){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
+        const pa = salPanel();
+        const zAcq = salAcqOn(pa);
+        if (!SAL_SP){ salSay('Wskaż eksport z Saferpaya albo pobierz go z panelu.', '#c47f00'); return; }
+        // Bez zestawienia z prologistics nie ma czego porownywac z ksiega — ale gdy
+        // zaznaczona jest kontrola acquirerow, jest co liczyc mimo to. Nie odsylamy
+        // wtedy z niczym, tylko robimy te czesc, ktora da sie zrobic, i mowimy o tym.
+        if (!SAL_SPEXP && !zAcq){ salSay('Najpierw pobierz zestawienie z prologistics.', '#c47f00'); return; }
         b.disabled = true;
         try {
-            // Eksport zawezamy do wybranego konta ZANIM cokolwiek policzymy — inaczej
-            // „spoza wyeksportowanych kont" bylaby lista wszystkich pozostalych walut.
-            const wyb = salSpKonto(salPanel());
-            const f = salSpDlaKonta(SAL_SP.poz, wyb);
-            if (wyb !== '*' && !f.poz.length){
-                salSay('W eksporcie nie ma ani jednej transakcji dla konta ' + wyb
-                     + ' (' + f.opis + '). Sprawdź, czy eksport obejmuje ten terminal.', '#c47f00');
-                b.disabled = false; return;
+            let zrobione = [];
+            if (SAL_SPEXP){
+                // Eksport zawezamy do wybranego konta ZANIM cokolwiek policzymy — inaczej
+                // „spoza wyeksportowanych kont" bylaby lista wszystkich pozostalych walut.
+                const wyb = salSpKonto(pa);
+                const f = salSpDlaKonta(SAL_SP.poz, wyb);
+                if (wyb !== '*' && !f.poz.length){
+                    salSay('W eksporcie nie ma ani jednej transakcji dla konta ' + wyb
+                         + ' (' + f.opis + '). Sprawdź, czy eksport obejmuje ten terminal.', '#c47f00');
+                    b.disabled = false; return;
+                }
+                const wynik = slUzgodnijSP({ poz: f.poz, wybor: SAL_SP.wybor, zawezenie: f.opis,
+                                            wszystkich: SAL_SP.poz.length,
+                                            // Odrzucone przy zawezeniu ida dalej: protokol ma
+                                            // o nich powiedziec, a nie udawac, ze ich nie bylo.
+                                            poza: f.poza || [] }, SAL_SPEXP);
+                // Nadwyzki doczytujemy PRZED zbudowaniem raportu — maja wejsc takze do tekstu
+                // do schowka, a ten powstaje razem z HTML-em.
+                if ((wynik.vatPrzeks || []).length){
+                    salSay('Sprawdzam nadwyżki po przeksięgowaniach VAT (' + wynik.vatPrzeks.length + ')…', '#666');
+                    await salVatOpen(wynik);
+                }
+                salRaportSP(wynik);
+                zrobione.push('księga');
+            } else {
+                // Zadnego raportu z ksiegi nie bedzie — ale kontener trzeba oproznic,
+                // bo inaczej pod nowym wynikiem zostalby poprzedni.
+                const d = document.getElementById('sal-spraport');
+                if (d) d.innerHTML = '<div style="font-size:11px;color:#c47f00;margin-bottom:8px">'
+                    + 'Zestawienia z prologistics nie pobrano — porównania z księgą nie ma. '
+                    + 'Poniżej sama kontrola acquirerów.</div>';
+                SAL_SPWYNIK = 'SALDA · Saferpay — bez porównania z księgą (nie pobrano zestawienia z prologistics)';
             }
-            const wynik = slUzgodnijSP({ poz: f.poz, wybor: SAL_SP.wybor, zawezenie: f.opis,
-                                        wszystkich: SAL_SP.poz.length,
-                                        // Odrzucone przy zawezeniu ida dalej: protokol ma
-                                        // o nich powiedziec, a nie udawac, ze ich nie bylo.
-                                        poza: f.poza || [] }, SAL_SPEXP);
-            // Nadwyzki doczytujemy PRZED zbudowaniem raportu — maja wejsc takze do tekstu
-            // do schowka, a ten powstaje razem z HTML-em.
-            if ((wynik.vatPrzeks || []).length){
-                salSay('Sprawdzam nadwyżki po przeksięgowaniach VAT (' + wynik.vatPrzeks.length + ')…', '#666');
-                await salVatOpen(wynik);
+
+            // ---------- opcja: czy acquirer zaplacil ----------
+            if (zAcq){
+                if (!SAL_ACQ_AX && !SAL_ACQ_WL){
+                    salSay('Kontrola acquirerów zaznaczona, ale nie ma ani rozliczeń Amexu, '
+                         + 'ani wypłat Worldline\'a — wskaż pliki.', '#c47f00');
+                } else {
+                    const wal = salAcqWal(pa);
+                    if (!wal){
+                        salSay('Kontrola acquirerów potrzebuje waluty — wybierz konto albo walutę.', '#c47f00');
+                    } else {
+                        acqRaport(acqUzgodnij(wal), !!SAL_SPEXP);
+                        zrobione.push('acquirerzy (' + wal + ')');
+                    }
+                }
             }
-            salRaportSP(wynik);
-            salSay('Gotowe.', '#0a7a2f');
+            salSay(zrobione.length ? ('Gotowe: ' + zrobione.join(' + ') + '.') : 'Nie było czego policzyć.',
+                   zrobione.length ? '#0a7a2f' : '#c47f00');
         } catch (e){
             salSay('Nie policzyłem: ' + ((e && e.message) || e), '#c00');
         }
@@ -49640,6 +50267,42 @@
         L.push('      zwroty: Saferpay ' + spZw.n + ' na ' + kw(spZw.sum)
              + ' · prologistics ' + plZw.n + ' na ' + kw(plZw.sum)
              + ' · roznica ' + kw(Math.round((plZw.sum - spZw.sum) * 100) / 100));
+
+        // ---------- pary o krok od przeksiegowania ----------
+        // Stoi PRZED sekcja rozpoznanych, bo to wlasnie ona tlumaczy, czemu przy jednej
+        // walucie przeksiegowan nie widac wcale, a przy innej widac wszystkie.
+        const vb = r.vatBlisko || [];
+        if (vb.length){
+            const sumaVb = vb.reduce(function (a, x){ return a + Math.abs(x.kw || 0); }, 0);
+            h += sek('Wygląda na przeksięgowanie, ale jednego warunku brakuje (' + vb.length + ')', 'vatBlisko');
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+               + 'Te pary mają <b>ten sam auftrag</b>, <b>tę samą kwotę co do grosza</b> '
+               + 'i przeciwny kierunek — czyli wyglądają na wyksięgowanie i zaksięgowanie '
+               + 'z powrotem. Za przeksięgowanie VAT uznaję je dopiero wtedy, gdy zajdą '
+               + '<b>obie</b> pozostałe rzeczy: ta sama sekunda i inne konto VAT. Tu brakuje '
+               + 'którejś — <b>nie ukrywam ich z sum</b>, bo nie wiem, czy to ta sama sprawa, '
+               + 'ale mówię, czego zabrakło. Razem <b>' + kw(sumaVb) + '</b>; ta kwota '
+               + 'podnosi obie strony porównania i dlatego pokazuje się jako różnica dwa razy.</div>'
+               + '<table style="border-collapse:collapse;font-size:12px;width:100%">'
+               + '<tr><td style="' + TH + '">auftrag</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<td style="' + TH + '">wpłata</td><td style="' + TH + '">zwrot</td>'
+               + '<td style="' + TH + '">czego zabrakło</td></tr>';
+            L.push(''); L.push('WYGLADA NA PRZEKSIEGOWANIE, ALE JEDNEGO WARUNKU BRAKUJE ('
+                 + vb.length + ') na ' + kw(sumaVb));
+            vb.slice(0, 300).forEach(function (x){
+                h += '<tr><td style="' + TD + ';font-size:11px">' + slAufKom(x.auf, x.aufTekst) + '</td>'
+                   + '<td style="' + TDR + '">' + kw(Math.abs(x.kw || 0)) + '</td>'
+                   + '<td style="' + TD + '">' + salEsc(x.data || '') + '</td>'
+                   + '<td style="' + TD + '">' + salEsc(x.dataZwr || '') + '</td>'
+                   + '<td style="' + TD + ';color:#b45309">' + salEsc(x.powod) + '</td></tr>';
+                L.push('  ' + (x.aufTekst || (x.auf && x.auf.nr) || '') + '  ' + kw(Math.abs(x.kw || 0))
+                     + '  wpłata ' + (x.data || '?') + ' · zwrot ' + (x.dataZwr || '?')
+                     + '  — ' + x.powod);
+            });
+            h += '</table>';
+            if (vb.length > 300) h += '<div style="font-size:11px;color:#888">…i jeszcze '
+                                    + (vb.length - 300) + ' — komplet w „Kopiuj wynik".</div>';
+        }
 
         // ---------- przeksiegowania VAT ----------
         // Wyjecie czegos z rachunku bez powiedzenia o tym jest gorsze niz zostawienie:
@@ -49924,6 +50587,45 @@
             // Bez daty faktury NIE zgadujemy — taki wiersz idzie do pytan.
             ((f && spOd && f < spOd) ? zwStare : zwPytanie).push(x);
         });
+        /* Sekcja stoi obok „jest w ksiedze, nie ma w Saferpayu", bo mowi o tym samym:
+           o wierszach ksiegi, ktorych automat nie ma jak sparowac. Roznica jest taka,
+           ze tamte maja numer i po prostu nie znalazly pary, a te numeru nie maja wcale. */
+        (function (){
+            const bn = r.bezNumeru || [];
+            const suma = bn.reduce(function (a, y){ return a + (y.kw || 0); }, 0);
+            h += sek('Wiersze bez numeru transakcji — księgowane ręcznie (' + bn.length + ')', 'bezNr');
+            L.push(''); L.push('WIERSZE BEZ NUMERU TRANSAKCJI — KSIEGOWANE RECZNIE (' + bn.length + ')');
+            if (!bn.length){
+                h += '<div style="color:#0a7a2f;font-size:12px">Nie ma — każdy wiersz księgi '
+                   + 'niesie numer transakcji.</div>';
+                L.push('  brak');
+                return;
+            }
+            h += '<div style="font-size:11px;color:#666;margin-bottom:4px">'
+               + 'Te wiersze nie mają numeru transakcji ani w kolumnie, ani w komentarzu — '
+               + 'czyli ktoś zaksięgował je ręcznie. <b>Nie da się ich sparować automatem</b>, '
+               + 'a mimo to wchodzą do sum wyżej, więc to one odpowiadają za różnicę, '
+               + 'której nie widać w żadnym innym kubełku. Razem <b>' + kw(suma) + '</b>.</div>'
+               + '<table style="border-collapse:collapse;font-size:12px;width:100%">'
+               + '<tr><td style="' + TH + '">auftrag</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<td style="' + TH + '">data</td><td style="' + TH + '">kierunek</td>'
+               + '<td style="' + TH + '">konto VAT</td><td style="' + TH + '">konto</td></tr>';
+            bn.slice(0, 300).forEach(function (y){
+                h += '<tr><td style="' + TD + ';font-size:11px">' + slAufKom(y.auf, y.aufTekst) + '</td>'
+                   + '<td style="' + TDR + '">' + kw(Math.abs(y.kw || 0)) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(y.data || '') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + (y.zwrot ? 'zwrot' : 'wpłata') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(y.vat || '—') + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + salEsc(y.konto || '') + '</td></tr>';
+                L.push('  ' + (y.aufTekst || (y.auf && y.auf.nr) || '—') + '  ' + kw(Math.abs(y.kw || 0))
+                     + '  ' + (y.data || '') + '  ' + (y.zwrot ? 'zwrot' : 'wpłata')
+                     + '  VAT ' + (y.vat || '—'));
+            });
+            h += '</table>';
+            if (bn.length > 300)
+                h += '<div style="font-size:11px;color:#888">…i ' + (bn.length - 300) + ' dalszych.</div>';
+        })();
+
         h += sek('Wpłaty i zwroty — jest w księdze, nie ma w Saferpayu (' + r.tylkoPL.length + ')', 'plBrak');
         L.push(''); L.push('WPLATY I ZWROTY — JEST W KSIEDZE, NIE MA W SAFERPAYU (' + r.tylkoPL.length + ')');
         if (!r.tylkoPL.length){
@@ -50050,19 +50752,10 @@
                    + '<td style="' + TH + '">data</td><td style="' + TH + '">nazwisko</td>'
                    + '<td style="' + TH + '">Reference number</td></tr>';
                 r.tylkoSP.slice(0, 300).forEach(function (x){
-                    // Odnosnik TYLKO wtedy, gdy to naprawde numer auftraga.
-                    // Rozbieramy tym samym slAuftrag, co reszta modulu — obsluguje
-                    // „14262936 / 3", ktoremu moj poprzedni warunek odmawial przez
-                    // ukosnik — i podpinamy od SIEDMIU cyfr w gore. Auftragi maja tu
-                    // osiem, a krotkie numery z tego pola (29022, 29335) piec i nie
-                    // prowadza do zadnego zamowienia. Odnosnik donikad jest gorszy
-                    // niz jego brak. Sam numer zostaje widoczny zawsze.
+                    // Zasada „odnosnik tylko od siedmiu cyfr" siedzi w slRefLink,
+                    // wspolnym dla wszystkich sekcji — byla tu wpisana drugi raz.
                     const ref = String(x.ref == null ? '' : x.ref).trim();
-                    const refA = slAuftrag(ref);
-                    const link = (refA && String(refA.nr).length >= 7)
-                        ? ('<a href="' + slAufUrl(refA) + '" target="_blank" '
-                           + 'style="color:#750000">' + salEsc(ref) + '</a>')
-                        : salEsc(ref.length > 18 ? (ref.slice(0, 18) + '…') : ref);
+                    const link = slRefLink(ref);
                     h += '<tr><td style="' + TD + ';font-family:ui-monospace,monospace;font-size:10px">'
                        + salEsc(x.tx) + '</td>'
                        + '<td style="' + TDR + '">' + kw(x.kw || 0) + ' ' + salEsc(x.wal) + '</td>'
@@ -50129,8 +50822,18 @@
                + 'nie znalazłem wiersza zwrotu o tej kwocie i walucie w oknie doby — z powodem, '
                + 'bo to nie jest jedna sprawa. <b>Brak wiersza na tę kwotę</b> to realna luka; '
                + '<b>tylko jako płatność</b> to przypadkowa zbieżność i nie ma czego szukać.</div>';
+            /* KOLUMNA „Reference number" JEST TU NAJWAZNIEJSZA. To zwroty, ktorych
+               w ksiedze NIE MA — wiec auftraga po tamtej stronie nie ma z definicji
+               i dotad wiersz pokazywal sam numer transakcji Saferpaya. Z takim
+               numerem nie da sie niczego znalezc w prologistics i trzeba bylo
+               szukac recznie. A Saferpay niesie WLASNY numer i czesto jest nim
+               wprost auftrag: SEK, wrzesien — zwrot 860,00 z 09.09 ma tam
+               „15500346". Gdy to auftrag, robimy z niego odnosnik; gdy numer
+               zamowienia ze sklepu (32-hex), zostaje napisem, ale i tak jest
+               czego szukac.                                                      */
             h += '<table style="border-collapse:collapse;font-size:12px;width:100%;margin-bottom:6px">'
-               + '<tr><td style="' + TH + '">transakcja</td><td style="' + TH + ';text-align:right">kwota</td>'
+               + '<tr><td style="' + TH + '">transakcja</td><td style="' + TH + '">Reference number</td>'
+               + '<td style="' + TH + ';text-align:right">kwota</td>'
                + '<td style="' + TH + '">data</td><td style="' + TH + '">nazwisko</td>'
                + '<td style="' + TH + '">dlaczego</td></tr>';
             zbp.slice(0, 300).forEach(function (x){
@@ -50139,13 +50842,15 @@
                 const luka = /nie ma wiersza/.test(String(x.powod || ''));
                 h += '<tr><td style="' + TD + ';font-family:ui-monospace,monospace;font-size:10px">'
                    + salEsc(x.tx) + '</td>'
+                   + '<td style="' + TD + ';font-size:11px">' + slRefLink(x.ref) + '</td>'
                    + '<td style="' + TDR + '">' + kw(x.kw || 0) + ' ' + salEsc(x.wal) + '</td>'
                    + '<td style="' + TD + ';font-size:11px">' + salEsc(x.data || '') + '</td>'
                    + '<td style="' + TD + ';font-size:11px">' + salEsc((x.tok || []).join(' ')) + '</td>'
                    + '<td style="' + TD + ';font-size:11px;color:' + (luka ? '#b45309' : '#888') + '">'
                    + salEsc(x.powod || '') + '</td></tr>';
-                L.push('  ' + x.tx + '  ' + kw(x.kw || 0) + ' ' + x.wal + '  ' + (x.data || '')
-                     + '  ' + (x.tok || []).join(' ') + '  — ' + (x.powod || ''));
+                L.push('  ' + x.tx + '  ref ' + (x.ref || '—') + '  ' + kw(x.kw || 0) + ' ' + x.wal
+                     + '  ' + (x.data || '') + '  ' + (x.tok || []).join(' ')
+                     + '  — ' + (x.powod || ''));
             });
             h += '</table>';
             // Zbiorka po powodzie: przy kilkuset pozycjach sama lista nic nie mowi.
@@ -50455,9 +51160,9 @@
         const UKLAD = [
             ['',                                 ['zbiorcze', 'sumy', 'dowyj']],
             ['Saferpay ma, w księdze nie ma',    ['spWpl', 'spZwr']],
-            ['Księga ma, w Saferpayu nie ma',    ['plBrak']],
+            ['Księga ma, w Saferpayu nie ma',    ['plBrak', 'bezNr']],
             ['Do sprawdzenia',                   ['rozne', 'zlyTerm', 'zlaData', 'wTickecie']],
-            ['Dlaczego czegoś tu nie ma',        ['vat', 'przeksAuf', 'poza', 'wglad']]
+            ['Dlaczego czegoś tu nie ma',        ['vat', 'vatBlisko', 'przeksAuf', 'poza', 'wglad']]
         ];
         // HTML tniemy po komentarzu-znaczniku, tekst do schowka po linii-znaczniku.
         // Co przed pierwszym znacznikiem — naglowek protokolu — zostaje na gorze.
@@ -50510,6 +51215,940 @@
         SAL_SPWYNIK = LO.join('\n');
         const kop = document.getElementById('sal-spkop');
         if (kop) kop.style.display = '';
+    }
+
+    // ---------- Saferpay ↔ Amex i Worldline ----------
+    /* Pytanie jest INNE niz przy uzgodnieniu „Saferpay ↔ Export payments". Tam pytamy,
+       czy ksiega zna kazda transakcje. Tu pytamy o to samo, co przy MobilePayu:
+       CZY ACQUIRER ZA TO ZAPLACIL. Saldo to nie „niesparowane", tylko „niepokryte
+       otrzymana wyplata" — transakcja czekajaca na najblizszy przelew nie jest brakiem.
+
+       Kto jest acquirerem, mowi kolumna `Provider` eksportu z Saferpaya — NIE terminal.
+       Na terminalu 17905406 stoja naraz „American Express GICC GBP", „... GICC SEK"
+       i „American Express Switzerland E-Link", wiec terminal nie rozstrzyga niczego.
+       Sierpien 2026: 39 828 wierszy Worldline'a, 1 486 Amexu i 4 093 reszty
+       (TWINT, PostFinance Pay, Account-to-Account) — tej reszty tu nie ruszamy.
+
+       Obie strony sprawdza sie INACZEJ i nie jest to wybor projektowy, tylko to,
+       co da sie zrobic z tymi plikami:
+
+       WORLDLINE — wiersz po wierszu. Plik wyplaty niesie `Your Reference`, ale po drugiej
+       stronie nie ma JEDNEGO pola: numer 32-hex trafia w `Reference number` Saferpaya,
+       a 28-znakowy w `Transaction ID`. Bierze sie to stad, ze `Reference number` sam
+       bywa 32-hex — 34 543 razy na 45 407 wierszy. Szukanie po samym `Transaction ID`
+       dawalo 2 473 trafienia z 14 298; po obu polach naraz — 12 638, czyli 88,4%.
+       Z 1 660 reszty 1 659 mialo date transakcji z lipca, czyli spoza sierpniowego
+       eksportu. Realny brak byl JEDEN.
+
+       AMEX — tylko kwotowo. W plikach `Settlements*.xls` NIE MA ani jednego numeru
+       transakcji: najnizszy poziom to `Submissions`, czyli partia z danego dnia.
+       Granica dnia Amexu lezy +3 h wzgledem `Capture Date` Saferpaya — ZMIERZONE,
+       nie zgadniete: przy przesunieciach od −12 do +24 h minimum sumy |roznic dziennych|
+       wypada na +3 h (7 972 przy 26 975 dla zera), a na 7 z 22 dni roznica wychodzi
+       wtedy dokladnie 0,00.                                                            */
+    const ACQ_AMEX = /american\s*express/i;
+    /* „Account-to-Account Payments" ROZLICZA WORLDLINE, choc w nazwie go nie ma.
+       Nie jest to domysl z nazwy, tylko z danych: wszystkie trzy transakcje A2A
+       z sierpnia 2026 maja swoj `Reference number` w plikach wyplat Worldline'a,
+       marka „A2A Payments", co do grosza — 219,98, 939,98 i 129,99. Bez tego
+       wypadaly z kontroli po obu stronach naraz: w Saferpayu szly do „innych
+       operatorow", a ich wyplaty do worka „wyplata bez transakcji" i byly
+       JEDYNYMI trzema niesparowanymi pozycjami w calym okresie.
+       TWINT-a i PostFinance tu NIE MA i nie bedzie: w plikach Worldline'a nie ma
+       ani jednego wiersza z ich marka, a to 3 961 i 129 transakcji — gdyby szly
+       tedy, bylo by je widac.                                                     */
+    const ACQ_WL   = /worldline|account-to-account/i;
+    /* OBCIAZENIE ZWROTNE (chargeback). Worldline nazywa to „Merchant Adjustment Debit"
+       i to NIE JEST zwrot: dzieje sie u acquirera, nie przez terminal, wiec w Saferpayu
+       nie ma go i nigdy nie bedzie. W ksiedze stoi za to nota kredytowa.
+       Sierpien 2026, konto 1022: jedna taka pozycja — 79,98 z 21.08, nota
+       „CREDIT 10386090 TICKET 602426". Bez tej kategorii ladowala w worku „wyplata
+       bez transakcji w Saferpayu" razem z tysiacem pozycji z lipca i przepadala.    */
+    const ACQ_ZWROTNE = /adjustment|chargeback/i;
+    // Zmierzona granica dnia Amexu. Stala, a nie liczona za kazdym razem, bo pomiar
+    // wymaga pelnego miesiaca po obu stronach — przy krotszym okresie wychodzilby szum.
+    const ACQ_AMEX_H = 3;
+    // Sekcje w pliku Amexu. Napis w kolumnie A przelacza tryb czytania i unieważnia
+    // naglowek — bez tego wiersze „Summary totals" wchodzilyby do sumy submissions.
+    const ACQ_SEKCJE = ['Settlements', 'Submissions', 'Summary totals', 'Adjustments',
+                        'Chargebacks', 'Charges', 'Credits', 'Transactions'];
+    // Znaki i skroty walut, po ktorych rozpoznajemy walute pliku Amexu, gdy plik
+    // NIE MA kolumny waluty. Jeden z dwoch ukladow jej nie ma — jest jednowalutowy
+    // i walute niesie wylacznie symbol przy kwocie.
+    const ACQ_WAL_ZNAK = [['€', 'EUR'], ['£', 'GBP'], ['$', 'USD'], ['CHF', 'CHF'],
+                          ['SEK', 'SEK'], ['DKK', 'DKK'], ['NOK', 'NOK'], ['PLN', 'PLN'],
+                          ['CZK', 'CZK'], ['HUF', 'HUF'], ['RON', 'RON']];
+
+    let SAL_ACQ_AX = null;     // { sub, set, pliki } — rozliczenia Amexu
+    let SAL_ACQ_WL = null;     // { poz, pliki }      — wiersze wyplat Worldline'a
+    let SAL_ACQWYNIK = '';     // wynik do schowka
+
+    function acqKto(prov){
+        const s = String(prov == null ? '' : prov);
+        if (ACQ_AMEX.test(s)) return 'amex';
+        if (ACQ_WL.test(s)) return 'wl';
+        return '';
+    }
+    // Kwoty Amexu w jednym z ukladow sa NAPISAMI z minusem NA KONCU: „€12.149,77-".
+    // slKwota tego nie zna — minus na koncu przepadal i kredyty wchodzily dodatnio,
+    // czyli zamiast pomniejszac sume, powiekszaly ja dwukrotnie.
+    function acqKwota(v){
+        if (v == null) return null;
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        let s = String(v).trim();
+        if (!s) return null;
+        const minus = /-\s*$/.test(s) || /^-/.test(s);
+        s = s.replace(/[^\d.,]/g, '');
+        if (!s) return null;
+        // Zapis europejski poznajemy po przecinku z dwiema cyframi na koncu.
+        if (/,\d{1,2}$/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
+        else s = s.replace(/,/g, '');
+        const n = parseFloat(s);
+        if (!isFinite(n)) return null;
+        return minus ? -Math.abs(n) : n;
+    }
+    // Amex pisze daty jednocyfrowym dniem i miesiacem — „31/8/2026". slData wymaga
+    // dwoch cyfr i na takim zapisie oddawalo pusty napis, czyli caly plik bez dat.
+    function acqData(v){
+        if (v == null) return '';
+        const s = String(v).trim();
+        const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        if (m) return m[3] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2);
+        return slData(s);
+    }
+    function acqDzien(ms){
+        if (!ms) return '';
+        return new Date(ms).toISOString().slice(0, 10);
+    }
+    function acqWalZePliku(probki){
+        const s = probki.join(' ');
+        for (let i = 0; i < ACQ_WAL_ZNAK.length; i++)
+            if (s.indexOf(ACQ_WAL_ZNAK[i][0]) >= 0) return ACQ_WAL_ZNAK[i][1];
+        return '';
+    }
+
+    // Rozliczenie Amexu. Plik nie ma jednej tabeli, tylko powtarzajace sie pary:
+    // naglowek „Settlements" + jeden wiersz rozliczenia, potem „Submissions" + N partii.
+    // Oba naglowki zaczynaja sie od „Settlement date" i rozroznia je dopiero obecnosc
+    // kolumny „Submission date" — dlatego tryb ustawiamy z zawartosci naglowka, a nie
+    // z napisu sekcji: napis „Submissions" bywa nad naglowkiem, ale nie zawsze.
+    function acqCzytajAmex(wiersze, nazwa){
+        const sub = [], set = [];
+        let H = null, tryb = '', okres = '';
+        const probki = [];
+        for (let i = 0; i < wiersze.length; i++){
+            const r = (wiersze[i] || []).map(function (x){ return String(x == null ? '' : x).trim(); });
+            const a = r[0] || '';
+            if (/^Date range$/i.test(a)){
+                okres = r.slice(1).filter(function (x){ return x; })[0] || '';
+                continue;
+            }
+            if (a === 'Settlement date'){
+                H = r;
+                tryb = (r.indexOf('Submission date') >= 0) ? 'sub' : 'set';
+                continue;
+            }
+            if (ACQ_SEKCJE.indexOf(a) >= 0){ tryb = ''; H = null; continue; }
+            if (!tryb || !H) continue;
+            if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(a)) continue;
+            const g = function (n){
+                const j = H.indexOf(n);
+                return (j >= 0 && j < r.length) ? r[j] : '';
+            };
+            const wal = String(g('Submission Currency Code') || g('Settlement Currency Code') || '').trim();
+            if (probki.length < 40) probki.push(g('Total charges'), g('Settlement amount'));
+            if (tryb === 'sub'){
+                sub.push({ plik: nazwa, wal: wal,
+                           dataSet: acqData(a), data: acqData(g('Submission date')),
+                           soc: g('SOC invoice number'),
+                           merch: String(g('Submitting Merchant ID') || '').replace(/\.0$/, ''),
+                           // Sumy NIE liczymy z „Total charges" minus „Credits": znak
+                           // kolumny Credits rozni sie miedzy ukladami plikow. Amex sam
+                           // wylicza „Submission amount" i to jego bierzemy.
+                           kw: acqKwota(g('Submission amount')),
+                           charges: acqKwota(g('Total charges')),
+                           credits: acqKwota(g('Credits')),
+                           ile: acqKwota(g('Transaction count')) || 0 });
+            } else {
+                set.push({ plik: nazwa, wal: wal,
+                           data: acqData(a),
+                           nr: String(g('Settlement number') || '').replace(/\.0$/, ''),
+                           merch: String(g('Payee Merchant ID') || '').replace(/\.0$/, ''),
+                           kw: acqKwota(g('Settlement amount')),
+                           przelane: acqKwota(g('Amount Paid To Bank')),
+                           zatrzymane: acqKwota(g('Held Funds')),
+                           prowizja: acqKwota(g('Discount amount')) });
+            }
+        }
+        if (!sub.length && !set.length)
+            throw new Error('to nie wygląda na rozliczenie Amexu — nie znalazłem ani jednego wiersza pod nagłówkiem „Settlement date"');
+        // Plik jednowalutowy nie ma kolumny waluty. Walute bierzemy wtedy z symbolu
+        // przy kwocie — i tylko stad. Zgadywanie z nazwy pliku nie wchodzi w gre.
+        const zZnaku = acqWalZePliku(probki);
+        [sub, set].forEach(function (L){
+            L.forEach(function (x){ if (!x.wal) x.wal = zZnaku; });
+        });
+        return { sub: sub, set: set, okres: okres, walZnaku: zZnaku };
+    }
+
+    // Wyplata Worldline'a. Naglowek stoi nisko (w zaobserwowanych plikach w wierszu 7),
+    // a kolumna A jest pusta — dlatego naglowka szukamy po nazwach kolumn, nie po numerze.
+    function acqCzytajWL(wiersze, nazwa){
+        let hi = -1, H = null;
+        for (let i = 0; i < Math.min(25, wiersze.length); i++){
+            const r = (wiersze[i] || []).map(function (x){ return String(x == null ? '' : x).trim(); });
+            if (r.indexOf('Your Reference') >= 0 && r.indexOf('Amount') >= 0){ hi = i; H = r; break; }
+        }
+        if (hi < 0)
+            throw new Error('to nie wygląda na wypłatę Worldline\'a — nie ma kolumn „Your Reference" i „Amount"');
+        const K = {};
+        ['Transaction Date', 'Transaction Time', 'Partner ID', 'Partner Name', 'Contract No.',
+         'Status', 'Type of Transaction', 'Your Reference', 'Acquirer Reference', 'Card Number',
+         'Brand', 'Delivery Currency', 'Amount', 'Gross Amount', 'Net Amount',
+         'Commission', 'Processing Fee', 'Terminal ID'].forEach(function (k){ K[k] = H.indexOf(k); });
+        const poz = [];
+        for (let i = hi + 1; i < wiersze.length; i++){
+            const r = wiersze[i] || [];
+            const g = function (n){
+                const j = K[n];
+                return (j >= 0 && j < r.length && r[j] != null) ? r[j] : '';
+            };
+            const ref = String(g('Your Reference')).trim();
+            if (!ref) continue;
+            /* KTORA KOLUMNA JEST KWOTA TRANSAKCJI. „Gross Amount" — bo to ona odpowiada
+               temu, co widzi Saferpay i co stoi w ksiedze. „Amount" jest tym, co Worldline
+               faktycznie ruszyl na wyplacie, a „Net Amount" tym, co zostalo po prowizji.
+               Na 14 298 wierszach sierpnia obie pierwsze rozjechaly sie DOKLADNIE RAZ —
+               przy obciazeniu zwrotnym 21.08: Gross −79,98, Amount −81,38, Net −109,98.
+               Roznica jednego wiersza nie robi salda, ale porownywanie zlej kolumny
+               robi z kazdego chargebacku pytanie bez odpowiedzi.                        */
+            const gross = slKwota(g('Gross Amount'));
+            poz.push({ plik: nazwa, ref: ref,
+                       kw: (gross != null) ? gross : slKwota(g('Amount')),
+                       ruch: slKwota(g('Amount')),
+                       netto: slKwota(g('Net Amount')),
+                       prowizja: slKwota(g('Commission')),
+                       oplata: slKwota(g('Processing Fee')),
+                       wal: String(g('Delivery Currency')).trim(),
+                       brand: String(g('Brand')).trim(),
+                       typ: String(g('Type of Transaction')).trim(),
+                       stan: String(g('Status')).trim(),
+                       acq: String(g('Acquirer Reference')).trim().replace(/\.0$/, ''),
+                       karta: String(g('Card Number')).trim(),
+                       term: String(g('Terminal ID')).trim().replace(/\.0$/, ''),
+                       partner: String(g('Partner ID')).trim().replace(/\.0$/, ''),
+                       spolka: String(g('Partner Name')).trim(),
+                       umowa: String(g('Contract No.')).trim().replace(/\.0$/, ''),
+                       chwila: slChwila(g('Transaction Date')),
+                       data: slData(g('Transaction Date')) });
+        }
+        if (!poz.length) throw new Error('nagłówek jest, ale pod nim nie ma ani jednego wiersza z „Your Reference"');
+        return { poz: poz };
+    }
+
+    // Jeden czytnik na oba formaty. Amex przychodzi jako OLE2/BIFF8 (.xls), Worldline
+    // jako ZIP/XLSX — rozstrzygaja pierwsze bajty, a nie rozszerzenie: pliki Worldline'a
+    // nazywaja sie „..._Transaction_list_of_payout.xlsx" i naprawde sa XLSX, ale
+    // rozszerzenie w tym projekcie juz raz klamalo.
+    async function acqWiersze(f){
+        const b = new Uint8Array(await f.arrayBuffer());
+        if (b[0] === 0x50 && b[1] === 0x4B) return await slXlsx(b);
+        if (b[0] === 0xD0 && b[1] === 0xCF && b[2] === 0x11 && b[3] === 0xE0) return slXls(b);
+        // Kontener OLE2 w tych plikach bywa uszkodzony i magii moze nie byc wcale —
+        // slXls i tak szuka rekordu BOF wprost w bajtach, wiec dajemy mu szanse.
+        return slXls(b);
+    }
+    async function salWczytajACQ(files, ktory){
+        const L = Array.prototype.slice.call(files || []);
+        if (!L.length) return;
+        const et = (ktory === 'ax') ? 'Amex' : 'Worldline';
+        salPraca('acq', 'czytam ' + L.length + ' ' + (L.length === 1 ? 'plik' : 'plików') + ' — ' + et + '…');
+        const zebrane = (ktory === 'ax') ? { sub: [], set: [], pliki: [] } : { poz: [], pliki: [] };
+        const zle = [];
+        for (let i = 0; i < L.length; i++){
+            const f = L[i];
+            try {
+                const w = await acqWiersze(f);
+                if (ktory === 'ax'){
+                    const r = acqCzytajAmex(w, f.name);
+                    zebrane.sub = zebrane.sub.concat(r.sub);
+                    zebrane.set = zebrane.set.concat(r.set);
+                    zebrane.pliki.push({ nazwa: f.name, ile: r.sub.length, okres: r.okres });
+                } else {
+                    const r = acqCzytajWL(w, f.name);
+                    zebrane.poz = zebrane.poz.concat(r.poz);
+                    zebrane.pliki.push({ nazwa: f.name, ile: r.poz.length });
+                }
+            } catch (e){ zle.push(f.name + ': ' + ((e && e.message) || e)); }
+        }
+        if (ktory === 'ax') SAL_ACQ_AX = zebrane.pliki.length ? zebrane : null;
+        else SAL_ACQ_WL = zebrane.pliki.length ? zebrane : null;
+        const ile = (ktory === 'ax') ? zebrane.sub.length : zebrane.poz.length;
+        salKoniec('acq', zle.length
+            ? ('Wczytane ' + zebrane.pliki.length + '/' + L.length + ' · ' + ile + ' wierszy. Odpadły: ' + zle.join(' | '))
+            : ('Wczytane: ' + zebrane.pliki.length + ' plików, ' + ile + ' wierszy.'),
+            zle.length ? '#c47f00' : '#0a7a2f');
+        salSpInfo();
+    }
+    // Waluty do wyboru bierzemy z WCZYTANEGO eksportu, a nie z listy kont: eksport
+    // obejmuje wszystkie terminale naraz i to on mowi, czego naprawde jest w okresie.
+    function acqWaluty(){
+        if (!SAL_SP) return [];
+        const w = {};
+        SAL_SP.poz.forEach(function (x){ if (x.wal && acqKto(x.prov)) w[x.wal] = (w[x.wal] || 0) + 1; });
+        return Object.keys(w).sort();
+    }
+    function salACQWal(p){
+        return String((p.querySelector('#sal-acqwal') || {}).value || '');
+    }
+    function acqOdswiezWaluty(chce){
+        const s = document.getElementById('sal-acqwal');
+        if (!s) return;
+        const stara = chce || s.value || (salUst().acqWal || '');
+        const L = acqWaluty();
+        s.innerHTML = L.length
+            ? L.map(function (w){
+                  return '<option value="' + salEsc(w) + '"' + (w === stara ? ' selected' : '') + '>' + salEsc(w) + '</option>';
+              }).join('')
+            : '<option value="">— najpierw wczytaj eksport z Saferpaya —</option>';
+    }
+
+    /* Obciazenie zwrotne kontra ksiega. W Saferpayu go nie ma, ale w ksiedze stoi nota
+       kredytowa — i to ja trzeba pokazac obok, zeby czlowiek nie szukal jej sam.
+       Parujemy po KWOCIE i DACIE, bo numeru wspolnego te dwie strony nie maja:
+       Worldline niesie „Acquirer Reference", ksiega — numer noty. Trzy dni tolerancji,
+       bo nota bywa ksiegowana dzien po obciazeniu.                                     */
+    function acqWKsiedze(x){
+        if (!SAL_SPEXP || !SAL_SPEXP.poz || !SAL_SPEXP.poz.length) return null;
+        const kw = Math.abs(Number(x.kw) || 0);
+        if (!kw) return null;
+        let naj = null;
+        SAL_SPEXP.poz.forEach(function (y){
+            // Obciazenie zwrotne odpowiada UZNANIU konta, czyli wierszowi zwrotu.
+            if (!y.zwrot) return;
+            if (Math.abs(Math.abs(Number(y.kw) || 0) - kw) > 0.005) return;
+            const d = slDni(x.data, y.data);
+            if (d > 3) return;
+            if (!naj || d < naj.d) naj = { d: d, y: y };
+        });
+        return naj ? naj.y : null;
+    }
+
+    /* Uzgodnienie. Saldem jest to, czego NIE POKRYLA otrzymana wyplata — nie to, czego
+       nie udalo sie sparowac. Rozroznia je jedna data: dokad siegaja wczytane wyplaty.
+       Transakcja pozniejsza czeka na przelew i jest osobna sekcja, nie brakiem.         */
+    function acqUzgodnij(wal){
+        const spWal = SAL_SP.poz.filter(function (x){ return x.wal === wal; });
+        // Okres eksportu bierzemy z SAMYCH DANYCH, nie z pol dat na ekranie: plik bywa
+        // wskazany z dysku i moze obejmowac zupelnie inny zakres niz ten wybrany wyzej.
+        let spOd = '', spDo = '';
+        SAL_SP.poz.forEach(function (x){
+            if (!x.data) return;
+            if (!spOd || x.data < spOd) spOd = x.data;
+            if (x.data > spDo) spDo = x.data;
+        });
+        const spAX = spWal.filter(function (x){ return acqKto(x.prov) === 'amex'; });
+        const spWL = spWal.filter(function (x){ return acqKto(x.prov) === 'wl'; });
+        const inne = spWal.filter(function (x){ return !acqKto(x.prov); });
+        const out = { wal: wal, spAX: spAX, spWL: spWL, inne: inne, ax: null, wl: null };
+
+        // ---------- WORLDLINE ----------
+        if (SAL_ACQ_WL && spWL.length){
+            const wlWszystko = SAL_ACQ_WL.poz.filter(function (x){ return x.wal === wal; });
+            // Obciazenia zwrotne wyjmujemy PRZED parowaniem. Szukanie ich w Saferpayu
+            // jest z definicji bezowocne — nie przeszly przez terminal.
+            const zwrotne = wlWszystko.filter(function (x){ return ACQ_ZWROTNE.test(x.typ); });
+            zwrotne.forEach(function (x){ x.ksiega = acqWKsiedze(x); });
+            const wlWal = wlWszystko.filter(function (x){ return !ACQ_ZWROTNE.test(x.typ); });
+            // Indeks po OBU polach naraz. Klucz z jednego pola nie wystarcza: numer
+            // 32-hex siedzi w „Reference number", a 28-znakowy w „Transaction ID".
+            const idx = {};
+            spWL.forEach(function (x){
+                if (x.tx && !idx[x.tx]) idx[x.tx] = x;
+                if (x.ref && !idx[x.ref]) idx[x.ref] = x;
+            });
+            const trafione = {};
+            const wlObce = [];
+            let trafWL = 0;
+            wlWal.forEach(function (w){
+                const t = idx[w.ref];
+                if (t){ trafione[t.tx] = (trafione[t.tx] || 0) + 1; w._sp = t; trafWL++; }
+                else wlObce.push(w);
+            });
+            // Dokad siegaja wyplaty. To jedyna granica, ktora oddziela brak od poczekalni.
+            let doDnia = '', odDnia = '';
+            wlWal.forEach(function (w){
+                if (!w.data) return;
+                if (w.data > doDnia) doDnia = w.data;
+                if (!odDnia || w.data < odDnia) odDnia = w.data;
+            });
+            /* OPERATOR BEZ ANI JEDNEGO TRAFIENIA to nie jest „niezaplacony" — to operator
+               rozliczany INNYM strumieniem. iDEAL i Wero ida przez Worldline'a, ale
+               w plikach „Transaction list of payout" nie ma ich w ogole: sierpien 2026
+               to 3 480 pozycji iDEAL-a i 7 Wero, ktore nie sparuja sie nigdy, ile plikow
+               by nie dolozyc. Wrzucone do jednego worka z kartami robily z salda
+               711 tysiecy euro, ktorych nikt nie jest nam winien.
+               Nie stawiamy tu zadnego progu procentowego: rozstrzyga ZERO trafien
+               w calym okresie, czyli fakt, a nie wybor granicy.                        */
+            const trafProv = {};
+            spWL.forEach(function (x){ if (trafione[x.tx]) trafProv[x.prov || ''] = 1; });
+            const brak = [], czeka = [], osobno = [];
+            spWL.forEach(function (x){
+                if (trafione[x.tx]) return;
+                if (!trafProv[x.prov || '']){ osobno.push(x); return; }
+                if (doDnia && x.data && x.data > doDnia) czeka.push(x);
+                else brak.push(x);
+            });
+            const suma = function (L, f){
+                return Math.round(L.reduce(function (s, x){ return s + (Number(f(x)) || 0); }, 0) * 100) / 100;
+            };
+            /* DWA POWODY, DLA KTORYCH POZYCJI NIE MA W WYPLACIE, i tylko jeden z nich
+               jest pytaniem o pieniadze:
+                 * brakuje PLIKU wyplaty — Worldline wystawia je paczkami i latwo
+                   pobrac ich mniej, niz jest;
+                 * pieniedzy naprawde nie ma.
+               Rozroznia je rozklad w czasie. Gdy caly dzien nie ma ANI JEDNEGO trafienia,
+               to nie jest osiemset zaginionych platnosci — to jedna niepobrana paczka.
+               Bez tej kontroli sierpien pokazywal „nie zaplacil: 5 982 pozycji", a byl
+               to komplet dziewieciu plikow z kilkunastu.                                */
+            const dniSP = {};
+            spWL.forEach(function (x){
+                // Liczymy TYLKO to, co w ogole ma prawo trafic — inaczej dzien pelen
+                // iDEAL-a wygladalby na dzien bez wyplaty.
+                if (!x.data || !trafProv[x.prov || '']) return;
+                const o = dniSP[x.data] || (dniSP[x.data] = { d: x.data, ile: 0, traf: 0 });
+                o.ile++;
+                if (trafione[x.tx]) o.traf++;
+            });
+            const dni = Object.keys(dniSP).sort().map(function (d){ return dniSP[d]; })
+                .filter(function (o){ return !odDnia || !doDnia || (o.d >= odDnia && o.d <= doDnia); });
+            const puste = dni.filter(function (o){ return !o.traf; });
+            // Niesparowane w rozbiciu na operatora. iDEAL i Wero ida przez Worldline,
+            // ale rozliczaja sie WLASNYM strumieniem — w plikach „Transaction list of
+            // payout" nie ma ich wcale i bez tego rozbicia wygladaly na brak zaplaty.
+            const wgOperatora = function (L){
+                const g = {};
+                L.forEach(function (x){
+                    const p = x.prov || '(bez operatora)';
+                    const o = g[p] || (g[p] = { prov: p, ile: 0, kw: 0 });
+                    o.ile++; o.kw = Math.round((o.kw + (Number(x.kw) || 0)) * 100) / 100;
+                });
+                return Object.keys(g).sort().map(function (p){ return g[p]; });
+            };
+            const brakWg = wgOperatora(brak), osobnoWg = wgOperatora(osobno);
+            /* DWA KIERUNKI, DWA MIANOWNIKI — i tylko jeden z nich ma prawo dojsc do stu.
+
+               OD WYPLAT DO SAFERPAYA: kazdy wiersz wyplaty POWINIEN miec transakcje.
+               Czego nie ma, to albo transakcja sprzed okresu eksportu (a wyplata
+               przychodzi kilka dni po niej, wiec lipiec w sierpniowej wyplacie to norma),
+               albo prawdziwe pytanie. Sierpien 2026: 1 658 z lipca i TRZY w okresie.
+
+               OD SAFERPAYA DO WYPLAT: tu stu nie bedzie nigdy, bo wyplat dostajemy
+               tyle, ile paczek ktos pobral. Ale mianownikiem nie moze byc CALOSC:
+               operatorzy rozliczani osobno (iDEAL, Wero, Maestro) nie maja w tych
+               plikach czego szukac. Liczac od calosci wychodzilo 67,7% i wygladalo,
+               jakby tracila sie jedna trzecia; liczac od kartowych — 83,4%.          */
+            const spKart = spWL.length - osobno.length;
+            const wOkresie = wlObce.filter(function (w){
+                return !w.data || !spOd || !spDo || (w.data >= spOd && w.data <= spDo);
+            });
+            out.wl = { wierszy: wlWal.length, doDnia: doDnia, odDnia: odDnia,
+                       trafWL: trafWL, spKart: spKart,
+                       obceWOkresie: wOkresie, obceSprzed: wlObce.length - wOkresie.length,
+                       spOd: spOd, spDo: spDo,
+                       zwrotne: zwrotne,
+                       sumaZwrotne: Math.round(zwrotne.reduce(function (s, x){
+                           return s + (Number(x.kw) || 0); }, 0) * 100) / 100,
+                       dni: dni, puste: puste,
+                       brakWg: brakWg, osobno: osobno, osobnoWg: osobnoWg,
+                       sumaOsobno: Math.round(osobno.reduce(function (s, x){
+                           return s + (Number(x.kw) || 0); }, 0) * 100) / 100,
+                       brak: brak, czeka: czeka, obce: wlObce,
+                       trafionych: Object.keys(trafione).length,
+                       sumaSP: suma(spWL, function (x){ return x.kw; }),
+                       sumaWL: suma(wlWal, function (x){ return x.kw; }),
+                       sumaBrak: suma(brak, function (x){ return x.kw; }),
+                       sumaCzeka: suma(czeka, function (x){ return x.kw; }),
+                       sumaObce: suma(wlObce, function (x){ return x.kw; }),
+                       spolki: (function (){
+                           const g = {};
+                           wlWal.forEach(function (w){
+                               const k = (w.spolka || '?') + ' · ' + (w.partner || '?') + ' · ' + (w.umowa || '?');
+                               g[k] = (g[k] || 0) + 1;
+                           });
+                           return Object.keys(g).sort().map(function (k){ return { kto: k, ile: g[k] }; });
+                       })() };
+        }
+
+        // ---------- AMEX ----------
+        if (SAL_ACQ_AX && spAX.length){
+            const sub = SAL_ACQ_AX.sub.filter(function (x){ return x.wal === wal; });
+            const set = SAL_ACQ_AX.set.filter(function (x){ return x.wal === wal; });
+            // Dzien liczymy z PRZESUNIETEJ chwili — granica batcha Amexu lezy +3 h.
+            const spDni = {}, spIle = {};
+            spAX.forEach(function (x){
+                const d = acqDzien(x.chwila ? (x.chwila + ACQ_AMEX_H * 3600000) : 0)
+                          || x.data || '';
+                if (!d) return;
+                spDni[d] = Math.round(((spDni[d] || 0) + (Number(x.kw) || 0)) * 100) / 100;
+                spIle[d] = (spIle[d] || 0) + 1;
+            });
+            const axDni = {}, axIle = {};
+            sub.forEach(function (s){
+                if (!s.data) return;
+                axDni[s.data] = Math.round(((axDni[s.data] || 0) + (Number(s.kw) || 0)) * 100) / 100;
+                axIle[s.data] = (axIle[s.data] || 0) + (Number(s.ile) || 0);
+            });
+            // Okno wspolne. Poza nim porownanie nie ma sensu: okres pliku Amexu jest
+            // po DACIE ROZLICZENIA, wiec partie w srodku siegaja tygodnia wstecz.
+            const dniSP = Object.keys(spDni).sort(), dniAX = Object.keys(axDni).sort();
+            const od = (dniSP.length && dniAX.length) ? (dniSP[0] > dniAX[0] ? dniSP[0] : dniAX[0]) : '';
+            const doo = (dniSP.length && dniAX.length) ? (dniSP[dniSP.length - 1] < dniAX[dniAX.length - 1]
+                                                          ? dniSP[dniSP.length - 1] : dniAX[dniAX.length - 1]) : '';
+            const wszystkie = {};
+            dniSP.concat(dniAX).forEach(function (d){ wszystkie[d] = 1; });
+            const dni = Object.keys(wszystkie).sort().map(function (d){
+                return { d: d, sp: spDni[d] || 0, ax: axDni[d] || 0,
+                         spN: spIle[d] || 0, axN: axIle[d] || 0,
+                         r: Math.round(((spDni[d] || 0) - (axDni[d] || 0)) * 100) / 100,
+                         wOknie: !!(od && doo && d >= od && d <= doo) };
+            });
+            const wOknie = dni.filter(function (x){ return x.wOknie; });
+            const sum = function (L, k){
+                return Math.round(L.reduce(function (s, x){ return s + x[k]; }, 0) * 100) / 100;
+            };
+            /* Rozliczyl, ale nie przelal — Z JEDNYM WYJATKIEM, ktory nie jest zatrzymaniem.
+               UJEMNE rozliczenie ma „Amount Paid To Bank" = 0,00 i to jest normalna kolej
+               rzeczy: Amex nie sciaga pieniedzy przelewem, tylko potraca je z najblizszej
+               wyplaty. Sierpien 2026, EUR: trzy ujemne rozliczenia (−312,78 z 14.08,
+               −341,95 z 12.08, −87,77 z 06.08) wracaja jako potracenia z 17.08, 13.08
+               i 07.08 — co do grosza, a suma „rozliczyl" rowna sie sumie „przelal".
+               Liczenie ujemnych jako zatrzymanych robilo z tego szesc falszywych pytan.  */
+            const zatrzymane = set.filter(function (s){
+                return s.kw != null && s.przelane != null
+                       && s.kw > 0.009
+                       && (s.kw - s.przelane) > 0.009;
+            });
+            // Ujemne rozliczenia trzymamy osobno — nie sa saldem, ale trzeba je widziec,
+            // bo tlumacza potracenia z kolejnych dni.
+            const ujemne = set.filter(function (s){ return s.kw != null && s.kw < -0.009; });
+            out.ax = { sub: sub, set: set, dni: dni, od: od, doo: doo,
+                       poslizgH: ACQ_AMEX_H,
+                       spOkno: sum(wOknie, 'sp'), axOkno: sum(wOknie, 'ax'),
+                       roznicaOkno: Math.round((sum(wOknie, 'sp') - sum(wOknie, 'ax')) * 100) / 100,
+                       zgodneDni: wOknie.filter(function (x){ return Math.abs(x.r) < 0.005; }).length,
+                       rozliczone: Math.round(set.reduce(function (s, x){ return s + (Number(x.kw) || 0); }, 0) * 100) / 100,
+                       przelane: Math.round(set.reduce(function (s, x){ return s + (Number(x.przelane) || 0); }, 0) * 100) / 100,
+                       zatrzymane: zatrzymane, ujemne: ujemne,
+                       // Ile z potracen tlumacza ujemne rozliczenia TEGO okresu. Reszta
+                       // to potracenie za cos sprzed okresu i dopiero ona jest pytaniem.
+                       potracone: Math.round(zatrzymane.reduce(function (s, x){
+                           return s + (x.kw - x.przelane); }, 0) * 100) / 100,
+                       ujemneRazem: Math.round(ujemne.reduce(function (s, x){
+                           return s + x.kw; }, 0) * 100) / 100,
+                       merchanci: (function (){
+                           const g = {};
+                           sub.forEach(function (s){ if (s.merch) g[s.merch] = (g[s.merch] || 0) + 1; });
+                           set.forEach(function (s){ if (s.merch) g[s.merch] = (g[s.merch] || 0) + 1; });
+                           return Object.keys(g).sort().map(function (k){ return { m: k, ile: g[k] }; });
+                       })() };
+        }
+        return out;
+    }
+
+    /* Raport odpowiada na trzy pytania w tej kolejnosci: ile acquirer przelal,
+       za co NIE zaplacil, i co jeszcze czeka na wyplate. Trzecia sekcja jest osobno
+       wlasnie po to, zeby nikt nie liczyl jej do salda.                                */
+    // `dopisz` = true dokleja ten raport POD protokolem z ksiegi, zamiast go zastapic.
+    // Tak powstaje jeden protokol na jedno klikniecie, a nie dwa osobne wyniki.
+    function acqRaport(r, dopisz){
+        const d = document.getElementById('sal-spraport');
+        if (!d) return;
+        const LO = [];
+        const k = function (n){ return salPln(n) + ' ' + r.wal; };
+        let h = '<div style="font-size:11px;line-height:1.6">';
+
+        LO.push('SALDA · Saferpay ↔ Amex i Worldline · waluta ' + r.wal);
+        LO.push('Saferpay w tej walucie: ' + r.spAX.length + ' Amex, ' + r.spWL.length
+                + ' Worldline, ' + r.inne.length + ' inni operatorzy (poza tym uzgodnieniem)');
+        h += '<div style="background:#f7f7f7;border-radius:6px;padding:6px 8px;margin-bottom:8px">'
+           + '<b>Waluta ' + salEsc(r.wal) + '</b> · Saferpay: '
+           + '<b>' + r.spAX.length + '</b> Amex, <b>' + r.spWL.length + '</b> Worldline, '
+           + r.inne.length + ' inni operatorzy '
+           + '<span style="color:#888">(TWINT, PostFinance i podobni — nie dotyczy ich to uzgodnienie)</span>'
+           + '</div>';
+
+        // ---------- WORLDLINE ----------
+        h += '<div style="font-weight:700;color:#750000;margin:10px 0 4px">Worldline</div>';
+        if (!r.wl){
+            const p = !r.spWL.length ? 'w tej walucie nie ma w Saferpayu ani jednej transakcji Worldline\'a'
+                                     : 'nie wskazano wypłat Worldline\'a';
+            h += '<div style="color:#888">' + salEsc(p) + '</div>';
+            LO.push(''); LO.push('WORLDLINE: ' + p);
+        } else {
+            const w = r.wl;
+            LO.push('');
+            LO.push('WORLDLINE — wypłaty sięgają do ' + (w.doDnia || '?'));
+            LO.push('  Saferpay ' + salPln(w.sumaSP) + ' / wypłaty ' + salPln(w.sumaWL)
+                    + ' · sparowanych ' + w.trafionych + ' z ' + r.spWL.length);
+            /* DWA KIERUNKI, DWA MIANOWNIKI — i tylko jeden z nich ma prawo dojsc do stu.
+               Liczac sparowane od CALOSCI wychodzilo 67,7% i wygladalo, jakby tracila sie
+               jedna trzecia. A operatorzy rozliczani osobno (iDEAL, Wero, Maestro) nie maja
+               w tych plikach czego szukac — od kartowych wychodzi 83,4%.                  */
+            const proc = function (a, b){ return b ? (Math.round(a * 1000 / b) / 10 + '%') : '—'; };
+            LO.push('  Saferpay ' + r.spWL.length + ' (kartowych ' + w.spKart + ') · wypłat ' + w.wierszy);
+            LO.push('  wypłat trafionych w Saferpay: ' + w.trafWL + ' z ' + w.wierszy
+                    + ' = ' + proc(w.trafWL, w.wierszy)
+                    + ' — niesparowane: ' + w.obceSprzed + ' sprzed okresu, '
+                    + w.obceWOkresie.length + ' W OKRESIE');
+            h += '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+               + '<tr><td style="padding:2px 0">Transakcje w Saferpayu (Worldline)</td>'
+               + '<td style="text-align:right"><b>' + r.spWL.length + '</b></td>'
+               + '<td style="text-align:right">' + salEsc(k(w.sumaSP)) + '</td></tr>'
+               + '<tr><td style="padding:2px 0;color:#888">— z tego rozliczane osobno</td>'
+               + '<td style="text-align:right;color:#888">' + (r.spWL.length - w.spKart) + '</td>'
+               + '<td style="text-align:right;color:#888">' + salEsc(k(w.sumaOsobno)) + '</td></tr>'
+               + '<tr><td style="padding:2px 0"><b>= kartowe</b> '
+               + '<span style="color:#888">— tylko te mogą mieć wypłatę</span></td>'
+               + '<td style="text-align:right"><b>' + w.spKart + '</b></td>'
+               + '<td style="text-align:right">'
+               + salEsc(k(Math.round((w.sumaSP - w.sumaOsobno) * 100) / 100)) + '</td></tr>'
+               + '<tr style="border-top:1px solid #eee"><td style="padding:3px 0">Wiersze wypłat Worldline\'a</td>'
+               + '<td style="text-align:right"><b>' + w.wierszy + '</b></td>'
+               + '<td style="text-align:right">' + salEsc(k(w.sumaWL)) + '</td></tr>'
+               + '<tr><td style="padding:2px 0">Sparowane</td>'
+               + '<td style="text-align:right"><b>' + w.trafionych + '</b></td>'
+               + '<td style="text-align:right;color:#888">' + proc(w.trafionych, w.spKart)
+               + ' kartowych</td></tr>'
+               + '</table>'
+               // Drugi kierunek osobno, bo to jedyny, ktory ma prawo dojsc do stu —
+               // i dlatego to on mowi, czy parowanie po numerach Saferpaya dziala.
+               + '<div style="background:#f7f7f7;border-radius:6px;padding:6px 8px;margin:6px 0">'
+               + '<b>Od wypłat do Saferpaya</b> — ten kierunek ma prawo dojść do stu, '
+               + 'bo każdy wiersz wypłaty powinien mieć swoją transakcję:<br>'
+               + '<b>' + w.trafWL + '</b> z ' + w.wierszy + ' = <b>' + proc(w.trafWL, w.wierszy) + '</b>'
+               + '<div style="color:#888;margin-top:3px">niesparowane: <b>' + w.obceSprzed + '</b> '
+               + 'sprzed okresu eksportu (' + salEsc(w.spOd || '?') + ' … ' + salEsc(w.spDo || '?')
+               + ') — wypłata przychodzi kilka dni po transakcji, więc to norma; '
+               + '<b style="color:' + (w.obceWOkresie.length ? '#c00' : '#0a7a2f') + '">'
+               + w.obceWOkresie.length + '</b> w okresie — i tylko te są pytaniem.</div></div>';
+            h += '<div style="color:#888;margin:4px 0">Wypłaty sięgają do <b>' + salEsc(w.doDnia || '?')
+               + '</b> — wszystko po tym dniu czeka na przelew, a nie jest brakiem.</div>';
+            if (w.spolki.length > 1 || (w.spolki[0] && w.spolki.length))
+                h += '<div style="color:#888;margin-bottom:6px">Spółki w plikach: '
+                   + w.spolki.map(function (s){ return salEsc(s.kto) + ' (' + s.ile + ')'; }).join(' · ') + '</div>';
+
+            // NAJPIERW ostrzezenie o kompletnosci, POTEM lista. Odwrotna kolejnosc
+            // kazalaby czytac tysiac pozycji, zanim padnie zdanie, ze to nie sa braki
+            // pieniedzy, tylko braki plikow.
+            if (w.puste.length){
+                const proc = w.dni.length ? Math.round(w.puste.length * 100 / w.dni.length) : 0;
+                LO.push('');
+                LO.push('  UWAGA: ' + w.puste.length + ' z ' + w.dni.length + ' dni okresu wypłat nie ma');
+                LO.push('  ANI JEDNEGO trafienia — to wygląda na brak plików wypłat, nie na brak pieniędzy.');
+                LO.push('  Dni bez trafień: ' + w.puste.map(function (o){ return o.d + ' (' + o.ile + ')'; }).join(', '));
+                h += '<div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;'
+                   + 'padding:6px 8px;margin:6px 0"><b>Najpierw sprawdź komplet plików.</b> '
+                   + '<b>' + w.puste.length + '</b> z ' + w.dni.length + ' dni okresu wypłat ('
+                   + proc + '%) nie ma <b>ani jednego</b> trafienia. Cały dzień bez trafienia to '
+                   + 'niepobrana paczka wypłat, a nie zaginione płatności — dociągnij brakujące pliki, '
+                   + 'zanim potraktujesz poniższą listę jako saldo.<div style="color:#888;margin-top:3px">'
+                   + salEsc(w.puste.map(function (o){ return o.d + ' (' + o.ile + ')'; }).join(', ')) + '</div></div>';
+            }
+            const wgTabela = function (tytul, lista, podpis, kolor){
+                if (!lista.length) return '';
+                LO.push('');
+                LO.push('  ' + tytul.toUpperCase() + ':');
+                let x = '<div style="font-weight:700;color:' + kolor + ';margin:6px 0 3px">'
+                      + salEsc(tytul) + '</div>'
+                      + '<div style="color:#888;margin-bottom:3px">' + salEsc(podpis) + '</div>'
+                      + '<table style="width:100%;border-collapse:collapse;font-size:11px">';
+                lista.forEach(function (o){
+                    LO.push('     ' + o.prov + '  ' + o.ile + ' szt.  ' + salPln(o.kw));
+                    x += '<tr><td style="padding:1px 0">' + salEsc(o.prov) + '</td>'
+                       + '<td style="text-align:right">' + o.ile + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(o.kw)) + '</td></tr>';
+                });
+                return x + '</table>';
+            };
+            if ((w.zwrotne || []).length){
+                LO.push('');
+                LO.push('  OBCIĄŻENIA ZWROTNE (chargebacki) — ' + w.zwrotne.length + ' szt., '
+                        + salPln(w.sumaZwrotne) + ' ' + r.wal);
+                LO.push('    Dzieją się u acquirera, nie przez terminal — w Saferpayu ich nie ma');
+                LO.push('    i nie będzie. Szukaj ich w księdze jako noty kredytowej.');
+                h += '<div style="font-weight:700;color:#c00;margin:8px 0 3px">Obciążenia zwrotne '
+                   + '<span style="font-weight:400;color:#888">(' + w.zwrotne.length + ' · '
+                   + salEsc(salPln(w.sumaZwrotne) + ' ' + r.wal) + ')</span></div>'
+                   + '<div style="color:#888;margin-bottom:3px">Worldline nazywa je „Merchant Adjustment '
+                   + 'Debit". To NIE są zwroty: dzieją się u acquirera, nie przez terminal, więc '
+                   + 'w Saferpayu ich nie ma i nie będzie — w księdze stoi za to nota kredytowa.</div>'
+                   + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                   + '<tr style="color:#888"><td>data</td><td>numer u acquirera</td>'
+                   + '<td style="text-align:right">kwota</td><td style="text-align:right">potrącone</td>'
+                   + '<td style="text-align:right">netto</td><td>w księdze</td></tr>';
+                w.zwrotne.forEach(function (x){
+                    const wk = x.ksiega
+                        ? ((x.ksiega.aufTekst || (x.ksiega.auf && x.ksiega.auf.nr) || '')
+                           + ' · ' + (x.ksiega.data || ''))
+                        : '— nie znalazłem —';
+                    LO.push('      ' + (x.data || '?') + '  ' + (x.acq || x.ref) + '  '
+                            + salPln(x.kw) + '  potrącone ' + salPln(x.ruch)
+                            + '  netto ' + salPln(x.netto) + '  · w księdze: ' + wk);
+                    h += '<tr><td style="padding:1px 0">' + salEsc(x.data || '') + '</td>'
+                       + '<td style="font-family:monospace;font-size:10px">' + salEsc(x.acq || x.ref) + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(x.kw)) + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(x.ruch)) + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(x.netto)) + '</td>'
+                       + '<td style="color:' + (x.ksiega ? '#0a7a2f' : '#c47f00') + '">'
+                       + salEsc(wk) + '</td></tr>';
+                });
+                h += '</table>';
+            }
+            h += wgTabela('Rozliczane osobno — te pliki tego nie obejmują', w.osobnoWg,
+                          'Ci operatorzy nie mają w wypłatach ani jednego trafienia w całym okresie. '
+                          + 'To nie brak zapłaty, tylko inny strumień rozliczenia — dociągnij ich '
+                          + 'zestawienia osobno albo uzgodnij poza tym ekranem.', '#666');
+            h += wgTabela('Niezapłacone wg operatora', w.brakWg,
+                          'Ci operatorzy w wypłatach są — więc każda ich pozycja bez pokrycia '
+                          + 'jest pytaniem o pieniądze albo o brakujący plik wypłaty.', '#c00');
+            h += acqSekcjaSP('Za to Worldline NIE zapłacił', w.brak, w.sumaBrak, r.wal, LO,
+                             'transakcja z okresu, który wypłaty już obejmują, a nie ma jej w żadnej z nich',
+                             '#c00');
+            h += acqSekcjaSP('Czeka na wypłatę', w.czeka, w.sumaCzeka, r.wal, LO,
+                             'transakcja po ostatnim dniu wypłat — to nie jest brak, tylko jeszcze nieprzelane',
+                             '#c47f00');
+            h += acqSekcjaWL('Wypłata bez transakcji w Saferpayu', w.obce, w.sumaObce, r.wal, LO,
+                             w.obceSprzed + ' z nich ma datę sprzed okresu eksportu i to jest norma; '
+                             + 'do wyjaśnienia jest ' + w.obceWOkresie.length
+                             + ' — resztę, z dni spoza ' + (w.spOd || '?') + ' … ' + (w.spDo || '?')
+                             + ', możesz pominąć');
+        }
+
+        // ---------- AMEX ----------
+        h += '<div style="font-weight:700;color:#750000;margin:14px 0 4px">American Express</div>';
+        if (!r.ax){
+            const p = !r.spAX.length ? 'w tej walucie nie ma w Saferpayu ani jednej transakcji Amexu'
+                                     : 'nie wskazano rozliczeń Amexu';
+            h += '<div style="color:#888">' + salEsc(p) + '</div>';
+            LO.push(''); LO.push('AMEX: ' + p);
+        } else {
+            const a = r.ax;
+            h += '<div style="color:#888;margin-bottom:6px">Amex nie podaje w rozliczeniu numerów '
+               + 'transakcji — najniższy poziom to partia z danego dnia. Dlatego tu porównują się '
+               + '<b>kwoty</b>, a nie wiersze. Dzień Amexu jest przesunięty o <b>+' + a.poslizgH
+               + ' h</b> względem daty pobrania w Saferpayu (zmierzone, nie założone).</div>';
+            if (a.merchanci.length)
+                h += '<div style="color:#888;margin-bottom:6px">Merchanci w tej walucie: '
+                   + a.merchanci.map(function (m){ return salEsc(m.m) + ' (' + m.ile + ')'; }).join(' · ') + '</div>';
+            LO.push('');
+            LO.push('AMEX — okno wspólne ' + (a.od || '?') + ' … ' + (a.doo || '?')
+                    + ' (przesunięcie dnia +' + a.poslizgH + ' h)');
+            LO.push('  Saferpay ' + salPln(a.spOkno) + ' / Amex ' + salPln(a.axOkno)
+                    + ' · różnica ' + salPln(a.roznicaOkno));
+            LO.push('  Amex rozliczył ' + salPln(a.rozliczone) + ', przelał ' + salPln(a.przelane));
+
+            h += '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:6px">'
+               + '<tr><td style="padding:2px 0">Okno wspólne</td><td colspan="2" style="text-align:right">'
+               + salEsc((a.od || '?') + ' … ' + (a.doo || '?')) + '</td></tr>'
+               + '<tr><td style="padding:2px 0">Saferpay w oknie</td><td></td>'
+               + '<td style="text-align:right">' + salEsc(k(a.spOkno)) + '</td></tr>'
+               + '<tr><td style="padding:2px 0">Amex w oknie (Submission amount)</td><td></td>'
+               + '<td style="text-align:right">' + salEsc(k(a.axOkno)) + '</td></tr>'
+               + '<tr style="border-top:1px solid #eee"><td style="padding:3px 0"><b>Różnica</b></td><td></td>'
+               + '<td style="text-align:right"><b style="color:'
+               + (Math.abs(a.roznicaOkno) < 0.005 ? '#0a7a2f' : '#c00') + '">'
+               + salEsc(k(a.roznicaOkno)) + '</b></td></tr>'
+               + '<tr><td style="padding:2px 0;color:#888">dni zgodnych co do grosza</td><td></td>'
+               + '<td style="text-align:right;color:#888">' + a.zgodneDni + ' z '
+               + a.dni.filter(function (x){ return x.wOknie; }).length + '</td></tr>'
+               + '<tr style="border-top:1px solid #eee"><td style="padding:3px 0">Amex rozliczył</td><td></td>'
+               + '<td style="text-align:right">' + salEsc(k(a.rozliczone)) + '</td></tr>'
+               + '<tr><td style="padding:2px 0">Amex <b>przelał</b> na rachunek</td><td></td>'
+               + '<td style="text-align:right"><b>' + salEsc(k(a.przelane)) + '</b></td></tr>'
+               + '</table>';
+
+            if (a.zatrzymane.length){
+                // Potracenie tlumaczy sie samo, dopoki jest czym: ujemnym rozliczeniem
+                // z tego okresu. Nadwyzka ponad nie jest potraceniem za cos SPRZED okresu
+                // i tylko ona jest pytaniem. Sierpien 2026: w EUR zostaje 0,00,
+                // w SEK 17 813,95 — i to jest jedyna pozycja Amexu do wyjasnienia.
+                const bezPodstawy = Math.round((a.potracone + a.ujemneRazem) * 100) / 100;
+                LO.push('  POTRĄCENIA Z WYPŁAT — ' + a.zatrzymane.length + ' rozliczeń, razem '
+                        + salPln(a.potracone));
+                LO.push('    z tego tłumaczą ujemne rozliczenia tego okresu: ' + salPln(-a.ujemneRazem)
+                        + ' (' + a.ujemne.length + ' szt.)');
+                LO.push('    BEZ PODSTAWY W TYM OKRESIE: ' + salPln(bezPodstawy)
+                        + (Math.abs(bezPodstawy) < 0.005
+                           ? '  — wszystko się tłumaczy, nie ma o co pytać'
+                           : '  — potrącone za coś sprzed okresu, TO JEST PYTANIE'));
+                h += '<div style="font-weight:700;color:' + (Math.abs(bezPodstawy) < 0.005 ? '#666' : '#c00')
+                   + ';margin:6px 0 3px">Potrącenia z wypłat '
+                   + '<span style="font-weight:400;color:#888">(' + a.zatrzymane.length + ')</span></div>'
+                   + '<div style="color:#888;margin-bottom:3px">Ujemne rozliczenie nie wraca przelewem — '
+                   + 'Amex potrąca je z najbliższej wypłaty. Dopóki potrącenia mają pokrycie '
+                   + 'w ujemnych rozliczeniach tego okresu, nie ma o co pytać.</div>'
+                   + '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:4px">'
+                   + '<tr><td style="padding:1px 0">potrącone razem</td>'
+                   + '<td style="text-align:right">' + salEsc(salPln(a.potracone)) + '</td></tr>'
+                   + '<tr><td style="padding:1px 0">ujemne rozliczenia tego okresu ('
+                   + a.ujemne.length + ')</td>'
+                   + '<td style="text-align:right">' + salEsc(salPln(-a.ujemneRazem)) + '</td></tr>'
+                   + '<tr style="border-top:1px solid #eee"><td style="padding:3px 0"><b>bez podstawy w tym okresie</b></td>'
+                   + '<td style="text-align:right"><b style="color:'
+                   + (Math.abs(bezPodstawy) < 0.005 ? '#0a7a2f' : '#c00') + '">'
+                   + salEsc(salPln(bezPodstawy)) + '</b></td></tr></table>'
+                   + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                   + '<tr style="color:#888"><td>data</td><td>rozliczenie</td>'
+                   + '<td style="text-align:right">kwota</td><td style="text-align:right">przelane</td>'
+                   + '<td style="text-align:right">różnica</td></tr>';
+                a.zatrzymane.forEach(function (s){
+                    const r2 = Math.round((s.kw - s.przelane) * 100) / 100;
+                    LO.push('    ' + s.data + '  ' + (s.nr || s.merch || '') + '  rozliczono '
+                            + salPln(s.kw) + ', przelano ' + salPln(s.przelane)
+                            + ', potrącone ' + salPln(r2));
+                    h += '<tr><td style="padding:1px 0">' + salEsc(s.data) + '</td>'
+                       + '<td>' + salEsc(s.nr || s.merch || '') + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(s.kw)) + '</td>'
+                       + '<td style="text-align:right">' + salEsc(salPln(s.przelane)) + '</td>'
+                       + '<td style="text-align:right;color:#c00">' + salEsc(salPln(r2)) + '</td></tr>';
+                });
+                h += '</table>';
+                if (a.ujemne.length){
+                    LO.push('    ujemne rozliczenia, które te potrącenia tłumaczą:');
+                    h += '<div style="color:#888;margin:4px 0 2px">Ujemne rozliczenia tego okresu '
+                       + '(przelew 0,00 — kwota przechodzi na następną wypłatę):</div>'
+                       + '<table style="width:100%;border-collapse:collapse;font-size:11px">';
+                    a.ujemne.forEach(function (s){
+                        LO.push('      ' + s.data + '  ' + (s.nr || s.merch || '') + '  ' + salPln(s.kw));
+                        h += '<tr><td style="padding:1px 0">' + salEsc(s.data) + '</td>'
+                           + '<td>' + salEsc(s.nr || s.merch || '') + '</td>'
+                           + '<td style="text-align:right">' + salEsc(salPln(s.kw)) + '</td></tr>';
+                    });
+                    h += '</table>';
+                }
+            }
+
+            h += '<div style="font-weight:700;margin:8px 0 3px">Dzień po dniu</div>'
+               + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+               + '<tr style="color:#888"><td>dzień</td><td style="text-align:right">Saferpay</td>'
+               + '<td style="text-align:right">szt.</td><td style="text-align:right">Amex</td>'
+               + '<td style="text-align:right">szt.</td><td style="text-align:right">różnica</td></tr>';
+            LO.push('  dzień | Saferpay | szt. | Amex | szt. | różnica');
+            a.dni.forEach(function (x){
+                const poza = !x.wOknie;
+                LO.push('    ' + x.d + (poza ? ' *' : '  ') + ' ' + salPln(x.sp) + ' (' + x.spN + ')  '
+                        + salPln(x.ax) + ' (' + x.axN + ')  ' + salPln(x.r));
+                h += '<tr' + (poza ? ' style="opacity:.45"' : '') + '>'
+                   + '<td style="padding:1px 0">' + salEsc(x.d) + (poza ? ' <span style="color:#888">*</span>' : '') + '</td>'
+                   + '<td style="text-align:right">' + salEsc(salPln(x.sp)) + '</td>'
+                   + '<td style="text-align:right;color:#888">' + x.spN + '</td>'
+                   + '<td style="text-align:right">' + salEsc(salPln(x.ax)) + '</td>'
+                   + '<td style="text-align:right;color:#888">' + x.axN + '</td>'
+                   + '<td style="text-align:right;color:' + (Math.abs(x.r) < 0.005 ? '#0a7a2f' : '#c00') + '">'
+                   + salEsc(salPln(x.r)) + '</td></tr>';
+            });
+            h += '</table>'
+               + '<div style="color:#888;margin-top:3px">* dzień poza oknem wspólnym — jedna ze stron '
+               + 'go nie obejmuje, więc różnica nic nie znaczy i nie wchodzi do sumy.</div>';
+            LO.push('  * dzień poza oknem wspólnym — nie wchodzi do sumy');
+        }
+
+        h += '</div>';
+        if (dopisz){
+            d.insertAdjacentHTML('beforeend',
+                '<div style="border-top:2px solid #750000;margin:14px 0 8px"></div>' + h);
+        } else {
+            d.innerHTML = h;
+        }
+        SAL_ACQWYNIK = LO.join('\n');
+        // Schowek ma oddawac to, co widac na ekranie — czyli calosc, gdy raporty stoja
+        // jeden pod drugim.
+        SAL_SPWYNIK = dopisz ? ((SAL_SPWYNIK || '') + '\n\n' + SAL_ACQWYNIK) : SAL_ACQWYNIK;
+        const kop = document.getElementById('sal-spkop');
+        if (kop) kop.style.display = '';
+    }
+    /* „Reference number" Saferpaya bywa numerem auftraga i wtedy ma byc klikalny,
+       a bywa numerem zamowienia ze sklepu (32-hex) i wtedy jest tylko napisem.
+       Rozstrzyga slAuftrag, ten sam, ktory rozpoznaje auftragi w calym module.
+       Uzywaja tego DWA raporty — acquirerow i uzgodnienia z ksiega — bo w obu
+       jest ten sam problem: sam numer transakcji Saferpaya nie mowi czlowiekowi,
+       GDZIE w prologistics tej sprawy szukac.                                    */
+    function slRefLink(v){
+        const t = String(v == null ? '' : v).trim();
+        if (!t) return '';
+        const a = slAuftrag(t);
+        /* OD SIEDMIU CYFR W GORE. slAuftrag lapie od pieciu, ale w tym polu stoja
+           tez krotkie numery (29022, 29335), ktore do zadnego zamowienia nie
+           prowadza — odnosnik donikad jest gorszy niz jego brak. Auftragi maja
+           tu osiem cyfr. Sam numer zostaje widoczny zawsze.                    */
+        if (!a || String(a.nr).length < 7)
+            return salEsc(t.length > 18 ? (t.slice(0, 18) + '…') : t);
+        return '<a href="' + salEsc(slAufUrl(a)) + '" target="_blank" '
+             + 'style="color:#750000">' + salEsc(t) + '</a>';
+    }
+    // Lista pozycji Saferpaya. Wypisujemy najwyzej 200 — przy dluzszej i tak nikt jej
+    // nie czyta na ekranie, a caly komplet idzie do schowka.
+    function acqSekcjaSP(tytul, L, suma, wal, LO, podpis, kolor){
+        LO.push('');
+        LO.push('  ' + tytul.toUpperCase() + ' — ' + L.length + ' szt., ' + salPln(suma) + ' ' + wal);
+        if (podpis) LO.push('    (' + podpis + ')');
+        let h = '<div style="font-weight:700;color:' + kolor + ';margin:8px 0 3px">' + salEsc(tytul)
+              + ' <span style="font-weight:400;color:#888">(' + L.length + ' · ' + salEsc(salPln(suma) + ' ' + wal) + ')</span></div>';
+        if (podpis) h += '<div style="color:#888;margin-bottom:3px">' + salEsc(podpis) + '</div>';
+        if (!L.length) return h + '<div style="color:#0a7a2f">— nic —</div>';
+        /* KOLUMNA NAZYWA SIE „Reference number", a nie „auftrag". Saferpay wpisuje tam
+           numer zamowienia ze sklepu — 32-hex w 34 543 wierszach na 45 407 — a numer
+           auftraga tylko w reszcie. Naglowek „auftrag" kazal wiec czytac
+           „7771c1b5eafdceeca600726404c7c4b9" jako numer zamowienia w prologistics.
+           Tam, gdzie to NAPRAWDE auftrag, robimy z niego odnosnik.                    */
+        h += '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+           + '<tr style="color:#888"><td>data</td><td>Transaction ID</td><td>Reference number</td>'
+           + '<td>operator</td><td style="text-align:right">kwota</td></tr>';
+        L.slice().sort(function (x, y){ return String(x.data).localeCompare(String(y.data)); })
+         .forEach(function (x, i){
+            LO.push('    ' + (x.data || '?') + '  ' + x.tx + '  ' + (x.ref || '') + '  '
+                    + (x.prov || '') + '  ' + salPln(x.kw));
+            if (i >= 200) return;
+            h += '<tr><td style="padding:1px 0">' + salEsc(x.data || '') + '</td>'
+               + '<td style="font-family:monospace;font-size:10px">' + salEsc(x.tx) + '</td>'
+               + '<td>' + slRefLink(x.ref) + '</td>'
+               + '<td style="color:#888">' + salEsc(x.prov || '') + '</td>'
+               + '<td style="text-align:right">' + salEsc(salPln(x.kw)) + '</td></tr>';
+        });
+        h += '</table>';
+        if (L.length > 200)
+            h += '<div style="color:#888">…i jeszcze ' + (L.length - 200)
+               + ' — komplet jest w „Kopiuj wynik".</div>';
+        return h;
+    }
+    function acqSekcjaWL(tytul, L, suma, wal, LO, podpis){
+        LO.push('');
+        LO.push('  ' + tytul.toUpperCase() + ' — ' + L.length + ' szt., ' + salPln(suma) + ' ' + wal);
+        if (podpis) LO.push('    (' + podpis + ')');
+        let h = '<div style="font-weight:700;color:#c47f00;margin:8px 0 3px">' + salEsc(tytul)
+              + ' <span style="font-weight:400;color:#888">(' + L.length + ' · ' + salEsc(salPln(suma) + ' ' + wal) + ')</span></div>';
+        if (podpis) h += '<div style="color:#888;margin-bottom:3px">' + salEsc(podpis) + '</div>';
+        if (!L.length) return h + '<div style="color:#0a7a2f">— nic —</div>';
+        // Grupujemy po dniu: przy tysiacu wierszy spoza okresu lista pozycji nie mowi nic,
+        // a rozklad dat mowi wszystko — od razu widac, ze to poprzedni miesiac.
+        const g = {};
+        L.forEach(function (x){
+            const dz = x.data || '?';
+            const o = g[dz] || (g[dz] = { ile: 0, kw: 0 });
+            o.ile++; o.kw = Math.round((o.kw + (Number(x.kw) || 0)) * 100) / 100;
+        });
+        h += '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+           + '<tr style="color:#888"><td>dzień transakcji</td><td style="text-align:right">szt.</td>'
+           + '<td style="text-align:right">kwota</td></tr>';
+        Object.keys(g).sort().forEach(function (dz){
+            LO.push('    ' + dz + '  ' + g[dz].ile + ' szt.  ' + salPln(g[dz].kw));
+            h += '<tr><td style="padding:1px 0">' + salEsc(dz) + '</td>'
+               + '<td style="text-align:right">' + g[dz].ile + '</td>'
+               + '<td style="text-align:right">' + salEsc(salPln(g[dz].kw)) + '</td></tr>';
+        });
+        h += '</table>';
+        return h;
     }
 
     // ---------- Amazon DE ↔ Export payments ----------
@@ -54046,13 +55685,27 @@
     // wiec numeru szukamy w CALYM wierszu, a nadawce bierzemy z pierwszej kolumny tylko
     // wtedy, gdy tabulatory naprawde sa. Ten sam ticket w kilku mailach to jedna robota —
     // dlatego wiersze scalamy po numerze i pokazujemy, ile maili go dotyczylo.
+    // Wiersz naglowka skrzynki. Po angielsku poznaje sie go po nazwach kolumn, ale
+    // skrzynka bywa w innym jezyku („Od / Temat / Otrzymano / Rozmiar", „De / Assunto /
+    // Recebido / Tamanho") i wtedy zadne z tych slow tam nie stoi — wiersz szedl dalej
+    // jako pozycja i konczyl bledem „nie ma w nim ani Ticket, ani auftrag".
+    // Drugi sprawdzian jest od jezyka NIEZALEZNY: kilka krotkich komorek rozdzielonych
+    // tabulatorami i ANI JEDNEJ CYFRY — kazdy wiersz maila niesie przynajmniej godzine
+    // albo rozmiar. Ten sam chwyt stoi w module Zwroty.
+    function ucNaglowek(s){
+        var t = String(s || '').trim();
+        if (!t) return false;
+        if (/^from\b/i.test(t) && /\bsubject\b/i.test(t)) return true;
+        if (/\d/.test(t)) return false;
+        var kom = t.split('\t').map(function (x){ return x.trim(); }).filter(function (x){ return x; });
+        return kom.length >= 3 && kom.every(function (x){ return x.length <= 30; });
+    }
     function parsePaste(raw){
         var lines = String(raw || '').split(/\r?\n/), out = [], errs = [], widziane = {};
         lines.forEach(function(line, i){
             var s = String(line == null ? '' : line).trim();
             if (!s) return;
-            var low = s.toLowerCase();
-            if (/^from\b/.test(low) && low.indexOf('subject') >= 0) return;   // naglowek skrzynki
+            if (ucNaglowek(s)) return;   // naglowek skrzynki — w dowolnym jezyku
             var f = String(line).split('\t');
             var mT = s.match(/ticket\s*[:#]?\s*(\d{3,})/i);
             var mA = s.match(/auftrag\s*[:#]?\s*(\d{3,})(?:\s*\/\s*(\d+))?/i);
@@ -58384,13 +60037,24 @@
                     var buf = r.response;
                     // Gdy menedzer zignoruje responseType, dostajemy tekst. Nie udajemy
                     // wtedy, ze mamy PDF — lepiej zlozyc wlasny dokument niz zalaczyc HTML.
-                    if (!buf || typeof buf === 'string' || buf.byteLength == null)
-                        zle(new Error('comprovativo przyszlo jako tekst, nie plik'));
-                    else if (buf.byteLength < 400)
-                        zle(new Error('comprovativo ma ' + buf.byteLength + ' bajtow — to nie jest PDF'));
-                    else if (typ && typ.indexOf('pdf') < 0 && typ.indexOf('octet-stream') < 0)
-                        zle(new Error('comprovativo ma typ ' + typ));
-                    else ok(new Blob([buf], { type: 'application/pdf' }));
+                    if (!buf || typeof buf === 'string' || buf.byteLength == null){
+                        zle(new Error('comprovativo przyszlo jako tekst, nie plik')); return; }
+                    if (buf.byteLength < 400){
+                        zle(new Error('comprovativo ma ' + buf.byteLength + ' bajtow — to nie jest PDF')); return; }
+                    // O tym, czy to PDF, rozstrzygaja BAJTY, a nie naglowek content-type.
+                    // eupago oddaje ten plik jako „application/x-download" — czyli naglowek
+                    // mowi tylko „to jest do pobrania", a nie CZYM to jest. Bialalista typow
+                    // odrzucala z tego powodu poprawny dokument (dziennik 10.09.2026 13:08:29,
+                    // refundID 168629: HTTP 200, typ application/x-download).
+                    var g = new Uint8Array(buf, 0, Math.min(5, buf.byteLength));
+                    if (!(g[0] === 0x25 && g[1] === 0x50 && g[2] === 0x44 && g[3] === 0x46)){
+                        zle(new Error('comprovativo nie zaczyna się od %PDF (typ '
+                                    + (typ || '—') + ', ' + buf.byteLength + ' bajtów)')); return; }
+                    // Nazwa prosto z naglowka — niech zalacznik nazywa sie tak,
+                    // jak nazywa go samo eupago, a nie tak, jak my zgadniemy.
+                    var mn = String(r.responseHeaders || '').match(/filename\s*=\s*"?([^";\r\n]+)"?/i);
+                    ok({ blob: new Blob([buf], { type: 'application/pdf' }),
+                         nazwa: mn ? mn[1].trim() : '' });
                 },
                 onerror: function (){ zle(new Error('nie połączyłem się z eupago po comprovativo')); },
                 ontimeout: function (){ zle(new Error('eupago nie oddało comprovativo w 120 s')); }
@@ -58654,8 +60318,25 @@
     // ===== Wklejka -> numery ticketow =====
     // Wiersz naglowka skrzynki („From  Subject  Received  Size") pomijamy w ciszy —
     // inaczej za kazdym razem robil sie z niego czerwony wiersz „brak numeru".
-    function naglowekSkrzynki(s){
-        return /^from\b/i.test(s) && /\bsubject\b/i.test(s) && /\breceived\b/i.test(s);
+    // Po angielsku poznaje sie go po nazwach kolumn — ale skrzynka bywa po polsku,
+    // portugalsku czy niemiecku i wtedy nie stoi tam ani „From", ani „Subject”. Taki
+    // wiersz szedl dalej jako pozycja i konczyl kreskami w tabeli.
+    // Drugi sprawdzian jest od jezyka NIEZALEZNY: naglowek ma kilka krotkich komorek
+    // rozdzielonych tabulatorami i NIE MA W NIM ANI JEDNEJ CYFRY — a kazdy wiersz maila
+    // niesie przynajmniej godzine albo rozmiar. Wiersz bez cyfr i z trzema krotkimi
+    // komorkami nie jest mailem w zadnym jezyku.
+    // „raw" to wiersz SUROWY, „plaski" — ten sam po splaszczeniu bialych znakow.
+    // Oba sa potrzebne: nazwy kolumn czyta sie wygodniej z plaskiego, ale liczbe komorek
+    // widac WYLACZNIE w surowym — splaszczenie zamienia tabulatory w spacje i wtedy nie ma
+    // juz po czym poznac, ze to cztery kolumny obok siebie.
+    function naglowekSkrzynki(raw, plaski){
+        var t = String(raw == null ? '' : raw);
+        var p = String(plaski == null ? t : plaski).trim();
+        if (!p) return false;
+        if (/^from\b/i.test(p) && /\bsubject\b/i.test(p)) return true;
+        if (/\d/.test(p)) return false;
+        var kom = t.split('\t').map(function (x){ return x.trim(); }).filter(function (x){ return x; });
+        return kom.length >= 3 && kom.every(function (x){ return x.length <= 30; });
     }
     // Temat MOWI WPROST, czym jest numer. Maile o zmianie odpowiedzialnego pisza
     // „New responsible for auftrag: 14888837/3" — czyli numer auftragu z pozycja po
@@ -58676,7 +60357,7 @@
         String(txt || '').split(/\r?\n/).forEach(function (w){
             var s = flat(w);
             if (!s) return;
-            if (naglowekSkrzynki(s)) return;
+            if (naglowekSkrzynki(w, s)) return;
             var z = zTematu(s);
             if (!z) { out.push({ line: s, nr: '', rodzaj: '', maili: 1, st: 'err',
                                  msg: 'nie znalazłem numeru w tym wierszu' }); return; }
@@ -58988,6 +60669,32 @@
         // jeszcze nie bylo.
         if (!z) throw new Error('eupago nie pokazuje jeszcze zwrotu dla tej płatności '
                               + '— potwierdzenia nie wystawiam');
+        // ZWROT NIEBEZPOSREDNI (directRefund = 0) MA GOTOWY DOKUMENT NA SERWERZE eupago.
+        // Bierzemy wtedy ICH plik, zamiast kazac panelowi skladac go w przegladarce:
+        // jego uchwyt html2pdf obsluguje WYLACZNIE zwroty bezposrednie, wiec przy tym
+        // pierwszym nie ma czego zrobic i konczylo sie czekaniem „panel nie złożył
+        // comprovativo w 60 s". Zaobserwowane 10.09.2026: refundID 168629,
+        // directRefund=0, karta panelu odpowiedziala tym bledem po minucie.
+        // Ta droga byla juz w module (euMaPlik + euComprovativo) i wypadla przy przejsciu
+        // na skladanie przez panel — a potrzebna jest przy KAZDYM zwrocie, ktorego HUB
+        // nie puscil sam przez /management/v1.02/refund/.
+        if (euMaPlik(z)){
+            try {
+                var s = await euComprovativo(z.refundID);
+                var bl = s && s.blob ? s.blob : s;
+                if (!bl || !bl.size) throw new Error('serwer oddał pusty plik');
+                dz('comprovativo z serwera eupago', z.refundID, bl.size, 'bajtow',
+                   s && s.nazwa ? ('nazwa=' + s.nazwa) : '(bez nazwy w nagłówku)');
+                return new File([bl], String((s && s.nazwa) || ('Comprovativo de Reembolso - '
+                                                               + z.refundID + '.pdf')),
+                                { type: 'application/pdf' });
+            } catch (eS){
+                // Nieudane pobranie nie moze zablokowac odpowiedzi klientowi — schodzimy
+                // na sciezke panelu i zapisujemy powod, zeby bylo widac, ktora droga poszla.
+                dz('comprovativo z serwera NIE wyszlo', z.refundID, (eS && eS.message) || eS,
+                   '→ próbuję przez panel');
+            }
+        }
         // Dokument sklada PANEL, swoim szablonem. My tylko podajemy piec wartosci,
         // ktore czyta jego uchwyt, i odbieramy gotowy plik.
         var w = await mostem('comprovativo', {
@@ -60586,8 +62293,13 @@
     function puls(zrodlo){
         ileTykniec++;
         try {
+            // ZWOP_VER, nie ZW_VER. „ZW_VER" jest zmienna z init_zwr — z INNEGO domkniecia,
+            // wiec tutaj nie istnieje: kazde wywolanie puls() konczylo sie cichym
+            // ReferenceError w tym try, a znak zycia karty NIE ZAPISYWAL SIE NIGDY.
+            // Skutek widoczny po drugiej stronie: „Karta eupago milczy — nie ma na niej
+            // wykonawcy", nawet gdy wykonawca stal tam i dzialal.
             GM_setValue(ZW_OP_H, JSON.stringify({
-                ver: ZW_VER, czas: Date.now(), zrodlo: zrodlo,
+                ver: ZWOP_VER, czas: Date.now(), zrodlo: zrodlo,
                 nasluch: mamNasluch, tyk: ileTykniec,
                 ukryta: (typeof document !== 'undefined' && document.visibilityState === 'hidden')
             }));
@@ -60605,16 +62317,36 @@
     // dlawi. Jesli polityka strony zabroni utworzenia workera z blob-a, schodzimy na
     // zwykly setInterval; wtedy puls to pokaze i bedzie wiadomo, czemu jest wolniej.
     var zegarZrodlo = 'interval';
+    var mamZapas = false;
+    function zapasowyZegar(powod){
+        if (mamZapas) return;
+        mamZapas = true;
+        zegarZrodlo = powod;
+        setInterval(tyknij, 700);
+    }
     try {
         var kod = 'setInterval(function(){ postMessage(1); }, 700);';
         var url = URL.createObjectURL(new Blob([kod], { type: 'text/javascript' }));
         var wrk = new Worker(url);
         wrk.onmessage = tyknij;
+        // Worker z blob-a bywa ubijany PO utworzeniu — polityka bezpieczenstwa strony
+        // odrzuca go wtedy zdarzeniem, a nie wyjatkiem. Bez tego zapasu karta zostawala
+        // CALKIEM bez zegara: konstruktor przeszedl, wiec catch nizej sie nie odpalal,
+        // a workera juz nie bylo. Wtedy dzialal tylko nasluch — a gdy i on milczal,
+        // zlecenia z prologistics nie mial kto podjac.
+        wrk.onerror = function (){ zapasowyZegar('interval (worker padł)'); };
         zegarZrodlo = 'worker';
+        // Druga zapora: gdy w trzy sekundy nie przyszedl ANI JEDEN tyk, workera
+        // faktycznie nie ma — schodzimy na zwykly zegar, zamiast czekac w nieskonczonosc.
+        setTimeout(function (){ if (ileTykniec < 2) zapasowyZegar('interval (worker milczał)'); }, 3000);
     } catch (e){
-        setInterval(tyknij, 700);
+        zapasowyZegar('interval');
     }
     puls(zegarZrodlo);
+    // Znak dla czlowieka, ze wykonawca NAPRAWDE stoi na tej karcie i w jakiej wersji.
+    // Dotad karta nie dawala po sobie znac niczym, wiec „czy modul tu w ogole jest"
+    // bylo pytaniem bez odpowiedzi.
+    chmurka('HUB ' + ZWOP_VER + ': wykonawca zwrotów eupago gotowy', '#0a7a2f', 6000);
 })();
     }
 
@@ -61278,12 +63010,480 @@
         tyknij();
     }
 
+    // ===== Saferpay — most do panelu (v5.41) =====
+    /* Po co ten modul istnieje. Uzgodnienia Saferpaya w Saldach zaczynaja sie od pliku,
+       ktory czlowiek klika w Backoffice i wskazuje z dysku. Backoffice ma jednak wlasne
+       API i da sie te sama liste wziac wprost — tyle ze NIE Z PROLOGISTICS:
+
+         * CSP panelu to `connect-src 'self'` — zapytanie z obcej domeny nie wyjdzie;
+         * sesja siedzi w ciasteczku saferpay.com, ktore w zapytaniu miedzydomenowym
+           nie jedzie (ta sama pulapka co przy eupago i OBI — patrz PULAPKI.md).
+
+       Dlatego pyta KARTA PANELU u siebie, a przez GM-magazyn jedzie tylko zlecenie
+       (dwie daty) i wynik. To uklad „mostu wykonawczego", ten sam co init_qpmost
+       i init_zwrop, a nie „mostu tokenowego" jak init_chtok.
+
+       CZEGO TU NIE ZGADUJEMY. Zapytanie zostalo zaobserwowane z odpowiedzia 200:
+
+         POST /BO/Commerce/JournalOverview/GetTransactions?DateRange=01.08.2026+-+31.08.2026
+              &DateType=CaptureDate&HasMultipartCaptureButNotFinalized=true&IsAuthorized=true
+              &IsCanceled=true&IsCaptured=true&IsCredit=true&IsDebit=true&LabelIds=-1
+              &LiabilityShiftSearchType=All&PageNumber=1
+         -> { IsSuccess, WarningMessage, Transactions: [...25...],
+              Pagination: { Items: [...], TotalItemsCount: "45'407" } }
+
+       Naglowkow tez NIE SKLADAMY z glowy: panel wysyla przy tym rotujacy X-XSRF-TOKEN,
+       a zgadywanie, skad go brac, to dokladnie ten blad, na ktorym 5.34 wyszlo z dwoma
+       404. Zamiast tego PRZECHWYTUJEMY naglowki, ktore panel i tak wysyla (ten sam
+       chwyt co przy ManoMano i Clearhausie), i powtarzamy je co do jednego.
+
+       ILE TO TRWA. Strona ma 25 wierszy — zmierzone, nie zalozone. Sierpien 2026 to
+       45 407 transakcji, czyli 1 817 stron po ~1,3 s: prawie 40 minut szeregowo.
+       Dlatego chodzimy po szesc stron naraz i MOWIMY czlowiekowi, ile to potrwa,
+       ZANIM zaczniemy. Przy waskim zakresie (jeden dzien, jeden terminal) to sekundy
+       i wtedy ta droga bije eksport na glowe.                                           */
+    function init_spmost(){
+(function () {
+    'use strict';
+    if (!/(^|\.)saferpay\.com$/i.test(location.hostname)) return;
+    // Ramka ma wlasne okno i wlasny komplet zegarow. Bez tej zapory osadzony panel
+    // uruchomilby DRUGIEGO wykonawce na tych samych kluczach i jedno zlecenie
+    // dostaloby dwie odpowiedzi.
+    if (window.top !== window.self) return;
+
+    var SP_Z = 'tm_sp_zlec';        // zlecenie z prologistics
+    var SP_O = 'tm_sp_odp';         // stan i wynik
+    var SP_D = 'tm_sp_dane_';       // porcje danych: SP_D + id + '_' + numer
+    var SP_H = 'tm_sp_puls';        // znak zycia karty
+    var SP_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+               ? GM_info.script.version : '?';
+    /* ILE ZAPYTAN WOLNO NAM ZROBIC. Ta liczba kosztowala zablokowane konto.
+       Stronicowanie z szescioma zapytaniami naraz to przy miesiacu 1 817 wywolan
+       w kilka minut — z punktu widzenia panelu nie wyglada to na czlowieka
+       klikajacego w Backoffice, tylko na robota, i Saferpay odpowiedzial na to
+       blokada konta. Eksport robi JEDNO zapytanie i wyglada dokladnie tak, jak
+       klikniecie „Export" przez czlowieka — dlatego jest jedyna droga domyslna.
+       Stronicowanie zostaje wylacznie na waskie zakresy, na wyrazne zadanie,
+       po dwa zapytania naraz, z przerwa miedzy nimi i z TWARDYM limitem stron. */
+    var RAZEM_NARAZ = 2;            // ile stron ciagniemy jednoczesnie
+    var PRZERWA_MS = 400;           // odstep miedzy zapytaniami jednego robotnika
+    var MAX_STRON = 40;             // twardy limit — 1 000 transakcji; wyzej odmawiamy
+    var NA_PORCJE = 4000;           // ile wierszy w jednej porcji przez GM-magazyn
+    var NA_B64 = 1500000;           // ile znakow base64 w jednej porcji (plik XLSX)
+
+    function chmurka(tekst, kolor, ile){
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483000;background:'
+            + kolor + ';color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:7px 11px;'
+            + 'border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);cursor:pointer;max-width:340px';
+        d.textContent = tekst;
+        d.onclick = function (){ d.remove(); };
+        if (document.body) document.body.appendChild(d);
+        setTimeout(function (){ if (d.parentNode) d.remove(); }, ile || 8000);
+    }
+
+    /* ---------- przechwycenie naglowkow ----------
+       Panel wysyla GetTransactions przez XMLHttpRequest z rotujacym X-XSRF-TOKEN.
+       Nie odtwarzamy go — zapamietujemy komplet naglowkow, ktore panel NAPRAWDE
+       wyslal na sciezke /BO/, i powtarzamy je. Gdy jeszcze nic nie przeszlo, mowimy
+       czlowiekowi wprost, zeby raz kliknal Search, zamiast probowac bez tokenu
+       i dostac 400 bez wyjasnienia.                                                   */
+    var NAGLOWKI = null;
+    var W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    try {
+        var O = W.XMLHttpRequest.prototype.open;
+        var Sh = W.XMLHttpRequest.prototype.setRequestHeader;
+        W.XMLHttpRequest.prototype.open = function (m, u){
+            this.__spU = String(u || '');
+            this.__spN = {};
+            return O.apply(this, arguments);
+        };
+        W.XMLHttpRequest.prototype.setRequestHeader = function (k, v){
+            try {
+                if (this.__spN) this.__spN[String(k)] = String(v);
+                if (/\/BO\//i.test(this.__spU || '') && this.__spN['X-XSRF-TOKEN'])
+                    NAGLOWKI = JSON.parse(JSON.stringify(this.__spN));
+            } catch (e){}
+            return Sh.apply(this, arguments);
+        };
+    } catch (e){}
+
+    function odpowiedz(id, dane){
+        var o = { id: id, ver: SP_VER, kiedy: Date.now() };
+        Object.keys(dane || {}).forEach(function (k){ o[k] = dane[k]; });
+        try { GM_setValue(SP_O, JSON.stringify(o)); } catch (e){}
+    }
+
+    // „45'407" — apostrof jako separator tysiecy, po szwajcarsku. parseInt oddalby z tego 45.
+    function liczba(v){
+        var s = String(v == null ? '' : v).replace(/[^\d-]/g, '');
+        var n = parseInt(s, 10);
+        return isFinite(n) ? n : 0;
+    }
+    // Kwoty przychodza tak samo: „1'898.00". Kropka jest dziesietna.
+    function kwota(v){
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        var s = String(v == null ? '' : v).replace(/[\s'’]/g, '').replace(/,/g, '');
+        if (!s) return null;
+        var n = parseFloat(s);
+        return isFinite(n) ? n : null;
+    }
+    // „31.08.2026 23:59" -> „2026-08-31 23:59:00". Salda czytaja daty przez slChwila,
+    // ktore zna zapis z myslnikami i z ukosnikami, ale NIE z kropkami — bez tej
+    // zamiany caly okres wychodzilby pusty.
+    function data(v){
+        var m = String(v == null ? '' : v).match(/^(\d{2})\.(\d{2})\.(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+        if (!m) return '';
+        return m[3] + '-' + m[2] + '-' + m[1]
+             + ' ' + (m[4] || '00') + ':' + (m[5] || '00') + ':' + (m[6] || '00');
+    }
+
+    function adres(od, doo, strona){
+        // Zakres w formacie, ktory panel wysyla: „01.08.2026 - 31.08.2026".
+        var zakres = od + ' - ' + doo;
+        return '/BO/Commerce/JournalOverview/GetTransactions'
+            + '?DateRange=' + encodeURIComponent(zakres)
+            // CaptureDate, nie AuthorizationDate: uzgodnienia w Saldach licza po dacie
+            // pobrania i po niej ida wszystkie okna. Panel pamieta ostatni wybor
+            // czlowieka, wiec NIE zdajemy sie na niego.
+            + '&DateType=CaptureDate'
+            + '&HasMultipartCaptureButNotFinalized=true&IsAuthorized=true&IsCanceled=true'
+            + '&IsCaptured=true&IsCredit=true&IsDebit=true&LabelIds=-1'
+            + '&LiabilityShiftSearchType=All&PageNumber=' + strona;
+    }
+
+    function strona(od, doo, nr){
+        var nag = { 'X-Requested-With': 'XMLHttpRequest' };
+        Object.keys(NAGLOWKI || {}).forEach(function (k){
+            // Naglowki, ktore przegladarka ustawia sama — powtorzone recznie sa
+            // odrzucane albo ignorowane.
+            if (/^(content-length|host|connection|accept-encoding)$/i.test(k)) return;
+            nag[k] = NAGLOWKI[k];
+        });
+        return fetch(adres(od, doo, nr), { method: 'POST', credentials: 'same-origin', headers: nag })
+            .then(function (r){
+                if (!r.ok) throw new Error('strona ' + nr + ': HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function (j){
+                if (!j || j.IsSuccess === false)
+                    throw new Error('strona ' + nr + ': ' + ((j && j.WarningMessage) || 'panel odmówił'));
+                return j;
+            });
+    }
+
+    // Wiersz w postaci, ktorej oczekuja Salda. Tablica, nie obiekt: przy 45 tysiacach
+    // wierszy nazwy pol wazylyby wiecej niz same dane.
+    function wiersz(t){
+        return [
+            String(t.GxId || ''),                       // 0 Transaction ID
+            String(t.OrderId || ''),                    // 1 Reference number
+            String(t.Currency || ''),                   // 2 waluta
+            kwota(t.MerchantAmount != null ? t.MerchantAmount : t.Amount),   // 3 kwota
+            String(t.TerminalId == null ? '' : t.TerminalId),                // 4 terminal
+            String(t.Provider || ''),                   // 5 acquirer
+            String(t.TransactionTypeName || ''),        // 6 rodzaj
+            data(t.CaptureDate) || data(t.AuthorizationDate),                // 7 chwila
+            String(t.Description || ''),                // 8 opis
+            String(t.HolderName || '')                  // 9 nazwisko z karty
+        ];
+    }
+
+    /* DWIE DROGI DO TEJ SAMEJ LISTY — i domyslna jest ta szybsza.
+
+       EKSPORT (domyslna). Jedno zadanie, panel sklada plik u siebie, my go pobieramy
+       i oddajemy BAJTAMI. Zaobserwowany lancuch:
+         POST /BO/Commerce/JournalOverview/Export  -> { PollingUrl, DownloadUrl: null }
+         GET  <PollingUrl>                         -> to samo, dopoki sie liczy
+         gdy DownloadUrl przestanie byc null       -> GET <DownloadUrl> = gotowy XLSX
+       Nic tu nie zgadujemy: pole nazywa sie DownloadUrl i przychodzi puste, wiec
+       pytlujemy, az przestanie.
+
+       STRONAMI (odwrot). 25 wierszy na strone — zmierzone w panelu. Sierpien 2026 to
+       45 407 transakcji, czyli 1 817 stron po ~1,3 s: nawet po szesc naraz wychodzi
+       ponad siedem minut, podczas gdy eksport to jedno zapytanie i minuta czekania.
+       Dlatego stronami idziemy TYLKO wtedy, gdy eksport nie wyszedl albo gdy ktos
+       poprosi wprost — przy waskim zakresie (jeden dzien) ta droga jest w sekundach.  */
+    function b64(bytes){
+        // Po 32 kB, bo String.fromCharCode.apply na kilku milionach bajtow przewraca stos.
+        var CH = 0x8000, out = [];
+        for (var i = 0; i < bytes.length; i += CH)
+            out.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CH)));
+        return btoa(out.join(''));
+    }
+    function naglowki(json){
+        var nag = { 'X-Requested-With': 'XMLHttpRequest' };
+        Object.keys(NAGLOWKI || {}).forEach(function (k){
+            if (/^(content-length|content-type|host|connection|accept-encoding)$/i.test(k)) return;
+            nag[k] = NAGLOWKI[k];
+        });
+        if (json) nag['Content-Type'] = 'application/json;charset=UTF-8';
+        return nag;
+    }
+    function eksport(z){
+        var id = z.id;
+        // Cialo przepisane z zaobserwowanego zadania, z jedna zmiana: DateType.
+        // Panel pamieta ostatni wybor czlowieka i w zrzucie stalo tam AuthorizationDate,
+        // a uzgodnienia w Saldach licza po dacie pobrania.
+        var cialo = {
+            DateRange: z.od + ' - ' + z.doo,
+            IsAuthorized: true, IsCaptured: true, IsCanceled: true,
+            HasMultipartCaptureButNotFinalized: true, IsCredit: true, IsDebit: true,
+            DateType: 'CaptureDate', LabelIds: '-1', LiabilityShiftSearchType: 'All',
+            PageNumber: 1, GlobalSearchQuery: null, fileType: 'excel'
+        };
+        var t0 = Date.now();
+        odpowiedz(id, { etap: 'zlecam', tryb: 'plik' });
+        return fetch('/BO/Commerce/JournalOverview/Export',
+                     { method: 'POST', credentials: 'same-origin',
+                       headers: naglowki(true), body: JSON.stringify(cialo) })
+            .then(function (r){
+                if (!r.ok) throw new Error('Export: HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function (j){
+                var poll = j && j.PollingUrl;
+                if (j && j.DownloadUrl) return j.DownloadUrl;
+                if (!poll) throw new Error('panel nie oddał PollingUrl');
+                return new Promise(function (ok, zle){
+                    var pyt = 0;
+                    (function krok(){
+                        if (ROBIE !== id) { zle(new Error('przerwane')); return; }
+                        if (Date.now() - t0 > 900000){ zle(new Error('panel składa plik dłużej niż 15 minut')); return; }
+                        pyt++;
+                        odpowiedz(id, { etap: 'skladam', tryb: 'plik',
+                                        sekund: Math.round((Date.now() - t0) / 1000), pytan: pyt });
+                        fetch(poll, { method: 'GET', credentials: 'same-origin', headers: naglowki(false) })
+                            .then(function (r){
+                                if (!r.ok) throw new Error('ExportState: HTTP ' + r.status);
+                                return r.json();
+                            })
+                            .then(function (s){
+                                if (s && s.DownloadUrl){ ok(s.DownloadUrl); return; }
+                                if (s && s.PollingUrl) poll = s.PollingUrl;
+                                setTimeout(krok, 3000);
+                            })
+                            .catch(zle);
+                    })();
+                });
+            })
+            .then(function (url){
+                odpowiedz(id, { etap: 'pobieram', tryb: 'plik',
+                                sekund: Math.round((Date.now() - t0) / 1000) });
+                return fetch(url, { method: 'GET', credentials: 'same-origin', headers: naglowki(false) })
+                    .then(function (r){
+                        if (!r.ok) throw new Error('pobranie pliku: HTTP ' + r.status);
+                        var nazwa = '';
+                        try {
+                            var cd = r.headers.get('content-disposition') || '';
+                            var m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+                            if (m) nazwa = decodeURIComponent(m[1]);
+                        } catch (e){}
+                        return r.arrayBuffer().then(function (ab){
+                            return { bajty: new Uint8Array(ab), nazwa: nazwa,
+                                     sekund: Math.round((Date.now() - t0) / 1000) };
+                        });
+                    });
+            });
+    }
+    function stronami(z){
+        var id = z.id;
+        var wszystkie = [], stron = 0, razem = 0, naStronie = 0, zrobione = 0;
+        strona(z.od, z.doo, 1).then(function (j){
+            var T = j.Transactions || [];
+            naStronie = T.length;
+            razem = liczba(j.Pagination && j.Pagination.TotalItemsCount);
+            if (!naStronie){
+                odpowiedz(id, { ok: true, ile: 0, porcji: 0, razem: 0, tryb: 'strony' });
+                ROBIE = null; ZROBIONE[id] = true;
+                return null;
+            }
+            if (!razem) razem = naStronie;
+            stron = Math.ceil(razem / naStronie);
+            // Odmawiamy, ZANIM cokolwiek pociagniemy. Lepiej powiedziec czlowiekowi,
+            // zeby wzial eksportem, niz zablokowac mu konto drugi raz.
+            if (stron > MAX_STRON){
+                odpowiedz(id, { ok: false, blad: 'to ' + razem + ' transakcji na ' + stron
+                    + ' stronach — za dużo, żeby ciągnąć stronami (limit ' + MAX_STRON
+                    + '). Weź to eksportem albo zawęź zakres dat.' });
+                ROBIE = null; ZROBIONE[id] = true;
+                return null;
+            }
+            T.forEach(function (t){ wszystkie.push(wiersz(t)); });
+            zrobione = 1;
+            odpowiedz(id, { etap: 'plan', tryb: 'strony', razem: razem, stron: stron,
+                            naStronie: naStronie, strona: 1, ile: wszystkie.length,
+                            sekund: Math.round(stron * 1.3 / RAZEM_NARAZ) });
+            if (stron <= 1) return null;
+
+            var nast = 2, bledy = [];
+            function robotnik(){
+                if (nast > stron) return Promise.resolve();
+                var nr = nast++;
+                // Przerwa jest po to, zeby ruch wygladal jak praca czlowieka, a nie
+                // jak zalew. Bez niej dwa robotniki i tak strzelaja tak szybko,
+                // jak panel oddaje.
+                return new Promise(function (ok){ setTimeout(ok, PRZERWA_MS); })
+                    .then(function (){ return strona(z.od, z.doo, nr); })
+                    .then(function (jj){
+                    (jj.Transactions || []).forEach(function (t){ wszystkie.push(wiersz(t)); });
+                    zrobione++;
+                    if (zrobione % 10 === 0 || zrobione === stron)
+                        odpowiedz(id, { etap: 'ciagne', tryb: 'strony', razem: razem, stron: stron,
+                                        strona: zrobione, ile: wszystkie.length });
+                }).catch(function (e){
+                    // Jednej strony nie zamiatamy pod dywan: policzymy ja i powiemy,
+                    // ile wierszy NA PEWNO brakuje w tym, co oddajemy.
+                    bledy.push((e && e.message) || String(e));
+                }).then(robotnik);
+            }
+            var ekipa = [];
+            for (var i = 0; i < RAZEM_NARAZ; i++) ekipa.push(robotnik());
+            return Promise.all(ekipa).then(function (){ return bledy; });
+        }).then(function (bledy){
+            if (ROBIE !== id) return;
+            var porcji = 0;
+            for (var i = 0; i < wszystkie.length; i += NA_PORCJE){
+                try { GM_setValue(SP_D + id + '_' + porcji, JSON.stringify(wszystkie.slice(i, i + NA_PORCJE))); }
+                catch (e){
+                    odpowiedz(id, { ok: false, blad: 'nie zmieściłem porcji ' + porcji + ': ' + ((e && e.message) || e) });
+                    ROBIE = null; ZROBIONE[id] = true;
+                    return;
+                }
+                porcji++;
+            }
+            odpowiedz(id, { ok: true, tryb: 'strony', ile: wszystkie.length, porcji: porcji,
+                            razem: razem, stron: stron, naStronie: naStronie,
+                            bledy: (bledy && bledy.length) ? bledy.slice(0, 5) : null,
+                            brakStron: (bledy && bledy.length) ? bledy.length : 0 });
+            ROBIE = null; ZROBIONE[id] = true;
+            chmurka('HUB: oddałem ' + wszystkie.length + ' transakcji. Wróć do prologistics.', '#0a7a2f', 10000);
+        }).catch(function (e){
+            odpowiedz(id, { ok: false, blad: (e && e.message) || String(e) });
+            ROBIE = null; ZROBIONE[id] = true;
+        });
+    }
+
+    var ROBIE = null;      // id zlecenia w robocie — drugie tego samego nie ruszamy
+    var ZROBIONE = {};     // id -> true
+
+    function wykonaj(z){
+        var id = z.id;
+        ROBIE = id;
+        odpowiedz(id, { etap: 'start' });
+        if (!NAGLOWKI){
+            odpowiedz(id, { ok: false, blad: 'ta karta nie widziała jeszcze żadnego zapytania panelu — '
+                + 'kliknij raz „Search" w Journal Overview i spróbuj ponownie' });
+            ROBIE = null; ZROBIONE[id] = true;
+            chmurka('HUB: kliknij raz „Search" w Journal Overview — muszę zobaczyć nagłówki panelu.', '#c47f00', 15000);
+            return;
+        }
+        if (z.tryb === 'strony'){ stronami(z); return; }
+        eksport(z).then(function (w){
+            if (ROBIE !== id) return;
+            // Plik idzie base64 w porcjach. Sierpien to 6,84 MB XLSX-a, czyli ~9 MB
+            // base64 — jednym GM_setValue nikt tyle w tym projekcie nie przenosil,
+            // a najwiecej, co przechodzilo, to 6 MB przy PDF-ie.
+            var t = b64(w.bajty);
+            var porcji = 0;
+            for (var i = 0; i < t.length; i += NA_B64){
+                try { GM_setValue(SP_D + id + '_' + porcji, t.slice(i, i + NA_B64)); }
+                catch (e){
+                    odpowiedz(id, { ok: false, blad: 'nie zmieściłem porcji ' + porcji + ' (plik '
+                        + Math.round(w.bajty.length / 1048576 * 10) / 10 + ' MB): ' + ((e && e.message) || e) });
+                    ROBIE = null; ZROBIONE[id] = true;
+                    return;
+                }
+                porcji++;
+            }
+            odpowiedz(id, { ok: true, tryb: 'plik', porcji: porcji, bajtow: w.bajty.length,
+                            nazwa: w.nazwa, sekund: w.sekund });
+            ROBIE = null; ZROBIONE[id] = true;
+            chmurka('HUB: oddałem plik (' + Math.round(w.bajty.length / 1048576 * 10) / 10
+                    + ' MB). Wróć do prologistics.', '#0a7a2f', 10000);
+        }).catch(function (e){
+            if (ROBIE !== id) return;
+            /* ZADNEGO AUTOMATYCZNEGO ODWROTU NA STRONY. Kiedys tu bylo `stronami(z)`
+               i wlasnie tedy jedno nieudane zlecenie zamienialo sie po cichu w 1 817
+               zapytan. Nieudany eksport melduje sie jako blad; stronicowanie zostaje
+               droga, o ktora trzeba poprosic wprost i tylko przy waskim zakresie.   */
+            odpowiedz(id, { ok: false, blad: 'eksport nie wyszedł: ' + ((e && e.message) || e)
+                + '. Spróbuj ponownie albo pobierz plik ręcznie w panelu.' });
+            ROBIE = null; ZROBIONE[id] = true;
+            chmurka('HUB: eksport nie wyszedł — ' + ((e && e.message) || e), '#c00', 15000);
+        });
+    }
+
+    function obsluz(v){
+        if (!v) return;
+        var z = null;
+        try { z = JSON.parse(v); } catch (e){ return; }
+        if (!z || !z.id || !z.od || !z.doo) return;
+        if (ROBIE === z.id || ZROBIONE[z.id]) return;
+        // Zlecenie starsze niz trzy minuty to slad po poprzedniej sesji, a nie prosba.
+        if (!z.kiedy || (Date.now() - z.kiedy) > 180000) return;
+        wykonaj(z);
+    }
+
+    var ileTykniec = 0;
+    var mamNasluch = false;
+    function puls(zrodlo){
+        try {
+            GM_setValue(SP_H, JSON.stringify({
+                ver: SP_VER, kiedy: Date.now(), zegar: zrodlo,
+                nasluch: mamNasluch, tyk: ileTykniec, naglowki: !!NAGLOWKI,
+                ukryta: (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+            }));
+        } catch (e){}
+    }
+    function tyknij(){
+        ileTykniec++;
+        puls(zegarZrodlo);
+        var v = '';
+        try { v = GM_getValue(SP_Z, '') || ''; } catch (e){ return; }
+        obsluz(v);
+    }
+    try {
+        GM_addValueChangeListener(SP_Z, function (k, s, n){ mamNasluch = true; obsluz(n); });
+        mamNasluch = true;
+    } catch (e){}
+
+    // Zegar w Web Workerze — karta w tle dlawi setInterval do jednego przebiegu na
+    // minute. Trzy zapory, bo worker z blob-a bywa ubijany PO utworzeniu, zdarzeniem,
+    // a nie wyjatkiem: wtedy konstruktor przechodzi, catch sie nie odpala i karta
+    // zostaje calkiem bez zegara.
+    var zegarZrodlo = 'interval';
+    var mamZapas = false;
+    function zapasowyZegar(powod){
+        if (mamZapas) return;
+        mamZapas = true;
+        zegarZrodlo = powod;
+        setInterval(tyknij, 700);
+    }
+    try {
+        var kod = 'setInterval(function(){ postMessage(1); }, 700);';
+        var url = URL.createObjectURL(new Blob([kod], { type: 'text/javascript' }));
+        var wrk = new Worker(url);
+        wrk.onmessage = tyknij;
+        wrk.onerror = function (){ zapasowyZegar('interval (worker padł)'); };
+        zegarZrodlo = 'worker';
+        setTimeout(function (){ if (ileTykniec < 2) zapasowyZegar('interval (worker milczał)'); }, 3000);
+    } catch (e){
+        zapasowyZegar('interval');
+    }
+    puls(zegarZrodlo);
+    chmurka('HUB ' + SP_VER + ': wykonawca Saferpaya gotowy', '#0a7a2f', 6000);
+})();
+    }
+
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
         { id: 'eutok',    name: 'EuPago — sesja panelu',     test: onEupago,  init: init_eutok },
         { id: 'chtok',    name: 'Clearhaus — sesja panelu',  test: onClearhaus, init: init_chtok },
         { id: 'qpmost',   name: 'QuickPay — most do panelu', test: onQuickpay,  init: init_qpmost },
+        { id: 'spmost',   name: 'Saferpay — most do panelu', test: onSaferpay,  init: init_spmost },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
         { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex(), init: init_mkt },
