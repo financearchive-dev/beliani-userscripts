@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.41
+// @version      5.42
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14552,8 +14552,13 @@
         function renderBal(forCopy){
             var g = state.bal, lines = [], html = '<table style="border-collapse:collapse;font-size:11px;width:100%">', CMb = pcCombinedColorMap();
             var DUP = pcDupOrderMap('bal');
+            // Rozdzieleni dostawcy NIE ida jednym przelewem, wiec znacznik
+            // „[DEPO→1 przelew]" musi tu zgasnac — inaczej ta tabela mowi co innego
+            // niz tabela scalona i okno przelewow. Mapy czytamy RAZ na render.
+            var _MRG = pcMergeLoad(), _ROZ = pcSplitLoad();
             g.order.forEach(function(sup){
-                var rows = g.groups[sup], isDepo = !!state.matched[sup];
+                var rows = g.groups[sup];
+                var isDepo = !!state.matched[sup] && !_ROZ[pcKorzen(pcKeyOf(state.sup2cid, sup), _MRG)];
                 rows.forEach(function(r){
                     var bg = isDepo ? (CMb[pcKeyOf(state.sup2cid, sup)] || PC_COMBINED_BG) : (r.bg || '');
                     var supC = forCopy ? esc(cellHL(r.supplierUrl, r.supplier)) : (aLink(r.supplierUrl, r.supplier, '#750000') + (isDepo ? ' <b style="color:#a15c00">[DEPO\u21921 przelew]</b>' : ''));
@@ -14756,6 +14761,15 @@
             try { L.push('Strona         : ' + location.href); } catch(e){}
             try { L.push('Przeglądarka   : ' + navigator.userAgent); } catch(e){}
             try { L.push('P/I dla balance: ' + (((wp.querySelector('#wp-bal-pi') || {}).checked) ? 'włączone' : 'wyłączone')); } catch(e){}
+            // Rozdzielenie zmienia LICZBE przelewow, wiec protokol ma o nim mowic —
+            // inaczej za pol roku nie da sie odpowiedziec, czemu dostawca dostal dwa.
+            try {
+                var _MGr = pcMergedGroups(), _rozd = [];
+                _MGr.depoOnly.concat(_MGr.balOnly).forEach(function (G){
+                    if (G.rozdziel && _rozd.indexOf(G.sup) === -1) _rozd.push(G.sup);
+                });
+                if (_rozd.length) L.push('Rozdzieleni ręcznie (depozyt i balance osobnymi przelewami): ' + _rozd.join(', '));
+            } catch (e){}
 
             sect('1. WKLEJONE DANE — BALANCE (surowe)', function(){
             L.push((D.raw && D.raw.bal) ? D.raw.bal : '(puste)'); });
@@ -14808,7 +14822,9 @@
                 var d = D.bal[o];
                 sub('order ' + o);
                 L.push('  konta w systemie: ' + ((d.banks && d.banks.length) ? d.banks.join(' / ') : '—'));
-                L.push('  ostatni P/I     : ' + (d.piUrl || '—'));
+                L.push('  wzięty P/I      : ' + (d.piUrl || '—'));
+                if (d.piPominiete && d.piPominiete.length)
+                    L.push('  pominięte pliki : ' + d.piPominiete.join(' ; '));
                 if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
                 if (d.pi) pcBankLog(d.pi.bank, L, '  ');
@@ -14825,7 +14841,9 @@
                 var d = D.dep[o];
                 sub('order ' + o);
                 L.push('  konta w systemie: ' + ((d.banks && d.banks.length) ? d.banks.join(' / ') : '—'));
-                L.push('  ostatni P/I     : ' + (d.piUrl || '—'));
+                L.push('  wzięty P/I      : ' + (d.piUrl || '—'));
+                if (d.piPominiete && d.piPominiete.length)
+                    L.push('  pominięte pliki : ' + d.piPominiete.join(' ; '));
                 if (d.piRaw) L.push('  sekcja P/I (surowa): ' + d.piRaw);
                 L.push('  wybrany komentarz deposit: ' + (d.com ? ('#' + d.com.idx + ' → kwota ' + pcNum(d.com.amount) + ', % ' + (d.com.pct == null ? '—' : d.com.pct)) : 'BRAK'));
                 if (d.pi) L.push('  odczyt z P/I    : kwota ' + pcNum(d.pi.amount) + ' | % ' + (d.pi.pct == null ? '—' : d.pi.pct) + ' | konto ' + (d.pi.acc || '—') + (d.pi.sheet ? ' | arkusz ' + d.pi.sheet + (d.pi.hidden ? ' [ukryty]' : '') : '') + (d.pi.err ? ' | błąd: ' + d.pi.err : ''));
@@ -14872,6 +14890,25 @@
             catch (e){ return {}; }
         }
         function pcMergeSave(o){ try { GM_setValue(PC_MERGE_KEY, JSON.stringify(o || {})); } catch (e){} }
+        /* ===== ROZDZIELENIE DEPO OD BALANCE =====
+           Odwrotnosc scalania. Automat sklada depozyt i balance tego samego dostawcy
+           w JEDEN przelew — bo prawie zawsze o to chodzi. Prawie: bywa, ze dostawca
+           kaze zaplacic depozyt na jedno konto, a balance na drugie (inny bank, inna
+           spolka w grupie). Wtedy jeden przelew nie wystarczy i trzeba grupe rozciac.
+           Zapis: klucz korzenia grupy -> 1. Wpis jest trwaly, tak jak przy scalaniu,
+           wiec przy kolejnej wklejce dostawca znow rozejdzie sie sam.
+           Po rozdzieleniu kazda polowa ma WLASNY klucz („…#depo" i „…#bal"), a na
+           kluczu wisi wszystko, co sie w tej sprawie roznicuje: numer konta w oknie
+           przelewow (state.painEdit), tytul przelewu i osobna transakcja w pain.001. */
+        var PC_SPLIT_KEY = 'pc_rozdziel_grupy';
+        function pcSplitLoad(){
+            try { var o = JSON.parse(GM_getValue(PC_SPLIT_KEY, '{}')); return (o && typeof o === 'object') ? o : {}; }
+            catch (e){ return {}; }
+        }
+        function pcSplitSave(o){ try { GM_setValue(PC_SPLIT_KEY, JSON.stringify(o || {})); } catch (e){} }
+        // Korzen grupy po scaleniach recznych — rozdzielenie zapisujemy wlasnie na nim,
+        // zeby dwa razy nie opisywac tej samej grupy dwoma kluczami.
+        function pcKorzen(k, M){ var m = (M || pcMergeLoad())[k]; return (m && m.root) ? m.root : k; }
         // Czy w zestawie sa naprawde ROZNE rachunki. Ten sam rachunek zapisany raz
         // z kontem lokalnym z przodu, a raz bez, rozny nie jest — od tego jest accTenSam.
         function pcKontaRozne(lista){
@@ -14919,6 +14956,23 @@
                 if (m) R.reczne = true;
             });
             byKey = byRoot; keys = rootKeys;
+            /* Rozdzielenie robimy PO scaleniu recznym i PRZED podzialem na sekcje —
+               dzieki temu polowa z samym depozytem wpada do sekcji DEPO, polowa
+               z samym balance do BALANCE, a sumy, tytuly i przelewy licza sie dalej
+               same, bez ani jednego wyjatku w kodzie nizej.                        */
+            var ROZ = pcSplitLoad(), byRoz = {}, rozKeys = [];
+            keys.forEach(function (k){
+                var G = byKey[k];
+                // Rozcinac jest co tylko wtedy, gdy grupa ma OBA rodzaje wierszy.
+                if (!ROZ[k] || !G.dep.length || !G.bal.length){ byRoz[k] = G; rozKeys.push(k); return; }
+                [['#depo', G.dep, []], ['#bal', [], G.bal]].forEach(function (cz){
+                    var H = {};
+                    for (var kk in G) if (Object.prototype.hasOwnProperty.call(G, kk)) H[kk] = G[kk];
+                    H.key = k + cz[0]; H.dep = cz[1]; H.bal = cz[2]; H.rozdziel = k;
+                    byRoz[H.key] = H; rozKeys.push(H.key);
+                });
+            });
+            byKey = byRoz; keys = rozKeys;
             var combined = [], depoOnly = [], balOnly = [];
             keys.forEach(function(k){ var G = byKey[k]; if (G.dep.length && G.bal.length) combined.push(G); else if (G.dep.length) depoOnly.push(G); else balOnly.push(G); });
             function bySup(a, b){ return String(a.sup).toLowerCase().localeCompare(String(b.sup).toLowerCase()); }
@@ -18712,11 +18766,20 @@
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 // Scalenie reczne ma byc WIDOCZNE — inaczej za pol roku nie wiadomo,
                 // czemu dwie firmy stoja w jednym wierszu.
-                + ((G.reczne && (G.czlony || []).length > 1)
+                + ((G.reczne && !G.rozdziel && (G.czlony || []).length > 1)
                     ? ('<span title="Scalone ręcznie. Automat łączy po numerze konta — te rekordy wspólnego nie mają." style="margin-left:8px;background:#750000;color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700">⛓ scalone: '
                        + esc(G.czlony.join(' + ')) + '</span>'
                        + ' <button class="pc-unmerge" data-root="' + esc(G.key) + '" style="padding:1px 7px;border:1px solid #750000;border-radius:4px;background:#fff;color:#750000;font-size:10px;cursor:pointer">Rozłącz</button>')
                     : '')
+                // ✂ Rozdziel / ⛓ Połącz z powrotem. Guzik stoi przy grupie, ktorej
+                // dotyczy — tak jak „Rozłącz" przy scaleniu recznym.
+                + (G.rozdziel
+                    ? ('<span title="Depozyt i balance tego dostawcy idą OSOBNYMI przelewami. Każda połowa ma własny numer konta w oknie przelewów, własny tytuł i własną pozycję w pliku pain.001." style="margin-left:8px;background:#0a58ca;color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700">✂ rozdzielone — '
+                       + (hasDep ? 'sam depozyt' : 'sam balance') + '</span>'
+                       + ' <button class="pc-rejoin" data-root="' + esc(G.rozdziel) + '" style="padding:1px 7px;border:1px solid #0a58ca;border-radius:4px;background:#fff;color:#0a58ca;font-size:10px;cursor:pointer">⛓ Połącz z powrotem</button>')
+                    : ((hasDep && hasBal)
+                        ? (' <button class="pc-split" data-root="' + esc(G.key) + '" title="Rozetnij na dwa przelewy: osobno depozyt, osobno balance. Do tego, gdy dostawca każe zapłacić depozyt na jedno konto, a balance na drugie." style="margin-left:8px;padding:1px 7px;border:1px solid #0a58ca;border-radius:4px;background:#fff;color:#0a58ca;font-size:10px;cursor:pointer">✂ Rozdziel depo / balance</button>')
+                        : ''))
                 // Puste miejsce na znacznik postepu komentarzy — wypelnia je pcRefreshDone
                 // po kazdym renderze i po kazdym dodanym komentarzu.
                 + '<span class="pc-done-badge" data-sup="' + gi + '" style="margin-left:8px;font-size:10px;font-weight:700"></span>'
@@ -18769,6 +18832,7 @@
                 html += colhead();
                 groups.forEach(function(G){
                     state._groups.push({ gi: gi, dep: G.dep, bal: G.bal, key: G.key, sup: G.sup,
+                                         rozdziel: G.rozdziel || '',
                                          cid: G.cid || null, konto: G.cid ? (_acc[G.cid] || '') : '' });
                     var gcol = CM[G.key] || '';
                     html += pcGroupHeader(G, gi, gcol);
@@ -18810,6 +18874,17 @@
                     alert('Zaznacz checkboxy przy nazwach co najmniej DWÓCH dostawców, potem kliknij „Połącz".');
                     return;
                 }
+                /* Polowki rozdzielonej grupy scalaniu nie podlegaja. Magazyn scalen
+                   trzyma klucze SPRZED rozdzielenia, wiec wpis z kluczem „…#depo" nie
+                   mialby sie przy nastepnym renderze z czym spotkac i po cichu nie
+                   zrobilby nic. Lepiej powiedziec to wprost, niz udawac, ze dziala. */
+                var rozdz = wyb.filter(function (g){ return g.rozdziel; });
+                if (rozdz.length){
+                    alert('Nie połączę połowy grupy rozdzielonej na depo i balance:\n\n  '
+                        + rozdz.map(function (g){ return g.sup; }).join('\n  ')
+                        + '\n\nNajpierw kliknij przy niej „⛓ Połącz z powrotem", potem scalaj.');
+                    return;
+                }
                 var lista = wyb.map(function (g, i){
                     return (i + 1) + '. ' + g.sup + (g.konto ? ('   [' + g.konto + ']') : '   [bez konta]');
                 }).join('\n');
@@ -18839,6 +18914,26 @@
                 pcMergeSave(M);
                 renderMerged();
             };
+            el.querySelectorAll('.pc-split').forEach(function (u){
+                u.onclick = function(){
+                    var root = u.getAttribute('data-root');
+                    if (!confirm('Rozdzielić depozyt i balance na DWA osobne przelewy?\n\n'
+                        + 'Każda połowa dostanie własny numer konta w oknie przelewów, własny '
+                        + 'tytuł i własną pozycję w pliku pain.001.\n\n'
+                        + 'Wybór zostaje zapamiętany — przy kolejnej wklejce ten dostawca rozejdzie się sam.')) return;
+                    var R = pcSplitLoad(); R[root] = 1; pcSplitSave(R);
+                    renderMerged();
+                };
+            });
+            el.querySelectorAll('.pc-rejoin').forEach(function (u){
+                u.onclick = function(){
+                    var root = u.getAttribute('data-root');
+                    if (!confirm('Z powrotem w jeden przelew?\n\nDepozyt i balance wrócą do jednej '
+                        + 'pozycji, na jedno konto.')) return;
+                    var R = pcSplitLoad(); delete R[root]; pcSplitSave(R);
+                    renderMerged();
+                };
+            });
             el.querySelectorAll('.pc-unmerge').forEach(function (u){
                 u.onclick = function(){
                     var root = u.getAttribute('data-root');
@@ -19159,9 +19254,37 @@
                 return a != null && isFinite(a) && Math.abs(Math.abs(a) - Math.abs(p.amt)) < 0.005;
             });
         }
+        /* ROSZCZENIE NALEZY DO SWOJEGO KONTENERA, nie do calego zamowienia.
+           Notatke przy wierszu balance pisze sie per ZAMOWIENIE, a jedno zamowienie
+           potrafi miec dwa wiersze: wlasny kontener i doplate jadaca kontenerem
+           innego zamowienia. Numer roszczenia stoi wtedy w notatce OBU wierszy.
+           BAZHOU PI, 11.09.2026, order 18680:
+             TCKU6743302    7080.75   „8295.75 USD penalty 1377"   <- tu penalty odjeto
+             (TCNU7625295)   364.65   „364.65 USD penalty 1377"    <- a tu nie ma czego
+           Penalty 1377 jest zapieta na kontener TCKU6743302 (tak mowi sam wpis
+           roszczenia) i zostala juz odjeta w pierwszym wierszu: 8295.75 − 1215.00.
+           Mimo to drugi wiersz dostawal zarzut „NIE odjeta — powinno byc -850.35",
+           czyli kazal policzyc to samo 1215.00 DRUGI RAZ.
+           Zasada: gdy roszczenie ma wlasny kontener i tym kontenerem jest INNY
+           wiersz tej samej wklejki, to tamten wiersz jest jego wlascicielem i zarzut
+           moze paść wylacznie na niego. Wiersz z kontenerem w nawiasie wlascicielem
+           byc nie moze — to doplata, ktora tym kontenerem tylko jedzie.
+           Gdy roszczenie kontenera nie ma albo jego kontenera nie ma we wklejce,
+           nic sie nie zmienia: jedynym swiadectwem zostaje numer z notatki.        */
+        function pcPenCudza(list, p, r){
+            if (!p || !p.cont) return false;
+            if (p.cont === pcNormCont(r && r.container)) return false;   // to MOJ kontener
+            return (list || []).some(function (x){
+                if (x === r) return false;
+                if (/^\s*\(/.test(String((x && x.container) || ''))) return false;
+                return pcNormCont(x && x.container) === p.cont;
+            });
+        }
         // Roszczenia, ktore POWINNY byly pomniejszyc te wplate, a nie pomniejszyly.
         function pcPenNieodjeta(list, pens, r, rc){
-            return pcPenTwarde(pens, r, rc).filter(function (p){ return !pcPenOsobno(list, p); });
+            return pcPenTwarde(pens, r, rc).filter(function (p){
+                return !pcPenOsobno(list, p) && !pcPenCudza(list, p, r);
+            });
         }
         // Co DOKLADNIE jest nie tak, gdy kwota sie nie zgadza. Sama liczba „(-947.96)\"
         // nie mowi, gdzie szukac, a najczestsza przyczyna to zle policzona penalty.
@@ -19414,16 +19537,19 @@
             }
             return after.slice(0, bound);
         }
-        function extractLatestPI(html){
+        /* LISTA plikow z sekcji „P/I", od najnowszego. Do 5.41 zwracany byl tylko
+           najnowszy — i to wystarczalo, dopoki w tej sekcji lezaly same proformy.
+           Nie lezą: patrz piZSekcji.                                              */
+        function extractPIlista(html){
             var sec = piSection(html);
-            if (sec == null) return null;
+            if (sec == null) return [];
             // Kazdy link do dokumentu bierzemy osobno, a date czytamy z ogonka ZA linkiem.
             // Wczesniej robil to jeden wielki regex wymagajacy "...</a><br />(by X on DATA)",
             // w ktorym nazwisko dopasowywalo sie przez [^)] — wiec kazde nazwisko z nawiasem,
             // np. "(by Agata Betiuk (Rozkrut) on 2025-12-22 08:20:00)", wywracalo dopasowanie
             // i caly dokument byl pomijany. Efekt: "brak P/I" mimo istniejacego pliku.
             var re = /<a[^>]*href="([^"]*doc\.php\?[^"]*doc_id=(\d+)[^"]*)"/gi;
-            var m, best = null, bestD = '', bestId = -1;
+            var m, out = [];
             while ((m = re.exec(sec)) !== null){
                 var href = m[1], id = parseInt(m[2], 10) || 0;
                 if (/[?&](?:del|delete|remove)\b/i.test(href) || /action=(?:del|remove)/i.test(href)) continue;
@@ -19441,10 +19567,70 @@
                 var dm = tail.match(/\bon\s+(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/i);
                 // Sekundy bywaja pominiete — normalizujemy, zeby porownanie tekstowe dzialalo.
                 var d = dm ? (dm[1] + ' ' + (dm[2] ? (dm[2].length === 5 ? dm[2] + ':00' : dm[2]) : '00:00:00')) : '';
-                // Bez daty decyduje doc_id — rosnie z czasem, wiec najwiekszy = najnowszy.
-                if (d > bestD || (d === bestD && id > bestId)) { bestD = d; bestId = id; best = href; }
+                // NAZWA PLIKU — tekst odnosnika. Wycinamy ja z ogona, a nie szerszym
+                // wzorcem na cale <a>…</a>: odnosnik bez domkniecia przepadlby wtedy
+                // razem z plikiem, a nazwa to tylko wygoda w komunikacie.
+                var gt = tail.indexOf('>'), kn = tail.indexOf('</a>'), nazwa = '';
+                if (gt >= 0 && kn > gt)
+                    nazwa = tail.slice(gt + 1, kn).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ')
+                                .replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim().slice(0, 90);
+                out.push({ href: href.replace(/&amp;/g, '&'), id: id, data: d, nazwa: nazwa });
             }
-            return best ? best.replace(/&amp;/g, '&') : null;
+            // Bez daty decyduje doc_id — rosnie z czasem, wiec najwiekszy = najnowszy.
+            out.sort(function (a, b){ return (a.data === b.data) ? (b.id - a.id) : (a.data < b.data ? 1 : -1); });
+            return out;
+        }
+        function extractLatestPI(html){ var l = extractPIlista(html); return l.length ? l[0].href : null; }
+
+        /* CO WLASCIWIE LEZY W SEKCJI „P/I". Nie zawsze proforma.
+           Order 21655 (Union Field, wrzesien 2026) ma tam jako NAJNOWSZY plik
+           „PO template [CSV]" — liste artykulow zamowienia: Order ID, Article ID,
+           ilosci, sprzedaz za 360 dni. Ani depozytu, ani procentu, ani jednego pola
+           bankowego. SheetJS otwiera go bez protestu (CSV to tez arkusz), parser
+           slusznie nic w nim nie znajduje — i modul meldowal trzy rozjazdy naraz:
+           „kwota P/I ?≠4671.00; % P/I ?≠15; konto ?≠788648152883".
+           To nieprawda. P/I niczemu nie zaprzeczylo; przeczytano nie ten plik.
+           Odtad: gdy z pliku nie da sie odczytac NICZEGO, bierzemy nastepny z sekcji,
+           od najnowszego. Pominiete pliki ida do wyniku i do protokolu — podmiana
+           nie moze byc cicha.
+           Pliku, z ktorego cokolwiek przeczytano, NIE zamieniamy, nawet gdy dane sa
+           niepelne: nowsza proforma ma pierwszenstwo przed starsza i to sie nie
+           zmienia. Chodzi wylacznie o pliki, ktore nie moga wniesc nic.           */
+        function piCosMa(pi){
+            if (!pi) return false;
+            if (pi.err || pi.manual) return true;      // to odpowiedz, nie cisza — nie ukrywamy jej
+            if (pi.pct != null || pi.amount != null || pi.acc) return true;
+            var b = pi.bank || {};
+            return !!(b.acc || b.swift || b.name);
+        }
+        // Ile plikow wolno otworzyc na jedno zamowienie. P/I potrafi wazyc kilka MB,
+        // wiec przegladanie calej sekcji byloby drogie — a trzy to i tak o dwa wiecej
+        // niz dotad.
+        var PI_ILE_PLIKOW = 3;
+        async function piZSekcji(h, order, tag){
+            var lista = extractPIlista(h), pominiete = [];
+            if (!lista.length) return { lista: lista, pominiete: pominiete };
+            for (var i = 0; i < lista.length && i < PI_ILE_PLIKOW; i++){
+                var k0 = lista[i], adr = k0.href.charAt(0) === '/' ? k0.href : ('/' + k0.href);
+                var buf = await fetchBin(adr);
+                if (!buf){
+                    dlog(tag + ' ' + order + ': nie pobrano P/I (' + adr + ')');
+                    pominiete.push((k0.nazwa || adr) + ' — nie pobrano');
+                    continue;
+                }
+                var pi0 = await parsePI(buf, order);
+                if (piCosMa(pi0)) return { pi: pi0, plik: k0, lista: lista, pominiete: pominiete };
+                pominiete.push((k0.nazwa || adr) + ' — nic do odczytania');
+                dlog(tag + ' ' + order + ': „' + (k0.nazwa || adr) + '" nie wygląda na P/I '
+                   + '(ani kwoty, ani %, ani konta, ani danych bankowych) — biorę starszy plik');
+            }
+            return { lista: lista, pominiete: pominiete };
+        }
+        // Komunikat o podmianie pliku. Jeden dla obu sciezek, zeby nie rozjechaly sie
+        // slowa przy tej samej sprawie.
+        function piSkadPlik(Z){
+            if (!Z || !Z.pominiete || !Z.pominiete.length) return '';
+            return ' [pominięte: ' + Z.pominiete.join('; ') + ']';
         }
         // Gdy P/I nie zostalo znalezione — zrzut sekcji do logu, zeby dalo sie ustalic
         // przyczyne bez wchodzenia na strone zamowienia.
@@ -19841,6 +20027,16 @@
             var cc = addrC || bicC || nmC;
             return { town: pbBankTown(addr, cc), ctry: cc, src: addrC ? 'addr' : (bicC ? 'bic' : (nmC ? 'name' : '')) };
         }
+        /* PODPIS WIERSZA DEPOZYTU. Procent bywa PRZED slowem i bez spacji — „15%Deposit".
+           Tak jest w P/I LOCTEK (order 21897) i wzorzec /^deposit\b/ takiego wiersza nie
+           widzial wcale. Skutek byl mylacy: procent modul wylawial osobno, z tekstu
+           „15%Deposit" w dowolnym miejscu arkusza, wiec protokol pokazywal
+           „kwota — | % 15" — co wyglada na nieodczytana liczbe, a bylo nieznalezieniem
+           CALEGO wiersza. Kwota stala w pliku obok procentu, w kolumnie O.
+           Wzorzec zostaje waski: podpis ma sie ZACZYNAC od (opcjonalnego) procentu
+           i slowa „deposit". „Deposit Value" z naglowka arkusza WSAD dalej sie tu lapie
+           tylko dlatego, ze ogranicza go dodatkowo dlugosc komorki.                    */
+        var PI_DEP_WIERSZ = /^(?:\d{1,3}(?:[.,]\d+)?\s*%\s*)?deposit\b/i;
         // aoaEt — ten sam arkusz BEZ wygaszonych kolumn. Etykiet szukamy w nim, a wartosci
         // dalej w „aoa", czyli z pominieciem kolumn ukrytych. Gdy nie podano, obie role
         // pelni „aoa" — tak jak dzialalo do 4.42.
@@ -19848,7 +20044,7 @@
             var pct = null, amount = null, acc = '', accZlepek = '';
             var depRow = -1, depLabel = '', totRowNum = -1;
             var et = aoaEt || aoa;
-            for (var i = 0; i < et.length && depRow < 0; i++){ var row = et[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (/^deposit\b/i.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
+            for (var i = 0; i < et.length && depRow < 0; i++){ var row = et[i] || []; for (var j = 0; j < row.length; j++){ var ct = String(row[j] == null ? '' : row[j]).trim(); if (PI_DEP_WIERSZ.test(ct) && ct.length < 20){ depRow = i; depLabel = ct; break; } } }
             if (depRow < 0){
                 var totRow = -1;
                 // „Total" musi byc etykieta WIERSZA SUM, a nie naglowkiem kolumny. W P/I PRIYA
@@ -19863,7 +20059,14 @@
                     for (var tj = 0; tj < rw.length; tj++){ if (/^total\b/i.test(String(rw[tj] == null ? '' : rw[tj]).trim())){ totRow = t; break; } }
                 }
                 totRowNum = totRow;
-                if (totRow >= 0){ for (var rr = totRow + 1; rr <= totRow + 2 && rr < aoa.length; rr++){ var r2 = aoa[rr] || []; var hasF = r2.some(function(v){ return typeof v === 'number' && v > 0 && v <= 1; }); var hasA = r2.some(function(v){ return typeof v === 'number' && v > 1; }); if (hasF && hasA){ depRow = rr; depLabel = ''; break; } } }
+                // OKNO PIECIU WIERSZY, NIE DWOCH. Miedzy „Total" a wierszem depozytu
+                // potrafia stac rabat i suma po rabacie: w P/I LOCTEK sa to „0.5% discount"
+                // i „Net Total", wiec depozyt siedzi dopiero TRZY wiersze nizej i przy
+                // oknie dwoch wierszy sciezka zapasowa nie miala szans go dosiegnac.
+                // Zgadywania pilnuje rachunek ponizej — podstawa razy procent musi dac
+                // kwote, inaczej odczyt jest odrzucany. Zrzut diagnostyczny pokazuje
+                // zreszta szesc wierszy za kazdym „Total" od dawna.
+                if (totRow >= 0){ for (var rr = totRow + 1; rr <= totRow + 5 && rr < aoa.length; rr++){ var r2 = aoa[rr] || []; var hasF = r2.some(function(v){ return typeof v === 'number' && v > 0 && v <= 1; }); var hasA = r2.some(function(v){ return typeof v === 'number' && v > 1; }); if (hasF && hasA){ depRow = rr; depLabel = ''; break; } } }
             }
             if (depRow >= 0){
                 var drow = aoa[depRow] || [], pctCol = -1;
@@ -19883,7 +20086,13 @@
             // odrzucac. Gdy zgadywalismy, a rachunek sie nie zgadza — wolimy powiedziec
             // „nie umiem odczytac" niz podac liczbe, ktora wyglada na odczytana.
             if (depRow >= 0 && !depLabel && pct != null && amount != null && totRowNum >= 0){
-                var sumy = (et[totRowNum] || []).filter(function (v){ return typeof v === 'number' && isFinite(v) && v > 1; });
+                // PODSTAWA nie musi stac w samym wierszu „Total". Gdy nizej jest rabat
+                // i „Net Total", to wlasnie od tej drugiej liczby dostawca liczy depozyt.
+                // Bierzemy wiec liczby ze wszystkich wierszy od „Total" do wiersza
+                // depozytu — rachunek i tak musi sie zgodzic co do grosza.
+                var sumy = [];
+                for (var sr = totRowNum; sr < depRow; sr++)
+                    (et[sr] || []).forEach(function (v){ if (typeof v === 'number' && isFinite(v) && v > 1) sumy.push(v); });
                 var zgadza = sumy.some(function (t0){ return Math.abs(t0 * (pct / 100) - amount) <= Math.max(0.02, Math.abs(amount) * 0.005); });
                 if (!zgadza){ pct = null; amount = null; }
             }
@@ -20462,7 +20671,11 @@
         var PI_WALUTY = /\b(USD|EUR|CNY|RMB|INR|GBP|PLN|CHF|HKD)\b/;
         // Podpis WIERSZA depozytu: „Deposit", „Deposit 15%", „Deposit:". Celowo WASKI —
         // „Deposit Value" z naglowka arkusza WSAD ma sie tu NIE lapac.
-        var PI_DEP_ETY = /^deposit\s*(?:\d+(?:[.,]\d+)?\s*%)?\s*[:：]?$/i;
+        // Procent z przodu („15%Deposit") liczy sie tak samo jak z tylu — patrz
+        // PI_DEP_WIERSZ. Ten wzorzec wybiera ARKUSZ, wiec musi widziec te same wiersze,
+        // co parser; inaczej plik z depozytem w takim zapisie wygladalby na arkusz
+        // bez depozytu i mogl przegrac z innym arkuszem tego samego pliku.
+        var PI_DEP_ETY = /^(?:\d+(?:[.,]\d+)?\s*%\s*)?deposit\s*(?:\d+(?:[.,]\d+)?\s*%)?\s*[:：]?$/i;
         // Zaliczka bywa nazwana inaczej niz „Deposit" — ale nadal musi byc podpisem WIERSZA.
         var PI_ADV_ETY = /^(?:advance\s*payment|down\s*payment|pre-?payment|prepayment)\s*(?:\d+(?:[.,]\d+)?\s*%)?\s*[:：]?$/i;
         // Czy w wierszu stoi jakakolwiek liczba. Uzywane do odroznienia wiersza depozytu
@@ -21133,10 +21346,17 @@
             // Potwierdzenie / zmiana danych bankowych z komentarzy tego zamowienia — czytamy
             // z juz pobranego HTML-a, wiec nie kosztuje to ani jednego zapytania wiecej.
             _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
-            var com = extractDepoComment(h, cs), banks = extractBankAccts(h), piUrl = extractLatestPI(h);
-            dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
-            if (!piUrl){ dg.piRaw = pcPiSecDump(h); base.piRaw = dg.piRaw; }
+            var com = extractDepoComment(h, cs), banks = extractBankAccts(h);
+            // „var base" MUSI stac przed pierwszym uzyciem. Stalo za nim, a ponizsza
+            // linia pisze do base — czyli zamowienie z pusta sekcja P/I konczylo sie
+            // TypeError-em na undefined. runPool nie ma try/catch, wiec wywracalo to
+            // caly przebieg „Przetwórz", nie jedno zamowienie.
             var base = { comAmount: com ? com.amount : null, comPct: com ? com.pct : null, piAmount: null, piAcc: null, piSheet: '', piBank: null, piRaw: '', depOk: extractDepoOk(cs, com ? com.idx : -1) };
+            var Z = await piZSekcji(h, order, 'DEPO');
+            var piUrl = Z.plik ? Z.plik.href : (Z.lista.length ? Z.lista[0].href : null);
+            dg.cs = pcDiagCs(cs); dg.com = com; dg.banks = banks; dg.piUrl = piUrl || '';
+            dg.piPominiete = Z.pominiete;
+            if (!piUrl){ dg.piRaw = pcPiSecDump(h); base.piRaw = dg.piRaw; }
             // piRaw — zrzut sekcji „P/I" ze strony zamowienia. Liczony byl od dawna do
             // diagnostyki; oddajemy go takze wolajacemu, bo bez niego „brak P/I" nie mowi,
             // czy sekcji nie ma, czy jest pusta, czy plik wisi pod inna etykieta.
@@ -21155,9 +21375,14 @@
             // rozstrzygac; zostaje w sygnaturze, bo wolaja go dwie sciezki.
             if (!com) dlog('DEPO ' + order + ': brak komentarza deposit (komentarzy: ' + cs.length + ') — czytam P/I dla danych bankowych');
             if (!piUrl) { dlog('DEPO ' + order + ': brak pliku P/I'); return ret({ ok: false, msg: 'brak P/I' }); }
-            var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
-            if (!buf) { dlog('DEPO ' + order + ': nie pobrano P/I (' + piUrl + ')'); return ret({ ok: false, msg: 'nie pobrano P/I' }); }
-            var pi = await parsePI(buf, order);
+            // Pliki byly, ale z zadnego nic sie nie da odczytac. To NIE jest rozjazd
+            // kwot — to zla zawartosc sekcji i tak trzeba to nazwac.
+            if (!Z.pi){
+                base.piUrl = piUrl;
+                return ret({ ok: false, msg: 'w sekcji P/I nie ma pliku, z którego da się cokolwiek odczytać'
+                                        + piSkadPlik(Z) });
+            }
+            var pi = Z.pi;
             dg.pi = pi || null;
             base.piAmount = (pi && pi.amount != null) ? pi.amount : null;
             base.piAcc = (pi && pi.acc) ? pi.acc : null;
@@ -21178,6 +21403,9 @@
             // Komentarz bez % — do tytulu przelewu bierzemy procent z P/I, a samego % nie porownujemy.
             if (com.pct == null && pi.pct != null) base.comPct = pi.pct;
             var bad = [], sfx = (pi && pi.hidden) ? ' [tylko ukryty arkusz: ' + pi.sheet + ']' : '';
+            // Podmiana pliku ma byc WIDOCZNA takze wtedy, gdy wszystko sie zgadza —
+            // inaczej nikt sie nie dowie, ze w sekcji P/I lezy cos, co P/I nie jest.
+            sfx += piSkadPlik(Z);
             if (pi.amount == null || Math.abs(pi.amount - com.amount) > 0.01) bad.push('kwota P/I ' + (pi.amount == null ? '?' : pi.amount.toFixed(2)) + '≠' + com.amount.toFixed(2));
             if (com.pct != null && (pi.pct == null || Math.round(pi.pct) !== Math.round(com.pct))) bad.push('% P/I ' + (pi.pct == null ? '?' : Math.round(pi.pct)) + '≠' + Math.round(com.pct));
             if (!pi.acc || banks.indexOf(pi.acc) === -1) bad.push('konto ' + (pi.acc || '?') + '≠' + (banks.join('/') || '?'));
@@ -21215,13 +21443,16 @@
             _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
             dg.cs = pcDiagCs(cs); dg.cands = cands; dg.pens = pens;
             if (!doPI) return { cands: cands, pens: pens, pi: null };
-            var banks = extractBankAccts(h), piUrl = extractLatestPI(h);
-            dg.banks = banks; dg.piUrl = piUrl || '';
+            var banks = extractBankAccts(h);
+            var Z = await piZSekcji(h, order, 'BALANCE');
+            var piUrl = Z.plik ? Z.plik.href : (Z.lista.length ? Z.lista[0].href : null);
+            dg.banks = banks; dg.piUrl = piUrl || ''; dg.piPominiete = Z.pominiete;
             if (!piUrl) dg.piRaw = pcPiSecDump(h);
             if (!piUrl) { dlog('BALANCE ' + order + ': brak pliku P/I'); return { cands: cands, pens: pens, pi: { ok: false, msg: 'brak P/I' } }; }
-            var buf = await fetchBin(piUrl.charAt(0) === '/' ? piUrl : '/' + piUrl);
-            if (!buf) { dlog('BALANCE ' + order + ': nie pobrano P/I (' + piUrl + ')'); return { cands: cands, pens: pens, pi: { ok: false, msg: 'nie pobrano P/I' } }; }
-            var pi = await parsePI(buf, order);
+            if (!Z.pi) return { cands: cands, pens: pens,
+                pi: { ok: false, msg: 'w sekcji P/I nie ma pliku, z którego da się cokolwiek odczytać'
+                                    + piSkadPlik(Z) } };
+            var pi = Z.pi;
             dg.pi = pi || null;
             var ttl = [];
             if (pi && pi.sheet) ttl.push('Arkusz P/I: ' + pi.sheet + (pi.hidden ? ' [ukryty]' : ''));
@@ -21245,7 +21476,10 @@
             var piNums = (pi.accAll && pi.accAll.length) ? pi.accAll : [pi.acc];
             var trafia = piNums.some(function (x){ return banks.indexOf(x) !== -1; });
             if (!trafia) return R({ ok: false, msg: 'konto ' + pi.acc + ' ≠ ' + banks.join('/'), title: title });
-            return R({ ok: true, warn: !!(pi && pi.hidden), msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : ''), title: title });
+            // Podmiana pliku widoczna tak samo jak po stronie depozytu.
+            var poz = piSkadPlik(Z);
+            return R({ ok: true, warn: !!(pi && pi.hidden) || !!poz,
+                       msg: 'konto ' + pi.acc + (pi.hidden ? ' [ukryty arkusz]' : '') + poz, title: title });
         }
         async function runBalCheck(status, doPI){
             var uniq = [], seen = {}, res = {}, byOrder = {};
