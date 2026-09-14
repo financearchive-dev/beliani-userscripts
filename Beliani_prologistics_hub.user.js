@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.45
+// @version      5.46
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -620,15 +620,15 @@
     ];
 
     // ---- Poziomy autoryzacji (progi w EUR) ----
-    // cash/voucher = górny limit, do którego dany poziom MOŻE zatwierdzić kwotę.
-    // Najwyższe poziomy (>1500 / >2000 w tabeli) traktujemy jako bez górnego limitu.
+    // Arkusz „2025" (CS Authorization Levels) — ta sama tabela co ZW_POZIOMY w module Zwroty; zmieniając progi, popraw obie.
+    // Progi są ostre: „< 150 €" znaczy, że 149,99 przechodzi, a 150,00 już nie. Najwyższe poziomy (>1500 / >2000) bez górnego limitu.
     const LEVELS = [
         { lvl: 'Level 0', roles: 'Assistant · Senior Assistant · Junior Specialist · CS Representative', cash: 50, voucher: 100, note: '< 5% Price Reduction' },
         { lvl: 'Level 1', roles: 'Specialist', cash: 150, voucher: 300 },
-        { lvl: 'Level 2', roles: 'Senior Specialist · Process Controller Specialist · Area Coordinator · Junior Team Leader', cash: 250, voucher: 500 },
-        { lvl: 'Level 3', roles: 'Team Leader', cash: 500, voucher: 1000 },
+        { lvl: 'Level 2', roles: 'Senior Specialist · Process Controller Specialist · Area Coordinator', cash: 250, voucher: 500 },
+        { lvl: 'Level 3', roles: 'Junior Team Leader · Team Leader', cash: 500, voucher: 1000 },
         { lvl: 'Level 4', roles: 'Senior Team Leader', cash: 1000, voucher: 2000 },
-        { lvl: 'Level 5', roles: 'Junior Manager · Manager · Senior Manager', cash: 1500, voucher: 3000 },
+        { lvl: 'Level 5', roles: 'Junior Manager · Manager · Senior Manager · Director', cash: 1500, voucher: 3000 },
         { lvl: 'Level 6', roles: 'Head of CS + Senior Manager', cash: Infinity, voucher: 4000 },
         { lvl: 'Level 7', roles: 'CEO', cash: Infinity, voucher: Infinity },
     ];
@@ -828,7 +828,7 @@
             const cap = L[type];
             let cls = 'neutral', mark = '';
             if (lastEur !== null) {
-                const ok = lastEur <= cap; // może zatwierdzić tę kwotę
+                const ok = lastEur < cap; // może zatwierdzić tę kwotę (próg ostry, jak w arkuszu)
                 cls = ok ? 'ok' : 'no';
                 mark = ok ? '✓' : '✕';
             }
@@ -7496,7 +7496,9 @@
         </div>
         <div style="font-size:11px; color:#666; margin-bottom:8px;">
             Wklej całą tabelę ze strony — skrypt sam wyciągnie numery z "Refund_ XXXXXXX". Sprawdza tylko refundy ze statusem "Refund approved".<br>
-            Przy wpłacie z Klarny zielone dostaje wyłącznie zwrot równy <b>całej</b> jej wpłacie.
+            Przy wpłacie z Klarny zielone dostaje wyłącznie zwrot równy <b>całej</b> jej wpłacie.<br>
+            Numer do 7 cyfr to <b>ticket</b> — tam kwoty z open amount nie porównuje; pilnuje, żeby zwroty z jednej wpłaty nie przekroczyły tego, co z niej zostało do zwrotu.<br>
+            Każdy zatwierdzony request przechodzi kontrolę autoryzacji: limit zatwierdzającego z arkusza 2025, kwota w EUR po kursie OANDA. Skasowany auftrag — bez autoryzacji.
         </div>
         <textarea id="tm-refund-input" placeholder="false&#9;1901240&#9;Refund_ 14548371&#9;Refund&#9;..." style="
             width: 100%; height: 120px; padding: 8px;
@@ -7544,7 +7546,7 @@
                 <button id="tm-exec-change" style="padding:6px 10px;border:none;border-radius:6px;background:#a15c00;color:#fff;cursor:pointer;font-size:12px;font-weight:bold;">Zmień zaznaczone → Refund Done</button>
                 <span id="tm-exec-status" style="font-size:11px;color:#666;margin-left:8px;"></span>
             </div>
-            <div style="font-weight:bold; color:#dc2626; margin-bottom:4px;">❌ Kwota nie odpowiada:</div>
+            <div style="font-weight:bold; color:#dc2626; margin-bottom:4px;">❌ Problemy:</div>
             <div id="tm-refund-fail" style="
                 font-size:11px; background:#fef2f2; border:1px solid #fecaca;
                 border-radius:6px; padding:8px; max-height:170px; overflow-y:auto;
@@ -7564,7 +7566,28 @@
         const unique = [...new Set(all)];
         const duplicates = unique.filter(n => counts[n] > 1);
 
-        return { unique, duplicates, counts };
+        // Numer importu stoi kolumne przed „Refund_ …" i jest tym samym numerem, co
+        // data-log-id wiersza w „Refund request". Przy tickecie tylko po nim wiadomo,
+        // ktory wiersz narzedzia dotyczy tej pozycji wklejki.
+        const importy = {};
+        for (const m of raw.matchAll(/(\d{5,})[ \t]+Refund_\s*(\d+)/g)) {
+            (importy[m[2]] = importy[m[2]] || []).push(m[1]);
+        }
+
+        // Waluta z kolumny „Requested Amount" — ostatniej komorki z cyfra w wierszu wklejki.
+        // Kwoty w narzedziu refundow waluty nie niosa, a limit autoryzacji jest w EUR.
+        const waluty = {};
+        raw.split('\n').forEach(linia => {
+            const mm = /Refund_\s*(\d+)/.exec(linia);
+            if (!mm || waluty[mm[1]]) return;
+            const zCyfra = linia.split('\t').map(c => c.trim()).filter(c => /\d/.test(c));
+            // Liczbe zdejmujemy tylko od CYFRY: sama klasa [\d\s.,'] zjadala tez kropke z „kr.",
+            // przez co DKK stawalo sie nieznanym „kr" (zlapal to test 14.09.2026).
+            const tok = (zCyfra[zCyfra.length - 1] || '').replace(/^[-+]?\d[\d\s.,']*/, '').replace(/[-+]?\d[\d\s.,']*$/, '').trim();
+            if (tok) waluty[mm[1]] = tok;
+        });
+
+        return { unique, duplicates, counts, importy, waluty };
     }
 
     function parseMoney(value) {
@@ -7602,12 +7625,15 @@
         return Number(amount).toFixed(2);
     }
 
-    // Numer auftraga jako klikalny link. W tym module numer z wklejki jest wprost numerem
-    // dla auction.php (checkRefund pobiera `/auction.php?number=${auftragNumber}&txnid=3`),
-    // wiec nie trzeba go nigdzie szukac. Nowa karta — zeby lista wynikow nie znikala.
+    // Numer z wklejki jako klikalny link: auftrag na auction.php, ticket na rma.php
+    // (patrz czyTicket). Nowa karta — zeby lista wynikow nie znikala.
     function auLink(n) {
         const s = String(n == null ? '' : n).trim();
         if (!/^\d+$/.test(s)) return `<strong>${s}</strong>`;
+        if (czyTicket(s))
+            return `<a href="/rma.php?rma_id=${s}" target="_blank" rel="noopener"`
+                + ` style="font-weight:bold;color:inherit;text-decoration:underline"`
+                + ` title="Otwórz ticket ${s} w nowej karcie">🎫 ${s}</a>`;
         return `<a href="/auction.php?number=${s}&txnid=3" target="_blank" rel="noopener"`
             + ` style="font-weight:bold;color:inherit;text-decoration:underline"`
             + ` title="Otwórz auftrag ${s} w nowej karcie">${s}</a>`;
@@ -7787,7 +7813,9 @@
             return;
         }
 
-        let html = `<span style="color:#FF2F00">✓ Znaleziono ${unique.length} unikalnych auftragów</span>`;
+        const ileTicketow = unique.filter(czyTicket).length;
+        let html = `<span style="color:#FF2F00">✓ Znaleziono ${unique.length} unikalnych numerów`
+            + ` (auftragi: ${unique.length - ileTicketow}, tickety: ${ileTicketow})</span>`;
 
         if (duplicates.length > 0) {
             html += `<br><span style="color:#f59e0b">⚠️ Duplikaty w liście (${duplicates.length}x): <strong>${duplicates.join(', ')}</strong></span>`;
@@ -7967,6 +7995,416 @@
         return { dotyczy: true, ok: true };
     }
 
+    // ---------- Tickety ----------
+    // Narzedzie „Refund request" stoi teraz takze na TICKECIE — i wtedy w kolumnie Source
+    // jest „Refund_ <numer ticketu>". checkRefund otwieral taki numer jako auction.php
+    // i konczyl na „Brak tabeli refund". Ticket poznajemy po dlugosci numeru: auftragi
+    // maja 8 cyfr (15,7 mln we wrzesniu 2026), tickety 6 (ok. 679 tys.). Siedem cyfr tez
+    // bierzemy za ticket — tickety dojda do miliona, a zwrotu na auftragu sprzed dziesieciu
+    // milionow nikt juz nie zglasza. Gdyby sie jednak trafil, zatrzyma go kontrola nizej:
+    // na tickecie musi stac wiersz z TYM numerem importu.
+    function czyTicket(n) {
+        return /^\d{1,7}$/.test(String(n == null ? '' : n).trim());
+    }
+
+    function escHtml(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // Request, ktory juz nic nie zrobi, nie jest „kolejnym requestem". „Refund Done" tu nie
+    // stoi: wykonany zwrot liczy sie do tego, ile z wplaty juz poszlo (sprawdzTransakcje).
+    const REFUND_NIEAKTYWNE = /^refund (?:deactivated|not approved)$/i;
+
+    // Wiersze „Refund request" — ten sam uklad na tickecie i na auftragu (sprawdzone
+    // 14.09.2026 na ticketach 678881 i 678912): Import ID, Payment method, Bank name, Date,
+    // Username, State, Refund amount, Paid amount, Transaction ID, Message for Beneficiary.
+    // Stan TYLKO z option[selected]: komorka State niesie tekst wszystkich opcji, a select
+    // w dokumencie z DOMParsera bez zaznaczenia oddaje pierwsza opcje, czyli „OK".
+    // Kto zatwierdzil — z a.log-info („changed by X on 2026-09-14 09:58:40"); pierwsza
+    // litera „changed" bywa cyrylicka, wiec celujemy w „by … on", jak modul Zwroty.
+    function refundRequestWiersze(doc) {
+        let t = doc.querySelector('table[data-simple-nav="Refund request"]') || doc.getElementById('refundTable');
+        if (!t) {
+            const hdr = Array.from(doc.querySelectorAll('td[data-field-name]'))
+                .find(td => (td.getAttribute('data-field-name') || '').trim() === 'Refund amount');
+            if (hdr) t = hdr.closest('table');
+        }
+        if (!t) return null;
+        const hr = t.querySelector('tr.table-heading-row');
+        const glowy = hr ? Array.from(hr.querySelectorAll('td')).map(td => normalizeText(td.textContent).toLowerCase()) : [];
+        const out = [];
+        t.querySelectorAll('tr.table-row').forEach(tr => {
+            const td = tr.querySelectorAll('td');
+            const kol = nazwa => {
+                const i = glowy.indexOf(nazwa);
+                return (i >= 0 && td[i]) ? normalizeText(td[i].textContent) : '';
+            };
+            const sel = tr.querySelector('select.state-select');
+            const opt = sel ? sel.querySelector('option[selected]') : null;
+            const log = tr.querySelector('a.log-info');
+            const m = log ? /\bby\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)/i.exec(normalizeText(log.textContent)) : null;
+            out.push({
+                importId: String((sel && sel.getAttribute('data-log-id')) || kol('import id')),
+                stan: opt ? normalizeText(opt.textContent) : '',
+                kwota: parseMoney(kol('refund amount')),
+                // Paid amount to NIE cala wplata, tylko to, co z niej zostalo do zwrotu
+                // w chwili zakladania requestu — patrz sprawdzTransakcje.
+                paid: parseMoney(kol('paid amount')),
+                tx: kol('transaction id'),
+                data: kol('date'),
+                kto: kol('username'),
+                zatwierdzil: m ? m[1] : '',
+                zatwierdzono: m ? m[2] : ''
+            });
+        });
+        return out;
+    }
+
+    // Numer auftragu ze strony ticketu — prowadzi tam jeden odnosnik auction.php.
+    function auftragZTicketu(doc) {
+        const ile = {};
+        doc.querySelectorAll('a[href*="auction.php"]').forEach(a => {
+            const m = /[?&]number=(\d+)/.exec(a.getAttribute('href') || '');
+            if (m) ile[m[1]] = (ile[m[1]] || 0) + 1;
+        });
+        const top = Object.entries(ile).sort((a, b) => b[1] - a[1])[0];
+        return top ? top[0] : '';
+    }
+
+    function opisRequestow(lista) {
+        return lista.map(w => `#${w.importId} ${formatAmount(w.kwota)} ${w.stan || 'stan nieustalony'}`).join('; ');
+    }
+
+    // Czy zwroty z JEDNEJ wplaty mieszcza sie w tym, co z niej zostalo. Inne requesty nie sa
+    // bledem same w sobie: wplata bywa zwracana w czesciach — przy tickecie 678488 najpierw
+    // 1089 z auftragu, potem 1078 z ticketu, razem cala wplata 2167 (decyzja z 14.09.2026).
+    // „Paid amount" w wierszu to NIE cala wplata, tylko to, co z niej zostalo do zwrotu
+    // w chwili zakladania requestu: request z 24.08 ma Paid 2167.00, request z 12.09 — 1078.00.
+    // Do requestu doliczamy wiec z tej samej transakcji tylko to, czego jego Paid jeszcze nie
+    // odlicza: requesty niezrealizowane i te „Refund Done", ktore zrealizowano PO jego
+    // zalozeniu. Inna transakcja to inna wplata. Request bez numeru transakcji — nie wiadomo,
+    // z ktorej wplaty jest, wiec to problem.
+    function sprawdzTransakcje(m, inne, problemy, uwagi) {
+        if (!m.tx) {
+            if (inne.length) problemy.push(`import ${m.importId} nie ma numeru transakcji — nie wiem, czy to ta sama wpłata co: ${opisRequestow(inne)}`);
+            return;
+        }
+        const bezTx = inne.filter(w => !w.tx);
+        if (bezTx.length) problemy.push(`obok jest request bez numeru transakcji — nie wiem, z której wpłaty: ${opisRequestow(bezTx)}`);
+        const tenSam = inne.filter(w => w.tx && w.tx === m.tx);
+        if (!tenSam.length) return;
+        if (m.paid == null) {
+            problemy.push(`import ${m.importId} nie ma Paid amount — nie policzę, ile z wpłaty zostało (${opisRequestow(tenSam)})`);
+            return;
+        }
+        const zrobionyPrzed = w => /^refund done$/i.test(w.stan) && !!w.zatwierdzono && !!m.data && w.zatwierdzono < m.data;
+        const przed = tenSam.filter(zrobionyPrzed);
+        const doliczone = tenSam.filter(w => !zrobionyPrzed(w));
+        const suma = (m.kwota || 0) + doliczone.reduce((s, w) => s + (w.kwota || 0), 0);
+        const czesci = [];
+        if (przed.length) czesci.push(`wcześniej z tej wpłaty zwrócono ${opisRequestow(przed)}`);
+        if (suma > m.paid + 0.02) {
+            czesci.push(`z wpłaty do zwrotu zostało ${formatAmount(m.paid)}, a requesty razem to ${formatAmount(suma)}: ${opisRequestow([m].concat(doliczone))}`);
+            problemy.push(czesci.join(' — '));
+            return;
+        }
+        czesci.push(doliczone.length
+            ? `razem z ${opisRequestow(doliczone)}: ${formatAmount(suma)} z ${formatAmount(m.paid)} do zwrotu`
+            : `mieści się w pozostałych ${formatAmount(m.paid)}`);
+        uwagi.push(czesci.join(' — '));
+    }
+
+    // ---------- Autoryzacja ----------
+    // Waluta z wklejki -> kod dla OANDA. „kr." to DKK: sprawdzone 14.09.2026 na auftragu
+    // 15519342 (wplata na koncie 1040 „Saferpay Beliani DE DKK"). Nieznany zapis waluty
+    // to problem, a nie cicha zgoda.
+    const REFUND_WALUTY = {
+        '€': 'EUR', 'eur': 'EUR', 'chf': 'CHF', 'nok': 'NOK', 'sek': 'SEK', 'dkk': 'DKK', 'kr.': 'DKK',
+        'ft': 'HUF', 'huf': 'HUF', 'kč': 'CZK', 'czk': 'CZK', 'zł': 'PLN', 'pln': 'PLN',
+        '£': 'GBP', 'gbp': 'GBP', 'ron': 'RON', 'lei': 'RON'
+    };
+    function kodWaluty(tok) {
+        return REFUND_WALUTY[String(tok == null ? '' : tok).trim().toLowerCase()] || '';
+    }
+
+    // Kurs OANDA — ta sama droga co panel kursow (fetchRate w init_vies): BID z okresu
+    // konczacego sie dzien przed wskazana data. Kopia, bo panel siedzi w innym domknieciu.
+    // Nieudane pobranie nie zostaje w pamieci — nastepny przebieg sprobuje jeszcze raz.
+    const REFUND_KURSY = {};
+    function kursDoEur(kod, dzien) {
+        if (kod === 'EUR') return Promise.resolve(1);
+        const klucz = kod + '|' + dzien;
+        if (!REFUND_KURSY[klucz]) {
+            REFUND_KURSY[klucz] = new Promise(resolve => {
+                try {
+                    const end = new Date(dzien + 'T12:00:00');
+                    const start = new Date(end.getTime() - 24 * 3600 * 1000);
+                    const fmt = d => d.toISOString().slice(0, 10);
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: 'https://fxds-public-exchange-rates-api.oanda.com/cc-api/currencies?base=' + encodeURIComponent(kod)
+                            + '&quote=EUR&data_type=general_currency_pair&start_date=' + fmt(start) + '&end_date=' + fmt(end),
+                        headers: { 'Accept': 'application/json' },
+                        timeout: 15000,
+                        onload: res => {
+                            try {
+                                const rows = (JSON.parse(res.responseText) || {}).response || [];
+                                const row = rows[rows.length - 1];
+                                const bid = row ? parseFloat(row.average_bid) : NaN;
+                                const ask = row ? parseFloat(row.average_ask) : NaN;
+                                resolve(!isNaN(bid) ? bid : (!isNaN(ask) ? ask : null));
+                            } catch (e) { resolve(null); }
+                        },
+                        onerror: () => resolve(null),
+                        ontimeout: () => resolve(null)
+                    });
+                } catch (e) { resolve(null); }
+            });
+            REFUND_KURSY[klucz].then(v => { if (v == null) delete REFUND_KURSY[klucz]; });
+        }
+        return REFUND_KURSY[klucz];
+    }
+
+    // Poziomy autoryzacji — KOPIA ZW_POZIOMY z modulu Zwroty (arkusz „2025", kolumna Cash,
+    // progi ostre, w EUR). Ta sama tabela stoi tez w panelu kursow OANDA (LEVELS w init_vies).
+    // Zmieniajac progi, popraw wszystkie trzy miejsca. Dopasowanie od najdluzszej nazwy,
+    // zeby „Senior Specialist" nie wpadl do „Specialist".
+    const REFUND_POZIOMY = [
+        { st: 'process controller specialist', lvl: 2, cash: 250 },
+        { st: 'senior team leader',            lvl: 4, cash: 1000 },
+        { st: 'junior team leader',            lvl: 3, cash: 500 },
+        { st: 'cs representative',             lvl: 0, cash: 50 },
+        { st: 'junior specialist',             lvl: 0, cash: 50 },
+        { st: 'senior specialist',             lvl: 2, cash: 250 },
+        { st: 'senior assistant',              lvl: 0, cash: 50 },
+        { st: 'area coordinator',              lvl: 2, cash: 250 },
+        { st: 'junior manager',                lvl: 5, cash: 1500 },
+        { st: 'senior manager',                lvl: 5, cash: 1500 },
+        { st: 'team leader',                   lvl: 3, cash: 500 },
+        { st: 'head of cs',                    lvl: 6, cash: Infinity },
+        { st: 'specialist',                    lvl: 1, cash: 150 },
+        { st: 'assistant',                     lvl: 0, cash: 50 },
+        { st: 'manager',                       lvl: 5, cash: 1500 },
+        { st: 'director',                      lvl: 5, cash: 1500 },
+        { st: 'ceo',                           lvl: 7, cash: Infinity }
+    ].sort((a, b) => b.st.length - a.st.length);
+    // Tabela dotyczy Customer Service; licza sie tez Data Processing oraz imiennie Hanna Kot
+    // i wlasciciel Stephan Widmer — jedyny bez limitu (ustalenia z 07.09.2026, jak w Zwrotach).
+    const REFUND_DZIALY_OK = [/customer\s*service/, /(^|[^a-z])cs([^a-z]|$)/, /data\s*processing/];
+    const REFUND_OSOBY_OK = ['stephan widmer', 'hanna kot'];
+    const REFUND_BEZ_LIMITU = 'stephan widmer';
+
+    function zlozNazwe(s) {
+        return normalizeText(s).normalize('NFD').replace(/[̀-ͯ]/g, '')
+            .replace(/[Łł]/g, 'l').replace(/[Øø]/g, 'o').replace(/ß/g, 'ss').toLowerCase();
+    }
+    function refundCzyCS(os) {
+        const d = String(os.department || '').toLowerCase();
+        return REFUND_DZIALY_OK.some(re => re.test(d)) || REFUND_OSOBY_OK.indexOf(zlozNazwe(os.name)) >= 0;
+    }
+    function refundPoziom(stanowisko) {
+        const s = String(stanowisko == null ? '' : stanowisko).toLowerCase();
+        return s ? (REFUND_POZIOMY.find(p => s.indexOf(p.st) >= 0) || null) : null;
+    }
+
+    // Lista pracownikow — ten sam adres co modul Zwroty (POST /api/filtersOptions/). Obiekt
+    // kluczowany loginem; pola value (imie i nazwisko), position, supervisor, inactive,
+    // department_name. Narzedzie refundow podaje imie i nazwisko, wiec szukamy po nim — po
+    // zlozeniu znakow diakrytycznych, gdyby log i lista zapisaly je inaczej. Jedna lista na
+    // przebieg: guzik „Sprawdz" zeruje REFUND_LISTA.
+    let REFUND_LISTA = null;
+    function listaPracownikow() {
+        if (REFUND_LISTA) return REFUND_LISTA;
+        const p = (async () => {
+            try {
+                const res = await fetch('/api/filtersOptions/', {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+                    body: 'type[]=employees&type[]=users_ext&shop_id=&siteid=&id='
+                });
+                if (!res.ok) return null;
+                const j = await res.json();
+                const o = (j && (j.options || j)) || {};
+                const mapa = {};
+                ['employees', 'users_ext'].forEach(t => {
+                    const g = o[t];
+                    if (g) Object.keys(g).forEach(k => { if (!mapa[k]) mapa[k] = g[k]; });
+                });
+                const indeks = {};
+                Object.keys(mapa).forEach(k => {
+                    const n = zlozNazwe(mapa[k] && mapa[k].value);
+                    if (n && !indeks[n]) indeks[n] = k;
+                });
+                return Object.keys(mapa).length ? { mapa, indeks } : null;
+            } catch (e) { return null; }
+        })();
+        REFUND_LISTA = p;
+        p.then(v => { if (!v && REFUND_LISTA === p) REFUND_LISTA = null; });
+        return p;
+    }
+    function refundPracownik(lista, nazwa) {
+        const k = lista.indeks[zlozNazwe(nazwa)];
+        if (!k) return null;
+        const e = lista.mapa[k] || {};
+        return {
+            name: normalizeText(e.value || k),
+            position: normalizeText(e.position),
+            supervisor: normalizeText(e.supervisor),
+            inactive: String(e.inactive) === '1',
+            department: e.department_name === 'NULL' ? '' : normalizeText(e.department_name)
+        };
+    }
+
+    // Skasowany auftrag nie wymaga autoryzacji (regula z arkusza; potwierdzone 14.09.2026).
+    // Status stoi w zrodle strony jako `const isDeleted = +"1";` — plakietke w naglowku sklada
+    // dopiero skrypt strony, wiec w HTML-u z fetch-a jej nie ma. Tak samo czytaja to Zwroty.
+    function auftragSkasowany(html) {
+        const m = String(html || '').match(/\bconst\s+isDeleted\s*=\s*([^;\n]{0,40});/);
+        if (!m) return null;
+        const v = m[1].replace(/[\s+"']/g, '').toLowerCase();
+        if (v === '1' || v === 'true') return true;
+        if (v === '0' || v === '' || v === 'false' || v === 'null') return false;
+        return null;
+    }
+
+    // Autoryzacja jednego zatwierdzonego requestu: zatwierdzajacy z logu -> lista pracownikow
+    // -> stanowisko -> limit w EUR. Zwraca { ok, opis }. Czego nie da sie sprawdzic, to problem.
+    async function autoryzacjaRequestu(w, walutaTok) {
+        const kto = w.zatwierdzil;
+        const kiedy = String(w.zatwierdzono || '').slice(0, 16);
+        if (!kto) return { ok: false, opis: `nie wiem, kto zatwierdził import ${w.importId} — autoryzacji nie sprawdziłem` };
+        const lista = await listaPracownikow();
+        if (!lista) return { ok: false, opis: 'nie pobrałem listy pracowników — autoryzacji nie sprawdziłem' };
+        const os = refundPracownik(lista, kto);
+        if (!os) return { ok: false, opis: `nie znalazłem „${kto}" na liście pracowników — autoryzacji nie sprawdziłem` };
+        if (os.inactive) return { ok: false, opis: `zatwierdził ${os.name}, a jego konto jest nieaktywne` };
+        if (!refundCzyCS(os)) return { ok: false, opis: `zatwierdził ${os.name} spoza Customer Service (${os.department || 'dział nieznany'})` };
+        if (zlozNazwe(os.name) === REFUND_BEZ_LIMITU) return { ok: true, opis: `zatwierdził ${os.name} (bez limitu) ${kiedy}`.trim() };
+        const p = refundPoziom(os.position);
+        if (!p) return { ok: false, opis: `stanowiska „${os.position || '—'}" (${os.name}) nie ma w tabeli autoryzacji` };
+        if (p.cash === Infinity) return { ok: true, opis: `zatwierdził ${os.name} (${os.position}, bez limitu) ${kiedy}`.trim() };
+        const kod = kodWaluty(walutaTok);
+        if (!kod) return { ok: false, opis: `nie znam waluty „${walutaTok || '?'}" — autoryzacji nie sprawdziłem` };
+        if (w.kwota == null) return { ok: false, opis: `import ${w.importId} bez kwoty — autoryzacji nie sprawdziłem` };
+        let dzien = String(w.zatwierdzono || w.data || '').slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dzien)) dzien = new Date().toISOString().slice(0, 10);
+        const kurs = await kursDoEur(kod, dzien);
+        if (kurs == null) return { ok: false, opis: `nie pobrałem kursu ${kod} z ${dzien} — autoryzacji nie sprawdziłem` };
+        const eur = w.kwota * kurs;
+        const wEur = kod === 'EUR' ? '' : ` ≈ ${eur.toFixed(2)} €`;
+        if (!(eur < p.cash))
+            return { ok: false, opis: `zatwierdził ${os.name} (${os.position}, limit < ${p.cash} €), a kwota ${formatAmount(w.kwota)} ${kod}${wEur} jest ponad limit — przełożony: ${os.supervisor || 'nieznany'}` };
+        return { ok: true, opis: `zatwierdził ${os.name} (${os.position}, < ${p.cash} €) ${kiedy}`.trim() };
+    }
+
+    // Przy tickecie kwoty z open amount nie potwierdzamy (decyzja z 14.09.2026). Sprawdzamy:
+    // czy request z tej wklejki ma „Refund approved", autoryzacje zatwierdzajacego oraz czy
+    // zwroty z tej samej wplaty — na tym tickecie i na jego auftragu — nie przekraczaja tego,
+    // co z niej zostalo. Requestow z ticketow auftrag NIE pokazuje (sprawdzone na 15272213),
+    // wiec o auftrag pytamy osobno.
+    async function checkTicketRefund(rmaId, importIds, walutaTok) {
+        const wynik = { ticket: true, auftragNumber: rmaId, ok: false, refundAmount: 0, transakcje: [], uwagi: [] };
+        try {
+            const resp = await fetch(`/rma.php?rma_id=${encodeURIComponent(rmaId)}`, { credentials: 'same-origin' });
+            if (!resp.ok) { wynik.error = `ticket: HTTP ${resp.status}`; return wynik; }
+            const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+            wynik.auftrag = auftragZTicketu(doc);
+            const wiersze = refundRequestWiersze(doc);
+            if (!wiersze || !wiersze.length) {
+                wynik.error = 'Brak tabeli Refund request na tickecie';
+                return wynik;
+            }
+
+            const ids = (importIds || []).map(String);
+            // Bez numeru importu (inny uklad wklejki) wiersz da sie wskazac tylko wtedy,
+            // gdy na tickecie jest jeden request.
+            const moje = ids.length
+                ? wiersze.filter(w => ids.indexOf(w.importId) >= 0)
+                : (wiersze.length === 1 ? wiersze : []);
+            if (!moje.length) {
+                wynik.error = ids.length
+                    ? `Na tickecie nie ma requestu z importu ${ids.join(', ')} (requestów w tabeli: ${wiersze.length})`
+                    : `Na tickecie jest ${wiersze.length} requestów, a wklejka nie podaje numeru importu — nie wiem, który sprawdzić`;
+                return wynik;
+            }
+
+            const problemy = [];
+            moje.forEach(w => {
+                if (!/^refund approved$/i.test(w.stan))
+                    problemy.push(`import ${w.importId} ma stan „${w.stan || 'nieustalony'}", nie „Refund approved"`);
+            });
+
+            // Status i requesty auftragu tego ticketu — jedno wejscie na auction.php.
+            let naAuftragu = [];
+            let skasowany = null;
+            if (wynik.auftrag) {
+                try {
+                    const ra = await fetch(`/auction.php?number=${encodeURIComponent(wynik.auftrag)}&txnid=3`, { credentials: 'same-origin' });
+                    if (!ra.ok) throw new Error('HTTP ' + ra.status);
+                    const htmlAuf = await ra.text();
+                    skasowany = auftragSkasowany(htmlAuf);
+                    naAuftragu = refundRequestWiersze(new DOMParser().parseFromString(htmlAuf, 'text/html')) || [];
+                } catch (e) {
+                    problemy.push(`nie odczytałem auftragu ${wynik.auftrag} (${e.message}) — requestów na nim nie sprawdziłem`);
+                }
+            } else {
+                problemy.push('nie znalazłem na tickecie numeru auftragu — requestów na auftragu nie sprawdziłem');
+            }
+
+            const uwagi = [];
+            for (const m of moje) {
+                if (!/^refund approved$/i.test(m.stan)) continue;
+                if (skasowany === true) {
+                    uwagi.push(`zatwierdził ${m.zatwierdzil || '?'} — auftrag skasowany, autoryzacja niewymagana`);
+                    continue;
+                }
+                const a = await autoryzacjaRequestu(m, walutaTok);
+                (a.ok ? uwagi : problemy).push(a.opis);
+            }
+
+            const czynne = wiersze.concat(naAuftragu).filter(w => !REFUND_NIEAKTYWNE.test(w.stan));
+            moje.forEach(m => sprawdzTransakcje(m, czynne.filter(w => w !== m), problemy, uwagi));
+
+            wynik.refundAmount = moje.reduce((s, w) => s + (w.kwota || 0), 0);
+            wynik.transakcje = moje.map(w => ({ importId: w.importId, tx: w.tx, kwota: w.kwota, paid: w.paid }));
+            wynik.uwagi = uwagi;
+            wynik.ok = problemy.length === 0;
+            wynik.error = problemy.length ? problemy.join(' · ') : null;
+            return wynik;
+        } catch (e) {
+            wynik.error = e.message;
+            return wynik;
+        }
+    }
+
+    // Requesty z narzedzia i status auftragu, zostawione przez checkRefund dla kontroli
+    // autoryzacji. Klucz to numer auftragu — w jednym przebiegu kazdy numer jest raz.
+    const AUFTRAG_NARZEDZIE = {};
+
+    // Autoryzacja na auftragu: kazdy request „Refund approved". Zwrot juz wykonany (executed)
+    // pomijamy — pieniadze poszly, zostal tylko status do zmiany.
+    async function autoryzacjaAuftragu(r, nr, walutaTok) {
+        const dane = AUFTRAG_NARZEDZIE[nr];
+        if (!r || r.executed || !dane) return;
+        const zatw = dane.wiersze.filter(w => /^refund approved$/i.test(w.stan));
+        if (!zatw.length) return;
+        const uwagi = [];
+        const problemy = [];
+        for (const w of zatw) {
+            if (dane.skasowany === true) {
+                uwagi.push(`zatwierdził ${w.zatwierdzil || '?'} — auftrag skasowany, autoryzacja niewymagana`);
+                continue;
+            }
+            const a = await autoryzacjaRequestu(w, walutaTok);
+            (a.ok ? uwagi : problemy).push(a.opis);
+        }
+        r.uwagi = (r.uwagi || []).concat(uwagi);
+        if (problemy.length) {
+            r.ok = false;
+            r.error = r.error ? r.error + ' · ' + problemy.join(' · ') : problemy.join(' · ');
+        }
+    }
+
     async function checkRefund(auftragNumber) {
         try {
             const resp = await fetch(`/auction.php?number=${auftragNumber}&txnid=3`);
@@ -7977,6 +8415,9 @@
 
             const openData = getOpenAmountData(doc, html);
             const openAmount = openData.amount;
+
+            // Dla kontroli autoryzacji (autoryzacjaAuftragu): requesty z narzedzia i status auftragu.
+            AUFTRAG_NARZEDZIE[auftragNumber] = { wiersze: refundRequestWiersze(doc) || [], skasowany: auftragSkasowany(html) };
 
             const approvedAmounts = [];
             const approvedLogIds = [];
@@ -8157,7 +8598,7 @@
 
     refundPanel.querySelector('#tm-refund-btn').onclick = async () => {
         const raw = document.getElementById('tm-refund-input').value;
-        const { unique, duplicates: inputDuplicates, counts } = parseAuftragNumbers(raw);
+        const { unique, duplicates: inputDuplicates, counts, importy, waluty } = parseAuftragNumbers(raw);
 
         if (unique.length === 0) {
             document.getElementById('tm-refund-preview').innerHTML =
@@ -8196,6 +8637,9 @@
         // byla juz pusta — nastepny wynik wygladal jak caly zaznaczony
         const execAll = document.getElementById('tm-exec-all');
         if (execAll) execAll.checked = false;
+        // Lista pracownikow swieza przy kazdym „Sprawdz" — awans czy odejscie widac od razu.
+        REFUND_LISTA = null;
+        Object.keys(AUFTRAG_NARZEDZIE).forEach(k => { delete AUFTRAG_NARZEDZIE[k]; });
 
         const okList = [];
         const failList = [];
@@ -8213,7 +8657,12 @@
                 const i = nextIndex++;
                 if (i >= unique.length) return;
                 try {
-                    results[i] = await checkRefund(unique[i]);
+                    if (czyTicket(unique[i])) {
+                        results[i] = await checkTicketRefund(unique[i], importy[unique[i]], waluty[unique[i]]);
+                    } else {
+                        results[i] = await checkRefund(unique[i]);
+                        await autoryzacjaAuftragu(results[i], unique[i], waluty[unique[i]]);
+                    }
                 } catch (e) {
                     results[i] = { auftragNumber: unique[i], ok: false, error: 'Błąd: ' + (e && e.message ? e.message : e) };
                 }
@@ -8225,6 +8674,36 @@
         await Promise.all(
             Array.from({ length: Math.min(CONCURRENCY, unique.length) }, refundWorker)
         );
+
+        // Kilka ticketow z requestami z TEJ SAMEJ wplaty w jednej wklejce. Kazdy ticket widzi
+        // swoja tabele i auftrag, ale nie pozostale tickety — wiec sumujemy je tutaj, ta sama
+        // miara co sprawdzTransakcje: razem nie moga przekroczyc tego, co z wplaty zostalo
+        // (Paid amount; bierzemy najmniejszy). Refund na samym auftragu liczy juz ticket.
+        const poTransakcji = {};
+        results.forEach(r => {
+            if (!r || !r.ticket) return;
+            (r.transakcje || []).forEach(t => {
+                if (t.tx) (poTransakcji[t.tx] = poTransakcji[t.tx] || []).push({ r, t });
+            });
+        });
+        Object.values(poTransakcji).forEach(grupa => {
+            const tickety = [...new Set(grupa.map(g => g.r.auftragNumber))];
+            if (tickety.length < 2) return;
+            const suma = grupa.reduce((s, g) => s + (g.t.kwota || 0), 0);
+            const paid = Math.min(...grupa.map(g => g.t.paid == null ? Infinity : g.t.paid));
+            const opis = `tickety ${tickety.join(', ')} zwracają z tej samej wpłaty razem ${formatAmount(suma)}`;
+            const zle = paid === Infinity || suma > paid + 0.02;
+            const txt = paid === Infinity ? `${opis}, a Paid amount nieznany`
+                : (zle ? `${opis}, a do zwrotu zostało ${formatAmount(paid)}` : `${opis} z ${formatAmount(paid)} do zwrotu`);
+            [...new Set(grupa.map(g => g.r))].forEach(r => {
+                if (zle) {
+                    r.ok = false;
+                    r.error = r.error ? r.error + ' · ' + txt : txt;
+                } else {
+                    r.uwagi = (r.uwagi || []).concat(txt);
+                }
+            });
+        });
 
         // Przetwarzanie wyników w kolejności wejściowej (widok bez zmian)
         for (let i = 0; i < unique.length; i++) {
@@ -8239,9 +8718,10 @@
                 });
                 failList.push(`${auLink(result.auftragNumber)} — ${result.error}`);
             } else if (result.ok) {
-                okList.push(`${auLink(result.auftragNumber)} (${result.refundAmount.toFixed(2)})`);
+                okList.push(`${auLink(result.auftragNumber)} (${result.refundAmount.toFixed(2)})`
+                    + (result.uwagi && result.uwagi.length ? ` — ${escHtml(result.uwagi.join(' · '))}` : ''));
             } else {
-                failList.push(`${auLink(result.auftragNumber)} — ${result.error}`);
+                failList.push(`${auLink(result.auftragNumber)} — ${escHtml(result.error)}`);
             }
         }
 
@@ -41972,7 +42452,7 @@
     // pozycje ze statusem OK. Status nadaje system: OK gdy kwota wplaty rowna sie
     // open amount auftragu, CHECK gdy sie rozni, NOT FOUND gdy nie ma auftragu.
     const MK_BLOCK = 'booking_without_assign';     // = przycisk „Book on main account"
-    const MK_BLOCK_SUB = 'booking_sub';            // = przycisk „Book & Assign on sub-account"
+    const MK_BLOCK_SUB = 'booking_sub_without_assign'; // = przycisk „Book on sub-account" — resztki ZAWSZE bez przypisania (decyzja 14.09.2026)
     // Ile groszy roznicy w „open amount" wolno wyrownac. Zaokraglenia rzedu 0.01–0.04
     // to normalny szum kursowy; wieksza roznica to juz realny problem i zostaje CHECK.
     const MK_TOL_KEY = 'mkt_open_tol';
@@ -42121,7 +42601,7 @@
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy ustawianiu statusu wiersza ' + rowId);
         return r.text();
     }
-    // „Book & Assign on sub-account" — inny przycisk niz ksiegowanie na koncie glownym.
+    // „Book on sub-account" — bez przypisania, inny przycisk niz ksiegowanie na koncie glownym.
     async function impBookSub(id, ids){
         const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK_SUB
                    + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
@@ -42551,7 +43031,7 @@
             const m = box.querySelector('#mk-fix-msg');
             if (!confirm('Ustawić status OK i zaksięgować ' + near.length + ' pozycji na subkoncie?\n\n'
                 + near.map(function (x){ return '  • ' + x.payment_descr + '  open ' + f2(impNum(x.open_amount)); }).join('\n')
-                + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „Book & Assign on sub-account".'
+                + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „Book on sub-account".'
                 + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
             fx.disabled = true; m.style.color = '#666'; m.textContent = 'ustawiam statusy…';
             try {
@@ -59023,9 +59503,9 @@
         var v = Number(gmGet(BK_TOL_KEY, 0.05));
         return (isFinite(v) && v >= 0) ? v : 0.05;
     }
-    // = przycisk „Book & Assign on sub-account".
-    var BK_BLOCK_SUB = 'booking_sub';
-    var BK_BLOCK_SUB_OPIS = 'Book & Assign on sub-account';
+    // = przycisk „Book on sub-account". Resztki ZAWSZE bez przypisania (decyzja 14.09.2026).
+    var BK_BLOCK_SUB = 'booking_sub_without_assign';
+    var BK_BLOCK_SUB_OPIS = 'Book on sub-account';
     // = przycisk „Book & Assign on main account". Import SAM NIE KSIEGUJE — tworzy tylko
     // paczke. Nazwy akcji sa odczytane wprost z handlerow przyciskow strony Import payments
     // (onClick -> save("<block>")), a nie zgadniete:
