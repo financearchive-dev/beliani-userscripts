@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.46
+// @version      5.47
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -4236,6 +4236,11 @@
                 orderNumber: item.orderNumber, amount: item.amount, accountNum: kontoWiersza, bookingDate: rowDate,
                 market: String(item.market || '').trim().toUpperCase(),
                 source: item.source || '', isGoodwill: !!item.isGoodwill, auftragNumber: item.auftragNumber || '',
+                // Rodzaj pozycji („Goodwill", „SAFE-T Reimbursement", „REVERSAL_REIMBURSEMENT")
+                // musi dojechac az do ksiegowania: decyduje nie tylko o tym, czy pozycja
+                // scala sie ze zwrotem (parser), ale i o tym, czy wolno rozbic ja na artykuly
+                // (bookOne). Zwykly zwrot ma rodzaj pusty.
+                kind: item.kind || '',
                 dupTotal: dupCount.get(k), dupIndex: idx,
                 loading: true, error: null, selected: false, booked: false, skipped: false
             };
@@ -6311,7 +6316,20 @@
                     throw new Error('Strona ticketu nie wyrenderowała się poprawnie (brak Auftrag Details / broken items / textarea / przycisku Update). Sprawdź ticket ręcznie.');
                 }
 
-                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                // CLAIM IDZIE NA JEDNĄ POZYCJĘ, nie rozbija się na artykuły.
+                // Goodwill, SAFE-T i REVERSAL_REIMBURSEMENT to jedno zdarzenie na CAŁYM
+                // zamówieniu — decyzja Amazona, a nie zwrot za konkretny produkt. Przy
+                // zaznaczonych pozycjach z credit note prologistics dzieli wpisaną kwotę
+                // po artykułach i robi osobny refund na każdy: SAFE-T 101.72 na tickecie
+                // z dwiema pozycjami wychodził jako 50.86 + 50.86. Suma się zgadza, ale
+                // czyta się to jak zwrot za produkty, którego nie było.
+                // Mechanizm jest ten sam, którym księguje się nieopłacone pobranie (1088)
+                // i z tego samego powodu — patrz komentarz przy fillTicket.
+                // Zwykły zwrot zostaje BEZ zmian: tam rozbicie na artykuły jest właściwe.
+                const jestClaim = !!String(row.kind || '').trim();
+                const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx,
+                                                    { total: row.dupTotal || 1, index: row.dupIndex || 1 },
+                                                    jestClaim ? { pierwszaPozycja: true } : null);
 
                 // v3.25: jeśli fillTicket zwrócił sukces (nie noSolution), to znaczy że
                 // Update został kliknięty. W następnej iteracji pre-check potencjalnie
@@ -6415,7 +6433,14 @@
                     let escalation = null;
                     let escalationKind = null; // 'fallback' | 'category_check'
                     const categoryMissing = !!fillResult.autoFilledCategory;
-                    const solutionMissing = !!fillResult.fallbackUsed;
+                    // Claim ksiegujemy na pierwszej pozycji Z WYBORU (patrz wywolanie fillTicket
+                    // wyzej), wiec fallbackUsed stoi wtedy zawsze i sam w sobie niczego nie mowi
+                    // o brakujacym solution — tak samo traktuje go Unpaid COD („nie meldujemy
+                    // tego jako odstepstwa"). „Please add solution" zostaje tylko wtedy, gdy na
+                    // pierwszej pozycji naprawde nie bylo pola Solution. Kategoria bez zmian.
+                    const naPierwszejZWyboru = fillResult.fallbackReason === 'ksiegowanie_na_pierwszej_pozycji';
+                    const solutionMissing = !!fillResult.fallbackUsed
+                        && !(naPierwszejZWyboru && fillResult.hadSolutionDropdown);
                     let escComment = null;
                     if (solutionMissing && categoryMissing) {
                         escComment = 'Please add solution and check category';
@@ -11504,10 +11529,7 @@
                     <input id="tm-workers" type="number" min="1" max="10" value="5"
                         style="width:52px;padding:3px 4px;border:1px solid #ccc;border-radius:4px;font-size:12px;text-align:center;">
                 </label>
-                <label style="display:flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;" title="Nie księguj, jeśli ta sama kwota jest już zaksięgowana na tym orderze, ale z INNĄ datą (możliwy duplikat wpisany wcześniej).">
-                    <input id="tm-dup-strict" type="checkbox" checked> 🛡 blokuj też przy innej dacie
-                </label>
-                <span style="color:#6b7280;">Duplikat = ta sama kwota + ta sama data</span>
+                <span style="color:#6b7280;">Duplikat = ta sama kwota + ta sama data · ta sama kwota z inną datą tylko ostrzega</span>
             </div>
 
             <button id="tm-book-btn" style="
@@ -11988,6 +12010,19 @@
             if (!byOrder[order]) byOrder[order] = [];
             if (!byOrder[order].some(function (x) { return x.no === no; })) byOrder[order].push({ no: no, key: dupKey });
 
+            // SAMODZIELNY WIERSZ „other" (kontener „-", kwota = notatka), np. 21221 other - 1265
+            // −2043.30. Do 15.09.2026 szedl jednym wpisem na kontach z panelu (1270/1049), bez SOP,
+            // wiec ramka z propozycja konta sie nie pokazywala. Uzytkownik: „wszystkie other musza
+            // przejsc przez SOP, zarowno - jak i +", zapis „dwa wpisy jak kontener". Ksiegujemy go wiec
+            // DOKLADNIE jak roznice w wierszu z kontenerem przy przelewie za towar rownym zero:
+            //   noga bankowa  = kwota wiersza  na 1270/1049   (21221: −2043.30)
+            //   druga noga    = ta sama kwota ze znakiem odwrotnym na 1270/konto wg SOP (+2043.30)
+            // Konto drugiej nogi wybiera sie w ramce „Roszczenia other" — puste = nic sie nie ksieguje.
+            // Tylko gdy WSZYSTKIE roszczenia w notatce sa „other"; penalty/overpayment itd. bez zmian.
+            const samoOther = !diff && !hasCont && claims.length > 0 && !!paid
+                && balClaimTypes(claims).every(function (t) { return balKindName(t) === 'other'; });
+            if (samoOther) { gross = 0; diff = bal2(0 - paid); }
+
             if (!diff) {
                 const desc = hasCont ? cont : label;
                 if (!desc) { errors.push('wiersz ' + no + ': nie ma czego wpisać w opis — brak numeru kontenera i brak numeru penalty/overpayment — ' + balShort(line)); continue; }
@@ -12133,8 +12168,12 @@
                 legs.push({ ty: ty, credit: legCredit, amount: kAmt, label: kLabel });
             }
             if (blocked) continue;
-            if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
-            entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
+            // Samodzielny „other" nie ma przelewu za towar: wpisu „kontener" na 0.00 nie robimy
+            // i nie ostrzegamy o braku kontenera — to jego normalny uklad.
+            if (!samoOther) {
+                if (!hasCont) warns.push('wiersz ' + no + ': brak numeru kontenera — w opisie pierwszego wpisu pójdzie „' + label + '".');
+                entries.push(Object.assign({}, base, { amount: balFix(gross), comment: hasCont ? cont : label, kind: 'kontener' }));
+            }
             entries.push(Object.assign({}, base, { amount: balFix(-diff), comment: label, kind: legs.map(function (l) { return l.ty; }).join('+') + ' −' }));
             legs.forEach(function (l) {
                 entries.push(Object.assign({}, base, { amount: balFix(l.amount), credit: l.credit, comment: l.label, kind: l.ty + ' +', plus: true }));
@@ -12230,6 +12269,21 @@
         // bylo brane za kwote, wiec samo „30030" ksiegowalo 30030 USD — teraz to blad.
         if (li <= 0) return { kind: '', why: 'jest numer orderu, ale w wierszu nie ma kwoty', f: f, li: li };
         if (bookAmt(f[li]) == null) return { kind: '', why: 'w ostatniej kolumnie „' + f[li] + '" nie ma kwoty', f: f, li: li };
+        // Druga kwota w wierszu to prawie zawsze wklejona obok SUMA GRUPY. 15.09.2026:
+        // „21918 ⇥ TIANJIN BOSEN ⇥ ⇥ 3484.38 ⇥ 6715.8" — regula „kwota w ostatniej kolumnie"
+        // wziela sume 6715.8 jako depozyt, a 3484.38 dokleila do nazwy dostawcy, i wiersz
+        // przeszedl bez bledu i bez ostrzezenia. Nie zgadujemy, ktora liczba jest depozytem.
+        const kwoty = [];
+        for (let j = 1; j <= li; j++) if (bookAmt(f[j]) != null) kwoty.push(f[j]);
+        if (kwoty.length > 1) return { kind: '', why: 'w wierszu jest więcej niż jedna kwota (' + kwoty.join(', ')
+            + ') — zostaw tylko kwotę depozytu; wklejona obok suma grupy zaksięgowałaby się jako depozyt', f: f, li: li };
+        // Jedyna kwota dopiero w kolumnie E przy pustych C i D to uklad SUMY GRUPY z „Kopiuj DEPO"
+        // (A=nr, B=dostawca, C=puste, D=depozyt, E=suma) w wierszu, w ktorym zabraklo kwoty z P/I.
+        // Depozyt ma kwote w B, C albo D — takiego formatu nie ma, a regula „ostatnia kolumna"
+        // zaksiegowalaby sume jako depozyt. Tylko przy tabulatorach: tam pozycja kolumny jest swieta.
+        if (String(line).indexOf('\t') >= 0 && li >= 4 && !f[2] && !f[3])
+            return { kind: '', why: 'kwota „' + f[li] + '" stoi dopiero w kolumnie ' + String.fromCharCode(65 + li)
+                + ', a C i D są puste — to układ sumy grupy z „Kopiuj DEPO”, nie depozytu; wpisz kwotę depozytu w kolumnie D', f: f, li: li };
         return { kind: 'depo', why: '', f: f, li: li };
     }
 
@@ -12548,6 +12602,9 @@
     // z tresci: normalizujemy CALA tresc i szukamy w niej znormalizowanego poczatku naszej
     // nazwy. Plik czyta FileReader w przegladarce — nigdzie nie jest wysylany ani zapisywany.
     let bankFile = null;   // ostatnio wczytany plik: { rows, currency, error, name, sum, debits }
+    // Zaznaczenie firm w panelu zlecenia zbiorczego. Trzymane POZA renderem, bo ramka
+    // przerysowuje sie przy kazdej zmianie wklejki, a wybor czlowieka ma to przezyc.
+    let epoSel = null, epoSig = '', epoDom = {};
 
     function bankNameNorm(s) {
         return String(s == null ? '' : s)
@@ -12764,6 +12821,16 @@
         // Dalej juz przeszukanie — dla zlecenia, ktore pokrywa tylko CZESC pozycji.
         // Malejaco, bo duza kwota szybciej wprowadza `zostalo < 0` i przycina galaz.
         const p = poz.slice().sort(function (a, b){ return b.gr - a.gr; });
+        // SUMA OGONA — ile najwyzej da sie jeszcze dolozyc od pozycji i w gore. Bez tego
+        // odciecia galaz, ktora pominela duza kwote, schodzi do samego dna, chociaz dobic
+        // do celu juz nie moze. Zmierzone na wyciagu z 03.09.2026 (trzydziesci firm, jedno
+        // zlecenie na 438 224,76): bez odciecia pelne przeszukanie kosztuje ponad
+        // 200 000 000 krokow i budzet konczy sie ZANIM padnie odpowiedz — z odcieciem
+        // 23 833 kroki, czyli dwa rzedy PONIZEJ budzetu. Roznica nie jest w szybkosci,
+        // tylko w tym, czy odpowiedz w ogole pada: „nie sprawdzilem wszystkich kombinacji”
+        // zamienia sie na pewne „zaden zestaw nie daje tej kwoty”.
+        const ogon = new Array(n + 1); ogon[n] = 0;
+        for (let i = n - 1; i >= 0; i--) ogon[i] = ogon[i + 1] + p[i].gr;
         const wybor = [];
         (function idz(i, zostalo){
             if (przerwane || out.length >= limit) return;
@@ -12771,7 +12838,7 @@
             // wobec czasu, ktory mial chronic.
             if (++krokow > 2000000){ przerwane = true; return; }
             if (zostalo === 0 && wybor.length){ out.push(wybor.slice()); return; }
-            if (i >= n || zostalo < 0) return;
+            if (i >= n || zostalo < 0 || ogon[i] < zostalo) return;
             wybor.push(p[i]);
             idz(i + 1, zostalo - p[i].gr);
             wybor.pop();
@@ -12779,6 +12846,114 @@
         })(0, celGr);
         return { zestawy: out, przerwane: przerwane };
     }
+    // ===== Zlecenie zbiorcze EPO — skladanie kwoty recznie =====
+    // Automat wyzej (epoZestawy) odpowiada tylko wtedy, gdy pasuje DOKLADNIE jeden zestaw.
+    // 03.09.2026 nie pasowal zaden: jedno zlecenie na 438 224,76 i trzydziesci firm bez
+    // przelewu, ktore sumuja sie do 460 314,43 — w paczce bylo cos, czego we wklejce nie ma.
+    // Raport pokazywal wtedy trzydziesci czerwonych wierszy „w pliku nie ma przelewu”
+    // i ani slowem, ile brakuje. Ten panel liczy wprost: suma zaznaczonych firm kontra
+    // kwota zlecenia i roznica miedzy nimi. Odznaczenie firmy odejmuje ja od sumy — kwote
+    // sklada czlowiek, modul tylko dodaje. Zadnego zgadywania.
+    // Po stronie banku wchodza WYLACZNIE wiersze „COLLECTIVE ORDER”: przelewy do
+    // developerow i wplywy nie maja z ta paczka nic wspolnego i do porownania nie ida.
+    function epoTx(rows) {
+        const out = [];
+        (rows || []).forEach(function (t) {
+            if (!(t.amt > 0)) return;   // wplyw ma kwote ujemna — tu nie wchodzi
+            if (String(t.txt || '').toUpperCase().indexOf('COLLECTIVE ORDER') < 0) return;
+            out.push(t);
+        });
+        return out;
+    }
+    // MESSAGE-ID w wyciagu to stempel, ktory sami wpisalismy do pliku: MsgId = 'BEL'
+    // + RRRRMMDD + GGMMSS (painBuild). Czyta sie z niego, ktory to plik pain.001 —
+    // z ktorego dnia i z ktorej godziny — wiec czlowiek wie, czego szukac w e-finance.
+    function epoStempel(txt) {
+        const m = String(txt == null ? '' : txt).match(/\bBEL(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\b/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1] + ' ' + m[4] + ':' + m[5] + ':' + m[6]) : '';
+    }
+    // Startowo zaznaczone sa te firmy, ktore wlasnego przelewu NIE maja — czyli kandydaci
+    // do paczki. Firma z wlasnym przelewem startuje odznaczona, ale zostaje na liscie:
+    // bywa, ze dopasowala sie po kwocie przypadkiem i trzeba ja przerzucic do paczki.
+    function epoDomyslne(list) {
+        const s = {};
+        (list || []).forEach(function (e) {
+            if (e.state === 'missing' || e.state === 'nokey' || e.state === 'epo') s[e.key] = 1;
+        });
+        return s;
+    }
+    // Nazwa celowo inna niz epoPodsumowanie z panelu wysylki EPO nizej (osobne IIFE):
+    // dwie funkcje o tej samej nazwie w dwoch zakresach mylily sie przy czytaniu.
+    function epoPanelWynik(cel, suma, ile) {
+        const roznica = bal2(suma - cel), zgoda = Math.abs(roznica) < 0.005;
+        return '<span style="color:' + (zgoda ? '#166534' : '#991b1b') + '">' + (zgoda ? '\u2713 ' : '\u26a0 ') +
+            'zaznaczone ' + ile + ' na <strong>' + balFix(suma) + '</strong> &nbsp;\u00b7&nbsp; zlecenie ' +
+            balFix(cel) + ' &nbsp;\u00b7&nbsp; ' +
+            (zgoda ? 'zgadza si\u0119 co do grosza'
+                   : ('r\u00f3\u017cnica <strong>' + (roznica > 0 ? '+' : '') + balFix(roznica) + '</strong> \u2014 ' +
+                      (roznica > 0 ? 'zaznaczono za du\u017co' : 'brakuje pozycji do zaznaczenia'))) + '</span>';
+    }
+    // Przeliczenie BEZ przerysowania ramki: gdyby panel szedl przez innerHTML, kazde
+    // klikniecie gubiloby pozycje przewijania przy trzydziestu wierszach.
+    function epoPrzelicz() {
+        const box = document.getElementById('tm-bank-box');
+        const sumEl = box && box.querySelector('#tm-epo-sum');
+        if (!sumEl) return;
+        let cel = 0;
+        epoTx(bankFile && bankFile.rows).forEach(function (t) { cel = bal2(cel + t.amt); });
+        let suma = 0, ile = 0;
+        Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
+            if (!c.checked) return;
+            suma = bal2(suma + (parseFloat(c.getAttribute('data-amt')) || 0));
+            ile++;
+        });
+        sumEl.innerHTML = epoPanelWynik(cel, suma, ile);
+    }
+    function epoPanelHtml(m, rows) {
+        const zb = epoTx(rows);
+        if (!zb.length) return '';
+        let cel = 0;
+        zb.forEach(function (t) { cel = bal2(cel + t.amt); });
+        // Zmiana skladu wklejki uniewaznia zaznaczenie — klucze sa inne i przeniesienie
+        // starego wyboru dawaloby sume z firm, ktorych juz na liscie nie ma.
+        const sig = m.list.map(function (e) { return e.key; }).join('|');
+        if (!epoSel || sig !== epoSig) { epoDom = epoDomyslne(m.list); epoSel = epoDomyslne(m.list); epoSig = sig; }
+        let suma = 0, ile = 0;
+        const li = m.list.map(function (e) {
+            const on = !!epoSel[e.key];
+            if (on) { suma = bal2(suma + e.total); ile++; }
+            const ids = e.ids.length
+                ? ' <span style="color:#9ca3af">' + balEsc(e.ids.slice(0, 6).join(', ')) +
+                  (e.ids.length > 6 ? '\u2026' : '') + '</span>'
+                : '';
+            const wl = (e.state === 'ok' || e.state === 'amt' || e.state === 'diff')
+                ? ' <span style="color:#6b7280">(ma w\u0142asny przelew)</span>' : '';
+            const nm = String(e.name || '');
+            return '<label style="display:block;padding:1px 0;cursor:pointer;">' +
+                '<input type="checkbox" class="tm-epo-c" data-key="' + balEsc(e.key) +
+                '" data-amt="' + balFix(e.total) + '"' + (on ? ' checked' : '') +
+                ' style="vertical-align:-2px;margin-right:6px;">' +
+                '<span style="font-family:monospace;">' + balFix(e.total) + '</span> ' +
+                balEsc(nm.length > 72 ? nm.slice(0, 72) + '\u2026' : nm) + wl + ids + '</label>';
+        }).join('');
+        const gl = zb.map(function (t) {
+            const st = epoStempel(t.txt);
+            return balFix(t.amt) + (st ? (' \u2014 plik pain.001 z ' + st) : '');
+        }).join(' &nbsp;\u00b7&nbsp; ');
+        const btn = 'style="font:inherit;font-size:11px;padding:0 5px;margin-left:4px;border:1px solid #d1d5db;' +
+            'border-radius:4px;background:#fff;cursor:pointer;color:#374151;"';
+        return '<div style="background:#fff;border:1px solid #fde68a;border-radius:6px;padding:6px 8px;margin-top:6px;">' +
+            '<div style="font-weight:700;color:#92400e;">Zlecenie zbiorcze EPO: ' + gl + '</div>' +
+            '<div id="tm-epo-sum" style="margin:2px 0 4px;">' + epoPanelWynik(cel, suma, ile) + '</div>' +
+            '<div style="color:#6b7280;margin-bottom:2px;">Zaznacz firmy, kt\u00f3re posz\u0142y t\u0105 paczk\u0105 \u2014 suma liczy si\u0119 na bie\u017c\u0105co.' +
+            '<button type="button" class="tm-epo-b" data-v="dom" ' + btn + '>domy\u015blne</button>' +
+            '<button type="button" class="tm-epo-b" data-v="all" ' + btn + '>wszystkie</button>' +
+            '<button type="button" class="tm-epo-b" data-v="none" ' + btn + '>\u017cadna</button></div>' +
+            '<div style="' + (m.list.length > 14 ? 'max-height:260px;overflow:auto;' : '') + '">' + li + '</div>' +
+            '<div style="color:#6b7280;margin-top:3px;">Po stronie banku liczy si\u0119 tylko zlecenie zbiorcze \u2014 ' +
+            'przelewy do developer\u00f3w i wp\u0142ywy do tego por\u00f3wnania nie wchodz\u0105.</div></div>';
+    }
+
     // Dopasowanie: znormalizowany klucz nazwy musi wystapic w znormalizowanej tresci przelewu.
     // Kilka przelewow do jednej firmy sumuje sie — bank czasem dzieli platnosc na dwa zlecenia.
     function bankMatch(expected, tx) {
@@ -12902,7 +13077,12 @@
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
                 (e.hits.length > 1 ? ' w ' + e.hits.length + ' przelewach' : '') + '</span>';
         } else if (e.state === 'missing') {
-            tail = '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
+            // Gdy w pliku jest zlecenie zbiorcze, zdanie „nie ma przelewu" jest nieprawdziwe
+            // w tonie: pieniadze najpewniej zeszly, tylko w paczce, ktorej nie rozlozylismy.
+            // Kierujemy wiec do panelu wyzej, zamiast sugerowac brak platnosci.
+            tail = epoTx(bankFile && bankFile.rows).length
+                ? '<span style="color:#991b1b">nie ma osobnego przelewu — składaj kwotę w panelu zlecenia zbiorczego wyżej</span>'
+                : '<span style="color:#991b1b">w pliku nie ma przelewu na tę firmę</span>';
         } else if (e.state === 'epo') {
             const inne = (e.epoRazem || []).filter(function (n) { return n !== e.name; });
             tail = '<span style="color:#166534">bank ' + balFix(e.bank) +
@@ -12997,6 +13177,10 @@
             '<div style="color:#6b7280;">' + head + '</div>' +
             '<strong>' + title + '</strong>' + warn;
 
+        // Panel zlecenia zbiorczego stoi NAD lista firm, bo gdy w pliku jest paczka EPO,
+        // to on tlumaczy czerwone wiersze pod spodem, a nie odwrotnie.
+        html += epoPanelHtml(m, bankFile.rows);
+
         if (bad.length) {
             html += '<div style="margin-top:4px;">' + bad.map(bankRowHtml).join('') + '</div>';
         }
@@ -13019,6 +13203,32 @@
         }
         html += '<div style="color:#6b7280;margin-top:3px;">Ta kontrola tylko informuje — księgowania nie blokuje.</div>';
         box.innerHTML = html + '</div>';
+        // Listener na KONTENERZE i tylko raz: innerHTML wymieniamy przy kazdej zmianie
+        // wklejki, wiec podpiecie sie do samych checkboxow gubiloby obsluge po pierwszym
+        // przerysowaniu. Zaznaczenie trzyma epoSel, nie DOM.
+        if (!box.__epoBound) {
+            box.__epoBound = 1;
+            box.addEventListener('change', function (ev) {
+                const t = ev.target;
+                if (!t || !t.classList || !t.classList.contains('tm-epo-c')) return;
+                if (!epoSel) epoSel = {};
+                epoSel[t.getAttribute('data-key')] = t.checked ? 1 : 0;
+                epoPrzelicz();
+            });
+            box.addEventListener('click', function (ev) {
+                const t = ev.target;
+                if (!t || !t.classList || !t.classList.contains('tm-epo-b')) return;
+                const v = t.getAttribute('data-v');
+                if (!epoSel) epoSel = {};
+                Array.prototype.forEach.call(box.querySelectorAll('.tm-epo-c'), function (c) {
+                    const k = c.getAttribute('data-key');
+                    const on = (v === 'all') ? true : (v === 'none') ? false : !!epoDom[k];
+                    c.checked = on;
+                    epoSel[k] = on ? 1 : 0;
+                });
+                epoPrzelicz();
+            });
+        }
     }
 
     // ===== Kontrola PO zaksiegowaniu: Export orders payments =====
@@ -13427,7 +13637,7 @@
             return '<div style="color:#dc2626;font-size:11px;margin-top:2px;" title="' + t + '">⛔ już zaksięgowane (' + d.bookingDate + ')</div>';
         }
         if (d.hasOtherDate) {
-            const t = 'Ta sama kwota ' + d.want + ' jest juz zaksiegowana z data: ' + dupDatesText(d.other) + '. Przy zaznaczonym „blokuj tez przy innej dacie" pominiemy ten wiersz.';
+            const t = 'Ta sama kwota ' + d.want + ' jest juz zaksiegowana z data: ' + dupDatesText(d.other) + '. To tylko ostrzezenie — wiersz zostanie zaksiegowany.';
             return '<div style="color:#b45309;font-size:11px;margin-top:2px;" title="' + t + '">⚠️ ta sama kwota z ' + dupDatesText(d.other) + '</div>';
         }
         return '';
@@ -13580,7 +13790,6 @@
 
     async function bookOrder(row, currency, month, day, year, opts) {
         let lastError = '';
-        const strictDup = !(opts && opts.strictDup === false);
 
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
@@ -13596,16 +13805,22 @@
                 paymentsCache[row.id] = pays;
                 const dup = dupScan(pays, row.amount, normalizeDateYYYYMMDD(year, month, day), row.dupIndex || 1);
 
+                // Ta sama kwota z INNA data juz nie blokuje (15.09.2026, na prosbe uzytkownika:
+                // „blokuj tez przy innej dacie" i tak zawsze sie wylaczalo). Zostaje slad —
+                // daty wczesniejszych wpisow ida z wynikiem do dziennika i do podsumowania.
+                // Liczone PRZED „juz zaksiegowane": gdy proba 1 zapisala, ale potwierdzenie nie
+                // wyszlo, proba 2 konczy sie wlasnie tam i notka by przepadla (przeglad 15.09.2026).
+                const innaData = dup.hasOtherDate
+                    ? ('ta sama kwota ' + dup.want + ' była już zaksięgowana z datą ' + dupDatesText(dup.other))
+                    : null;
+
                 if (dup.isBooked) {
                     return {
                         ok: true, attempts: attempt - 1, verified: true, alreadyBooked: true,
-                        dupMsg: `w Payments jest już ${dup.exact.length}× kwota ${dup.want} z datą ${dup.bookingDate}`
-                    };
-                }
-                if (strictDup && dup.hasOtherDate) {
-                    return {
-                        ok: false, duplicate: true,
-                        error: `możliwy duplikat — kwota ${dup.want} jest już zaksięgowana z datą ${dupDatesText(dup.other)}. Nic nie zaksięgowano. Jeśli to celowe, odznacz „🛡 blokuj też przy innej dacie" i powtórz.`
+                        dupMsg: `w Payments jest już ${dup.exact.length}× kwota ${dup.want} z datą ${dup.bookingDate}`,
+                        // Tylko przy ponowieniu: w probie 1 „juz zaksiegowane" znaczy, ze wpis byl
+                        // wczesniej, i licznik „inna data" nie powinien go liczyc.
+                        innaData: attempt > 1 ? innaData : null
                     };
                 }
 
@@ -13641,7 +13856,8 @@
                         verified: verify.ok,
                         rowsBefore,
                         rowsAfter,
-                        verifyNote: verify.ok ? null : ('weryfikator nie potrafił dopasować dodanego wiersza: ' + verify.error)
+                        verifyNote: verify.ok ? null : ('weryfikator nie potrafił dopasować dodanego wiersza: ' + verify.error),
+                        innaData: innaData
                     };
                 }
 
@@ -14004,7 +14220,6 @@
         const bookBtn      = document.getElementById('tm-book-btn');
 
         const workers = Math.max(1, Math.min(10, parseInt(document.getElementById('tm-workers').value, 10) || 5));
-        const strictDup = !!document.getElementById('tm-dup-strict').checked;
 
         markDuplicateRows(previewRows);
 
@@ -14014,7 +14229,7 @@
         bookBtn.disabled  = true;
         bookBtn.textContent = workers > 1 ? `⏳ Księguję (${workers} równolegle)…` : '⏳ Księguję…';
 
-        let ok=0, fail=0, dupSkipped=0, already=0;
+        let ok=0, fail=0, already=0, innaDat=0;
 
         function logLine(html) {
             const div = document.createElement('div');
@@ -14042,7 +14257,7 @@
 
             let result;
             try {
-                result = await bookOrder(row, currency, month, day, year, { strictDup });
+                result = await bookOrder(row, currency, month, day, year);
             } catch (e) {
                 result = { ok:false, error: e.message };
             }
@@ -14051,14 +14266,16 @@
             if (result.ok) {
                 ok++;
                 if (result.alreadyBooked) already++;
+                if (result.innaData) innaDat++;
                 const rowsInfo = (result.rowsBefore != null && result.rowsAfter != null)
                     ? ` | Payments: ${result.rowsBefore} → ${result.rowsAfter}`
                     : '';
-                const noteInfo = result.verifyNote
+                const noteInfo = (result.verifyNote
                     ? ` <span style="color:#b45309">(⚠ ${result.verifyNote})</span>`
-                    : '';
+                    : '')
+                    + (result.innaData ? ` <span style="color:#b45309">(⚠ ${result.innaData})</span>` : '');
                 if (result.alreadyBooked) {
-                    logRow.innerHTML = `⛔ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | POMINIĘTO, już zaksięgowane (${result.dupMsg || 'wpis był już widoczny'})`;
+                    logRow.innerHTML = `⛔ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | POMINIĘTO, już zaksięgowane (${result.dupMsg || 'wpis był już widoczny'})${noteInfo}`;
                     logRow.style.color = '#b45309';
                     if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">⛔ już zaksięgowany</span>';
                 } else {
@@ -14072,11 +14289,6 @@
                     const _st = await ensureContainerStatus(row.id);
                     logRow.innerHTML += _st.html;
                 }
-            } else if (result.duplicate) {
-                dupSkipped++;
-                logRow.innerHTML = `🛡 ${tag}<strong>${row.id}</strong>${kindTag} — POMINIĘTO: ${result.error}`;
-                logRow.style.color = '#b45309';
-                if (statusCell) statusCell.innerHTML = '<span style="color:#b45309">🛡 możliwy duplikat</span>';
             } else {
                 fail++;
                 logRow.innerHTML = `❌ ${tag}<strong>${row.id}</strong>${kindTag} — BŁĄD: ${result.error}`;
@@ -14104,9 +14316,9 @@
         } finally {
             const parts = [`✅ OK: <strong>${ok - already}</strong>`];
             if (already)    parts.push(`⛔ już było: <strong>${already}</strong>`);
-            if (dupSkipped) parts.push(`🛡 duplikaty pominięte: <strong>${dupSkipped}</strong>`);
+            if (innaDat)    parts.push(`⚠ ta sama kwota była już z inną datą: <strong>${innaDat}</strong>`);
             if (fail)       parts.push(`❌ błędy: <strong>${fail}</strong>`);
-            summary.innerHTML = (fail === 0 && dupSkipped === 0 && already === 0)
+            summary.innerHTML = (fail === 0 && already === 0 && innaDat === 0)
                 ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
                 : parts.join(' &nbsp; ');
             summary.style.color = fail===0 ? '#16a34a' : '#b45309';
@@ -14918,9 +15130,12 @@
                 // Po jednym slowie kluczowym stoi czasem CALA LISTA numerow:
                 // „overpayment 1078, 1084, 1137, 1184". Kazdy z nich to roszczenie, a nie
                 // zamowienie — bez tego szly do sprawdzania jako cudze zamowienia.
-                // Ciagniemy liste tylko dopoki numery nie sa DLUZSZE od pierwszego i maja
-                // najwyzej cztery cyfry: „penalty 1270, 15395" nie moze polknac zamowienia.
-                var ogon = s0.slice(m.index + m[0].length), maks = Math.min(4, m[2].length);
+                // Ciagniemy liste dopoki numery maja najwyzej cztery cyfry: „penalty 1270,
+                // 15395" nie moze polknac zamowienia. Warunku „nie dluzsze od pierwszego"
+                // tu nie ma i byc nie moze — „penalty 979,1297" to DWA roszczenia, a przy
+                // tamtym warunku 1297 (cztery cyfry po trzycyfrowym 979) wypadalo z listy
+                // i szlo dalej jako zamowienie. 04.09.2026, HK JIANHUI, zamowienie 20249.
+                var ogon = s0.slice(m.index + m[0].length), maks = 4;
                 // ZAKRES: „other - 1115-1117" to trzy roszczenia, nie jedno. Warunki te same,
                 // co w bcExpandRange, ktory rozwija zakresy w tytule: koniec wiekszy od
                 // poczatku, ta sama liczba cyfr, rozpietosc najwyzej 60. Bez nich
@@ -17993,6 +18208,14 @@
             out.bezPotw = lista.filter(function (o){ return !pokryte[o]; });   // tylko z Twojej wklejki
             return out;
         }
+        // „1 kontrola", „3 kontrole", „9 kontroli". Licznik stoi w naglowku sekcji,
+        // wiec czyta go czlowiek, nie maszyna — zla forma klulaby w oczy.
+        function bcOdmKontrola(n){
+            var d = n % 10, s = n % 100;
+            if (n === 1) return 'kontrola';
+            if (d >= 2 && d <= 4 && !(s >= 12 && s <= 14)) return 'kontrole';
+            return 'kontroli';
+        }
         function bcOrdLink(o){
             return '<a href="/op_order.php?id=' + encodeURIComponent(o) + '" target="_blank"'
                  + ' style="color:#7c3aed;text-decoration:none;font-family:monospace">' + esc(o) + '</a>';
@@ -18047,6 +18270,19 @@
         // kwot albo po zaznaczeniu wiersza — wiec filtr trzeba przykladac ZA KAZDYM
         // razem, a nie raz po wyrysowaniu. Inaczej wiersz, ktory wlasnie zrobil sie
         // zielony, dalej wisi na liscie „z bledami".
+        // Zwijanie sekcji kontroli. Widoczna sekcja to 'grid', nie '' — siatka jest
+        // zadeklarowana w stylu wiersza, wiec pusty display zrobilby z niej blok
+        // i kolumny by sie rozjechaly.
+        function bcSekcjaPokaz(body, pokaz){
+            if (!body) return;
+            body.style.display = pokaz ? 'grid' : 'none';
+            var h = body.previousElementSibling, z = h && h.querySelector ? h.querySelector('.bc-sek-z') : null;
+            if (z) z.textContent = pokaz ? '▾' : '▸';
+        }
+        function bcSekcja(naglowek){
+            var body = naglowek && naglowek.nextElementSibling;
+            if (body) bcSekcjaPokaz(body, body.style.display === 'none');
+        }
         function bcZastosujFiltr(box){
             if (!box) return;
             var f = box.getAttribute('data-filtr') || 'wszystkie';
@@ -18158,6 +18394,12 @@
                             + (p[0] === 'wszystkie' ? ';font-weight:700;text-decoration:underline' : '') + '">'
                             + p[1] + '</button>';
                    }).join('')
+               // Zwijanie hurtem. Sekcje bez zastrzezen startuja zwiniete, wiec „rozwiń
+               // wszystko" jest droga POWROTNA do pelnej listy — nic nie jest schowane
+               // na stale.
+               + '<span style="color:#ddd">|</span>'
+               + '<button class="chn-btn ghost bc-rozw" data-v="all" style="padding:1px 8px;font-size:11px">rozwiń wszystko</button>'
+               + '<button class="chn-btn ghost bc-rozw" data-v="clean" style="padding:1px 8px;font-size:11px">zwiń zgodne</button>'
                + '</div>';
             (r.wiersze || []).forEach(function (w){
                 var kol = w.bledy.length ? '#c00' : (w.uwagi.length ? '#c47f00' : '#0a0');
@@ -18189,6 +18431,18 @@
                    + '<div style="font-size:11px;color:#666;margin-top:2px">' + esc(w.tytul) + '</div>';
                 // Pelna lista porownan — takze tych udanych. Bez niej widac bylo tylko
                 // zastrzezenia i nie bylo wiadomo, CO w ogole zostalo sprawdzone.
+                // Kontrole stoja w SEKCJACH — jedna na zamowienie, plus „cały przelew".
+                // Do 5.28 sekcje roznil tylko drobny naglowek, a znak ✓ stal na KONCU
+                // linii, ZA wartoscia o dowolnej dlugosci. Przy trzech zamowieniach po
+                // dziewiec kontroli nie dalo sie okiem odpowiedziec, do czego ten haczyk
+                // nalezy. Trzy zmiany, wszystkie o to samo:
+                //   1. znak w PIERWSZEJ kolumnie siatki — etykiety i wartosci stoja
+                //      wtedy jedna pod druga, a znaki tworza pionowy pasek do skanowania;
+                //   2. sekcja obramowana od lewej kolorem swojego najgorszego wyniku
+                //      i podpisana licznikiem, wiec widac ja jako calosc;
+                //   3. sekcja bez zastrzezen zwinieta — to ona robila sciane zieleni.
+                //      Nic nie znika: naglowek mowi, ile kontroli przeszlo, a klikniecie
+                //      go rozwija. Guziki „rozwiń / zwiń" nad lista robia to hurtem.
                 if ((w.kontrole || []).length){
                     var grupy = [], wg = {};
                     w.kontrole.forEach(function (k){
@@ -18197,11 +18451,10 @@
                         wg[g].push(k);
                     });
                     grupy.forEach(function (g){
-                        h += '<div style="margin-top:5px">'
-                           + '<div style="font-size:11px;font-weight:700;color:#444">'
-                           + (g ? bcOrdLink(g) : 'cały przelew') + '</div>'
-                           + '<ul style="margin:2px 0 0;padding-left:18px;font-size:11px;line-height:1.5">';
-                        wg[g].forEach(function (k){
+                        // Wynik kazdej kontroli liczymy RAZ i tutaj: bierze sie z niego
+                        // i kolor linii, i licznik w naglowku. Liczony dwa razy w dwoch
+                        // miejscach potrafilby sie rozjechac.
+                        var poz = wg[g].map(function (k){
                             // Zielone „ok" przy PUSTCE po obu stronach to nie zgodnosc,
                             // tylko brak danych. Zadne dzisiejsze porownanie tego nie
                             // produkuje, ale to jest wlasnie ten rodzaj falszywego haczyka,
@@ -18209,8 +18462,29 @@
                             var pustaL = !String(k.lewo == null ? '' : k.lewo).replace(/^—$/, '').trim();
                             var pustaP = !String(k.prawo == null ? '' : k.prawo).replace(/^—$/, '').trim();
                             var wyn = (k.wynik === 'ok' && pustaL && pustaP) ? 'uwaga' : k.wynik;
-                            var kk = wyn === 'zle' ? '#c00' : (wyn === 'uwaga' ? '#c47f00' : '#0a0');
-                            var zn = wyn === 'zle' ? '✗' : (wyn === 'uwaga' ? '⚠' : '✓');
+                            return { k: k, wyn: wyn, bezDanych: wyn !== k.wynik };
+                        });
+                        var nZle = 0, nUw = 0;
+                        poz.forEach(function (x){ if (x.wyn === 'zle') nZle++; else if (x.wyn === 'uwaga') nUw++; });
+                        var czyste = !nZle && !nUw;
+                        var kolS = nZle ? '#c00' : (nUw ? '#c47f00' : '#0a0');
+                        var licz = czyste
+                            ? ('wszystko zgodne · ' + poz.length + ' ' + bcOdmKontrola(poz.length))
+                            : ((nZle ? (nZle + ' ✗') : '') + (nZle && nUw ? ' · ' : '') + (nUw ? (nUw + ' ⚠') : '')
+                               + ' z ' + poz.length);
+                        h += '<div style="margin-top:6px;border-left:2px solid ' + kolS + ';padding-left:7px">'
+                           + '<div class="bc-sek-h" style="cursor:pointer;display:flex;align-items:baseline;gap:6px;font-size:11px"'
+                           + ' title="Kliknij, żeby zwinąć albo rozwinąć tę sekcję">'
+                           + '<span class="bc-sek-z" style="color:#999;width:9px;flex:none">' + (czyste ? '▸' : '▾') + '</span>'
+                           + '<span style="font-weight:700;color:#333">' + (g ? bcOrdLink(g) : 'cały przelew') + '</span>'
+                           + '<span style="color:' + kolS + '">' + licz + '</span></div>'
+                           + '<div class="bc-sek-b" data-czyste="' + (czyste ? '1' : '0') + '"'
+                           + ' style="display:' + (czyste ? 'none' : 'grid')
+                           + ';grid-template-columns:12px auto 1fr;gap:1px 7px;font-size:11px;line-height:1.5;margin-top:2px">';
+                        poz.forEach(function (x){
+                            var k = x.k;
+                            var kk = x.wyn === 'zle' ? '#c00' : (x.wyn === 'uwaga' ? '#c47f00' : '#0a0');
+                            var zn = x.wyn === 'zle' ? '✗' : (x.wyn === 'uwaga' ? '⚠' : '✓');
                             // Identyczne wartosci pokazujemy RAZ — powtarzanie tego samego
                             // ciagu po obu stronach tylko rozpycha wiersz i nic nie wnosi.
                             // Dopisek mowi jednak wprost, ze to WYNIK zestawienia dwoch
@@ -18222,13 +18496,13 @@
                                 : ('<span style="font-family:monospace">' + esc(k.lewo) + '</span>'
                                    + ' <span style="color:#999">↔</span> '
                                    + '<span style="font-family:monospace">' + esc(k.prawo) + '</span>');
-                            if (wyn !== k.wynik)
+                            if (x.bezDanych)
                                 war += ' <span style="color:#c47f00;font-size:10px">— nie było czego porównać</span>';
-                            h += '<li style="color:' + kk + '"><span style="color:#666">' + esc(k.co) + ':</span> '
-                               + '<span style="color:#333">' + war + '</span> '
-                               + '<span style="color:' + kk + '">' + zn + '</span></li>';
+                            h += '<span style="color:' + kk + ';text-align:center">' + zn + '</span>'
+                               + '<span style="color:#666">' + esc(k.co) + '</span>'
+                               + '<span style="color:#333">' + war + '</span>';
                         });
-                        h += '</ul></div>';
+                        h += '</div></div>';
                     });
                 }
                 // Guzik tylko tam, gdzie kwota sie NIE spina — przy zgodnej sumie nie ma
@@ -18257,8 +18531,12 @@
                + '<button id="bc-wk-add" class="chn-btn maroon" style="padding:3px 10px;font-size:12px" title="Dopisze ten komentarz do KAŻDEGO zamówienia z zaznaczonych przelewów, a potem sprawdzi na zamówieniu, czy naprawdę wszedł">💬 Dodaj komentarz do zaznaczonych</button>'
                + '<button id="bc-wk-all" class="chn-btn ghost" style="padding:3px 8px;font-size:11px" title="Zaznacz wszystkie przelewy — także te z zastrzeżeniami">\u2611 Zaznacz wszystkie</button>'
                + '<button id="bc-wk-none" class="chn-btn ghost" style="padding:3px 8px;font-size:11px" title="Odznacz wszystkie przelewy">\u2610 Odznacz wszystkie</button>'
+               + '<button id="bc-wk-chk2" class="chn-btn ghost" style="padding:3px 8px;font-size:11px" title="Czyta zaznaczone zamówienia jeszcze raz i pokazuje przy KAŻDYM numerze, czy komentarz o tej treści na nim jest — z datą i autorem">\ud83d\udd0d Sprawdź, czy komentarze weszły</button>'
                + '<span id="bc-wk-kom-st" style="font-size:11px;color:#666"></span>'
-               + '</div>';
+               + '</div>'
+               // Wynik sprawdzenia stoi POD paskiem, nie w nim: przy kilkunastu
+               // zamowieniach jest to kilka linijek, a pasek ma zostac paskiem.
+               + '<div id="bc-wk-kom-out"></div>';
             return h;
         }
 
@@ -22918,13 +23196,9 @@
                 });
                 return out;
             }
-            async function doKomentarz(){
-                if (busy) return;
-                var st = sp.querySelector('#bc-wk-kom-st');
-                function mow(t, kol){ if (st){ st.textContent = t; st.style.color = kol || '#666'; } }
-                var pole = sp.querySelector('#bc-wk-kom');
-                var tekst = String((pole && pole.value) || '').trim();
-                if (!tekst){ mow('Wpisz treść komentarza.', '#c00'); return; }
+            // Zamowienia z zaznaczonych przelewow. Wyjete z doKomentarz, bo to samo
+            // zaznaczenie obsluguje teraz i dopisywanie, i sprawdzanie po fakcie.
+            function bcZaznaczoneOrdery(){
                 var ord = [], seen = {};
                 sp.querySelectorAll('.bc-wk-chk').forEach(function (c){
                     if (!c.checked) return;
@@ -22933,6 +23207,89 @@
                         if (o && !seen[o]){ seen[o] = 1; ord.push(o); }
                     });
                 });
+                return ord;
+            }
+            // Przeglad zamowien JESZCZE RAZ, juz po zapisie. Czytamy strony od nowa,
+            // wiec to jest odczyt z serwera, a nie powtorzenie tego, co skrypt sam
+            // przed chwila napisal.
+            // Po pieciu naraz, tak samo jak przy sciaganiu potwierdzen: to sa odczyty
+            // stron zamowien, nic nie zapisuja, a przy kilkunastu numerach po kolei
+            // czekaloby sie kilkanascie sekund. Kolejnosc wynikow bcPool zachowuje,
+            // wiec lista pod paskiem idzie w kolejnosci zamowien.
+            async function bcSprawdzKom(ord, tekst, mow){
+                var zrobione = 0;
+                if (mow) mow('Sprawdzam: 0/' + ord.length + '…');
+                var res = await bcPool(ord, 5, async function (o){
+                    var r = await pcKomentarzSzukaj(o, tekst);
+                    zrobione++;
+                    if (mow) mow('Sprawdzam: ' + zrobione + '/' + ord.length + '…');
+                    return r;
+                });
+                return ord.map(function (o, i){
+                    var r = res[i];
+                    return { o: o, r: (r && !r.err) ? r : { st: null } };
+                });
+            }
+            // Wynik PRZY KAZDYM numerze. Do 5.28 stalo tu jedno zdanie „potwierdzone:
+            // 12/14" — i zeby dowiedziec sie, KTORE dwa nie weszly, trzeba bylo otwierac
+            // zamowienia po kolei. Numer jest odnosnikiem, wiec z tej listy idzie sie
+            // wprost na zamowienie, ktore wymaga reki.
+            function bcPokazKom(wyn, tekst){
+                var box = sp.querySelector('#bc-wk-kom-out');
+                if (!box) return { jest: 0, nie: 0, nieznane: 0 };
+                var jest = 0, nie = 0, nieznane = 0;
+                var chips = (wyn || []).map(function (x){
+                    var r = x.r || {}, kol, zn, opis;
+                    if (r.st === true){
+                        jest++; kol = '#0a7a2f'; zn = '✓';
+                        opis = (r.date ? esc(r.date) : 'bez daty')
+                             + (r.author ? (' · ' + esc(r.author)) : '')
+                             + (r.ile > 1 ? (' · ' + r.ile + '×') : '');
+                    } else if (r.st === false){
+                        nie++; kol = '#c00'; zn = '✗'; opis = 'nie ma takiego komentarza';
+                    } else {
+                        nieznane++; kol = '#c47f00'; zn = '⚠'; opis = 'nie otworzyłem zamówienia';
+                    }
+                    return '<span style="display:inline-block;margin:1px 8px 1px 0;white-space:nowrap">'
+                         + '<span style="color:' + kol + ';font-weight:700">' + zn + '</span> ' + bcOrdLink(x.o)
+                         + ' <span style="color:#888;font-size:10px">' + opis + '</span></span>';
+                }).join('');
+                box.innerHTML = '<div style="font-size:11px;margin-top:5px;padding-top:5px;border-top:1px dashed #eee">'
+                    + '<b>Komentarz „' + esc(tekst) + '" na zamówieniach:</b> '
+                    + '<span style="color:#0a7a2f">jest ' + jest + '</span>'
+                    + (nie ? (' · <span style="color:#c00">BRAK ' + nie + '</span>') : '')
+                    + (nieznane ? (' · <span style="color:#c47f00">niesprawdzone ' + nieznane + '</span>') : '')
+                    + '<div style="margin-top:3px;line-height:1.7">' + chips + '</div></div>';
+                return { jest: jest, nie: nie, nieznane: nieznane };
+            }
+            // Samo sprawdzenie, bez pisania czegokolwiek. Wolno je powtorzyc kiedykolwiek —
+            // takze dla komentarzy dopisanych wczoraj albo przez kogos innego.
+            async function doSprawdzKom(){
+                if (busy) return;
+                var st = sp.querySelector('#bc-wk-kom-st');
+                function mow(t, kol){ if (st){ st.textContent = t; st.style.color = kol || '#666'; } }
+                var pole = sp.querySelector('#bc-wk-kom');
+                var tekst = String((pole && pole.value) || '').trim();
+                if (!tekst){ mow('Wpisz treść komentarza, której mam szukać.', '#c00'); return; }
+                var ord = bcZaznaczoneOrdery();
+                if (!ord.length){ mow('Nic nie zaznaczone.', '#c47f00'); return; }
+                busy = true;
+                try {
+                    var wyn = await bcSprawdzKom(ord, tekst, mow), l = bcPokazKom(wyn, tekst);
+                    mow('Sprawdzone ' + ord.length + ': jest ' + l.jest
+                        + (l.nie ? (', BRAK ' + l.nie) : '')
+                        + (l.nieznane ? (', niesprawdzone ' + l.nieznane) : ''),
+                        l.nie ? '#c00' : (l.nieznane ? '#c47f00' : '#0a7a2f'));
+                } finally { busy = false; }
+            }
+            async function doKomentarz(){
+                if (busy) return;
+                var st = sp.querySelector('#bc-wk-kom-st');
+                function mow(t, kol){ if (st){ st.textContent = t; st.style.color = kol || '#666'; } }
+                var pole = sp.querySelector('#bc-wk-kom');
+                var tekst = String((pole && pole.value) || '').trim();
+                if (!tekst){ mow('Wpisz treść komentarza.', '#c00'); return; }
+                var ord = bcZaznaczoneOrdery();
                 if (!ord.length){ mow('Nic nie zaznaczone.', '#c47f00'); return; }
                 if (!confirm('Dopisać komentarz „' + tekst + '" do ' + ord.length + ' zamówień?\n\n'
                            + ord.join(', ') + '\n\nTego nie da się cofnąć z poziomu skryptu.')) return;
@@ -22951,10 +23308,19 @@
                         else if (jest === false) zle.push(ord[i] + ' (wysłane, ale nie ma go na zamówieniu)');
                         else niepewne.push(ord[i]);
                     }
-                    var cz = ['potwierdzone: ' + ok + '/' + ord.length];
-                    if (niepewne.length) cz.push('niesprawdzone (nie otworzyłem zamówienia): ' + niepewne.join(', '));
+                    // DRUGI przebieg, po wszystkich zapisach. Pierwszy czyta zamowienie
+                    // sekunde po wlasnym POST-cie i bywa niepewny („nie otworzylem
+                    // zamowienia"); ten czyta na spokojnie i to on jest odpowiedzia na
+                    // pytanie, czy komentarze weszly. Wynik idzie przy KAZDYM numerze.
+                    var wyn = await bcSprawdzKom(ord, tekst, mow), l = bcPokazKom(wyn, tekst);
+                    var cz = ['dopisane: ' + ok + '/' + ord.length];
                     if (zle.length) cz.push('nie udało się: ' + zle.join(', '));
-                    mow(cz.join(' · '), zle.length ? '#c00' : (niepewne.length ? '#c47f00' : '#0a7a2f'));
+                    cz.push('po sprawdzeniu jest na ' + l.jest + '/' + ord.length);
+                    if (l.nie) cz.push('BRAK na: ' + wyn.filter(function (x){ return x.r && x.r.st === false; })
+                        .map(function (x){ return x.o; }).join(', '));
+                    if (l.nieznane) cz.push('niesprawdzone: ' + wyn.filter(function (x){ return !x.r || x.r.st == null; })
+                        .map(function (x){ return x.o; }).join(', '));
+                    mow(cz.join(' · '), (zle.length || l.nie) ? '#c00' : (l.nieznane ? '#c47f00' : '#0a7a2f'));
                 } finally { busy = false; }
             }
             async function doPaste(){
@@ -23090,7 +23456,21 @@
                         bcMalujWiersz(c.closest ? c.closest('.bc-wiersz') : null, c.checked);
                 });
                 kb.addEventListener('click', function (e){
-                    var b = e.target && e.target.closest ? e.target.closest('.bc-filtr') : null;
+                    var cel = e.target, blisko = function (sel){ return cel && cel.closest ? cel.closest(sel) : null; };
+                    // Naglowek sekcji zwija i rozwija. Numer zamowienia w naglowku jest
+                    // ODNOSNIKIEM — klikniecie w niego ma otworzyc zamowienie i NIE ruszac
+                    // sekcji, wiec link wychodzi z tej obslugi pierwszy.
+                    var sh = blisko('.bc-sek-h');
+                    if (sh && !blisko('a')){ bcSekcja(sh); return; }
+                    var rb = blisko('.bc-rozw');
+                    if (rb){
+                        var wszystko = rb.getAttribute('data-v') === 'all';
+                        kb.querySelectorAll('.bc-sek-b').forEach(function (body){
+                            bcSekcjaPokaz(body, wszystko || body.getAttribute('data-czyste') !== '1');
+                        });
+                        return;
+                    }
+                    var b = blisko('.bc-filtr');
                     if (!b) return;
                     kb.setAttribute('data-filtr', b.getAttribute('data-filtr') || 'wszystkie');
                     bcZastosujFiltr(kb);
@@ -23112,6 +23492,7 @@
                 var t = e.target;
                 if (!t || !t.id) return;
                 if (t.id === 'bc-wk-add') doKomentarz();
+                else if (t.id === 'bc-wk-chk2') doSprawdzKom();
                 else if (t.id === 'bc-wk-all') bcZaznaczWszystkie(true);
                 else if (t.id === 'bc-wk-none') bcZaznaczWszystkie(false);
             });
@@ -23474,6 +23855,27 @@
                 if (pcTxt(cs[i].text || '').toLowerCase() === szuk) return true;
             }
             return false;
+        }
+        // Czy komentarz o tej tresci JEST na zamowieniu — z data i autorem najnowszego
+        // trafienia. To NIE jest to samo pytanie, co pcKomentarzWszedl: tamto patrzy na
+        // DWA ostatnie komentarze, bo pyta „czy moj zapis wlasnie wszedl", i sekunde po
+        // zapisie to wystarcza. Sprawdzenie PO FAKCIE musi przejrzec WSZYSTKIE — miedzy
+        // zapisem a sprawdzeniem ktos zdazy dopisac swoje i komentarz zjedzie z konca,
+        // a on tam dalej jest.
+        // Date oddajemy razem z wynikiem, bo sama zgodnosc tresci nie jest dowodem:
+        // „ok" sprzed tygodnia wyglada tak samo jak „ok" sprzed minuty i czlowiek musi
+        // to widziec, zamiast dostac zielony haczyk za cudzy stary wpis.
+        async function pcKomentarzSzukaj(order, tekst){
+            var html = '';
+            try { html = await pcOrderHtml(order); } catch (e){ html = ''; }
+            if (!html) return { st: null };
+            var cs = [];
+            try { cs = pcComments(html) || []; } catch (e){ return { st: null }; }
+            var szuk = pcTxt(tekst).toLowerCase(), tr = [];
+            cs.forEach(function (c){ if (pcTxt((c && c.text) || '').toLowerCase() === szuk) tr.push(c); });
+            if (!tr.length) return { st: false, ile: 0 };
+            var ost = tr[tr.length - 1];
+            return { st: true, ile: tr.length, date: (ost && ost.date) || '', author: (ost && ost.author) || '' };
         }
         async function pcOrderHtml(o){ try { return (await fetchT('/op_order.php?id=' + encodeURIComponent(o))) || ''; } catch (e){ return ''; } }
         // delegacja zmian: checkbox dostawcy -> zaznacz grupe; radio kwoty -> przelicz sumy
@@ -28958,8 +29360,25 @@
     function ebayNum(v){
         const s = String(v == null ? '' : v).trim();
         if (!s || s === '--') return null;
-        // Format niemiecki: kropka to separator tysiecy, przecinek dziesietny.
-        const t = s.replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+        // Separator dziesietny rozpoznajemy PO KSZTALCIE liczby, nie po jezyku raportu.
+        // 15.09.2026 raport beliani-de (etykiety po niemiecku, wyplata w CHF) przyszedl z liczbami
+        // w ukladzie angielskim: wiersze „-9.08", „99.9", naglowek „12,306.91 CHF". Stara regula
+        // „kropka = tysiace" robila z -9.08 liczbe -908, a z 12,306.91 liczbe 12.31 — kontrola
+        // sumy wierszy (1 086 070,00 wobec 12,31) zatrzymala wczytanie.
+        //   oba znaki                          -> dziesietny jest ten, ktory stoi dalej (1.234,56 / 1,234.56)
+        //   jeden znak raz, 1-2 cyfry za nim   -> dziesietny (49,99 / -9.08 / 99.9)
+        //   poza tym (1.234 / 1,234 / 1.234.567) -> tysiace, jak dotad
+        // \s w JS obejmuje tez twarda spacje; apostrof to szwajcarski separator tysiecy.
+        let t = s.replace(/[\s']/g, '');
+        const kr = t.lastIndexOf('.'), pr = t.lastIndexOf(',');
+        if (kr >= 0 && pr >= 0){
+            t = kr > pr ? t.replace(/,/g, '') : t.replace(/\./g, '').replace(',', '.');
+        } else if (kr >= 0 || pr >= 0){
+            const zn = kr >= 0 ? '.' : ',';
+            const za = t.length - Math.max(kr, pr) - 1;
+            const ile = t.split(zn).length - 1;
+            t = (ile === 1 && za >= 1 && za <= 2) ? t.replace(zn, '.') : t.split(zn).join('');
+        }
         const n = Number(t);
         return isFinite(n) ? n : null;
     }
@@ -35360,7 +35779,13 @@
         // w zapytaniu miedzydomenowym. Mowimy to ZANIM ktos kliknie i zobaczy 404.
         if (onProlo){
             const vh = {};
-            jobs.forEach(function (j){ if (mkTodo(j) && j.ref && j.kind === 'vtex' && j.host) vh[j.host] = (vh[j.host] || 0) + 1; });
+            // Warunek ten sam, co w vtexPass: numer z przelewu ALBO sama kwota. Dotad
+            // stalo tu samo „j.ref" i zlecenie z arkusza nie dawalo nawet tego baneru —
+            // z arkusza OBI milczalo wszedzie.
+            jobs.forEach(function (j){
+                if (mkTodo(j) && j.kind === 'vtex' && j.host && (j.ref || j.amount != null))
+                    vh[j.host] = (vh[j.host] || 0) + 1;
+            });
             Object.keys(vh).forEach(function (host){
                 h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
                   +  '<b>' + vh[host] + ' zleceń czeka na zestawienia z ' + esc(host) + '</b> — tej platformy nie pobiorę stąd, bo jej sesja nie działa międzydomenowo. '
@@ -40745,7 +41170,17 @@
         // tu zadnego zgadywania po dacie — albo trafiamy dokladnie, albo wcale.
         // Okno dat jest szerokie wstecz, bo data w referencji to dzien rozliczenia,
         // a przelew ksieguje sie pozniej (weekend wplywa w poniedzialek).
+        //
+        // vtexDotarl mowi, czy ostatni przelot w ogole DOTARL do panelu (vtexReports
+        // oddal liste). Bez tego przy kazdym zerze szedl ten sam komunikat o sesji —
+        // takze wtedy, gdy panel odpowiedzial normalnie, a zlecenie po prostu nie
+        // pasowalo do zadnego raportu. Czyta ja petla w „Przelec wszystkie sklepy".
+        let vtexDotarl = false;
         async function vtexPass(jobs, host){
+            // Zerujemy na samym poczatku, nie dopiero przed zapytaniem: nizej jest
+            // „return 0" bez zadnego zapytania, a flaga po poprzednim hoscie albo
+            // poprzednim kliknieciu nie moze za ten przelot zaswiadczac.
+            vtexDotarl = false;
             // Wpis dodany recznie albo wziety z arkusza NIE MA referencji z przelewu.
             // Warunek „jobs[k].ref" wyrzucal go stad po cichu — zlecenie nie dostawalo
             // nawet komunikatu, wygladalo na czekajace w nieskonczonosc. Wpuszczamy je,
@@ -40765,6 +41200,9 @@
             let reps = null, fromCache = false;
             try {
                 reps = await vtexReports(host, from, to);
+                // Panel odpowiedzial. Zestawienia odlozone w pamieci (catch nizej) sie
+                // nie licza — wtedy do panelu wlasnie NIE dotarlismy.
+                vtexDotarl = true;
                 if (location.hostname === host) vtexCacheSave(host, reps);   // odkladamy na potem
             } catch (e){
                 // Zapas: zestawienia odlozone przy ostatniej wizycie na stronie OBI.
@@ -41577,8 +42015,14 @@
                 try {
                     const got = await vtexPass(jobsLoad(), vhosts[vi]);
                     ok += got;
+                    // O sesji mowimy TYLKO wtedy, gdy panel naprawde nie odpowiedzial.
+                    // Dotad to zdanie szlo przy kazdym zerze — takze wtedy, gdy panel
+                    // odpowiedzial normalnie, a zlecenie po prostu nie pasowalo do zadnego
+                    // raportu. Czlowiek szedl wtedy klikac w panelu i dostawal to samo.
                     if (!got && mkHostsOf(jobsLoad(), 'vtex').indexOf(vhosts[vi]) >= 0)
-                        problem.push('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa');
+                        problem.push(vtexDotarl
+                            ? (mkPanelUrl(vhosts[vi]) + ': panel odpowiedział, ale nie dopasowałem rozliczenia — powód stoi przy zleceniu')
+                            : ('otwórz ' + mkPanelUrl(vhosts[vi]) + ' i kliknij tam „Pobierz zestawienia" — stąd jego sesja nie działa'));
                 } catch (e){ problem.push(vhosts[vi] + ': ' + ((e && e.message) || e)); }
             }
             // Od razu po pobraniu sprawdzamy, czy ktos tego juz nie zaksiegowal —
@@ -46621,14 +47065,16 @@
        znak (obciazenia ujemne, uznania dodatnie), wiec skladnik = Debit + Credit.
        Nie odwracamy tu niczego recznie — w pliku „Fees" stoi juz -4 083,99.        */
     const SL_FSR_OPLATY = [
-        ['Payment fees',         'prowizje od płatności'],
-        ['Refunded fees',        'prowizje oddane przy zwrotach'],
+        // Opisy te same co w tabeli „Podsumowanie PayPala" (SL_FSR_PL). Bez „brutto" —
+        // w polskiej ksiegowosci to odruchowo „z VAT", a tu chodzi o sposob fakturowania.
+        ['Payment fees',         'opłaty od płatności'],
+        ['Refunded fees',        'zwrócone opłaty'],
         ['Chargeback fees',      'opłaty za chargebacki'],
-        ['Dispute Fees',         'opłaty za spory'],
-        ['Bank Return Fees',     'opłaty za zwroty bankowe'],
-        ['Account fees invoice', 'opłaty za prowadzenie konta'],
-        ['Campaign fees',        'opłaty kampanijne'],
-        ['Fees gross billed',    'opłaty naliczone w brutto'],
+        ['Dispute Fees',         'opłaty z tytułu sporów'],
+        ['Bank Return Fees',     'opłaty banku za zwrócone transakcje'],
+        ['Account fees invoice', 'opłaty za konto wg faktury'],
+        ['Campaign fees',        'opłaty za kampanie'],
+        ['Fees gross billed',    'opłaty fakturowane okresowo'],
         ['Other fees',           'pozostałe opłaty']
     ];
     // Ktore skladniki NIE MAJA szans pojawic sie w raporcie transakcji. Uzywane
@@ -46683,8 +47129,151 @@
             oplatySkladniki: suma,
             oplatyRozjazd: (razem == null) ? null : Math.round((razem - suma) * 100) / 100,
             sporyObc: wartosc('Chargebacks & disputes'),
-            sporyZwr: wartosc('Dispute reimbursements')
+            sporyZwr: wartosc('Dispute reimbursements'),
+            // Cala strona w ukladzie PayPala — do widoku po polsku (salPodsumowanieHtml).
+            strona: slStronaFSR(wiersze)
         };
+    }
+
+    /* ---------- CALA STRONA PODSUMOWANIA — widok po polsku ----------
+       Uklad XLSX (sprawdzone 14.09.2026 na NOK 08.2026): kolumna A = etykieta, B i C =
+       kwoty jako tekst („-4,083.99"). Wiersz z pusta etykieta i „Beginning | Ending"
+       otwiera SALDA (B = poczatek, C = koniec okresu), a z „Debit | Credit" — OBROTY
+       (B = obciazenia, C = uznania; obie kolumny niosa znak). Kategoria (Sales activity,
+       Fees…) ma wypelniona DOKLADNIE JEDNA kolumne — to netto jej wierszy; wiersz
+       szczegolowy ma obie. Pogrubienie i tlo sa w pliku, ale slXlsx stylow nie czyta,
+       wiec o kategorii mowi lista SL_FSR_KATEGORIE, a zapasowo ta regula. Wiersze bez
+       liczb (firma, adres, tytul, „Note: This is not an actual bill.") pomijamy.
+       Etykieta spoza slownika zostaje — po angielsku i oznaczona — a nie znika.
+       PDF tego samego raportu (GBP 07.2026) pisze czesc etykiet inaczej: „and" zamiast
+       „&", „Gift voucher", „Money (not yet) available", „cashback" — slEtyFSR sprowadza
+       je do jednego klucza.                                                           */
+    function slEtyFSR(s){
+        return String(s == null ? '' : s).toLowerCase().replace(/&/g, ' and ').replace(/\s+/g, ' ').trim()
+            .replace(/cash back/g, 'cashback').replace(/gift voucher/g, 'gift certificate')
+            .replace(/^money (not yet )?available$/, 'funds $1available');
+    }
+    // Tlumaczenia po recenzji ksiegowej i recenzji znaczen PayPala (14.09.2026). Unikamy
+    // slow, ktore w polskiej ksiegowosci znacza co innego: „brutto" (VAT), „faktura" jako
+    // nazwa wiersza (dokument), „dywidendy" (udzial w zysku), „zwolnienia platnosci".
+    const SL_FSR_PL = {
+        'total balance': 'Saldo łączne',
+        'available balance': 'Saldo dostępne',
+        'payables balance': 'Saldo zobowiązań wobec PayPala',
+        'sales activity': 'Sprzedaż',
+        'payments received': 'Otrzymane płatności',
+        'disbursements received': 'Otrzymane przekazania środków',
+        'refunds sent': 'Wysłane zwroty',
+        'fees': 'Opłaty',
+        'payment fees': 'Opłaty od płatności',
+        'refunded fees': 'Zwrócone opłaty',
+        'chargeback fees': 'Opłaty za chargebacki',
+        'dispute fees': 'Opłaty z tytułu sporów',
+        'bank return fees': 'Opłaty banku za zwrócone transakcje',
+        'account fees invoice': 'Opłaty za konto wg faktury',
+        'campaign fees': 'Opłaty za kampanie',
+        'fees gross billed': 'Opłaty fakturowane okresowo',
+        'other fees': 'Pozostałe opłaty',
+        'dispute activity': 'Spory',
+        'chargebacks and disputes': 'Chargebacki i spory',
+        'dispute reimbursements': 'Zwolnienia wstrzymań i refundacje po sporach',
+        'transfers and withdrawals': 'Przewalutowania, zasilenia i wypłaty',
+        'currency transfers': 'Przewalutowania',
+        'transfers to paypal account': 'Zasilenia konta PayPal',
+        'transfers from paypal account': 'Wypłaty z konta PayPal',
+        'purchase activity': 'Zakupy',
+        'online payments sent': 'Wysłane płatności online',
+        'refunds received': 'Otrzymane zwroty',
+        'debit card purchases': 'Zakupy kartą debetową',
+        'debit card returns': 'Zwroty na kartę debetową',
+        'reserves and releases': 'Rezerwy, wstrzymania i zwolnienia środków',
+        'reserve holds': 'Wstrzymania na rezerwę',
+        'reserve releases': 'Zwolnienia z rezerwy',
+        'payment review holds': 'Wstrzymania do weryfikacji płatności',
+        'payment review releases': 'Zwolnienia po weryfikacji płatności',
+        'payment holds': 'Wstrzymania środków z płatności',
+        'payment releases': 'Zwolnienia wstrzymanych środków',
+        'gift certificate purchases': 'Bony podarunkowe kupione przez klientów',
+        'gift certificate redemption': 'Realizacja bonów podarunkowych',
+        'funds not yet available': 'Środki jeszcze niedostępne',
+        'funds available': 'Środki udostępnione',
+        'blocked payments': 'Zablokowane płatności',
+        'tax holds': 'Wstrzymania podatkowe',
+        'tax releases': 'Zwolnienia wstrzymań podatkowych',
+        'tax': 'Podatek',
+        'tax withholding': 'Pobrany podatek',
+        'other activity': 'Pozostałe operacje',
+        'money market dividends': 'Dochód z funduszu rynku pieniężnego',
+        'debit card cashback': 'Cashback z karty debetowej',
+        'credit card cashback': 'Cashback z karty kredytowej',
+        'other': 'Pozostałe'
+    };
+    const SL_FSR_KATEGORIE = { 'sales activity': 1, 'fees': 1, 'dispute activity': 1, 'transfers and withdrawals': 1,
+                               'purchase activity': 1, 'reserves and releases': 1, 'tax': 1, 'other activity': 1 };
+    const SL_FSR_MIES_EN = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    const SL_FSR_MIES_PL = ['stycznia', 'lutego', 'marca', 'kwietnia', 'maja', 'czerwca', 'lipca', 'sierpnia',
+                            'września', 'października', 'listopada', 'grudnia'];
+    // „Financial Statement from 1 Aug 2026 to 31 Aug 2026" -> „Zestawienie finansowe za okres
+    // 1–31 sierpnia 2026 r.". Gdy wzor nie pasuje, zostaje tekst PayPala — lepszy niz zaden.
+    function slOkresFSR(t){
+        const s = String(t == null ? '' : t);
+        const m = /from\s+(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})\s+to\s+(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})/i.exec(s);
+        if (!m) return s;
+        const m1 = SL_FSR_MIES_EN[m[2].toLowerCase()], m2 = SL_FSR_MIES_EN[m[5].toLowerCase()];
+        if (m1 == null || m2 == null) return s;
+        if (m1 === m2 && m[3] === m[6])
+            return 'Zestawienie finansowe za okres ' + m[1] + '–' + m[4] + ' ' + SL_FSR_MIES_PL[m1] + ' ' + m[3] + ' r.';
+        return 'Zestawienie finansowe za okres ' + m[1] + ' ' + SL_FSR_MIES_PL[m1] + ' ' + m[3] + ' r. – '
+             + m[4] + ' ' + SL_FSR_MIES_PL[m2] + ' ' + m[6] + ' r.';
+    }
+    function slStronaFSR(wiersze){
+        const txt = function (v){ return v == null ? '' : String(v).trim(); };
+        // Pusta kolumna kategorii: w XLSX pusty napis, w PDF „--".
+        const pusty = function (v){ const s = txt(v); return s === '' || /^[-–—]{1,2}$/.test(s); };
+        const r2 = function (v){ return Math.round(v * 100) / 100; };
+        const salda = [], obroty = [], obce = [];
+        let sekcja = null, kat = null;
+        (wiersze || []).forEach(function (r){
+            r = r || [];
+            const a = txt(r[0]), b = txt(r[1]), c = txt(r[2]);
+            if (!a && /^beginning$/i.test(b) && /^ending$/i.test(c)){ sekcja = 'salda'; return; }
+            if (!a && /^debit$/i.test(b) && /^credit$/i.test(c)){ sekcja = 'obroty'; kat = null; return; }
+            if (!a || !sekcja) return;
+            const kb = pusty(r[1]) ? null : slKwota(r[1]);
+            const kc = pusty(r[2]) ? null : slKwota(r[2]);
+            if (kb == null && kc == null) return;
+            const klucz = slEtyFSR(a);
+            const pl = SL_FSR_PL[klucz] || '';
+            if (!pl) obce.push(a);
+            if (sekcja === 'salda'){ salda.push({ en: a, pl: pl, pocz: kb, kon: kc }); return; }
+            // Regula zapasowa (jedna pusta kolumna) tylko dla etykiet spoza slownika: znany wiersz
+            // szczegolowy nie awansuje do kategorii i nie jest liczony drugi raz (przeglad 14.09.2026).
+            const kategoria = !!SL_FSR_KATEGORIE[klucz] || (!pl && pusty(r[1]) !== pusty(r[2]));
+            const w = { en: a, pl: pl, obc: kb, uzn: kc, kategoria: kategoria, wiersze: [] };
+            if (kategoria){ kat = w; obroty.push(w); }
+            else if (kat) kat.wiersze.push(w);
+            else obroty.push(w);
+        });
+        // KONTROLE WLASNE. Netto pozycji = obciazenia + uznania (obie ze znakiem).
+        // Saldo: poczatek + suma netto pozycji najwyzszego poziomu (kategorie niosa juz
+        // netto swoich wierszy — nie doliczamy ich drugi raz) = koniec.
+        const netto = function (w){ return r2((w.obc || 0) + (w.uzn || 0)); };
+        const kategorie = [];
+        let ruch = 0;
+        obroty.forEach(function (k){
+            ruch += netto(k);
+            if (!k.kategoria || !k.wiersze.length) return;
+            const s = r2(k.wiersze.reduce(function (n, w){ return n + netto(w); }, 0));
+            if (Math.abs(s - netto(k)) >= 0.005) kategorie.push({ en: k.en, pl: k.pl, kategoria: netto(k), wiersze: s });
+        });
+        ruch = r2(ruch);
+        const total = salda.filter(function (x){ return slEtyFSR(x.en) === 'total balance'; })[0];
+        let saldo = null;
+        if (total && total.pocz != null && total.kon != null){
+            const wyliczone = r2(total.pocz + ruch);
+            saldo = { pocz: total.pocz, obroty: ruch, wyliczone: wyliczone, kon: total.kon, roznica: r2(total.kon - wyliczone) };
+        }
+        return { salda: salda, obroty: obroty, obce: obce, kontrola: { saldo: saldo, kategorie: kategorie } };
     }
     function slCzytajPP(wiersze) {
         const hi = wiersze.findIndex(function (r) { return r && String(r[1] || '').trim() === 'Type'; });
@@ -56403,6 +56992,8 @@
         // nadpisywala komunikat o bledzie i po wrzuceniu czegos nie tego widac bylo
         // tylko „wczytane: 0 plikow".
         let dodane = 0, odrzucone = 0, ostatni = '';
+        const jakoPodsumowanie = [];   // pliki, ktore okazaly sie strona podsumowania
+        const pominiete = [];          // podsumowania juz wczytane (ta sama tresc)
         for (let i = 0; i < files.length; i++){
             // Ten sam plik dwa razy to prawie zawsze pomylka, nie zamiar.
             if (SAL_PLIKI[gdzie].some(function (x){ return x.nazwa === files[i].name; })) continue;
@@ -56423,8 +57014,22 @@
                     catch (eFS){ throw ePP; }        // nie jest ani jednym, ani drugim
                 }
                 if (fsr){
+                    // To samo podsumowanie drugi raz blokowaloby potem „Porownaj" („Wgrales 2 strony
+                    // podsumowania"). Poznajemy je po TRESCI, nie po nazwie: trzy rozne raporty PayPala
+                    // pobieraja sie pod ta sama nazwa, a ta sama tresc przychodzi jako „… (1).XLSX".
+                    // Pominiety plik nazywamy w komunikacie — nic nie znika po cichu (przeglad 14.09.2026).
+                    const konSalda = function (x){
+                        const s = x && x.strona && x.strona.kontrola && x.strona.kontrola.saldo;
+                        return s ? s.kon : null;
+                    };
+                    const juz = SAL_PLIKI.fsr.filter(function (x){
+                        return x.okres === fsr.okres && x.waluta === fsr.waluta && x.skrzynka === fsr.skrzynka
+                            && x.fsr.oplatyRazem === fsr.oplatyRazem && konSalda(x.fsr) === konSalda(fsr);
+                    })[0];
+                    if (juz){ pominiete.push('„' + files[i].name + '” to samo co „' + juz.nazwa + '”'); continue; }
                     SAL_PLIKI.fsr.push({ nazwa: files[i].name, okres: fsr.okres,
                                          waluta: fsr.waluta, skrzynka: fsr.skrzynka, fsr: fsr });
+                    jakoPodsumowanie.push(files[i].name);
                     dodane++;
                     continue;
                 }
@@ -56436,10 +57041,27 @@
                 ostatni = '„' + files[i].name + '”: ' + ((e && e.message) || e);
             }
         }
+        // Plik, ktory okazal sie strona podsumowania, nazywamy wprost — inaczej zielone
+        // „wczytane: 1 plik" w polu „transakcje" wyglada jak raport transakcji na miejscu.
+        // Trzy rozne raporty PayPala pobieraja sie pod ta sama nazwa „FSR-<okres>".
+        // Ostrzegamy tylko wtedy, gdy raportu transakcji naprawde brak — podsumowanie dolozone obok
+        // raportu transakcji to poprawny komplet i zostaje na zielono (przeglad 14.09.2026).
+        const brakPP = !SAL_PLIKI.pp.length;
+        const uwagaFsr = jakoPodsumowanie.length
+            ? (' · „' + jakoPodsumowanie.join('”, „') + '” to strona podsumowania — dołączona jako podsumowanie'
+               + (brakPP ? '; raport transakcji to osobny plik PayPala (z kolumną „Type”)' : ''))
+            : '';
+        const uwagaPomin = pominiete.length
+            ? (' · pominięte, bo to samo podsumowanie jest już wczytane: ' + pominiete.join('; '))
+            : '';
+        const uwagaWiele = SAL_PLIKI.fsr.length > 1
+            ? (' · wczytanych stron podsumowania: ' + SAL_PLIKI.fsr.length + ' — do porównania zostaw jedną')
+            : '';
         salKoniec('plik',
-            odrzucone ? (ostatni + (dodane ? (' · wczytane: ' + dodane) : ''))
-                      : ('wczytane: ' + dodane + ' plik' + (dodane === 1 ? '' : 'ów')),
-            odrzucone ? '#c00' : '#0a7a2f');
+            (odrzucone ? (ostatni + (dodane ? (' · wczytane: ' + dodane) : ''))
+                       : ('wczytane: ' + dodane + ' plik' + (dodane === 1 ? '' : 'ów'))) + uwagaFsr + uwagaPomin + uwagaWiele,
+            odrzucone ? '#c00'
+                      : (((jakoPodsumowanie.length && brakPP) || uwagaPomin || uwagaWiele) ? '#c47f00' : '#0a7a2f'));
         salPlikInfo();
     }
 
@@ -56530,7 +57152,25 @@
     }
 
     function salPorownaj(b){
-        if (!SAL_PLIKI.pp.length){ salSay('Wskaż raport transakcji z PayPala.', '#c47f00'); return; }
+        // Bez raportu transakcji nie ma uzgodnienia — ale strona podsumowania sama tez jest
+        // cos warta. 14.09.2026 wrzucona w pole „transakcje" dawala gole „Wskaz raport
+        // transakcji", choc plik w tym polu byl. Teraz mowimy, co wczytano, i ja pokazujemy.
+        if (!SAL_PLIKI.pp.length){
+            if (SAL_PLIKI.fsr.length === 1){
+                salRaportPodsumowania(SAL_PLIKI.fsr[0].fsr);
+                salSay('Wczytany plik to strona podsumowania, a nie raport transakcji — pokazuję samo podsumowanie. '
+                     + 'Do uzgodnienia dołóż raport transakcji (plik PayPala z kolumną „Type”).', '#c47f00');
+                return;
+            }
+            // Dwie przeszkody naraz nazywamy obie — samo „doloz raport transakcji" konczylo sie
+            // potem czerwonym „Wgrales 2 strony podsumowania" (przeglad 14.09.2026).
+            salSay(SAL_PLIKI.fsr.length
+                ? ('Wczytanych stron podsumowania: ' + SAL_PLIKI.fsr.length + ' ('
+                   + SAL_PLIKI.fsr.map(function (x){ return '„' + x.nazwa + '”'; }).join(', ')
+                   + '), a raportu transakcji brak. Zostaw jedno podsumowanie (×) i dołóż raport transakcji (plik PayPala z kolumną „Type”).')
+                : 'Wskaż raport transakcji z PayPala.', '#c47f00');
+            return;
+        }
         if (!SAL_EXP){ salSay('Najpierw pobierz zestawienie z prologistics albo wskaż plik.', '#c47f00'); return; }
         // Zapora walutowa. Raport PayPala dotyczy JEDNEJ skrzynki i JEDNEJ waluty,
         // a lista kont pozwala zaznaczyc jedenascie. Porownanie funtow z frankami
@@ -56597,6 +57237,99 @@
         b.disabled = false;
     }
 
+    /* Strona podsumowania PayPala w jego wlasnym ukladzie, po polsku (prosba uzytkownika
+       z 14.09.2026: „w takiej formie, ale w jezyku polskim"): tabela sald (na poczatek /
+       na koniec okresu) i tabela obrotow (obciazenia / uznania) z kategoriami i wierszami
+       szczegolowymi. Angielska etykieta zostaje w dymku (title), zeby dalo sie zestawic
+       z oryginalem. Liczby jak u PayPala — ze znakiem, zera wyszarzone. Pod tabela
+       kontrole ze slStronaFSR. Style te same co w salRaport.                         */
+    function salPodsumowanieHtml(f){
+        const s = f && f.strona;
+        if (!s) return '';
+        // Plik przeszedl jako podsumowanie (ma wiersz „Fees"), ale tabel nie odczytalismy —
+        // mowimy o tym, zamiast po cichu nie pokazac sekcji.
+        if (!s.salda.length && !s.obroty.length)
+            return '<div style="margin:12px 0 4px;font-size:11px;color:#b45309">⚠ Strony podsumowania nie odczytałem: '
+                 + 'nie znalazłem nagłówków „Beginning | Ending” ani „Debit | Credit” — układ pliku jest inny niż znany.</div>';
+        const TH = 'padding:4px 6px;font-weight:400;color:#888;border-bottom:1px solid #e5e5e5';
+        const TD = 'padding:3px 6px';
+        const TDR = 'padding:3px 6px;text-align:right;font-variant-numeric:tabular-nums';
+        const sek = function (tyt) {
+            return '<div style="margin:12px 0 4px;font-size:11px;letter-spacing:.06em;'
+                 + 'text-transform:uppercase;color:#750000;font-weight:700">' + tyt + '</div>';
+        };
+        const kw = function (v){
+            if (v == null) return '<span style="color:#bbb">—</span>';
+            return Math.abs(v) < 0.005 ? '<span style="color:#aaa">' + salPln(v) + '</span>' : salPln(v);
+        };
+        const ety = function (w, wciecie){
+            const nazwa = w.pl ? salEsc(w.pl)
+                : (salEsc(w.en) + ' <span style="font-size:10px;color:#b45309">(bez tłumaczenia)</span>');
+            return '<td style="' + TD + (wciecie ? ';padding-left:22px' : '') + (w.kategoria ? ';font-weight:700' : '')
+                 + '" title="' + salEsc(w.en) + '">' + nazwa + '</td>';
+        };
+        let h = sek('Podsumowanie PayPala')
+            + '<div style="font-size:11px;color:#666;margin:-2px 0 4px">' + salEsc(slOkresFSR(f.okres))
+            + (f.waluta ? (' · kwoty w ' + salEsc(f.waluta)) : '') + '</div>';
+        if (s.salda.length){
+            h += '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+               + '<tr><td style="' + TH + '">Salda</td><td style="' + TH + ';text-align:right">Na początek okresu</td>'
+               + '<td style="' + TH + ';text-align:right">Na koniec okresu</td></tr>'
+               + s.salda.map(function (w){
+                     return '<tr>' + ety(w) + '<td style="' + TDR + '">' + kw(w.pocz) + '</td>'
+                          + '<td style="' + TDR + '">' + kw(w.kon) + '</td></tr>';
+                 }).join('')
+               + '</table>';
+        }
+        if (s.obroty.length){
+            h += '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px">'
+               + '<tr><td style="' + TH + '">Obroty</td><td style="' + TH + ';text-align:right">Obciążenia</td>'
+               + '<td style="' + TH + ';text-align:right">Uznania</td></tr>';
+            s.obroty.forEach(function (k){
+                const gruba = k.kategoria ? ';font-weight:700' : '';
+                h += '<tr' + (k.kategoria ? ' style="background:#f6f8fb;border-top:1px solid #e5e5e5"' : '') + '>'
+                   + ety(k) + '<td style="' + TDR + gruba + '">' + kw(k.obc) + '</td>'
+                   + '<td style="' + TDR + gruba + '">' + kw(k.uzn) + '</td></tr>';
+                k.wiersze.forEach(function (w){
+                    h += '<tr>' + ety(w, true) + '<td style="' + TDR + '">' + kw(w.obc) + '</td>'
+                       + '<td style="' + TDR + '">' + kw(w.uzn) + '</td></tr>';
+                });
+            });
+            h += '</table>';
+        }
+        const kt = s.kontrola || {};
+        const linie = [];
+        if (kt.saldo){
+            const ok = Math.abs(kt.saldo.roznica) < 0.005;
+            linie.push('<span style="color:' + (ok ? '#0a7a2f' : '#b45309') + '">' + (ok ? '✓ ' : '⚠ ')
+                + 'saldo łączne na początek ' + salPln(kt.saldo.pocz) + ' + obroty ' + salPln(kt.saldo.obroty)
+                + ' = ' + salPln(kt.saldo.wyliczone)
+                + (ok ? ' — zgodne z saldem na koniec'
+                      : (' — a PayPal podaje na koniec ' + salPln(kt.saldo.kon) + ', różnica ' + salPln(kt.saldo.roznica)))
+                + '</span>');
+        } else {
+            linie.push('<span style="color:#b45309">⚠ salda nie sprawdziłem — brak wiersza „Total balance” z obiema kwotami</span>');
+        }
+        (kt.kategorie || []).forEach(function (x){
+            linie.push('<span style="color:#b45309">⚠ ' + salEsc(x.pl || x.en) + ': kategoria ' + salPln(x.kategoria)
+                + ', a jej wiersze razem ' + salPln(x.wiersze) + '</span>');
+        });
+        if (s.obce && s.obce.length)
+            linie.push('<span style="color:#b45309">⚠ etykiety bez tłumaczenia (pokazane po angielsku): '
+                + s.obce.map(salEsc).join(', ') + '</span>');
+        return h + '<div style="font-size:11px;margin-top:6px;line-height:1.6">' + linie.join('<br>') + '</div>';
+    }
+    // Samo podsumowanie, gdy nie ma raportu transakcji — bez uzgodnienia, ale z tabela.
+    function salRaportPodsumowania(f){
+        const d = document.getElementById('sal-raport');
+        if (!d) return;
+        SAL_WYNIK = null;
+        d.innerHTML = '<div style="border:1px solid #DBD9D7;border-radius:10px;padding:12px">'
+            + '<div style="font-weight:700;font-size:13px">Podsumowanie PayPala — bez uzgodnienia</div>'
+            + '<div style="font-size:11px;color:#666;margin-top:2px">Brak raportu transakcji, więc nie ma porównania z prologistics.</div>'
+            + salPodsumowanieHtml(f) + '</div>';
+    }
+
     // Raport ma forme protokolu uzgodnienia: zestawienie zbiorcze, rozliczenie
     // roznicy, klasyfikacja pozycji nieuzgodnionych ze statusem, pozycje
     // informacyjne i zastrzezenia. Zadnych polecen w rodzaju „patrz tu" —
@@ -56642,6 +57375,9 @@
           + '<td style="' + TDR + ';font-weight:700">' + salPln(nettoPL) + '</td>'
           + '<td style="' + TDR + ';font-weight:700;color:' + kolR(roz(nettoPP, nettoPL)) + '">'
           + salPln(roz(nettoPP, nettoPL)) + '</td></tr></table>';
+
+        // --- strona podsumowania PayPala po polsku (tylko gdy wgrano podsumowanie) ---
+        h += salPodsumowanieHtml(r.oplaty);
 
         // --- rozliczenie roznicy: z czego sklada sie kazda roznica ---
         const skladniki = function (b) {
@@ -66056,6 +66792,13 @@
     }
 
 
+    // Znacznik budowy (15.09.2026). NIE edytuj recznie: kopia-wersji.sh wstawia tu skrot
+    // ostatniego commita pliku i jego date przy robieniu „HUB v<numer>.txt". Launcher pokazuje
+    // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
+    // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
+    // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
+    const HUB_BUDOWA = '0076a8e · 15.09.2026 09:06';
+
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
         { id: 'mmtok',    name: 'ManoMano — sesja panelu',   test: onMano,    init: init_mmtok },
@@ -66116,6 +66859,7 @@
             #beliani-launcher .bl-gear{color:#750000;font-weight:bold;}
             #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
+            #beliani-launcher .bl-build{padding:6px 14px;font-size:11px;color:#888;background:#fff;border-top:1px solid #eee;user-select:text;cursor:default;}
             /* Krzyzyk wstrzykiwany do paneli, ktore nie mialy wlasnego zamkniecia.
                sticky + height:0 => nie zajmuje miejsca w ukladzie i nie odjezdza przy
                przewijaniu dlugiego panelu. */
@@ -66459,6 +67203,18 @@
         });
         html += '<button class="bl-set-row" id="bl-pos-reset">\u21BA Przywr\u00F3\u0107 pozycj\u0119 guzika</button>';
         html += '</div>';
+        // Stopka ze znacznikiem budowy. Znak zastepczy (plik wklejony prosto z repo, nie z kopii)
+        // poznajemy po podkresleniach na poczatku — sam znak nie moze tu stac drugi raz,
+        // bo kopia-wersji.sh podmienia go i sprawdza, ze wystepuje dokladnie raz.
+        {
+            let wer = '?';
+            try { if (typeof GM_info !== 'undefined' && GM_info.script) wer = GM_info.script.version || '?'; } catch (e) {}
+            const opis = /^__/.test(HUB_BUDOWA)
+                ? 'bez znacznika — plik prosto z repozytorium'
+                : ('zmiana ' + String(HUB_BUDOWA).replace(/[<>&"]/g, ''));
+            html += '<div class="bl-build" title="Ma się zgadzać z: git log -1 --oneline -- Beliani_prologistics_hub.user.js">HUB '
+                + String(wer).replace(/[<>&"]/g, '') + ' · ' + opis + '</div>';
+        }
         panel.innerHTML = html;
 
         wrap.appendChild(btn); wrap.appendChild(panel);
