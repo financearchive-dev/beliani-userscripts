@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.47
+// @version      5.48
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -26175,7 +26175,305 @@
     }
 
     const MK_ACC_KEY = 'mkt_accounts';
-    function mkAcctLoad(){ try { return JSON.parse(GM_getValue(MK_ACC_KEY, '[]')) || []; } catch (e){ return []; } }
+    const MK_ACC_RECZNE = 'mkt_accounts_reczne';
+    // Plan kont WBUDOWANY — zrzut accounts.php z 15.09.2026 (825 kont, 50 nieaktywnych).
+    // Po co, skoro umiemy go pobrac: samoczynne pobranie dziala wybiorczo (z karty Mirakla
+    // czy VTEX-a zapytanie potrafi wrocic strona zamiast danych), a bez listy nie ma
+    // podpowiedzi kont i trzeba znac numery na pamiec. Lista wbudowana to podloga:
+    // pobranie z prologistics ja nadpisuje po numerze, a wpisy dopisane recznie zostaja.
+    const MK_ACC_WBUD = [
+        ["1000", "Kasse PLN BCE", 1], ["1001", "Kasse EUR BCE", 1], ["1002", "Kasse CHF BCE", 1],
+        ["1003", "Kasse CNY BCE", 1], ["1007", "Qualistyle Revolut PLN", 1], ["1008", "Qualistyle Revolut EUR", 1],
+        ["1009", "Qualistyle Revolut CHF", 1], ["1010", "Postfinance CHF Beliani CH", 1], ["1011", "Saferpay Beliani CHF", 1],
+        ["1012", "Raiffeisen BCE PLN", 1], ["1013", "UniCredit RO Beliani EU GmbH", 1], ["1014", "UBS NOK Beliani (Norge) GmbH", 1],
+        ["1015", "Hypovereinsbank EUR Beliani (International) GmbH", 1], ["1016", "Postfinance CHF Beliani UK", 1], ["1017", "Postfinance EUR Beliani CH", 1],
+        ["1018", "Postfinance USD Beliani USA", 1], ["1019", "Saferpay Beliani GBP", 1], ["1020", "Credit Suisse (Michael Widmer)", 0],
+        ["1021", "Qualistyle PF EUR", 1], ["1022", "Saferpay Beliani EUR", 1], ["1023", "PayU Beliani PL", 1],
+        ["1024", "PLN Alior Bank", 1], ["1025", "PLN CITIBANK Michael Widmer", 1], ["1026", "VidaXL PL", 1],
+        ["1027", "BZ WBK PLN Beliani PL", 1], ["1028", "Saferpay PLN Beliani PL", 1], ["1029", "Paypal PLN Beliani PL", 1],
+        ["1030", "CITIBANK PLN Beliani CH", 1], ["1031", "Przelewy24 Beliani PL", 1], ["1032", "Shopgate PLN Beliani PL", 1],
+        ["1033", "Superwnetrze.pl Beliani PL", 1], ["1034", "Galaxus CHF", 1], ["1035", "Payever EUR Beliani DE", 1],
+        ["1036", "Eboutic Beliani CH", 1], ["1037", "Decofinder CH", 1], ["1038", "DeinDeal Beliani CH", 1],
+        ["1039", "Saferpay Beliani DE SEK", 1], ["1040", "Saferpay Beliani DE DKK", 1], ["1041", "Home 24 Beliani Switzerland GmbH", 1],
+        ["1042", "Raiffeisen PLN Beliani PL", 1], ["1043", "Siroop Beliani CH", 1], ["1044", "Groupon CH", 1],
+        ["1045", "Hypovereinsbank EUR Beliani (PL) GmbH", 1], ["1046", "MyStore Beliani CH", 1], ["1047", "VidaXL CH", 1],
+        ["1048", "VidaXL DE", 1], ["1049", "PostFinance Beliani INT USD", 1], ["1050", "VidaXL FR", 1],
+        ["1051", "VidaXL IT", 1], ["1052", "VidaXL PT", 1], ["1053", "Coop Beliani CH", 1],
+        ["1054", "VidaXL SE", 1], ["1055", "CDON FI Beliani DE", 1], ["1056", "VidaXL HU", 1],
+        ["1057", "VidaXL DK", 1], ["1058", "VidaXL CZ", 1], ["1059", "VidaXL FI", 1],
+        ["1060", "VidaXL ES", 1], ["1061", "ePrice Beliani IT", 1], ["1062", "Carrefour ES Beliani Europe OU", 1],
+        ["1063", "Credit Suisse Beliani Switzerland", 1], ["1064", "DiniChance Beliani Switzerland", 1], ["1065", "Postfinance Beliani Switzerland CHF", 1],
+        ["1066", "Microspot Beliani CH", 1], ["1067", "Limango PLN, Beliani PL", 1], ["1068", "Swissbilling SA", 1],
+        ["1069", "Allegro Beliani Polska", 1], ["1070", "UBS/Credit Suisse Beliani International GmbH", 1], ["1071", "Allegro Beliani", 1],
+        ["1072", "OberBank CZK Beliani International", 1], ["1073", "Carrefour HiPay PLN", 1], ["1074", "UBS Beliani Switzerland", 1],
+        ["1075", "Hir TV", 1], ["1076", "COD Rohling Suus", 1], ["1077", "COD DPD", 1],
+        ["1078", "COD GLS", 1], ["1079", "COD DTS", 1], ["1080", "Raiffeisenbank CZK Beliani (International) GmbH", 1],
+        ["1081", "Klarna Beliani PL", 1], ["1082", "Amazon PL", 1], ["1083", "Amazon SE", 1],
+        ["1084", "PayU CZK Beliani DE", 1], ["1085", "COD FUTAR HU", 1], ["1086", "COD GLS HUF", 1],
+        ["1087", "EMAG HUF", 1], ["1088", "Unpaid COD", 1], ["1089", "COD Ambro", 1],
+        ["1090", "CDON discounts", 1], ["1091", "CDON NO - Beliani Norway- NOK", 1], ["1092", "Manor CH", 1],
+        ["1093", "COD DHL", 1], ["1094", "COD InPost", 1], ["1095", "eMag RO Beliani (EU) GmbH", 1],
+        ["1096", "COD PTT Beliani RO", 1], ["1097", "COD GLS Beliani RO", 1], ["1098", "COD Rohling Suus RO", 1],
+        ["1099", "CS Beliani (PL) GmbH PLN", 1], ["1100", "Postbank 100235705 (BCE)", 1], ["1101", "CITIBANK Prologistics", 1],
+        ["1102", "Monetico FR", 1], ["1103", "Conforama ES", 1], ["1104", "Vente Unique ES Beliani DE", 1],
+        ["1107", "E.Leclerc FR", 1], ["1108", "Maisons Du Monde ES", 1], ["1110", "Galaxus DE", 1],
+        ["1111", "Raiffeisenbank CZK Beliani (DE) GmbH", 1], ["1113", "Vente Unique IT Beliani DE", 1], ["1114", "Vente Unique DE Beliani DE", 1],
+        ["1115", "Conforama PT Beliani DE", 1], ["1116", "Black Red White", 1], ["1117", "Leroy Merlin ES Beliani DE", 1],
+        ["1118", "Raiffeisenbank EUR Beliani (DE) GmbH", 1], ["1119", "Maisons Du Monde DE", 1], ["1120", "Home and You PLN", 1],
+        ["1121", "Vente Unique BE", 1], ["1122", "Vente Unique Beliani Swizterland GmbH", 1], ["1123", "Productpine Beliani Europe OU", 1],
+        ["1124", "Furniture 1 FI", 1], ["1125", "JUMPL Beliani DE GmbH FR", 1], ["1126", "Millenium Bank Beliani DE PT", 1],
+        ["1127", "XXXLutz EUR Beliani (DE) GmbH", 1], ["1128", "Raiffeisenbank CZK Beliani Europe OU", 1], ["1129", "DNB Bank Beliani Norway OU", 1],
+        ["1130", "Corplife Beliani AT", 1], ["1131", "Kaufland SK Beliani DE", 1], ["1132", "Danske Bank Beliani Norway OU", 1],
+        ["1133", "Kaufland CZK Beliani DE", 1], ["1134", "Groupon DE", 1], ["1135", "MOB SK Beliani DE GmbH", 1],
+        ["1136", "COD GLS CZ", 1], ["1137", "COD Toptrans CZK", 1], ["1138", "Home24 Beliani DE", 1],
+        ["1139", "Krakkainen FI Beliani DE EUR", 1], ["1141", "COD Toptrans EUR", 1], ["1142", "COD GLS Beliani SK", 1],
+        ["1143", "Vente Unique PT", 1], ["1144", "Vente Unique NL Beliani Europe OU", 1], ["1145", "Home24 FR Beliani DE", 1],
+        ["1146", "B&Q Beliani (UK) GmbH", 1], ["1147", "Home24 AT Beliani DE", 1], ["1148", "Allegro CZ Beliani DE", 1],
+        ["1149", "Carrefour FR Beliani DE", 1], ["1150", "Brico Depot ES Beliani DE", 1], ["1151", "Brico Depot PT Beliani DE", 1],
+        ["1152", "Castorama FR Beliani DE", 1], ["1153", "Hypoveriensbank EUR Beliani (EU) GmbH BE", 1], ["1154", "Gamm vert FR (Terract) Beliani DE", 1],
+        ["1155", "Paypal EUR BE Beliani (EU)", 1], ["1156", "Saferpay EUR BE Beliani (EU)", 1], ["1157", "Klarna EUR BE Beliani (EU)", 1],
+        ["1158", "Paypal NO Beliani Norway OU", 1], ["1159", "Saferpay RO Beliani (EU) GmbH", 1], ["1160", "Klarna RO Beliani (EU) GmbH", 1],
+        ["1161", "CS RON Beliani (EU) Gmbh", 1], ["1162", "CS EUR Beliani (EU)Gmbh", 1], ["1163", "Home24 NL Beliani (EU) GmbH", 1],
+        ["1164", "Robert Dyas Beliani (UK) GmbH", 1], ["1165", "BNP PLN Beliani PL", 1], ["1166", "Post Finance DKK Beliani (DE) GmbH", 1],
+        ["1167", "Post Finance SEK Beliani (DE) GmbH", 1], ["1168", "Shein Beliani (DE) GmbH", 1], ["1169", "Joybuy DE Beliani (DE) GmbH", 1],
+        ["1177", "vat account", 0], ["1200", "Cortal Consors (Qualitrade)", 0], ["1201", "Chase Bank Beliani USA LLC", 1],
+        ["1202", "Bank of Amercica Beliani LLC", 1], ["1203", "Morele NET Beliani (PL) GmbH", 1], ["1206", "Paypal Beliani USA LLC", 1],
+        ["1207", "Ebay UK", 1], ["1208", "Ebay DE", 1], ["1209", "Ebay IT", 1],
+        ["1210", "Ebay ES", 1], ["1211", "Ebay FR", 1], ["1212", "CS - Beliani Int - SEK", 1],
+        ["1213", "CS - Beliani Int - DKK", 1], ["1214", "CS - Beliani Int - HUF", 1], ["1215", "CS - Beliani Int - CZK", 1],
+        ["1216", "Unicredit Beliani DE HUF", 1], ["1218", "CS - Beliani DE - EUR", 1], ["1219", "CS - Beliani DE - CHF", 1],
+        ["1220", "Maisons Du Monde IT", 1], ["1221", "CS - Beliani DE - NOK", 1], ["1222", "Settlement of payments in other currencies", 1],
+        ["1223", "Wayfair", 1], ["1224", "Check24", 1], ["1230", "VIDA XL Beliani UK", 1],
+        ["1231", "Soisy IT Beliani DE", 1], ["1232", "EUPAGO PT Beliani DE", 1], ["1238", "ManoMano GBP Beliani UK", 1],
+        ["1239", "Berliner Bank Beliani DE", 1], ["1240", "Commerzbank 2727121 (Guenstigerdirekt)", 0], ["1241", "Wayfair GBP Beliani UK", 1],
+        ["1242", "Westwing FR Schoenteakmoebel", 1], ["1243", "Postbank Beliani SP alias Beliani DE", 1], ["1244", "Bestmarques FR Schoenteakmoebel", 1],
+        ["1245", "Lesara Schoenteakmoebel", 1], ["1246", "Handelsbanken Beliani DE DKK", 1], ["1247", "Millenium Bank Beliani GmbH - PT", 1],
+        ["1248", "Handelsbanken Beliani DE SEK", 1], ["1249", "Deutsche Bank Beliani DE - ES", 1], ["1250", "Commerzbank Fachhandelpro", 1],
+        ["1251", "Paypal EUR Schoenteakmoebel", 1], ["1252", "Amazon EUR Schoenteakmoebel", 1], ["1253", "Commerzbank Schoenteakmoebel", 1],
+        ["1254", "Commerzbank EUR Beliani DE", 1], ["1255", "Postbank EUR Beliani DE", 1], ["1256", "Bank Austria Beliani DE", 1],
+        ["1257", "Commerzbank HUF Beliani DE", 1], ["1258", "ManoMano FR Beliani DE", 1], ["1259", "Limango PS EUR Schoenteakmoebel", 1],
+        ["1260", "Postbank (Bonviva venture)", 1], ["1261", "ManoMano IT Beliani DE", 1], ["1262", "Westwing DE EUR Schoenteakmoebel", 1],
+        ["1263", "ManoMano ES Beliani DE", 1], ["1264", "Hypoveriensbank Beliani SP (DE)", 1], ["1265", "Delamaison FR Beliani DE", 1],
+        ["1266", "ManoMano DE Beliani DE", 1], ["1267", "Crowdfox DE Beliani DE", 1], ["1268", "Idealo Direktkauf DE Beliani DE", 1],
+        ["1269", "KuantoKusta PT Beliani DE", 1], ["1270", "Orders on the way", 1], ["1271", "Paypal EUR Fachhandelpro (p)", 1],
+        ["1272", "Saferpay EUR NL", 1], ["1273", "Paypal CHF Beliani CH", 1], ["1274", "Paypal GBP Beliani UK", 1],
+        ["1275", "Klarna EUR NL", 1], ["1276", "Shopgate GBP Beliani UK", 1], ["1277", "Paypal GBP Beliani CH", 1],
+        ["1278", "Paypal USD Beliani CH", 1], ["1279", "PayPal EUR AT Beliani CH", 1], ["1280", "Postbank 1412709 (Guenstigerdirekt GmbH)", 1],
+        ["1281", "PayPal EUR DE/AT/FR Beliani CH", 1], ["1282", "Amazon GBP Beliani UK", 1], ["1283", "HSBC GBP Beliani UK", 1],
+        ["1284", "Saferpay Beliani USA", 1], ["1285", "Amazon EUR Beliani FR", 1], ["1286", "Amazon USD Beliani", 1],
+        ["1287", "Walmart Beliani LLC", 1], ["1288", "Overstock Beliani LLC", 1], ["1289", "Beliani UK Homfer", 1],
+        ["1290", "Saferpay Beliani CA", 1], ["1291", "PayPal CAD Beliani CA", 1], ["1292", "Beanstream Velago CA", 1],
+        ["1293", "PayPal CAD Velago CA", 1], ["1294", "PayPal USD Beliani UK", 1], ["1295", "PayPal CHF Beliani UK", 1],
+        ["1296", "PayPal EUR AT Beliani UK", 1], ["1297", "PayPal EUR DE Beliani UK", 1], ["1298", "OnBuy GBP Beliani UK", 1],
+        ["1299", "Google Checkout GBP Beliani UK", 1], ["1300", "Postfinance (Michael Widmer)", 1], ["1301", "PayPal EUR DE/AT/FR Beliani DE", 1],
+        ["1302", "Billpay CHF Beliani CH", 1], ["1303", "Billpay EUR Beliani DE", 1], ["1304", "Shopgate CHF Beliani CH", 1],
+        ["1305", "GrouponShopDE Beliani DE", 1], ["1306", "MobelloDE", 1], ["1307", "Real DE Beliani DE", 1],
+        ["1308", "Stripe Beliani LLC CAD", 1], ["1309", "Stripe Beliani LLC USD", 1], ["1310", "C discount Beliani DE", 1],
+        ["1311", "Shopgate DE & AT Beliani DE", 1], ["1312", "Wayfair EUR Beliani DE", 1], ["1313", "Paypal USD Beliani USA", 1],
+        ["1314", "PriceMinister Beliani DE EUR", 1], ["1315", "Bank USD Beliani USA", 1], ["1316", "Pixmania Beliani DE", 1],
+        ["1317", "Paypal EUR Beliani NL", 1], ["1318", "Saferpay EUR Beliani NL", 1], ["1319", "Billpay EUR Beliani NL", 1],
+        ["1320", "Rabobank NL", 1], ["1321", "iDeal EUR Beliani NL", 1], ["1322", "Bank BMO CAN", 1],
+        ["1323", "Amazon EUR Beliani DE", 1], ["1324", "Bank CAD CA", 1], ["1325", "Rue du Commerce Beliani DE", 1],
+        ["1326", "Ricardo Beliani CH", 1], ["1327", "Uni Credit Beliani Europe EUR", 1], ["1328", "Yatego.de Beliani DE", 1],
+        ["1329", "Bol.com EUR |Beliani NL", 1], ["1330", "Beslist.nl EUR NL", 1], ["1331", "Neckermann EUR Beliani NL", 1],
+        ["1332", "PostNL Rembours EUR Beliani NL", 1], ["1333", "PayPal SEK Beliani DE", 1], ["1334", "DARTY Beliani DE", 1],
+        ["1335", "Amazon EUR Beliani ES", 1], ["1336", "Stripe Beliani UK", 1], ["1337", "Amazon EUR Beliani IT", 1],
+        ["1338", "Rakuten.ES Beliani DE", 1], ["1339", "PayPal DKK Beliani DE", 1], ["1340", "PayPal HUF Beliani DE", 1],
+        ["1341", "Yodetiendas.es Beliani DE", 1], ["1342", "PayPal CZK Beliani DE", 1], ["1343", "Klarna Beliani NL", 1],
+        ["1344", "Capayable Beliani NL", 1], ["1345", "VidaXL NL", 1], ["1346", "Bancontact Beliani NL", 1],
+        ["1347", "FonQ Beliani NL", 1], ["1348", "Blokker Beliani NL", 1], ["1349", "Homedeco Beliani NL", 1],
+        ["1350", "INS Tulip NL", 0], ["1351", "Bank Austria Beliani AT", 1], ["1352", "PayPal NOK Beliani DE", 1],
+        ["1353", "Amazon Beliani NL", 1], ["1354", "Leen Bakker Beliani NL", 1], ["1355", "Leroy Merlin FR", 1],
+        ["1356", "SprayPay NL", 1], ["1358", "Paytrail FI Beliani DE", 1], ["1359", "Empik Beliani PL", 1],
+        ["1360", "Vente Unique FR Beliani DE", 1], ["1361", "Mall CZK Beliani DE", 1], ["1362", "Leroy Merlin IT", 1],
+        ["1363", "BUT Beliani FR-DE", 1], ["1364", "PayPal NL Beliani Europe OU", 1], ["1366", "Mall SK", 1],
+        ["1367", "Clearing Account Beliani PL", 1], ["1368", "Mall HU", 1], ["1369", "OBI CH Switzerland", 1],
+        ["1370", "COD Sameday HU", 1], ["1371", "Bloop PT", 1], ["1372", "COD HDT HUF Beliani (DE) GmbH", 1],
+        ["1373", "Vivre RO Beliani (EU) Gmbh", 1], ["1374", "Wayfair Beliani (UK) GmbH", 1], ["1375", "DNB NOK Beliani (Norge) GmbH", 1],
+        ["1376", "Cultura FR Beliani (DE) GmbH", 1], ["1377", "Shöpping AT Beliani (DE) GmbH", 1], ["1378", "Altex RO Beliani (EU) GmbH", 1],
+        ["1379", "XXX Lutz CH Beliani Switzerland GmbH", 1], ["1380", "Temu CH Beliani Switzerland GmbH", 1], ["1381", "Leroy Merlin RO Beliani (EU) Gmbh", 1],
+        ["1400", "Kasse Beliani CH Allegro Broken", 1], ["1401", "Kasse PLN Michael Private", 1], ["1402", "Klarna Beliani Switzerland", 1],
+        ["1403", "Migros CH", 1], ["1404", "MAISONDUMONDE FR", 1], ["1405", "Kasse BCE", 1],
+        ["1406", "CIC Beliani FR", 1], ["1407", "CIC Beliani France", 1], ["1408", "CIC FR Beliani DE GmbH", 1],
+        ["1410", "Kasse Beliani Polska", 1], ["1411", "Saferpay HU Beliani DE", 1], ["1412", "Klarna SE Beliani DE", 1],
+        ["1413", "Fyndiq SE Beliani DE", 1], ["1414", "Shop.com Beliani UK", 1], ["1415", "Saferpay CZK Beliani DE", 1],
+        ["1416", "CDON SE Beliani DE", 1], ["1417", "Fnac FR Beliani DE", 1], ["1418", "Deco FR Beliani DE", 1],
+        ["1419", "Mano Mano BE Beliani DE", 1], ["1420", "Conforama FR Beliani DE", 1], ["1421", "Bricoprivé FR Beliani DE", 1],
+        ["1422", "Worten PT Beliani DE", 1], ["1423", "Amazon Retail FR Beliani DE", 1], ["1424", "IBS Beliani DE EUR", 1],
+        ["1425", "CDON DK Beliani DE", 1], ["1426", "Wupti DK Beliani DE", 1], ["1427", "Klarna DE Beliani DE", 1],
+        ["1428", "Klarna FI Beliani DE", 1], ["1429", "Klarna DKK Beliani DE", 1], ["1430", "Klarna IT Beliani DE", 1],
+        ["1431", "MobilePay DKK", 1], ["1432", "Moebel24 EUR", 1], ["1433", "Klarna UK Beliani UK", 1],
+        ["1434", "Deutsche Bank Schoenteakmoebel", 1], ["1435", "Amazon Pay Beliani DE", 1], ["1436", "FNAC PT", 1],
+        ["1437", "Worten ES", 1], ["1438", "Saferpay NOK Beliani DE", 1], ["1439", "Klarna NOK", 1],
+        ["1440", "Klarna AT", 1], ["1441", "Klarna ES Beliani DE", 1], ["1443", "CS - Beliani DE - SEK", 1],
+        ["1444", "CS - Beliani DE - DKK", 1], ["1445", "CS - Beliani DE - HUF", 1], ["1446", "CS - Beliani DE - CZK", 1],
+        ["1447", "CS - Beliani DE - NOK", 1], ["1448", "CS - Beliani DE - RON", 1], ["1449", "UniCredit IT Beliani DE", 1],
+        ["1450", "Raiffeisenbank CZ Beliani SP GmbH", 1], ["1451", "Raiffeisenbank CZ EUR Beliani SP GmbH", 1], ["1452", "Amazon NL Beliani EU GmbH", 1],
+        ["1453", "COD NO LIMIT Beliani PL", 1], ["1454", "Vente Unique UK Beliani (UK) GmbH", 1], ["1455", "Leroy Merlin PT Beliani (DE) GmbH", 1],
+        ["1456", "Vente Unique SE Beliani (DE) GmbH", 1], ["1457", "Vente Unique DK Beliani (DE) GmbH", 1], ["1458", "Vivre HU Beliani (DE) Gmbh", 1],
+        ["1459", "Mömax DE Beliani (DE) GmbH", 1], ["1460", "Debenhams Beliani (UK) GmbH", 1], ["1461", "Mömax AT Beliani (DE) GmbH", 1],
+        ["1462", "XXXLutz RO Beliani (EU) GmbH", 1], ["1500", "Compensation Beliani PL", 1], ["1501", "UniCredit- Beliani Norway- NOK", 1],
+        ["1502", "Klarna CZ Beliani DE", 1], ["1503", "Klarna FR Beliani DE", 1], ["1504", "Klarna PT Beliani DE", 1],
+        ["1509", "Klarna HU Beliani DE", 1], ["1510", "Klarna SK Beliani DE", 1], ["1511", "Kaufland PL Beliani PL", 1],
+        ["1512", "Kaufland AT", 1], ["1513", "Brico Bravo IT", 1], ["1514", "Clubfasion PT", 1],
+        ["1515", "Limango DE", 1], ["1516", "Allegro HU Beliani DE", 1], ["1517", "Allegro SK Beliani DE", 1],
+        ["1518", "Vente Unique PL Beliani PL", 1], ["1519", "Praxis NL Beliani (EU) GmbH", 1], ["1520", "Brico BE Beliani EU GmbH", 1],
+        ["1521", "OBI DE Beliani DE", 1], ["1522", "Hormbach DE Beliani DE", 1], ["1523", "Castorama PL", 1],
+        ["1524", "Wowcher Beliani UK (GmbH)", 1], ["1525", "XXXLutz AT Beliani (DE) GmbH", 1], ["1526", "Vente Unique AT Beliani (DE) GmbH", 1],
+        ["1527", "Vente Unique LU Beliani (DE) GmbH", 1], ["1528", "Hobbybox FI Beliani (DE) GmbH", 1], ["1529", "Bricomarche FR Beliani (DE) GmbH", 1],
+        ["1530", "Saferpay EUR Beliani (Europe) GmbH", 1], ["1531", "Hypoveriensbank EUR Beliani (Europe) GmbH", 1], ["1532", "Pay Pal EUR Beliani (Europe) GmbH", 1],
+        ["1533", "Hypoveriensbank EUR Beliani (Polska) GmbH", 1], ["1534", "Hypoveriensbank EUR Beliani Partner Limited", 1], ["1535", "BNP PLN Beliani (Polska) GmbH", 1],
+        ["1538", "InPost Pay PL Beliani (PL) GmbH", 1], ["1611", "Forderungen Tulip", 1], ["1745", "BCE Verbindlichkeiten", 1],
+        ["1756", "Beliani International", 1], ["1770", "Umsatzsteuer 0% DE Out of country, within EU", 1], ["1774", "Umsatzsteuer 23% SK", 1],
+        ["1775", "Umsatzsteuer 16% DE", 1], ["1776", "Umsatzsteuer 19% DE", 1], ["1801", "Umsatzsteuer 21% BE", 1],
+        ["1802", "Umsatzsteuer 17% LU", 1], ["1803", "Umsatzsteuer 23% PT", 1], ["1804", "Umsatzsteuer 21% ES", 1],
+        ["1805", "Umsatzsteuer 22% IT", 1], ["1806", "Umsatzsteuer 24% FI", 1], ["1807", "Umsatzsteuer 21% NL", 1],
+        ["1808", "Umsatzsteuer 20% AT", 1], ["1809", "Umsatzsteuer 20% SK", 1], ["1999", "VAT Vente Unique FR", 1],
+        ["2022", "Clearing Account Beliani (UK) GmbH", 1], ["2023", "Clearing Account Beliani AT", 1], ["2024", "Clearing Account BE", 1],
+        ["2025", "Clearing Account Beliani CZ", 1], ["2026", "Clearing Account Beliani DE", 1], ["2027", "Clearing Account Beliani DK", 1],
+        ["2028", "Clearing Account Beliani ES", 1], ["2029", "Clearing Account Beliani FI", 1], ["2030", "Clearing Account Beliani FR", 1],
+        ["2031", "Clearing Account Beliani HU", 1], ["2032", "Clearing Account Beliani IT", 1], ["2033", "Clearing Account Beliani LU", 1],
+        ["2034", "Clearing Account Beliani PT", 1], ["2035", "Clearing Account Beliani SE", 1], ["2036", "Clearing Account Beliani SK", 1],
+        ["2037", "Clearing Account Beliani DE Avandeo", 1], ["2038", "Clearing Account Beliani DE Schoenteakmoebel", 1], ["2039", "Clearing Account Beliani Switzerland", 1],
+        ["2040", "Clearing Account Beliani NL", 1], ["2041", "Clearing Account Beliani Norway", 1], ["2042", "Clearing Account Beliani PL", 0],
+        ["2043", "Clearing Account Schoenteakmoebel", 1], ["2051", "BCE Michael Widmer CHF", 1], ["2100", "Paypal Spesen", 0],
+        ["2101", "Paypal Gebühren", 1], ["2106", "Klarna AT", 1], ["2107", "PayPal EUR Beliani AT", 1],
+        ["2108", "Saferpay EUR Beliani AT", 1], ["2109", "Billpay EUR Beliani AT", 1], ["2110", "VidaXL AT Beliani AT", 1],
+        ["2200", "Umsatzsteuer 7,7% CHF", 1], ["2201", "Umsatzsteuer 0% GBP", 1], ["2202", "Umsatzsteuer 0% Export", 1],
+        ["2203", "Umsatzsteuer PL 19%", 1], ["2204", "Umsatzsteuer 8,1% CHF", 1], ["2205", "Umsatzsteuer 20% GBP", 1],
+        ["2206", "Umsatzsteuer 0% Export GBP", 1], ["2207", "HST / GST CAN", 1], ["2208", "Umsatzsteur 0%PLN", 1],
+        ["2209", "Umsatzsteur 23%PLN", 1], ["2210", "Umsatzsteuer 21%EUR", 1], ["2211", "Umsatzsteuer 19% SEK", 1],
+        ["2212", "Umsatzsteuer 0% SEK Out of country, within EU Sesam", 1], ["2213", "Umsatzsteuer 19% HU", 1], ["2214", "Umsatzsteuer 0% HU Out of country, within EU", 1],
+        ["2215", "Umsatzsteuer 19% DKK", 1], ["2216", "Umsatzsteuer 0% DKK Out of country, within EU", 1], ["2217", "Umsatzsteuer 0% NOK", 1],
+        ["2218", "Umsatzsteuer 19% CZK", 1], ["2219", "Umsatzsteuer 0% CZK Out of country, within EU", 1], ["2220", "Umsatzsteuer 0% AT Out of country, within EU", 1],
+        ["2221", "Umsatzsteuer 25% NOK Beliani Norway", 1], ["2222", "Umsatzsteuer 20% AT", 1], ["2223", "Umsatzsteuer 19% CY", 1],
+        ["2224", "Umsatzsteuer 23%SK", 1], ["2225", "Umsatzsteuer ES 19%", 1], ["2226", "Umsatzsteuer FR 19%", 1],
+        ["2230", "Umsatzsteuer 16% LU", 1], ["2231", "Sales Tax 0% CAD", 1], ["2232", "Umsatzsteuer 16% SEK", 1],
+        ["2233", "Umsatzsteuer 16% HU", 1], ["2234", "Umsatzsteuer 16% DKK", 1], ["2235", "Umsatzsteuer 16% CZK", 1],
+        ["2236", "Umsatzsteuer 20% FR", 1], ["2237", "Umsatzsteuer 0% FR Out of country, within EU", 1], ["2238", "Umsatzsteuer 25% SE", 1],
+        ["2239", "Umsatzsteuer 27% HU", 1], ["2242", "Umsatzsteuer 25% DK", 1], ["2243", "Umsatzsteuer 21% CZ", 1],
+        ["2244", "Umsatzsteuer 21% BE", 1], ["2245", "Umsatzsteuer 17% LU", 1], ["2246", "Umsatzsteuer 22% IT", 1],
+        ["2247", "Umsatzsteuer IT 0%", 1], ["2248", "Umsatzsteuer ES 21%", 1], ["2249", "Umsatzsteuer ES 0%", 1],
+        ["2250", "Umsatzsteuer PT 23%", 1], ["2251", "Umsatzsteuer PT 0%", 1], ["2252", "Umsatzsteuer FI 24%", 1],
+        ["2253", "Umsatzsteuer FI 0%", 1], ["2254", "Umsatzsteuer BE 0%", 1], ["2255", "Umsatzsteuer LU 0%", 1],
+        ["2256", "Umsatzsteuer AT 20%", 1], ["2257", "Umsatzsteuer AT 0%", 1], ["2258", "Umsatzsteuer NL 21%", 1],
+        ["2259", "Umsatzsteuer NL 0%", 1], ["2260", "Umsatzsteuer SK 20%", 1], ["2261", "Umsatzsteuer SK 0%", 1],
+        ["2262", "Umsatzsteuer DE 19%", 1], ["2263", "Umsatzsteuer DE 0%", 1], ["2264", "Umsatzsteuer DE 7%", 1],
+        ["2265", "Umsatzsteuer AT 5%", 1], ["2266", "Umsatzsteuer IT 4%", 1], ["2267", "Umsatzsteuer ES 4%", 1],
+        ["2268", "Umsatzsteuer EUR 0%", 1], ["2269", "Umsatzsteuer CH 0%", 1], ["2270", "Umsatzsteuer NO 0%", 1],
+        ["2271", "Umsatzsteuer UK 0%", 1], ["2272", "Umsatzsteuer RO 19%", 1], ["2279", "Umsatzsteuer PT Azores 16%", 1],
+        ["2280", "Umsatzsteuer PT Madeira 22%", 1], ["2281", "Umsatzsteuer FI 25.50 %", 1], ["2282", "Umsatzsteuer RO 21%", 1],
+        ["2283", "Umsatzsteuer 23% PLN - JPK", 1], ["2284", "Umsatzsteuer HR 19%", 1], ["2285", "Umsatzsteuer SI 19%", 1],
+        ["2286", "Umsatzsteuer HR 25%", 1], ["2287", "Umsatzsteuer SI 22%", 1], ["2288", "Umsatzsteuer HR 0%", 1],
+        ["2289", "Umsatzsteuer SI 0%", 1], ["2290", "Umsatzsteuer AT 19%", 1], ["2291", "Umsatzsteuer FI 19%", 1],
+        ["2292", "Umsatzsteuer IT19%", 1], ["2293", "Umsatzsteuer PT 19%", 1], ["2294", "Umsatzsteuer SK 19%", 1],
+        ["2295", "Umsatzsteuer BE 19%", 1], ["2296", "Umsatzsteuer NL 19%", 1], ["2297", "Umsatzsteuer RO 0%", 1],
+        ["2298", "Umsatzsteuer LT 0%", 1], ["3200", "Erlös 7.7% CHF", 1], ["3201", "Erlös 8.1% CHF", 1],
+        ["3202", "Erlös 0% CHF", 1], ["3203", "Erlös 0% GBP", 1], ["3204", "Erlös B2B Intra-comm 0% PL", 1],
+        ["3205", "Erlös 20% GBP", 1], ["3206", "Erlöse BE", 1], ["3207", "Erlöse 16% LU", 1],
+        ["3208", "Erlöse PT", 1], ["3209", "Erlös 23% PLN", 1], ["3210", "Erlös 21% EUR", 1],
+        ["3211", "Erlöse SE 19%", 1], ["3212", "Erlös 25% NOK Beliani Norway OU", 1], ["3213", "Erlöse HU 19%", 1],
+        ["3214", "Erlöse B2B Intra-comm 0% SE", 1], ["3215", "Erlöse B2B Intra-comm 0% HU", 1], ["3216", "Erlös SE 0% Marketplace", 1],
+        ["3217", "Erlöse DK 19%", 1], ["3218", "Erlöse B2B Intra-comm 0% DK", 1], ["3219", "Erlöse DK 0% Marketplace", 1],
+        ["3220", "Erlös 0% NOK Export", 1], ["3221", "Erlöse CZK 19%", 1], ["3222", "Erlöse B2B Intra-comm 0% CZ", 1],
+        ["3223", "Erlöse Marketplace FR 0%", 1], ["3224", "Erlöse SE 16% Umsatzsteuer", 1], ["3225", "Erlös 16% HU", 1],
+        ["3226", "Erlös 16% DKK", 1], ["3227", "Erlös 16% CZK", 1], ["3228", "Erlös 20% FR", 1],
+        ["3229", "Erlöse FR 0% Marketplace", 1], ["3230", "Erlöse B2B Intra-comm 0% FR", 1], ["3231", "Erlös 25% SE", 1],
+        ["3232", "Erlös 27% HU", 1], ["3233", "Erlös 25% DK", 1], ["3234", "Erlös 21% CZ", 1],
+        ["3235", "Erlös 21% BE", 1], ["3236", "Erlös 17% LU", 1], ["3237", "Erlöse IT 22%", 1],
+        ["3238", "Erlöse Export CZ", 1], ["3239", "Erlös Export HU", 1], ["3240", "Erlöse 25% Beliani Norge", 1],
+        ["3241", "Erlöse NL 21%", 1], ["3242", "Erlöse AT 20%", 1], ["3243", "Erlöse PT 23%", 1],
+        ["3244", "Erlöse ES 21%", 1], ["3245", "Erlöse FI 24%", 1], ["3246", "Erlöse SK 20%", 1],
+        ["3247", "Erlöse DE 7%", 1], ["3248", "Erlöse ES 4%", 1], ["3249", "Erlöse IT 4%", 1],
+        ["3250", "Erlöse AT 5%", 1], ["3251", "Erlöse SK 23%", 1], ["3252", "Erlöse DE 0% Marketplace", 1],
+        ["3253", "Erlöse AT 0% Marketplace", 1], ["3254", "Erlöse BE 0% Marketplace", 1], ["3255", "Erlöse LU 0% Marketplace", 1],
+        ["3256", "Erlöse PT 0% Marketplace", 1], ["3257", "Erlöse ES 0% Marketplace", 1], ["3258", "Erlöse IT 0% Marketplace", 1],
+        ["3259", "Erlöse FI 0% Marketplace", 1], ["3260", "Erlöse SK 0% Marketplace", 1], ["3261", "Erlöse NL 0% Marketplace", 1],
+        ["3262", "Erlöse Export EUR 0%", 1], ["3263", "Erlöse B2B Intra-comm 0% DE", 1], ["3264", "Erlöse B2B Intra-comm 0% AT", 1],
+        ["3265", "Erlöse B2B Intra-comm 0% BE", 1], ["3266", "Erlöse B2B Intra-comm 0% LU", 1], ["3267", "Erlöse B2B Intra-comm 0% PT", 1],
+        ["3268", "Erlöse B2B Intra-comm 0% ES", 1], ["3269", "Erlöse B2B Intra-comm 0% IT", 1], ["3270", "Erlöse B2B Intra-comm 0% FI", 1],
+        ["3271", "Erlöse B2B Intra-comm 0% SK", 1], ["3272", "Erlöse B2B Intra-comm 0% NL", 1], ["3273", "Erlöse B2B Intra-comm 0% EUR", 1],
+        ["3274", "Erlöse Export CH 0%", 1], ["3275", "Erlöse Marketplace CH 0%", 1], ["3276", "Erlöse Export UK 0%", 1],
+        ["3277", "Erlöse RO 19%", 1], ["3278", "Erlöse RO 0% Marketplace", 1], ["3279", "Erlöse RO 21%", 1],
+        ["3280", "Erlöse INS CZK", 0], ["3281", "Erlöse INS NOK", 0], ["3282", "Erlöse INS EUR", 0],
+        ["3283", "Erlöse DE 19%", 1], ["3284", "Erlöse SE 0% Marketplace", 1], ["3285", "Erlöse DK 0% Marketplace", 1],
+        ["3286", "Erlöse HU 0% Marketplace", 1], ["3287", "Erlöse CZ 0% Marketplace", 1], ["3288", "Erlöse INS GBP", 0],
+        ["3289", "Erlöse UK 0% Marketplace", 1], ["3290", "Erlös 19% CY", 1], ["3291", "Erlös 16% PT Azores", 1],
+        ["3292", "Erlöse PL 0% Marketplace", 1], ["3293", "Erlös 22% PT Madeira", 1], ["3294", "Erlös B2B Intra-comm Marketplace 0% PL", 1],
+        ["3295", "Verluste/Ertraege", 0], ["3296", "Versandkosten/Warenverkauf", 1], ["3297", "Erlös PL 19% DE declaration", 1],
+        ["3298", "Erlöse FI 25.50%", 1], ["3299", "COD debit", 1], ["3300", "Erlose ES Reseller 21%", 1],
+        ["3301", "Erlöse ES 19%", 1], ["3302", "Erlöse FR 19%", 1], ["3303", "Erlos 23% Reseller broken NEW", 1],
+        ["3304", "Erlös 19% HR", 1], ["3305", "Erlös 19% SI", 1], ["3306", "Erlös 25% HR", 1],
+        ["3307", "Erlös 22% SI", 1], ["3308", "Erlöse B2B Intra-comm 0% HR", 1], ["3309", "Erlöse B2B Intra-comm 0% SI", 1],
+        ["3310", "Erlöse NO 0% Marketplace", 1], ["3311", "Erlöse AT 19%", 1], ["3312", "Erlöse FI 19%", 1],
+        ["3313", "Erlöse IT19%", 1], ["3314", "Erlöse PT 19%", 1], ["3315", "Erlöse SK 19%", 1],
+        ["3316", "Erlöse BE19%", 1], ["3317", "Erlöse NL 19%", 1], ["3319", "Erlös B2B Intra-comm 0% RO", 1],
+        ["3320", "Erlös B2B Intra-comm 0% FI", 1], ["3321", "Erlös B2B Intra-comm 0% PT", 1], ["3322", "Erlös B2B Intra-comm 0% ES", 1],
+        ["3323", "Erlös B2B Intra-comm 0% IT", 1], ["3324", "Erlös B2B Intra-comm 0% LT", 1], ["4001", "Sales 0% USA", 1],
+        ["4002", "Sales 0% CA", 1], ["4203", "Purchase USD", 1], ["4221", "Cost of goods discounts/ Compensation", 1],
+        ["4222", "Cost of goods FX differences", 1], ["4223", "Cost of goods penalty", 1], ["4224", "Cost of goods - spare parts", 1],
+        ["4276", "Inbound cost freight refunds/ additional fee", 1], ["4400", "Warehouse contractors EUR", 1], ["4401", "Warehouse contractors PLN", 1],
+        ["4402", "Warehouse contractors CHF", 1], ["4716", "Other Income Insurance CAD", 1], ["4717", "Other Income Insurance USD", 1],
+        ["5200", "Office contractors CHF", 1], ["5201", "Office contractors EUR", 1], ["5202", "Office contractors PLN", 1],
+        ["6000", "Income EUR", 0], ["6561", "Bank fees USD", 1], ["6702", "Amazon Kosten der Warenabgabe DE", 1],
+        ["7001", "Sales 20% AT", 0], ["7002", "Sales 0% AT", 0], ["8001", "Penalty in Purchase", 1],
+        ["8002", "Loss on purchase orders", 1], ["8100", "Non-operating Income penalties", 1], ["8104", "Profit on purchase orders", 1],
+        ["8105", "INS RON Non-operating Income", 1], ["8110", "INS EUR Non-operating Income", 1], ["8120", "INS SEK Non-operating Income", 1],
+        ["8125", "Lexware, Out of country, within EU selling account", 0], ["8130", "INS DKK Non-operating Income", 1], ["8140", "INS HUF Non-operating Income", 1],
+        ["8150", "INS CZK Non-operating Income", 1], ["8160", "INS GBP Non-operating Income", 1], ["8170", "INS PLN Non-operating Income", 1],
+        ["8180", "INS CHF Non-operating Income", 1], ["8190", "INS NOK Non-operating Income", 1], ["8200", "Lexware Sonstige Erträge, Insurance Cases", 0],
+        ["8340", "Lexware Erlöse DE 16% Umst", 0], ["8341", "Lexware Erlöse AT 16% Umst", 0], ["8342", "Lexware Erlöse FR 16% Umst", 0],
+        ["8343", "Lexware Erlöse BE 16% Umst", 0], ["8344", "Lexware Erlöse LU 16% Umst", 0], ["8345", "Lexware Erlöse PT 16% Umst", 0],
+        ["8347", "Lexware Erlöse ES 16% Umst", 0], ["8349", "Lexware Erlöse IT 16% Umst", 0], ["8351", "Lexware Erlöse FI 16% Umst", 0],
+        ["8400", "Lexware Erlöse 16% Umsatzsteuer", 0], ["8410", "Lexware Erlöse DE 19% Umst", 0], ["8411", "Lexware Erlöse AT 19% Umst", 0],
+        ["8412", "Lexware Erlöse FR 19% Umst", 0], ["8413", "Lexware Erlöse BE 19% Umst", 0], ["8414", "Lexware Erlöse LU 19% Umst", 0],
+        ["8415", "Lexware Erlöse PT 19% Umst", 0], ["8416", "Lexware Erlöse SE 19% Umst", 0], ["8417", "Lexware Erlöse ES 19% Umst", 0],
+        ["8418", "Lexware Erlöse HU 19% Umst", 0], ["8419", "Lexware Erlöse IT 19% Umst", 0], ["8420", "Lexware Erlöse DK 19% Umst", 0],
+        ["8421", "Lexware Erlöse FL 19% Umst", 0], ["8423", "Lexware Erlöse NL 19% Umst", 0], ["8430", "Lexware Erlöse BE 21% Umst", 0],
+        ["8431", "Lexware Erlöse LU 17% Umst", 0], ["8432", "Lexware Erlöse PT 23% Umst", 0], ["8433", "Lexware Erlöse ES 21% Umst", 0],
+        ["8434", "Lexware Erlöse IT 22% Umst", 0], ["8435", "Lexware Erlöse FI 24% Umst", 0], ["8436", "Lexware Erlöse NL 21% Umst", 0],
+        ["8437", "Lexware Erlöse AT 20% Umst", 0], ["8438", "Lexware Erlöse SK 19% Umst", 0], ["8439", "Lexware Erlöse SK 20% Umst", 0],
+        ["8440", "Aveco Technical Account", 1], ["11001", "Umsatzsteuer Vente Unique FR 20%", 1], ["11002", "Umsatzsteuer Amazon FR 20%", 1],
+        ["11003", "Umsatzsteuer Cdiscount FR 20%", 1], ["11004", "Umsatzsteuer Conforama FR 20%", 1], ["11005", "Umsatzsteuer eBay FR 20%", 1],
+        ["11006", "Umsatzsteuer ManoMano FR 20%", 1], ["11007", "Umsatzsteuer Priceminister FR 20%", 1], ["11008", "Umsatzsteuer Rue du Commerce FR 20%", 1],
+        ["11009", "Umsatzsteuer eBay DE 19%", 1], ["11010", "Umsatzsteuer ManoMano DE 19%", 1], ["11011", "Umsatzsteuer Vente Unique DE 19%", 1],
+        ["11012", "Umsatzsteuer eBay IT 22%", 1], ["11013", "Umsatzsteuer Leroy Merlin IT 22%", 1], ["11014", "Umsatzsteuer ManoMano IT 22%", 1],
+        ["11015", "Umsatzsteuer Vente Unique IT 22%", 1], ["11016", "Umsatzsteuer eBay UK 20%", 1], ["11017", "Umsatzsteuer ManoMano ES 21%", 1],
+        ["11018", "Umsatzsteuer Vente Unique ES 21%", 1], ["11019", "Umsatzsteuer Amazon DE, AT, CZ", 1], ["11020", "Umsatzsteuer Kaufland DE 19%", 1],
+        ["11021", "Umsatzsteuer Worten ES 21%", 1], ["11022", "Umsatzsteuer Amazon ES 21%", 1], ["11023", "Umsatzsteuer Amazon IT 22%", 1],
+        ["11024", "Umsatzsteuer Amazon SE 25%", 1], ["11025", "Umsatzsteuer CDON SE 25%", 1], ["11026", "Umsatzsteuer CDON DK 25%", 1],
+        ["11027", "Umsatzsteuer Kaufland CZ 21%", 1], ["11028", "Umsatzsteuer Mall CZ 21%", 1], ["11029", "Umsatzsteuer Mall SK 20%", 1],
+        ["11030", "Umsatzsteuer Worten PT 23%", 1], ["11031", "Umsatzsteuer CDON FI 24%", 1], ["11032", "Umsatzsteuer Otto DE 19%", 1],
+        ["11033", "Umsatzsteuer Amazon UK 20%", 1], ["11034", "Umsatzsteuer Mall HU 27%", 1], ["11035", "Umsatzsteuer Darty FR 20%", 1],
+        ["11036", "Umsatzsteuer Allegro CZ 21%", 1], ["11037", "Umsatzsteuer Vente PT 23%", 1], ["11038", "Umsatzsteuer Vente NL 21%", 1],
+        ["11039", "Umsatzsteuer amazon AT 20%", 1], ["11040", "Umsatzsteuer Carrefour FR 20%", 1], ["11041", "Umsatzsteuer EMAG HU 27%", 1],
+        ["11042", "Umsatzsteuer B&Q UK 20%", 1], ["11043", "Umsatzsteuer CDON FI 25,5 %", 1], ["11044", "Umsatzsteuer Allegro HU 27%", 1],
+        ["11045", "Umsatzsteuer Allegro SK 23%", 1], ["11046", "Umsatzsteuer Amazon UK 5%", 1], ["11047", "Umsatzsteuer Vente Unique AT 20%", 1],
+        ["11048", "Umsatzsteuer Vente Unique LU 17%", 1], ["11049", "Umsatzsteuer Shein DE 19%", 1], ["11050", "Umsatzsteuer Vente Unique UK 20%", 1],
+        ["11051", "Umsatzsteuer Vente Unique SE 25%", 1], ["11052", "Umsatzsteuer Vente Unique DK 25%", 1], ["11053", "Umsatzsteuer Leroy Merlin PT 23%", 1],
+        ["11054", "Umsatzsteuer Debenhams UK 20%", 1], ["11111", "xxx", 1], ["12001", "Umsatzsteuer Vente Unique CH 8,1%", 1],
+        ["12002", "Umsatzsteuer Galaxus CH 8,1%", 1], ["12003", "Umsatzsteuer Home24 CH 8,1%", 1], ["12004", "Umsatzsteuer Manor CH 8,1%", 1],
+        ["12005", "Umsatzsteuer XXX Lutz CH 8,1%", 1], ["13001", "Umsatzsteuer Amazon PL 23%", 1], ["13002", "Umsatzsteuer Vente Unique PL 23%", 1],
+        ["13003", "Umsatzsteuer Amazon PL 19%", 1], ["13004", "Umsatzsteuer Allegro PL 23%", 1], ["13005", "Umsatzsteuer Allegro Brand 23%", 1],
+        ["14001", "Umsatzsteuer Vente Unique BE 21%", 1], ["14002", "Umsatzsteuer Vente Unique NL 21%", 1], ["14003", "Umsatzsteuer eMag RO 19%", 1],
+        ["14004", "Umsatzsteuer Amazon NL 21%", 1], ["14005", "Umsatzsteuer Leroy Merlin RO 21%", 1], ["15001", "Umsatzsteuer Vente Unique NO 25%", 1]
+    ];
+    function mkAcctPobrane(){ try { return JSON.parse(GM_getValue(MK_ACC_KEY, '[]')) || []; } catch (e){ return []; } }
+    function mkAcctReczne(){ try { return JSON.parse(GM_getValue(MK_ACC_RECZNE, '[]')) || []; } catch (e){ return []; } }
+    // Trzy warstwy, pozniejsza wygrywa po numerze: wbudowane < dopisane recznie < pobrane.
+    // Pobrane na koncu, bo to stan prologistics z dzis — nazwa i aktywnosc stamtad sa prawda.
+    function mkAcctLoad(){
+        const mapa = {};
+        const dodaj = function (a, zr){
+            if (!a || !a.n) return;
+            mapa[String(a.n)] = { n: String(a.n), nm: String(a.nm || ''), on: a.on !== false, zr: zr };
+        };
+        MK_ACC_WBUD.forEach(function (w){ dodaj({ n: w[0], nm: w[1], on: !!w[2] }, 'wbud'); });
+        mkAcctReczne().forEach(function (a){ dodaj(a, 'reczne'); });
+        mkAcctPobrane().forEach(function (a){ dodaj(a, 'pobrane'); });
+        return Object.keys(mapa).sort(function (a, b){ return Number(a) - Number(b); })
+                     .map(function (n){ return mapa[n]; });
+    }
     function mkAccFromAccountsPage(html){
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const out = [], seen = {};
@@ -26259,6 +26557,13 @@
     // ==========================================================================
     const MK_SH_SECRET = '123456';
 
+    // Najstarsze wdrozenie Apps Scriptu, ktore umie wszystko, czego HUB od niego chce:
+    // zakladki osob („MM/RRRR Ula", „MM/RRRR Tomasz"), Booked przestawiany dopiero po
+    // zaksiegowaniu i odnosniki w Comments. Nowe wdrozenie oddaje „wersja" w kazdej
+    // odpowiedzi; starsze nie oddaje nic — i to jedyna roznica, po ktorej je poznac,
+    // bo stare po cichu robi mniej, zamiast odpowiadac bledem.
+    const MK_SH_WERSJA = '2026-09-15';
+    function shStare(r){ return !(r && r.wersja && String(r.wersja) >= MK_SH_WERSJA); }
     function shCfg(){
         let o = null;
         try { o = JSON.parse(GM_getValue(MK_SH_KEY, 'null')); } catch (e){}
@@ -26907,21 +27212,25 @@
         if (!cfg.on || !cfg.url || !cfg.secret || !list || !list.length) return null;
         const po = list.filter(function (x){ return x && x.tab && x.row; });
         const kl = list.filter(function (x){ return !(x && x.tab && x.row); });
-        let updated = 0; const missing = [];
+        // „notatki" jada razem z oznaczeniem — tekst do Comments z odnosnikiem (brak
+        // ticketu). Stare wdrozenie je pomija, wiec „stare" wraca do wolajacego.
+        let updated = 0, stare = false; const missing = [];
         if (po.length){
             const r = await shTodoSet(po.map(function (x){
-                return { tab: x.tab, row: x.row, refunded: 'Tak' };
+                return { tab: x.tab, row: x.row, refunded: 'Tak', notatki: x.notatki };
             }));
             updated += (r && r.updated) || 0;
+            if (shStare(r)) stare = true;
             ((r && r.missing) || []).forEach(function (m){ missing.push(m); });
         }
         if (kl.length){
             const r = await shReq('POST', cfg.url,
                 JSON.stringify({ secret: cfg.secret, action: 'refunded', rows: kl }));
             updated += (r && r.updated) || 0;
+            if (shStare(r)) stare = true;
             ((r && r.missing) || []).forEach(function (m){ missing.push(m); });
         }
-        return { ok: true, updated: updated, missing: missing };
+        return { ok: true, updated: updated, missing: missing, stare: stare };
     }
     // Czy ta wyplata jest juz w arkuszu. To najwazniejsza z trzech kontroli duplikatow,
     // bo arkusz jest wspolny i czesc wierszy powstaje recznie — o cudzej pracy nie dowiemy
@@ -27032,7 +27341,9 @@
             const r = await shReq('GET', cfg.url + (cfg.url.indexOf('?') < 0 ? '?' : '&')
                                   + 'secret=' + encodeURIComponent(cfg.secret));
             if (r && Array.isArray(r.akcje))
-                return 'wdrożenie …' + ogon + ' zna akcje: ' + r.akcje.join(', ');
+                return 'wdrożenie …' + ogon + ' zna akcje: ' + r.akcje.join(', ')
+                     + (shStare(r) ? ' · ale jest starsze niż HUB — nie zna zakładek Uli i Tomka, wdróż nową wersję'
+                                   : (' · podział: ' + [].concat(r.podzial || []).join('; ')));
             return 'wdrożenie …' + ogon + ' NIE ma pola „akcje" — pod tym adresem leży kod '
                  + 'sprzed zmiany. Albo wdrożenie nie dostało nowej wersji, albo nowa wersja '
                  + 'poszła pod INNY adres (wtedy popraw adres w ⚙ Konta).';
@@ -27069,7 +27380,15 @@
         if (!res) return ' · arkusz nie odpowiedział';
         if (res.odhaczone)
             return res.added ? ' · odhaczone w arkuszu' : ' · NIE ZNALAZŁEM wiersza w arkuszu — odhacz ręcznie';
-        return res.added ? ' · wpisane do arkusza' : ' · w arkuszu już było';
+        // Odmowa arkusza (np. brak zakładki miesiąca) wyglądała dotąd jak „już było".
+        if (res.ok === false) return ' · ARKUSZ: ' + (res.err || 'nie przyjął wiersza') + ' — wiersz dopisz ręcznie';
+        if (res.added) return ' · wpisane do arkusza';
+        // Wiersz już był — zwykle ten, który wpisał import z Booked „Nie". Nowe Apps Script
+        // przestawia go na „Tak" i mówi o tym w „updated"; stare nie umie i wiersz zostaje
+        // na „Nie" — to musi być widać, a nie brzmieć jak „już było".
+        if (res.updated) return ' · odhaczone w arkuszu (Booked: Tak)';
+        if (shStare(res)) return ' · w arkuszu już było, ale wdrożone Apps Script nie przestawia Booked na „Tak" — odhacz ręcznie i wdróż nową wersję';
+        return ' · w arkuszu już było';
     }
 
     // --- booking_setting ---
@@ -27130,7 +27449,74 @@
     // obiektow z polem „id" i dlatego nie znajdowal niczego nawet na prologistics.
     // Numeru konta w tej odpowiedzi NIE MA; jest tylko nazwa, i to po niej dopasowujemy.
     const MK_BS_URL = '/api/bankSettings/index/';
-    function bsLoad(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    const MK_BS_RECZNE = 'mkt_bank_settings_reczne';
+    // Bank settings WBUDOWANE — zrzut strony Bank settings z 15.09.2026 (205 aktywnych).
+    // Ta sama zasada co przy planie kont: podloga, ktora nadpisuje pobranie z /api/bankSettings/.
+    const MK_BS_WBUD = {
+        "6": "Raiffeisen PL", "7": "Raiffeisen PL COD", "10": "Wayfair new", "11": "Bank Austria",
+        "13": "Credit Suisse CZK", "14": "Credit Card", "15": "Paypal", "17": "PayU PL",
+        "18": "Wayfair USA", "19": "Credit Suisse CHF", "20": "DeinDeal", "23": "Klarna",
+        "24": "Unicredit HU", "25": "Postfinance Switzerland", "26": "PayPal NL", "27": "fonQ NL",
+        "28": "Bol.com NL", "29": "EuPago PT", "30": "VidaXL NL", "31": "Blokker NL",
+        "32": "Homedeco NL", "33": "Beslist NL", "34": "Klarna NL", "35": "Limango PL",
+        "36": "Paypal PL", "37": "Mobile Pay", "38": "Oberbank CZ", "40": "Schoenteak Commerzbank",
+        "41": "Przelewy24", "42": "Amazon Pay", "43": "Paytrail", "44": "UBS CH",
+        "45": "Microspot", "47": "COOP CH", "48": "Galaxus CH", "49": "Ricardo CH",
+        "51": "Empik PL", "52": "Carrefour PL", "53": "VidaXL DE", "54": "ManoMano DE",
+        "55": "Real DE", "56": "Amazon DE", "57": "Priceminister FR", "58": "CDisccount FR",
+        "59": "Rue du Commerce FR", "60": "Darty FR", "61": "Conforama FR", "62": "ManoMano FR",
+        "63": "Fnac FR", "64": "VidaXL FR", "65": "Amazon FR", "66": "Amazon Retail FR",
+        "68": "ManoMano UK", "70": "Furnish UK", "71": "Amazon UK", "72": "COD Rohling Suus",
+        "73": "COD DPD", "74": "COD GLS", "75": "COD DTS", "85": "CDON FI",
+        "86": "CDON DK", "87": "CDON SE", "88": "Carrefour ES", "89": "ManoMano ES",
+        "90": "ManoMano IT", "91": "Amazon ES", "92": "Amazon IT", "93": "Worten PT",
+        "94": "Worten ES", "95": "Paypal UK", "96": "Home Furnishing", "97": "LeenBakker NL",
+        "98": "Raiffeisenbank CZK", "99": "Saferpay phone", "100": "Stripe UK", "101": "IBS IT",
+        "102": "Leroy Merlin FR", "103": "Maisondumonde FR", "105": "PayPal CH", "106": "Migros",
+        "107": "PayPal CH - automatic booking", "108": "PayPal PL - automatic booking", "109": "PayPal - automatic booking", "110": "PayPal UK - automatic booking",
+        "111": "PayPal NL - automatic booking", "112": "PayPal AT - automatic booking", "113": "Ebay DE", "114": "FonQ NL BE",
+        "115": "Saferpay - automatic booking", "116": "Ebay UK", "117": "Trademax", "119": "Klarna automatic booking",
+        "121": "Ebay FR", "122": "PayU CZK", "123": "CHECK24", "124": "Ebay IT",
+        "125": "COD GLS HUF", "126": "COD FUTAR", "128": "CROWDFOX", "129": "Ebay ES",
+        "130": "EMAG RO", "132": "HVB UniCredit", "133": "AmazonPay - automatic booking", "134": "COD Ambro",
+        "135": "PayU - automatic booking", "136": "P24 - automatic booking", "137": "Vente Unique FR Beliani DE", "138": "Mall CZK Beliani DE",
+        "139": "Maison Du Monde IT", "140": "Leroy Merlin IT", "141": "BUT Beliani FR-DE", "142": "Paytrail new",
+        "145": "Moebel 24", "146": "CDON NO", "147": "Maisondumonde ES", "148": "Mall SK Beliani DE",
+        "149": "Manor CH", "150": "Raiffeisenbank CZK Beliani DE", "151": "Conforama ES", "153": "Vente Unique ES",
+        "154": "Vente Unique IT", "155": "Galaxus DE", "156": "Leroy Merlin ES", "157": "Vente Unique DE",
+        "158": "Conforama PT", "159": "Black Red White Beliani PL", "160": "COD DHL PL", "161": "Maison Du Monde DE",
+        "164": "Vente Unique BE Beliani Europe OU", "165": "Vente Unique Beliani Swizterland GmbH", "166": "Furniture 1", "167": "Mall HU",
+        "168": "XXX Lutz", "169": "Home 24 Beliani Switzerland GmbH", "170": "Kaufland SK", "173": "MOB SK Beliani DE GmbH",
+        "174": "Kaufland CZ", "175": "Home 24 Beliani DE", "177": "COD GLS SK", "178": "Home & You Beliani PL",
+        "179": "COD GLS CZ", "180": "B&Q Beliani (UK) GmbH", "181": "Home 24 FR Beliani DE", "182": "Vente Unique PT",
+        "183": "Vente Unique NL Beliani Europe OU", "184": "Home 24 AT", "185": "Allegro 1071", "186": "Brico Depot ES Beliani DE",
+        "188": "Gamm vert FR (Terract)", "189": "Castorama FR", "190": "Carrefour FR", "192": "PayPal NO - automatic booking",
+        "193": "Kaufland PL", "194": "Kaufland AT", "195": "Amazon SE", "196": "Allegro 1069",
+        "197": "Clubfasion PT", "198": "Brico Bravo IT", "199": "Galaxus CH NEW", "200": "Limango DE",
+        "201": "HVB EU", "202": "InPost PL", "203": "Raiffeisenbank CZ Beliani SP GmbH", "204": "OBI CH",
+        "205": "Vente Unique Beliani PL", "206": "Hornbach", "207": "COD PTT RO", "208": "COD RON GLS",
+        "209": "Praxis NL BE", "210": "Castorama PL", "211": "OBI DE", "212": "XXX Lutz AT",
+        "213": "Raiffeisen SK SP EUR", "214": "Home 24 NL", "216": "Robert Dyas Beliani UK", "217": "COD Sameday RO",
+        "218": "COD Sameday HU", "219": "Bloop PT", "220": "BNP Paribas PL SP", "221": "COD HDT HUF",
+        "222": "Shein DE", "223": "Brico BE", "224": "Vente Unique AT", "226": "Hobbybox FI",
+        "228": "Vente Unique LU", "229": "BRICOMARCHE FR", "230": "VIVRE RO", "231": "inpost pl new",
+        "232": "Wayfair UK", "234": "Amazon NL", "235": "Shoepping AT", "236": "UNICREDIT RON",
+        "237": "BRICO DEPOT PT", "240": "JOYBUY DE", "241": "Leroy Merlin PT", "243": "VIVRE HU",
+        "244": "XXX Lutz CH", "245": "Allegro CZ", "246": "Allegro HU", "247": "Allegro SK",
+        "248": "PayPal SI/HR - automatic booking", "249": "Momax DE Beliani DE", "250": "InPost Pay", "251": "Zadbano CZ",
+        "252": "Order Payment $"
+    };
+    function bsPobrane(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function bsReczne(){ try { return JSON.parse(GM_getValue(MK_BS_RECZNE, '{}')) || {}; } catch (e){ return {}; } }
+    function bsLoad(){
+        const out = {};
+        Object.keys(MK_BS_WBUD).forEach(function (id){ out[id] = { nm: MK_BS_WBUD[id], off: false, zr: 'wbud' }; });
+        const r = bsReczne();
+        Object.keys(r).forEach(function (id){ out[id] = { nm: String((r[id] && r[id].nm) || ''), off: false, zr: 'reczne' }; });
+        const p = bsPobrane();
+        Object.keys(p).forEach(function (id){ out[id] = { nm: p[id].nm, off: !!p[id].off, zr: 'pobrane' }; });
+        return out;
+    }
     function bsSave(o){ try { GM_setValue(MK_BS_KEY, JSON.stringify(o)); } catch (e){} }
     // „inactive" nie jest ozdoba: Home 24 Beliani DE wystepuje jako 175 (zywe) i 176
     // (martwe), tak samo Robert Dyas i Joybuy DE. Bez tego podpowiedz co drugi raz
@@ -29346,16 +29732,18 @@
         vat:   ['von ebay eingezogene steuer', 'ebay collected tax'],
         gross: ['transaktionsbetrag (inkl. kosten)', 'transaction amount (incl. costs)', 'gross transaction amount'],
         curTx: ['transaktionswährung', 'transaktionswahrung', 'transaction currency'],
-        ref:   ['referenznummer', 'reference number'],
-        title: ['angebotstitel', 'listing title'],
+        // „reference id", „item title", „item id" — nazwy z raportu beliani_uk po angielsku.
+        ref:   ['referenznummer', 'reference number', 'reference id'],
+        title: ['angebotstitel', 'listing title', 'item title'],
         sku:   ['bestandseinheit', 'custom label'],
-        item:  ['artikelnr.', 'artikelnr', 'item number']
+        item:  ['artikelnr.', 'artikelnr', 'item number', 'item id']
     };
     // Typy wierszy, ktore cokolwiek znacza. Reszta ("Andere Gebühr", "Versandetikett",
     // "Auszahlung") to prowizje i etykiety zwrotne — sa juz potracone w kolumnie netto,
     // wiec do ksiegowania na zamowieniach NIE ida. Tak samo robi makro dzialu.
     const MK_EBAY_ORDER  = /^(bestellung|order)$/i;
-    const MK_EBAY_REFUND = /^(rückerstattung|ruckerstattung|refund|fall|case|zahlungsstreitfall|payment dispute)$/i;
+    // „claim" to angielska nazwa niemieckiego „Fall" — tak stoi w preambule raportu UK.
+    const MK_EBAY_REFUND = /^(rückerstattung|ruckerstattung|refund|fall|case|claim|zahlungsstreitfall|payment dispute)$/i;
 
     function ebayNum(v){
         const s = String(v == null ? '' : v).trim();
@@ -29397,8 +29785,13 @@
         const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
         return iso ? iso[0] : '';
     }
-    // Podzial wiersza CSV ze srednikiem, z cudzyslowami i podwojonym cudzyslowem w srodku.
-    function ebaySplit(line){
+    // Podzial wiersza CSV z cudzyslowami i podwojonym cudzyslowem w srodku. Separator
+    // zalezy od konta, nie od kraju: beliani-de oddaje SREDNIK, a beliani_uk (15.09.2026,
+    // raport po angielsku, wyplata 7719398930) — PRZECINEK. Uklad 38 kolumn jest ten sam.
+    // Dotad dzielilismy tylko po sredniku, wiec plik UK rozpadal sie na jedna kolumne
+    // i nie byl rozpoznawany wcale („Nie rozpoznałem po zawartości").
+    function ebaySplit(line, sep){
+        const s = sep || ';';
         const out = [];
         let pole = '', q = false;
         for (let i = 0; i < line.length; i++){
@@ -29407,7 +29800,7 @@
                 if (c === '"'){ if (line[i + 1] === '"'){ pole += '"'; i++; } else q = false; }
                 else pole += c;
             } else if (c === '"') q = true;
-            else if (c === ';'){ out.push(pole); pole = ''; }
+            else if (c === s){ out.push(pole); pole = ''; }
             else pole += c;
         }
         out.push(pole);
@@ -29428,10 +29821,15 @@
         const linie = String(text == null ? '' : text).replace(/^﻿/, '').split(/\r?\n/);
         // Naglowek to pierwszy wiersz o sensownej liczbie kolumn — nazwa pierwszej kolumny
         // zalezy od jezyka, wiec nie da sie na niej zakotwiczyc.
-        let hi = -1, hdr = null;
-        for (let i = 0; i < linie.length && i < 60; i++){
-            const p = ebaySplit(linie[i]);
-            if (p.length >= 20){ hi = i; hdr = p; break; }
+        // Separator poznajemy po tym samym wierszu: ten, przy ktorym naglowek rozpada sie
+        // na 20+ kolumn. Smieciowa linia „--,--,…" ma ich 13, wiec sie nie myli.
+        let hi = -1, hdr = null, sep = ';';
+        for (let i = 0; i < linie.length && i < 60 && hi < 0; i++){
+            [';', ','].some(function (s){
+                const p = ebaySplit(linie[i], s);
+                if (p.length >= 20){ hi = i; hdr = p; sep = s; return true; }
+                return false;
+            });
         }
         if (hi < 0) return { err: 'to nie wygląda na raport transakcji eBaya — nie znalazłem wiersza nagłówka' };
         const c = ebayCols(hdr);
@@ -29454,7 +29852,7 @@
         // Preambula: sprzedawca i zapowiedziana kwota wyplaty.
         let seller = '', zapow = null, zapowCur = '';
         for (let i = 0; i < hi; i++){
-            const p = ebaySplit(linie[i]);
+            const p = ebaySplit(linie[i], sep);
             const k = String(p[0] || '').trim().toLowerCase();
             const v = String(p[1] || '').trim();
             if (/^(verkäufer|verkaufer|seller)$/.test(k)) seller = v;
@@ -29472,7 +29870,7 @@
         let netto = 0, gross = 0, refund = 0, nPos = 0, nZwr = 0, pominiete = 0;
         let payNo = '', payDate = '', curNet = zapowCur, curTx = '';
         for (let i = hi + 1; i < linie.length; i++){
-            const r = ebaySplit(linie[i]);
+            const r = ebaySplit(linie[i], sep);
             if (r.length < 5 || !String(r[0] || '').trim()) continue;
             const typ = String(r[c.typ] || '').trim();
             const netRow = ebayNum(r[c.net]);
@@ -29524,7 +29922,7 @@
                 wRef.push({ r: r, kw: kw });
             }
         }
-        if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung” / „Rückerstattung”' };
+        if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung”/„Order” ani „Rückerstattung”/„Refund”' };
         return {
             seller: seller, shop: ebayShop(seller),
             payNo: payNo, payDate: payDate,
@@ -37806,8 +38204,10 @@
                 // Wspolrzedne wiersza sa pewniejsze niz klucz data+konto+kwota — patrz
                 // komentarz przy shMarkRefunded.
                 const a = j.zArkusza;
-                g[key].keys.push((a && a.tab && a.row) ? { tab: a.tab, row: a.row }
-                                                       : shKey(j, c.acct));
+                // „kj" wiąże wiersz arkusza z pozycjami tego rozliczenia — po nim
+                // refDoArkusza wie, które pozycje decydują o Refunded którego wiersza.
+                g[key].keys.push((a && a.tab && a.row) ? { tab: a.tab, row: a.row, kj: kj }
+                                                       : Object.assign(shKey(j, c.acct), { kj: kj }));
             }
             // v3.71: domyslnie na liste idzie WARTOSC BEZWZGLEDNA — parsery zapisuja zwroty
             // raz na plus, raz na minus i lista ma je pokazywac jednolicie. Wyjatkiem sa
@@ -37819,7 +38219,7 @@
                 // Opis potracenia (Wayfair) zostaje przy pozycji — bez niego przy ksiegowaniu
                 // nie widac, czego zwrot dotyczyl. kind = rodzaj marketplace: bez niego nie
                 // da sie powiedziec, czy temu opisowi wolno trafic do ticketu (MK_KOM_MP).
-                g[key].rows.push({ id: x.id, amt: x.amt, ref: j.ref, kind: j.kind,
+                g[key].rows.push({ id: x.id, amt: x.amt, ref: j.ref, kind: j.kind, kj: kj,
                                    note: x.note, rodzaj: x.rodzaj,
                                    data: x.data || '', typ: x.typ || '' });
                 g[key].sum = r2(g[key].sum + x.amt);
@@ -38077,11 +38477,73 @@
                 // i nie chcemy, zeby zlapal go ktorykolwiek z ogolniejszych wzorcow nizej.
                 if (/deleted/i.test(t)) { out[r.id] = 'auftrag Deleted — pominięty, nic nie zaksięgowano'; return; }
                 if (/timeout/i.test(t)) { out[r.id] = 'przekroczony czas'; return; }
-                if (/brak\s+ticketu/i.test(t)) { out[r.id] = 'brak ticketu'; return; }
+                // Przy kilku auftragach modul ticketa pisze „Znaleziono N auftragów, ale nie
+                // znaleziono ticketu w żadnym z nich" — to ten sam brak ticketu.
+                if (/brak\s+ticketu|nie\s+znaleziono\s+ticketu/i.test(t)) { out[r.id] = 'brak ticketu'; return; }
                 if (/BŁĄD|blad|błąd/i.test(t)) { out[r.id] = 'błąd'; return; }
             }
         });
         return out;
+    }
+    // Adresy auftragow pozycji bez ticketu — do odnosnika w Comments. Modul ticketa
+    // wypisuje je po przebiegu w liscie „Do wykonania recznie" (#tm-t-issue-report):
+    // numer zamowienia w <strong>, obok linki „Auftrag #…". Czytamy tylko. Gdy listy
+    // nie ma, notatka idzie bez odnosnika — sam napis „brak ticketu" dalej mowi swoje.
+    function ksLinkiAuftragow(x){
+        const out = {};
+        const box = document.getElementById('tm-t-issue-report');
+        if (!box) return out;
+        const li = Array.prototype.slice.call(box.querySelectorAll('li'));
+        (x.rows || []).forEach(function (r){
+            li.forEach(function (el){
+                const s = el.querySelector('strong');
+                if (!s || String(s.textContent || '').trim() !== String(r.id)) return;
+                if (!/brak\s+ticketu|nie\s+znaleziono\s+ticketu/i.test(String(el.textContent || ''))) return;
+                el.querySelectorAll('a[href*="auction.php"]').forEach(function (a){
+                    const m = String(a.href || '').match(/[?&]number=(\d+)/);
+                    if (!m) return;
+                    const lista = out[r.id] || (out[r.id] = []);
+                    if (!lista.some(function (z){ return z.num === m[1]; })) lista.push({ num: m[1], url: String(a.href) });
+                });
+            });
+        });
+        return out;
+    }
+    // Co zwroty tej grupy znacza dla kolumny Refunded — PER WIERSZ arkusza, bo grupa
+    // (data + konto) to czesto kilka rozliczen, a kazde ma swoj wiersz.
+    // Wiersz idzie na „Tak", gdy KAZDA jego pozycja jest zalatwiona:
+    //   * zaksiegowana — log ticketa albo trwaly zapis modulu ticketa,
+    //   * pominieta, bo auftrag jest Deleted — nie ma czego ksiegowac,
+    //   * stoi na braku ticketu — wtedy do Comments idzie notatka z odnosnikiem do auftragu.
+    // Pozycja z innym powodem (czas, blad, log milczy) zostawia wiersz na „Nie": tam
+    // naprawde jest jeszcze robota. Dotad po kazdym nieprzerwanym przebiegu cala grupa
+    // szla na „Tak", takze z pozycjami, ktore stanely na czasie.
+    // Wiersz bez niezerowych pozycji pomijamy — arkusz ma tam „Brak" i niech zostanie.
+    function refDoArkusza(x, done, usuniete, powody, zapis, linki){
+        const oznacz = [], zostaje = [];
+        (x.keys || []).forEach(function (k){
+            const poz = (x.rows || []).filter(function (r){ return r.kj === k.kj; });
+            if (!poz.length) return;
+            const notatki = [], otwarte = [];
+            poz.forEach(function (r){
+                if (done.indexOf(r.id) >= 0 || zapis[r.id + '|' + Math.abs(r.amt).toFixed(2)]) return;
+                if (usuniete.indexOf(r.id) >= 0) return;
+                if (powody[r.id] === 'brak ticketu'){
+                    const au = linki[r.id] || [];
+                    notatki.push({
+                        tekst: 'brak ticketu — '
+                             + (au.length ? ('auftrag ' + au.map(function (a){ return a.num; }).join(', ') + ' ') : '')
+                             + '(zam. ' + r.id + ', ' + f2(r.amt) + ')',
+                        linki: au.map(function (a){ return { fragment: a.num, url: a.url }; })
+                    });
+                    return;
+                }
+                otwarte.push(r.id + (powody[r.id] ? (' (' + powody[r.id] + ')') : ''));
+            });
+            if (otwarte.length) zostaje.push({ klucz: k, otwarte: otwarte });
+            else oznacz.push(Object.assign({}, k, notatki.length ? { notatki: notatki } : {}));
+        });
+        return { oznacz: oznacz, zostaje: zostaje };
     }
     // Podpowiedz przy przekroczeniach czasu — modul ticketa ma na to dwa pokretla,
     // a jego wlasna instrukcja mowi, ze przy wiekszej liczbie workerow trzeba podniesc
@@ -39119,14 +39581,25 @@
         } else {
             rdMark(x.key, x.rows.map(function (rr){ return rr.id; }), false);
         }
-        // Zwroty zaksiegowane — odhaczamy je w arkuszu. Niepowodzenie tego kroku nie
-        // cofa ksiegowania, trafia tylko na pasek stanu.
+        // Zwroty zalatwione — odhaczamy je w arkuszu, per wiersz (patrz refDoArkusza).
+        // Niepowodzenie tego kroku nie cofa ksiegowania, trafia tylko na pasek stanu.
         let ark = '';
         const tArk = Date.now();
         try {
-            const res = await shMarkRefunded(x.keys);
-            if (res) ark = 'w arkuszu oznaczonych ' + (res.updated || 0)
-                + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : '');
+            const plan = refDoArkusza(x, done, usuniete, ksBledy(x), ksZapis(), ksLinkiAuftragow(x));
+            plan.zostaje.forEach(function (z){
+                const kz = z.klucz;
+                mkLog('arkusz', '    zostaje „Nie": ' + (kz.tab ? (kz.tab + ' w. ' + kz.row)
+                      : (kz.data + ' / ' + kz.konto + ' / ' + f2(kz.kwota))) + ' — niezałatwione: ' + z.otwarte.join(', '));
+            });
+            const nNot = plan.oznacz.reduce(function (s, o){ return s + (o.notatki || []).length; }, 0);
+            const res = plan.oznacz.length ? await shMarkRefunded(plan.oznacz) : null;
+            if (res) ark = 'w arkuszu Refunded „Tak": ' + (res.updated || 0)
+                + (nNot ? (' (z odnośnikiem „brak ticketu": ' + nNot + ')') : '')
+                + ((res.missing && res.missing.length) ? (', nie znalazłem ' + res.missing.length + ' wierszy') : '')
+                + ((nNot && res.stare) ? ' — wdrożone Apps Script nie dopisuje odnośników, wdróż nową wersję' : '');
+            if (plan.zostaje.length)
+                ark += (ark ? ', ' : 'w arkuszu ') + 'zostaje „Nie": ' + plan.zostaje.length + ' (powody w logu)';
             mkLog('arkusz', '✔ ' + (ark || 'arkusz pominiety') + ' — ' + mkLogSek(tArk));
         } catch (e){
             ark = 'arkusz: ' + ((e && e.message) || e);
@@ -39750,9 +40223,14 @@
                              _konto0: String(x.konto == null ? '' : x.konto).trim() };
                 });
                 shRysuj();
+                // Stare wdrożenie czyta tylko „MM/RRRR" — wiersze z zakładek Uli i Tomka
+                // byłyby niewidoczne, a lista wyglądałaby na kompletną.
+                const stareA = shStare(r);
                 say('Arkusz: ' + shLista.length + ' wierszy z Booked = Nie'
                     + ((r.tabs && r.tabs.length) ? (' · zakładki ' + r.tabs.slice(0, 3).join(', ')
-                       + (r.tabs.length > 3 ? ' …' : '')) : ''), '#0a7a2f');
+                       + (r.tabs.length > 3 ? ' …' : '')) : '')
+                    + (stareA ? ' · UWAGA: wdrożone Apps Script jest starsze niż HUB i nie czyta zakładek „MM/RRRR Ula" ani „MM/RRRR Tomasz" — wdróż nową wersję' : ''),
+                    stareA ? '#c47f00' : '#0a7a2f');
             } catch (e){
                 shZamknij();
                 // Nie zostawiamy czlowieka z samym „nie zna akcji" — od razu sprawdzamy,
@@ -40633,7 +41111,8 @@
         function dlAcct(){
             let o = '';
             acc.forEach(function (a){
-                if (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm)) return;
+                // Wpis dopisany recznie pokazujemy zawsze — ktos go dopisal wlasnie po to.
+                if (a.zr !== 'reczne' && (!a.on || !/^1\d{3}$/.test(a.n) || MK_NOT_BANK.test(a.nm))) return;
                 o += '<option value="' + esc(a.n + ' — ' + a.nm) + '"></option>';
             });
             return '<datalist id="mk-dl-acct">' + o + '</datalist>';
@@ -40673,6 +41152,36 @@
               +   ((bsN && acc.length) ? ('↻ Odśwież z prologistics (' + acc.length + ' kont, ' + bsN + ' bank settings)')
                                        : '⇩ Uzupełnij z prologistics')
               + '</button></span></div>';
+        // Dopisywanie reczne konta albo bank settingu, ktorego nie ma na liscie. Zapisuje sie
+        // od razu, bez „Zapisz" — tamten guzik dotyczy tabeli sklepow ponizej.
+        const rAcc = mkAcctReczne(), rBs = bsReczne();
+        const chipR = function (typ, klucz, opis){
+            return '<span style="display:inline-block;margin:3px 6px 0 0;padding:1px 6px;border:1px solid #ede9fe;border-radius:5px">'
+                 + esc(opis) + ' <button type="button" class="mk-r-del" data-t="' + typ + '" data-k="' + esc(klucz) + '"'
+                 + ' title="Usuń wpis dopisany ręcznie" style="border:none;background:transparent;color:#c00;cursor:pointer;font-size:11px;padding:0 2px">✕</button></span>';
+        };
+        const inR = 'font-size:11px;padding:2px 4px;border:1px solid #ddd;border-radius:4px';
+        const btR = 'padding:3px 9px;border:1px solid #5b21b6;border-radius:6px;background:#fff;color:#5b21b6;cursor:pointer;font-size:10px';
+        h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px;font-size:11px">'
+          +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+          +  '<b style="color:#5b21b6">Dopisz ręcznie:</b>'
+          +  '<span>konto</span><input id="mk-r-an" placeholder="numer" style="width:60px;' + inR + '">'
+          +  '<input id="mk-r-anm" placeholder="nazwa konta" style="width:170px;' + inR + '">'
+          +  '<button id="mk-r-acc" type="button" style="' + btR + '">+ konto</button>'
+          +  '<span style="color:#ddd">|</span>'
+          +  '<span>bank setting</span><input id="mk-r-bn" placeholder="numer" style="width:50px;' + inR + '">'
+          +  '<input id="mk-r-bnm" placeholder="nazwa (jak w Bank settings)" style="width:170px;' + inR + '">'
+          +  '<button id="mk-r-bs" type="button" style="' + btR + '">+ bank setting</button>'
+          +  '<span id="mk-r-msg" style="font-size:10px;color:#666"></span></div>'
+          +  ((rAcc.length || Object.keys(rBs).length)
+                ? ('<div style="margin-top:3px;color:#666">dopisane: '
+                   + rAcc.map(function (a){ return chipR('k', a.n, 'konto ' + a.n + ' — ' + a.nm); }).join('')
+                   + Object.keys(rBs).map(function (id){ return chipR('b', id, 'bank setting ' + id + ' — ' + ((rBs[id] || {}).nm || '')); }).join('')
+                   + '</div>')
+                : '')
+          +  '<div style="font-size:10px;color:#888;margin-top:3px">Plan kont (' + acc.length + ') i bank settings (' + bsN + ') są wbudowane w skrypt (stan z 15.09.2026) — działają bez pobierania. '
+          +  '„Odśwież z prologistics" dociąga zmiany; wpis dopisany ręcznie zostaje, dopóki go nie usuniesz.</div>'
+          +  '</div>';
         const sc = shCfg();
         h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px">'
           +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
@@ -40911,6 +41420,11 @@
                         m.style.color = '#c47f00';
                         m.textContent = '✓ połączone, ale wdrożenie nie zna akcji „todo" i „todoSet" — '
                                       + 'wgraj nowy kod i wdróż NOWĄ wersję (Manage deployments → ołówek → New version)';
+                    } else if (shStare(r)){
+                        m.style.color = '#c47f00';
+                        m.textContent = '✓ połączone, ale wdrożenie jest starsze niż HUB — nie zna zakładek Uli i Tomka, '
+                                      + 'Booked po zaksięgowaniu ani odnośników „brak ticketu". Wklej oba pliki (APP i Markety) '
+                                      + 'i wdróż NOWĄ wersję (Manage deployments → ołówek → New version)';
                     } else {
                         const need = {};
                         jobList().forEach(function (j){
@@ -40927,6 +41441,58 @@
                 t.disabled = false;
             };
         })();
+        // Dopisywanie i usuwanie wpisow recznych — stoi ZA obiema galeziami wyzej, bo pole
+        // dopisywania jest takze wtedy, gdy tabeli sklepow jeszcze nie ma.
+        (function (){
+            const pisz = function (t, kol){
+                const m = $('#mk-set') && $('#mk-set').querySelector('#mk-r-msg');
+                if (m){ m.style.color = kol || '#0a7a2f'; m.textContent = t; }
+            };
+            const pole = function (id){ const el = box.querySelector(id); return String((el && el.value) || '').replace(/\s+/g, ' ').trim(); };
+            const bA = box.querySelector('#mk-r-acc');
+            if (bA) bA.onclick = function(){
+                const n = pole('#mk-r-an'), nm = pole('#mk-r-anm');
+                if (!/^\d{3,6}$/.test(n)){ pisz('numer konta to same cyfry', '#c00'); return; }
+                if (!nm){ pisz('podaj nazwę konta', '#c00'); return; }
+                const byl = mkAcctLoad().filter(function (a){ return a.n === n; })[0];
+                const l = mkAcctReczne().filter(function (a){ return String(a.n) !== n; });
+                l.push({ n: n, nm: nm, on: true });
+                try { GM_setValue(MK_ACC_RECZNE, JSON.stringify(l)); } catch (e){ pisz('nie zapisałem: ' + ((e && e.message) || e), '#c00'); return; }
+                renderSet();
+                pisz('✓ dopisane konto ' + n + ' — ' + nm
+                     + (byl && byl.zr === 'pobrane' ? ' (uwaga: prologistics zna je jako „' + byl.nm + '" i ta nazwa wygrywa)' : ''),
+                     byl && byl.zr === 'pobrane' ? '#c47f00' : '#0a7a2f');
+            };
+            const bB = box.querySelector('#mk-r-bs');
+            if (bB) bB.onclick = function(){
+                const id = pole('#mk-r-bn'), nm = pole('#mk-r-bnm');
+                if (!/^\d{1,6}$/.test(id)){ pisz('numer bank settingu to same cyfry', '#c00'); return; }
+                if (!nm){ pisz('podaj nazwę bank settingu', '#c00'); return; }
+                const byl = bsLoad()[id];
+                const r = bsReczne();
+                r[id] = { nm: nm };
+                try { GM_setValue(MK_BS_RECZNE, JSON.stringify(r)); } catch (e){ pisz('nie zapisałem: ' + ((e && e.message) || e), '#c00'); return; }
+                renderSet();
+                pisz('✓ dopisany bank setting ' + id + ' — ' + nm
+                     + (byl && byl.zr === 'pobrane' ? ' (uwaga: prologistics zna go jako „' + byl.nm + '" i ta nazwa wygrywa)' : ''),
+                     byl && byl.zr === 'pobrane' ? '#c47f00' : '#0a7a2f');
+            };
+            box.querySelectorAll('.mk-r-del').forEach(function (b){
+                b.onclick = function(){
+                    const k = b.getAttribute('data-k') || '';
+                    try {
+                        if (b.getAttribute('data-t') === 'k'){
+                            GM_setValue(MK_ACC_RECZNE, JSON.stringify(mkAcctReczne().filter(function (a){ return String(a.n) !== k; })));
+                        } else {
+                            const r = bsReczne(); delete r[k];
+                            GM_setValue(MK_BS_RECZNE, JSON.stringify(r));
+                        }
+                    } catch (e){ pisz('nie usunąłem: ' + ((e && e.message) || e), '#c00'); return; }
+                    renderSet();
+                    pisz('✓ usunięte: ' + k);
+                };
+            });
+        })();
         const pull = box.querySelector('#mk-pull');
         if (pull) pull.onclick = function(){ mkPull(true); };
         // Pierwsze otwarcie panelu na czystym profilu: nie kazemy szukac guzika,
@@ -40934,7 +41500,9 @@
         // MK_AUTOPULL jest tu konieczne: mkPull konczy sie renderSet(), a ten trafia
         // znowu w to miejsce. Gdyby pobralo sie tylko jedno z dwoch zrodel, warunek
         // nadal bylby prawdziwy i para renderSet↔mkPull krecilaby sie bez konca.
-        if (!MK_AUTOPULL && (!bsN || !acc.length)){
+        // Warunek liczy tylko to, co POBRANE — listy wbudowane sa zawsze, a swiezy stan
+        // z prologistics nadal warto dociagnac przy pierwszym otwarciu.
+        if (!MK_AUTOPULL && (!Object.keys(bsPobrane()).length || !mkAcctPobrane().length)){
             MK_AUTOPULL = true;
             setTimeout(function (){ mkPull(false); }, 60);
         }
@@ -43751,7 +44319,9 @@
             // Kazdy wiersz odpowiada za siebie: „missing" niesie zakladke i numer,
             // wiec powod trafia do tego zlecenia, ktorego dotyczy.
             ((r && r.missing) || []).forEach(function (t){
-                const m = String(t).match(/^(\S+)\s+w\.\s+(\d+)/);
+                // Nazwa zakladki bywa ze spacja („10/2026 Ula") — \S+ gubil wtedy powod
+                // i wiersz, ktory arkusz odrzucil, meldowal sie jako poprawiony.
+                const m = String(t).match(/^(.+?)\s+w\.\s+(\d+)/);
                 const k = m ? czyj[m[1] + '!' + Number(m[2])] : null;
                 if (k){ zle[k] = 1; dopisz(k, ' · ARKUSZ: ' + t); }
             });
@@ -44075,9 +44645,16 @@
                         const w = await shDopiszSklep(jobs) || {};
                         if (w.err) cur.msg += ' · ARKUSZ: ' + w.err;
                     } else {
-                        const res = await shZapisz(j, c);
+                        // Import to dopiero WGRANIE paczki — wiersz idzie z Booked „Nie".
+                        // Na „Tak" przestawi go shAfterBook po „Zaksięguj": arkusz rozpozna
+                        // ten sam wiersz po kluczu data + konto + kwota. Dotąd szedł od razu
+                        // jako „Tak" i niezaksięgowana paczka wyglądała w arkuszu na zrobioną.
+                        const w = shRow(j, c);
+                        w.booked = 'Nie';
+                        const res = await shPost([w]) || {};
                         const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
-                        cur.msg += shSlowo(res) + (res.added ? tb : '');
+                        cur.msg += (res.ok === false) ? (' · ARKUSZ: ' + (res.err || 'nie przyjął wiersza') + ' — wiersz dopisz ręcznie')
+                                 : (res.added ? (' · wpisane do arkusza jako niezaksięgowane' + tb) : ' · w arkuszu już było');
                     }
                 } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); }
                 jobsSave(jobs);
@@ -66797,7 +67374,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '0076a8e · 15.09.2026 09:06';
+    const HUB_BUDOWA = '9872acf · 15.09.2026 10:42';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
