@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.48
+// @version      5.49
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -26834,7 +26834,11 @@
             .replace(/[\u0142]/g, 'l').replace(/[\u0144\u00f1]/g, 'n')
             .replace(/[\u00f3\u00f2\u00f4\u00f6]/g, 'o').replace(/[\u015b\u0161]/g, 's')
             .replace(/[\u00fa\u00f9\u00fb\u00fc]/g, 'u').replace(/[\u017c\u017a\u017e]/g, 'z')
-            .replace(/[^a-z0-9]/g, '');
+            .replace(/[^a-z0-9]/g, '')
+            // \u201eMoemax" to \u201eM\u00f6max" pisany bez umlautu \u2014 tak stoi w arkuszu i w SEPA. Samo \u00f6\u2192o
+            // dawalo \u201emomax" kontra \u201emoemax" i wiersz \u201eMoemax AT" nie trafial w nic. Tylko ta
+            // jedna marka: ogolne oe\u2192o zmieniloby dopasowanie wszystkich nazw w module.
+            .replace(/moemax/g, 'momax');
     }
     // Wszystko, co modul potrafi obsluzyc, sprowadzone do jednej listy celow. Zrodla
     // sa dwa i uzupelniaja sie: reczne wejscia (MK_MAN) nios\u0105 walute i rodzaj,
@@ -27703,6 +27707,7 @@
         'MICROSPOT|CH':                      'https://beliani.brickfox.net/',
         'MIGROS|CH':                         'https://mlsplus.migros.net/mlsplus/#!login',
         'MOEBEL24|DE':                       'https://marketplace.moebel24.de/vendor.php?dispatch=auth.login_form&return_url=vendor.php',
+        'MÖMAX|AT':                          'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'MÖMAX|DE':                          'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'MORELE|PL':                         'https://marketplace.morele.net/login',
         'OBI|CH':                            'https://streckenportal.obi.net/sites/ObiProdAx/ThirdPartyVendorPortal',
@@ -27740,7 +27745,9 @@
         'WOWCHER|UK':                        'https://merchant-area.wowcher.co.uk/login',
         'XXXLUTZ|AT':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|CH':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
-        'XXXLUTZ|DE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
+        'XXXLUTZ|CZ':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|DE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|RO':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
     };
     // Adres panelu dla zlecenia. Kraj bierzemy z nazwy sklepu — tak samo jak przy
     // zgadywaniu konta w mkAcctGuess. Marka („Vente Unique") bywa inna niz sklep
@@ -28025,10 +28032,18 @@
           ref: /\b(\d{4,})\s+TERACT\b/i,
           brand: 'Gamm Vert', short: 'Gamm Vert', host: 'teractfr-prod.mirakl.net' },
         { mp: 'Gamm Vert',      ok: false, payer: /MANGOPAY/i, ref: /(TERACT)/i },
-        // Zapasowa: inny, NIEZNANY Mirakl przez MANGOPAY z tym samym ksztaltem referencji.
-        // Regula Carrefoura powyzej ma IDENTYCZNY wzorzec ref, wiec ta linia nie odbiera
-        // jej niczego — zostaje jako siatka bezpieczenstwa, gdyby doszedl piaty taki sklep.
-        { mp: 'Mirakl (inny)',  ok: false, payer: /MANGOPAY/i,  ref: /\b(\d{5,})\s*MARKETPAY/i },
+        // Zapasowa dla KAZDEJ wplaty od MANGOPAY, ktorej nie rozpoznala zadna regula wyzej.
+        // Stala tu dotad „Mirakl (inny)" z wzorcem IDENTYCZNYM jak u Carrefoura („NNNNN
+        // MARKETPAY"). mkDetect bierze pierwsze trafienie, wiec nie zadzialala nigdy, a tytul
+        // nieznanego Mirakla ma inny ksztalt i nie trafial w nic — wiersz znikal z wyciagu
+        // bez slowa, tak jak PayPro przed swoja regula „nieznany sklep" wyzej.
+        // Sprawdzone 15.09.2026 na wyciagach UBS: 147 wplat od MANGOPAY, 126 Vente,
+        // 16 Carrefour i 5 „<numer> SAS EQUIPEMEN" bez zadnej reguly. „MARKETPAY" (PSP
+        // Carrefoura) nie wystapil w tych wyciagach u nikogo innego.
+        // Bez wzorca referencji i PO wszystkich regulach MANGOPAY: nie odbiera niczego
+        // regulom wyzej, a zlecenia nie zaklada (ok: false) — wplata trafia do
+        // „pozostałych marketplace'ów", gdzie ja widac.
+        { mp: 'Mangopay (nieznany sklep)', ok: false, payer: /MANGOPAY/i },
         { mp: 'Amazon',         ok: false, payer: /AMAZON PAYMENTS/i },
         { mp: 'Klarna',         ok: false, payer: /KLARNA/i },
         { mp: 'Worldline',      ok: false, payer: /WORLDLINE/i },
@@ -28145,6 +28160,31 @@
         if (!l || l.length < 2) return null;
         const h = String(j.host || '');
         return (!h || l.indexOf(h) >= 0) ? l : null;
+    }
+    // Zlecenie „kilka paneli" (np. „Conforama NN") dostaje mp PIERWSZEGO kandydata —
+    // przy Conforamie iberyjskie, bo ta regula stoi w MK_RULES wyzej. Gdy rozliczenie
+    // przyszlo z INNEGO panelu, przelot przestawial sam host, a mp zostawal iberyjski.
+    // Razem z nim zly byl klucz ustawien: „Mirakl (Conforama) · <sklep FR>" — i tak
+    // w ⚙ Konta powstal wiersz z francuskim kontem 1420 pod panelem iberyjskim.
+    // Marketplace bierzemy z regul TEGO hosta, ale tylko gdy wszystkie mowia to samo.
+    // Przy sprzecznych albo przy braku regul zostaje, co bylo: lepiej nie poprawic,
+    // niz poprawic zle. Carrefour FR/ES (MK_PANELE) ma jeden mp na obu panelach,
+    // wiec tej funkcji nie potrzebuje i nie jest z nia wolany.
+    function mkMpZHosta(j, host){
+        const h = String(host || '');
+        if (!j || !h) return false;
+        const reg = MK_RULES.filter(function (r){ return r.ok && r.mp && r.host === h; });
+        if (!reg.length) return false;
+        const mp = reg[0].mp;
+        if (!reg.every(function (r){ return r.mp === mp; }) || mp === j.mp) return false;
+        // Marka z reguly tej samej marki, jesli jest: XXXLutz i Mömax dziela host i mp.
+        const marka = mkNorm(j.brand || j.short || '');
+        const r0 = reg.filter(function (r){ return marka && mkNorm(r.brand || r.short || '') === marka; })[0] || reg[0];
+        j.mp = mp;
+        j.brand = r0.brand || j.brand || '';
+        j.short = r0.short || j.short || '';
+        if (r0.kind) j.kind = r0.kind;
+        return true;
     }
     function mkDetect(payer, reason){
         for (let i = 0; i < MK_RULES.length; i++){
@@ -28581,6 +28621,23 @@
         // wyciag bankowy i wgrany eksport musza nazywac ten marketplace tak samo.
         '6740': { mp: 'Mirakl (XXXLutz)', brand: 'Mömax', short: 'Mömax',
                   host: 'marketplace.xxxlgroup.com', shop: 'Mömax DE' },
+        // Mömax AT — ten sam panel. 7012 odczytany 15.09.2026 wprost z panelu: po przelaczeniu
+        // na sklep /sellerpayment/private/shops/current oddal {"name":"Beliani MMX AT",
+        // "uuid":7012}; lista sklepow tego loginu: 2026 Beliani, 3752 Beliani AT, 6740 Beliani
+        // MMX DE, 7012 Beliani MMX AT, 6346 Beliani CH, 7031 CZ, 7044 RO, 6254 SI, 7077 HR.
+        // Nazwe wpisujemy JAWNIE: przelew za Austrie moze przyjsc od XXXLutz KG (marka
+        // XXXLutz), a wtedy „marka + kraj" daloby „XXXLutz AT" z kontem 1525 zamiast 1461.
+        '7012': { mp: 'Mirakl (XXXLutz)', brand: 'Mömax', short: 'Mömax',
+                  host: 'marketplace.xxxlgroup.com', shop: 'Mömax AT' },
+        // XXXLutz CZ i RO — ten sam panel i login, z tej samej listy sklepow z 15.09.2026:
+        // 7031 „Beliani CZ", 7044 „Beliani RO" (oba Open). Nazwy wpisane jawnie jak przy
+        // 2026 XXXLutz DE: klucz ustawien jest wtedy wlasny i od razu zgodny z etykieta
+        // w _Markety, zamiast „Beliani CZ" z panelu. Konto RO: 1462 „XXXLutz RO Beliani (EU)
+        // GmbH"; konta CZ w planie kont z 15.09.2026 nie ma.
+        '7031': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CZ' },
+        '7044': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz RO' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
@@ -28635,6 +28692,11 @@
     // tak samo, a wtedy dwa kraje dostalyby jeden numer importu i jedno konto. Sklep,
     // ktorego numeru jeszcze nie znam, dostaje wiec etykiete z numerem — brzydka, ale
     // wlasna, i od razu widac, ktory numer mi podeslac.
+    // Numery sklepow z MK_SHOPID, ktore naleza do danego panelu — do przelotu po sklepach.
+    function mkSklepyPanelu(host){
+        const h = String(host || '');
+        return Object.keys(MK_SHOPID).filter(function (k){ return MK_SHOPID[k] && MK_SHOPID[k].host === h; });
+    }
     function mkShopLabel(id, nazwaZPanelu, host){
         const i = String(id == null ? '' : id).trim();
         const w = MK_SHOPID[i];
@@ -39735,7 +39797,7 @@
         async function mkWczytajWyciagi(fs){
             if (!fs || !fs.length) return;
             let addT = 0, knownT = 0, otherT = 0;
-            const per = [], errs = [];
+            const per = [], errs = [], nieznaneT = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 try {
@@ -39745,7 +39807,13 @@
                     let add = 0, known = 0, other = 0;
                     p.rows.forEach(function (r){
                         if (!r.mp) return;
-                        if (!r.ok){ other++; return; }
+                        if (!r.ok){
+                            // „… (nieznany sklep)" to nie platnik poza zakresem, tylko wplata od
+                            // znanego posrednika, ktorej sklepu nie umiemy nazwac. Tam jest robota
+                            // (dopisac regule), wiec idzie na osobna liste — patrz komunikat nizej.
+                            if (/\(nieznany sklep\)$/.test(String(r.mp))) nieznaneT.push(r); else other++;
+                            return;
+                        }
                         known++;
                         const k = r.ref || (r.txId || (r.date + '_' + r.amount));
                         if (jobs[k] && jobs[k].status === 'done') return;
@@ -39770,10 +39838,20 @@
                 + 'rozpoznanych obsługiwanych ' + knownT + ' (nowych zleceń ' + addT + ')'
                 + (fs.length > 1 ? (' — ' + per.join(', ')) : '')
                 + (otherT ? (', pozostałych marketplace’ów ' + otherT + ' — na razie poza zakresem') : '') + '.'
+                // Z data, kwota i poczatkiem tytulu — sama liczba w zbiorczym „poza zakresem"
+                // wygladala jak brak roboty, a to wplata, dla ktorej trzeba dopisac regule.
+                + (nieznaneT.length ? (' NIEROZPOZNANY SKLEP (' + nieznaneT.length + '): '
+                    + nieznaneT.slice(0, 5).map(function (x){
+                          return x.date + ' ' + f2(x.amount) + ' ' + (x.cur || '') + ' — '
+                               + String(x.mp).replace(/\s*\(nieznany sklep\)$/, '')
+                               + ' „' + String(x.reason || x.payer || '').slice(0, 50) + '”';
+                      }).join('; ')
+                    + (nieznaneT.length > 5 ? ('; … +' + (nieznaneT.length - 5)) : '')
+                    + ' — tej wpłaty nie umiem przypisać, trzeba dopisać regułę.') : '')
                 + (czeka ? (' Zestawień jeszcze nie pobierałem — kliknij „⬇ Pobierz zestawienia" (czeka '
                             + czeka + ').') : '')
                 + (errs.length ? (' Problem: ' + errs.join('; ')) : ''),
-                errs.length ? '#c47f00' : '#0a7a2f');
+                (errs.length || nieznaneT.length) ? '#c47f00' : '#0a7a2f');
         }
         // Most z Bank Importu. Ten sam wyciag, ktory poszedl do importu bankowego, moze
         // zalozyc tu zlecenia — na konto PostFinance wpadaja tez wyplaty marketplace.
@@ -40464,7 +40542,11 @@
                 const kand = Object.keys(jobs).filter(function (k){
                     const j0 = jobs[k];
                     if (!mkTodo(j0) || (j0.kind || 'mirakl') !== 'mirakl') return false;
-                    if (String(j0.host || '') !== p.host) return false;
+                    // Zlecenie „kilka paneli" (np. „Conforama NN" z arkusza) ma host PIERWSZEGO
+                    // kandydata. Plik z drugiego panelu tez jest jego — bez tego obok powstawalo
+                    // blizniacze zlecenie CYKL-…, a czekajace dobieralo ten sam cykl przy
+                    // nastepnym przelocie i dwa gotowe zlecenia niosly jedno rozliczenie.
+                    if (String(j0.host || '') !== p.host && (j0.hosty || []).indexOf(p.host) < 0) return false;
                     if (bez){
                         const dc = mkDay(p.do), dj = mkDay(j0.date);
                         return dc != null && dj != null && dc <= dj && (dj - dc) <= 6 * 86400000;
@@ -40524,6 +40606,15 @@
                     say('Wypłata z pliku ' + f2(p.wyplata) + ' nie zgadza się z wpłatą ' + f2(j.amount)
                         + ' — nie przypisałem go do tego zlecenia.', '#c00');
                     return;
+                }
+                // Plik rozstrzygnal panel — tak samo jak przelot w mkPass: host z pliku, lista
+                // kandydatow juz niepotrzebna, marketplace z regul tego panelu (mkMpZHosta).
+                if ((j.hosty || []).length > 1){
+                    j.host = p.host; j.hosty = null;
+                    const mpPrzed = j.mp;
+                    if (mkMpZHosta(j, j.host))
+                        j.note = (j.note ? j.note + '; ' : '') + 'rozliczenie z panelu ' + j.host
+                               + ' — marketplace poprawiony z „' + mpPrzed + '" na „' + j.mp + '"';
                 }
                 j.note = 'rozliczenie z pliku ' + f.name
                        + (j.zPliku ? ' · zlecenie założone z tego pliku, BEZ potwierdzenia z wyciągu — kwota to wypłata z cyklu, nie przelew' : '')
@@ -41087,7 +41178,7 @@
             const j = jobs[k];
             if (!j.data || !j.data.shop) return;
             const key = setKey(j.mp, j.data.shop);
-            if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(j.brand, j.data.shop, acc) || {}).n || '' };
+            if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(mkMarkaSklepu(j.data.shop) || j.brand, j.data.shop, acc) || {}).n || '' };
         });
         const keys = Object.keys(rows).sort();
         const bk = bkLoad();
@@ -41721,7 +41812,15 @@
                     j.wymus = ''; j.kand = null; j.kandSklep = '';
                     // Panel juz znany — lista przestaje byc potrzebna, a zlecenie
                     // ma pamietac TEN, z ktorego rozliczenie naprawde przyszlo.
-                    if ((j.hosty || []).length > 1){ j.host = host || j.host; j.hosty = null; }
+                    // Razem z panelem poprawiamy marketplace (mkMpZHosta) — inaczej ustawienia
+                    // tego zlecenia zapisalyby sie pod mp pierwszego kandydata z listy.
+                    if ((j.hosty || []).length > 1){
+                        j.host = host || j.host; j.hosty = null;
+                        const mpBylo = j.mp;
+                        if (mkMpZHosta(j, j.host))
+                            j.note = (j.note ? j.note + '; ' : '') + 'rozliczenie przyszło z panelu ' + j.host
+                                   + ' — marketplace poprawiony z „' + mpBylo + '" na „' + j.mp + '"';
+                    }
                     // Marka z kilkoma panelami: zapamietujemy TEN, ktory oddal
                     // rozliczenie, zeby nastepnym razem nie zaczynac od drugiego.
                     else if (host && mkPaneleMarki(j)) j.host = host;
@@ -42490,7 +42589,16 @@
                     say('Platforma ' + (hi + 1) + '/' + hosts.length + ' — łączę się z ' + host + '…');
                     const boot = await mkBoot();
                     home = boot.home || '';
-                    const ids = boot.ids || [];
+                    // Do zapamietanych numerow dokladamy sklepy znane z MK_SHOPID. Zapamietane
+                    // rosna tylko o to, co HUB zobaczyl na panelu — a na panelach na wlasnej
+                    // domenie (XXXL Group) HUB nie dziala, wiec lista rosla wylacznie o sklep
+                    // biezacy. Mömax AT, XXXLutz CZ i RO nie bylyby odwiedzone nigdy, choc
+                    // wiadomo, ze sa pod tym samym loginem. Sklep biezacy idzie pierwszy.
+                    const zPamieci = boot.ids || [];
+                    const ids = zPamieci.slice();
+                    const zMapy = mkSklepyPanelu(host);
+                    if (home && zMapy.length && ids.indexOf(home) < 0) ids.unshift(home);
+                    zMapy.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
                     if (!ids.length){
                         // Bez listy nie ma czym przelaczac, ale sklep BIEZACY zawsze mozemy
                         // sprawdzic — przy jednym sklepie to zalatwia sprawe w calosci.
@@ -42527,8 +42635,18 @@
                         if (!mkLeft(jobs, host)) break;       // z tej platformy juz wszystko mamy
                         say(host + ' — sklep ' + (i + 1) + '/' + ids.length + '…');
                         try { await mkSwitch(ids[i]); } catch (e){ continue; }
+                        // Numer dolozony z MK_SHOPID, a nie widziany na tym loginie, sprawdzamy:
+                        // gdyby panel przyjal przelaczenie i zostal na poprzednim sklepie,
+                        // etykieta z mapy opisalaby cudze rozliczenie — a po niej idzie klucz
+                        // ustawien, czyli bank_setting i konto. Bez potwierdzenia pomijamy.
+                        let nazwaPanelu = '';
+                        if (zPamieci.indexOf(ids[i]) < 0 && ids[i] !== home){
+                            const cur = await mkShop();
+                            if (cur.uuid == null || String(cur.uuid) !== String(ids[i])) continue;
+                            nazwaPanelu = String(cur.name || cur.shopName || '');
+                        } else nazwaPanelu = await mkShopName();
                         seen++;
-                        const nm = mkShopLabel(ids[i], await mkShopName(), host);
+                        const nm = mkShopLabel(ids[i], nazwaPanelu, host);
                         if (nm && odwiedzone.indexOf(nm) < 0) odwiedzone.push(nm);
                         ok += await mkPass(jobs, nm, host);
                     }
@@ -44124,6 +44242,17 @@
     // sklepow. Takiej nie wolno przepuszczac przez skladanie „marka + kraj": „Praxis NL"
     // wyszloby z tego jako „Maxeda NL", bo marka panelu nie ma nic wspolnego z etykieta
     // sklepu. Nazwy podane przez panel (zwykle „Beliani cos") ta droga nie ida.
+    // Marka sklepu znanego z imienia (MK_SHOPID). Na wspolnym panelu marka ZLECENIA mowi,
+    // kto zaplacil, a nie czyj to sklep: przelew za Mömax AT od XXXLutz KG niesie marke
+    // XXXLutz. Podpowiedz konta musi pytac o marke sklepu, inaczej trafia w XXXLutz AT.
+    function mkMarkaSklepu(nazwa){
+        const n = mkNorm(nazwa);
+        if (!n) return '';
+        const k = Object.keys(MK_SHOPID).filter(function (x){
+            return MK_SHOPID[x] && MK_SHOPID[x].shop && mkNorm(MK_SHOPID[x].shop) === n;
+        })[0];
+        return k ? String(MK_SHOPID[k].brand || '') : '';
+    }
     function mkSklepZnany(nazwa){
         const n = mkNorm(nazwa);
         if (!n) return false;
@@ -67374,7 +67503,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '9872acf · 15.09.2026 10:42';
+    const HUB_BUDOWA = '3dd2ebd · 15.09.2026 13:33';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
