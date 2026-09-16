@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.49
+// @version      5.50
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -36,6 +36,7 @@
 // @connect      leenbakker.nl
 // @connect      castorama.fr
 // @connect      xxxlgroup.com
+// @connect      bricodepot.es
 // @connect      myvtex.com
 // @connect      galaxus.ch
 // @connect      wayfair.com
@@ -26073,6 +26074,16 @@
         'Mirakl (Leroy) · Leroy Merlin IT': { bank: '', booking: '9', acct: '1362' },
         'Mirakl (Leroy) · Leroy Merlin ES': { bank: '', booking: '9', acct: '1117' },
         'Mirakl (Leroy) · Leroy Merlin PT': { bank: '', booking: '9', acct: '1455' },
+        // Brico Depot ES i PT: jeden panel (marketplace.bricodepot.es), dwa sklepy.
+        // Konta z planu kont: 1150 „Brico Depot ES Beliani DE", 1151 „Brico Depot PT
+        // Beliani DE". Importy z listy bank settings: 186 „Brico Depot ES Beliani DE",
+        // 237 „BRICO DEPOT PT". Booking 9 („Fulfillment No") jak przy pozostalych
+        // sklepach Mirakla.
+        'Mirakl (Brico Depot) · Brico Depot ES': { bank: '186', booking: '9', acct: '1150' },
+        'Mirakl (Brico Depot) · Brico Depot PT': { bank: '237', booking: '9', acct: '1151' },
+        // Hornbach DE: panel hornbach-mp.mirakl.net, jeden sklep 2370. Konto 1522 (w planie
+        // kont z literowka: „Hormbach DE Beliani DE"), import 206 „Hornbach", booking 9.
+        'Mirakl (Hornbach) · Hornbach DE': { bank: '206', booking: '9', acct: '1522' },
         // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
         // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
         'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
@@ -28138,6 +28149,22 @@
           brand: 'Castorama', short: 'Castorama', host: 'marketplace.castorama.fr' },
         // Castorama spoza Francji albo bez numeru: wiersz ma zostac chociaz NAZWANY.
         { mp: 'Castorama',      ok: false, payer: /CASTORAMA/i },
+        // Brico Depot ES i PT — panel marketplace.bricodepot.es (wlasna domena, stad osobny
+        // @connect), sklepy w MK_SHOPID. Rozliczenia ida bez posrednika (pspName
+        // NOT_SPECIFIED w cyklach). Wplaty z wyciagu jeszcze nie widzielismy, wiec platnik
+        // to na razie sama nazwa i nie ma wzorca referencji: cykl dobiera sie po kwocie
+        // i dacie. Regula daje przede wszystkim cel wierszom „Brico Depot ES/PT" z arkusza
+        // (mkCele, lista paneli: BRICO DEPOT|ES i |PT prowadza na ten sam host).
+        { mp: 'Mirakl (Brico Depot)', ok: true, payer: /BRICO\s*D[EÉ]P[OÔ]T/i,
+          brand: 'Brico Depot', short: 'Brico Depot', host: 'marketplace.bricodepot.es' },
+        // Hornbach DE — panel hornbach-mp.mirakl.net (domena Mirakla, wystarcza @connect
+        // mirakl.net), jeden sklep 2370. Cykle ida bez posrednika (pspName NOT_SPECIFIED),
+        // a payOut.reference ma postac „SELLER_<uuid>, triggered by mpois". Wplaty z wyciagu
+        // jeszcze nie widzielismy, wiec platnik to sama nazwa i nie ma wzorca referencji:
+        // cykl dobiera sie po kwocie i dacie. Regula daje cel wierszom „Hornbach DE"
+        // z arkusza (mkCele, lista paneli: HORNBACH|DE prowadzi na ten sam host).
+        { mp: 'Mirakl (Hornbach)', ok: true, payer: /HORNBACH/i,
+          brand: 'Hornbach', short: 'Hornbach', host: 'hornbach-mp.mirakl.net' },
         { mp: 'Furniture1',     ok: false, payer: /BALDAI1|Furniture1/i }
     ];
     // Marka, ktora ma WIECEJ NIZ JEDEN panel. Regula wyciagu niesie jeden host, bo
@@ -28662,7 +28689,27 @@
                   host: 'but-prod.mirakl.net' },
         // Castorama FR: 2241 z naglowka mirakl-shop-uuid panelu marketplace.castorama.fr.
         '2241': { mp: 'Mirakl (Castorama FR)', brand: 'Castorama', short: 'Castorama',
-                  host: 'marketplace.castorama.fr' }
+                  host: 'marketplace.castorama.fr' },
+        // Brico Depot: jeden login, cztery sklepy, odczytane 15.09.2026 wprost z panelu
+        // (/sellerpayment/private/shops/current po przelaczeniu, uuid = numer sklepu):
+        // 2555 „Beliani ES (Vendedor Internacional - UE)" i 2606 „Beliani PT (…)" sa
+        // zawieszone i maja rozliczenia do 09.2025. 4013 „Beliani Kundendienst GmbH
+        // (Vendedor Internacional - UE)" i 4187 „Beliani Kundendienst GmbH PT (…)" sa
+        // otwarte. Kraj 4013 wynika z pary: sklep PT ma „PT" w nazwie, drugi to ES.
+        // Stare numery zostaja, bo niosa rozliczenia sprzed zawieszenia.
+        '2555': { mp: 'Mirakl (Brico Depot)', brand: 'Brico Depot', short: 'Brico Depot',
+                  host: 'marketplace.bricodepot.es', shop: 'Brico Depot ES' },
+        '2606': { mp: 'Mirakl (Brico Depot)', brand: 'Brico Depot', short: 'Brico Depot',
+                  host: 'marketplace.bricodepot.es', shop: 'Brico Depot PT' },
+        '4013': { mp: 'Mirakl (Brico Depot)', brand: 'Brico Depot', short: 'Brico Depot',
+                  host: 'marketplace.bricodepot.es', shop: 'Brico Depot ES' },
+        '4187': { mp: 'Mirakl (Brico Depot)', brand: 'Brico Depot', short: 'Brico Depot',
+                  host: 'marketplace.bricodepot.es', shop: 'Brico Depot PT' },
+        // Hornbach DE: 2370 odczytany 15.09.2026 wprost z panelu (shops/current: „Beliani DE",
+        // uuid 2370, jedyny sklep tego loginu; przelaczenie na cudzy numer panel odrzuca 403).
+        // Nazwe wpisujemy jawnie, bo „Beliani DE" z panelu nie jest etykieta z _Markety.
+        '2370': { mp: 'Mirakl (Hornbach)', brand: 'Hornbach', short: 'Hornbach',
+                  host: 'hornbach-mp.mirakl.net', shop: 'Hornbach DE' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -34772,6 +34819,39 @@
             return (a.roz - b.roz) || (a.dni - b.dni);
         });
         return out;
+    }
+    // Lista „Które to rozliczenie?" przy zleceniu. Przelot po panelu z kilkoma sklepami
+    // (XXXL Group: szesc numerow z MK_SHOPID) wola mkPass dla KAZDEGO sklepu, a kazdy
+    // sklep bez trafienia zapisywal tu swoja liste bez warunku. Zostawala lista sklepu
+    // ostatniego, przy swiezo otwartych CZ i RO zwykle pusta. Lista ze sklepu, ktory
+    // naprawde mial podobne rozliczenia, znikala razem z ramka wyboru.
+    // Zasady: lista z TEGO SAMEGO sklepu zawsze sie odswieza, takze do pustej. Pusta
+    // z innego sklepu niczego nie kasuje. Niepusta z innego wygrywa, gdy to sklep
+    // zlecenia albo gdy jej najblizszy kandydat lezy blizej kwoty wplaty.
+    function mkKandZapisz(j, kd, shopName){
+        const nowa = (kd || []).length ? kd.map(function (x){
+            return { id: x.id, data: x.data, kwota: x.kwota, roz: x.roz, powod: x.powod };
+        }) : null;
+        const sklep = String(shopName || '');
+        const stary = String(j.kandSklep || '');
+        if (!(j.kand || []).length || stary === sklep){
+            j.kand = nowa; j.kandSklep = nowa ? sklep : '';
+            return;
+        }
+        if (!nowa) return;
+        const swoj = mkNorm(j.shop || (j.data && j.data.shop) || '');
+        if (swoj && mkNorm(sklep) === swoj){ j.kand = nowa; j.kandSklep = sklep; return; }
+        if (swoj && mkNorm(stary) === swoj) return;
+        // Podejrzenie pomylki w zapisie kwoty (powod) jest mocniejsze niz kazda roznica.
+        const najblizej = function (l){
+            let b = Infinity;
+            l.forEach(function (x){
+                if (x && x.powod) b = -1;
+                else if (x && x.roz != null && x.roz < b) b = x.roz;
+            });
+            return b;
+        };
+        if (najblizej(nowa) < najblizej(j.kand)){ j.kand = nowa; j.kandSklep = sklep; }
     }
     // Panele, na ktorych KAZDY KRAJ MA WLASNY LOGIN — nie da sie ich obejsc jedna sesja.
     // To nie to samo, co kilka adresow (Conforama): tam pomaga przelot po hostach, tu
@@ -41739,11 +41819,9 @@
                         j.msg = (shopName ? ('Sklep ' + shopName + ': ') : '') + mkCoWPanelu(cycles, j);
                         // Kandydaci ZOSTAJA przy zleceniu — z nich powstaje lista wyboru
                         // pod zleceniem. Pieciu wystarczy: dalej to juz nie sa kandydaci.
-                        const kd = mkKandydaci(cycles, j).slice(0, 5);
-                        j.kand = kd.length ? kd.map(function (x){
-                            return { id: x.id, data: x.data, kwota: x.kwota, roz: x.roz, powod: x.powod };
-                        }) : null;
-                        j.kandSklep = shopName || '';
+                        // Przy kilku sklepach na panelu kolejny sklep nie moze tej listy
+                        // bez warunku nadpisac. Zasady stoja przy mkKandZapisz.
+                        mkKandZapisz(j, mkKandydaci(cycles, j).slice(0, 5), shopName);
                         jobsSave(jobs); render();
                         continue;
                     }
@@ -42597,8 +42675,20 @@
                     const zPamieci = boot.ids || [];
                     const ids = zPamieci.slice();
                     const zMapy = mkSklepyPanelu(host);
+                    // Strona glowna nie zawsze niesie currentShopUUID. Bez sklepu wyjsciowego
+                    // petla po numerach z mapy pomijala sklep biezacy spoza mapy i nie miala
+                    // dokad wrocic. Pytamy wiec panel wprost: jedno zapytanie, i tylko przy
+                    // hoscie, dla ktorego mapa cos zna.
+                    if (!home && zMapy.length){
+                        const c0 = await mkShop();
+                        if (c0.uuid != null && /^\d+$/.test(String(c0.uuid))) home = String(c0.uuid);
+                    }
                     if (home && zMapy.length && ids.indexOf(home) < 0) ids.unshift(home);
-                    zMapy.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
+                    // Bez pamieci i bez sklepu wyjsciowego zostaje dawna droga nizej: sam sklep
+                    // biezacy, bez przelaczania, bo nie byloby dokad wrocic.
+                    if (home || zPamieci.length){
+                        zMapy.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
+                    }
                     if (!ids.length){
                         // Bez listy nie ma czym przelaczac, ale sklep BIEZACY zawsze mozemy
                         // sprawdzic — przy jednym sklepie to zalatwia sprawe w calosci.
@@ -67503,7 +67593,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '3dd2ebd · 15.09.2026 13:33';
+    const HUB_BUDOWA = '7b940e6 · 16.09.2026 07:00';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
