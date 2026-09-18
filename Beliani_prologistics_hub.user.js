@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.53
+// @version      5.54
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -35842,7 +35842,10 @@
     //
     // Magazyn 'mkt_f1_drive' = {url, secret}. Pusty wpis znaczy „wartosc wbudowana" — wartosc
     // rowna wbudowanej tez zapisujemy jako pusta, zeby nowa wersja HUB-a mogla zmienic domysl.
-    const F1_URL_DEF = '';
+    // Adres wdrozenia Apps Scriptu „Furniture1 pliki” (tylko do odczytu, konto imienne).
+    // Wbudowany na stale, zeby kazdy dostawal go z wersja i nie wpisywal recznie w ⚙ Konta —
+    // ten sam wzorzec co RCN_URL_DEF przy Reconciliation. Wlasny adres z ⚙ Konta ma pierwszenstwo.
+    const F1_URL_DEF = 'https://script.google.com/a/macros/beliani.com/s/AKfycbznTDhSNHPzcIf1X8YPcouzq_rjkcmDEJM_Euv4vzcZHK0NtXbQultM2QCSsK7nZlXR/exec';
     const F1_SECRET_DEF = 'e6lO7bC63sim9_r1DnL8nkkuE1x6-4KDp2EBKYlsPx0';
     const F1_DRIVE_KEY = 'mkt_f1_drive';
     const F1_DRIVE_WERSJA = '2026-09-17';      // najstarsza wersja skryptu, ktora ten kod rozumie
@@ -77512,7 +77515,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '3ce6b88 · 18.09.2026 14:45';
+    const HUB_BUDOWA = '9b1f7fa · 18.09.2026 15:02';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
