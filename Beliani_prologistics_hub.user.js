@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.54
+// @version      5.55
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11878,7 +11878,13 @@
     'use strict';
 
     const SC = 'https://salescenter.allegro.com';
-    const KEY = 'al_booking_state_v2';
+    // v3, bo stan zapisany przed poprawka na podwojona kwote (ponizej, kwotaZeSpanu)
+    // niesie juz sklejone liczby typu "699699" i NIE DA SIE ich naprawic po fakcie:
+    // normAmount skasowal walute i spacje, wiec falszywe "699699" jest nie do
+    // odroznienia od prawdziwej kwoty 699699. Podbicie klucza sprawia, ze po
+    // wklejeniu poprawki panel zglasza "Brak danych do eksportu." zamiast po cichu
+    // oddac stary, zly CSV. Starego klucza nie kasujemy — sam nikomu nie szkodzi.
+    const KEY = 'al_booking_state_v3';
     const WIDE_FROM = '2020-07-01T00:00:00.000Z'; // szeroki zakres = "all period" na settlements
 
     const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
@@ -11903,6 +11909,70 @@
         let intPart = (dec >= 0 ? t.slice(0, dec) : t).replace(/[.,]/g, '');
         let frac = dec >= 0 ? t.slice(dec + 1).replace(/[.,]/g, '') : '';
         return (neg ? '-' : '') + intPart + (frac ? '.' + frac : '');
+    }
+
+    // ---------- kwota z wiersza listy operacji ----------
+    //
+    // Allegro renderuje kwote DWA RAZY w jednym spanie: raz dla czytnika ekranu,
+    // raz dla oka (ta druga kopia ma aria-hidden="true"). textContent widzi obie
+    // sklejone bez odstepu, wiec normAmount robilo z "CZK 699" liczbe "699699".
+    // Potwierdzone w konsoli 29.09.2026 i na 11 wierszach eksportu; eksporty do
+    // 01.09.2026 byly czyste, wiec zmienil sie Allegro, nie HUB.
+    //
+    // Kopii NIE wybieramy po aria-hidden. Ten atrybut mowi o dostepnosci, nie
+    // o widocznosci — widoczna jest akurat ta Z aria-hidden, a druga niesie
+    // odcisk klas "visually hidden". Dopoki obie daja te sama liczbe, jest
+    // wszystko jedno, ktora wezmiemy; gdy zaczna sie roznic, nie zgadujemy.
+    // Kwota zostaje wtedy PUSTA i widac to w tabeli i w CSV, bo strona odbiorcza
+    // (init_ksieg, wklejka Allegro) nie ma dla CZ/HU/SK ani jednej kontroli kwoty:
+    // zla liczba doszlaby cicho az do pola formularza ticketu.
+    const AL_WALUTY = 'CZK|EUR|HUF|PLN|Ft|zł|€';
+
+    function alCzysc(t) {
+        return String(t || '')
+            .replace(/[   ]/g, ' ')  // spacja twarda, waska, cienka
+            .replace(/[−–]/g, '-')        // minus typograficzny i polpauza
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    // Ucina druga kopie kwoty. Nie porownuje dlugosci ani znakow — szuka drugiego
+    // symbolu waluty, wiec przezyje spacje miedzy kopiami i rozny znak minusa.
+    // Waluta z przodu ("CZK 699") -> tniemy PRZED druga; z tylu ("13 990 Ft")
+    // -> tniemy ZA pierwsza. O tym, ktory to przypadek, rozstrzyga cyfra przed
+    // pierwszym symbolem, a nie jego pozycja (przy zwrocie tekst zaczyna minus).
+    function alPierwszaKopia(t) {
+        const s = alCzysc(t);
+        const re = new RegExp(AL_WALUTY, 'g');
+        const traf = [];
+        let m;
+        while ((m = re.exec(s)) !== null) traf.push({ i: m.index, len: m[0].length });
+        if (traf.length < 2) return s;
+        const przedem = /\d/.test(s.slice(0, traf[0].i));
+        const kawalek = przedem ? s.slice(0, traf[0].i + traf[0].len) : s.slice(0, traf[1].i);
+        return kawalek.replace(/[-\s]+$/, '').trim();
+    }
+
+    function kwotaZeSpanu(el) {
+        if (!el) return '';
+        let kopie = [];
+        try {
+            kopie = Array.prototype.slice.call(el.children || [])
+                .map(function (c) { return c.textContent || ''; })
+                .filter(function (t) { return /\d/.test(t); });
+        } catch (e) { kopie = []; }
+        if (kopie.length >= 2) {
+            const w = kopie.map(function (t) { return normAmount(alPierwszaKopia(t)); });
+            if (w.every(function (x) { return x === w[0]; })) return w[0];
+            // Kopie sie roznia. Gdy caly tekst niesie dwa symbole waluty, to mimo
+            // wszystko podwojenie i pierwsza kopia jest wiarygodna — ale nie wiemy
+            // ktora, wiec oddajemy pusto. Gdy symbol jest jeden, to nie byly kopie,
+            // tylko kawalki jednej kwoty (np. grosze w osobnym spanie) — czytamy calosc.
+            const caly = alCzysc(el.textContent || '');
+            const ile = (caly.match(new RegExp(AL_WALUTY, 'g')) || []).length;
+            return ile < 2 ? normAmount(alPierwszaKopia(caly)) : '';
+        }
+        return normAmount(alPierwszaKopia(el.textContent || ''));
     }
 
     function fmtDate(d) { const p = String(d || '').split('-'); return p.length === 3 ? p[2] + '.' + p[1] + '.' + p[0] : (d || ''); }
@@ -12009,7 +12079,7 @@
                         return /CZK|EUR|HUF|PLN|Ft|z\u0142|\u20ac/.test(s.textContent || '');
                     });
                 }
-                if (amtSpan) amount = amtSpan.textContent;
+                if (amtSpan) amount = kwotaZeSpanu(amtSpan);
             }
             const md = (row.textContent || '').match(/(\d{2}\.\d{2}\.\d{4})/);
             const date = md ? md[1] : '';
@@ -12230,7 +12300,11 @@
         const st = { active: true, market: getMarket(), filter: filter, rangeFrom: rangeFrom, rangeTo: rangeTo, idx: 0, rows: ops };
         saveState(st);
         buildTable(ops);
-        msg('Znaleziono ' + ops.length + ' operacji (' + rangeFrom + ' \u2013 ' + rangeTo + '). Startuje\u2026');
+        // kwotaZeSpanu zostawia pole puste, gdy nie potrafi rozstrzygnac kwoty \u2014
+        // to ma byc widac od razu, a nie dopiero w CSV
+        const bezKwoty = ops.filter(function (o) { return !o.amount; }).length;
+        msg('Znaleziono ' + ops.length + ' operacji (' + rangeFrom + ' \u2013 ' + rangeTo + ').' +
+            (bezKwoty ? ' \u26a0\ufe0f ' + bezKwoty + ' bez kwoty \u2014 sprawdz je recznie!' : '') + ' Startuje\u2026');
         location.href = ordersUrl(st, ops[0].uuid);
     }
 
@@ -12785,22 +12859,62 @@
         if (kinds.some(function (k) { return !items.some(function (it) { return it.kind === k; }); })) {
             return { ok: false, reason: 'dup', items: items };
         }
+        // Roszczenia z notatki naleza do ORDERU, nie do pojedynczego wiersza: ten sam numer
+        // potrafi dotyczyc innego wiersza tego samego zamowienia (CV. MULYA RATTAN, 29.09.2026 —
+        // roznica 2000,00 przy notatce „other 1327 + overpayment 1425", gdzie 1327 = 2000,00,
+        // a 1425 = 2520,30 ma w tej samej wklejce wlasny wiersz). Dlatego kazde roszczenie moze
+        // tu wystapic na plus, na minus ALBO nie wystapic wcale. Obrona przed zgadywaniem zostaje
+        // ta sama i jedyna: podzial musi byc JEDNOZNACZNY. Przy dziesieciu roszczeniach (gorny
+        // limit wyzej) daje to 3^10 = 59 049 ukladow — tanio.
         const n = items.length, hits = [], seen = {};
-        for (let mask = 0; mask < (1 << n); mask++) {
-            let sum = 0; const byKind = {};
+        const ukladow = Math.pow(3, n);
+        for (let kod = 0; kod < ukladow; kod++) {
+            let sum = 0, k = kod;
+            const byKind = {}, uzyteIds = [];
             for (let i = 0; i < n; i++) {
-                const v = bal2(((mask >> i) & 1 ? -1 : 1) * items[i].amt);
+                const st = k % 3; k = (k - st) / 3;          // 0 = pomijamy, 1 = na plus, 2 = na minus
+                if (!st) continue;
+                uzyteIds.push(items[i].id);
+                const v = bal2((st === 1 ? 1 : -1) * items[i].amt);
                 sum = bal2(sum + v);
                 byKind[items[i].kind] = bal2((byKind[items[i].kind] || 0) + v);
             }
+            if (!uzyteIds.length) continue;                  // same pominiecia to nie jest podzial
             if (Math.abs(bal2(sum - diff)) >= 0.005) continue;
-            const key = Object.keys(byKind).sort().map(function (k) { return k + '=' + balFix(byKind[k]); }).join('|');
-            if (seen[key]) continue;
-            seen[key] = 1; hits.push(byKind);
+            // Rodzaj, ktory wyszedl na zero (np. +A i -A tego samego typu), nie ma czego ksiegowac.
+            Object.keys(byKind).forEach(function (kk) { if (!byKind[kk]) delete byKind[kk]; });
+            const key = Object.keys(byKind).sort().map(function (kk) { return kk + '=' + balFix(byKind[kk]); }).join('|');
+            // TEN SAM podzial potrafi wyjsc kilkoma droga mi — raz biorac roszczenie A, raz biorac
+            // zamiast niego B+C. Ksiegowanie jest wtedy identyczne, ale to, KTORE roszczenie uchodzi
+            // za uzyte, decyduje o tresci ostrzezenia przy innym wierszu tego orderu. Dlatego uzyte
+            // liczymy jako PRZECIECIE wszystkich rownowaznych ukladow: numer jest „rozliczony tutaj"
+            // tylko wtedy, gdy nie da sie tego podzialu zrobic bez niego. Wariant odwrotny —
+            // najmniej pominiec — przechylalby w strone ciszy, a cisza wyglada tu tak samo
+            // jak przeoczenie.
+            if (seen[key]) {
+                seen[key].uzyte = seen[key].uzyte.filter(function (id) { return uzyteIds.indexOf(id) >= 0; });
+                uzyteIds.forEach(function (id) {
+                    if (seen[key].unia.indexOf(id) < 0) seen[key].unia.push(id);
+                });
+                continue;
+            }
+            seen[key] = { byKind: byKind, uzyte: uzyteIds.slice(), unia: uzyteIds.slice() };
+            hits.push(key);
         }
         if (!hits.length) return { ok: false, reason: 'nofit', items: items };
-        if (hits.length > 1) return { ok: false, reason: 'ambiguous', items: items, splits: hits };
-        return { ok: true, byKind: hits[0], items: items, mism: mism };
+        if (hits.length > 1) return { ok: false, reason: 'ambiguous', items: items,
+                                      splits: hits.map(function (k) { return seen[k].byKind; }) };
+        const wyn = seen[hits[0]];
+        // Trzy stany, nie dwa. Przeciecie bywa puste — przy dwoch roszczeniach tego samego
+        // rodzaju o rownych kwotach kazdy uklad bierze jedno z nich, wiec zadne nie jest
+        // niezbedne, a mimo to JEDNO sie rozliczylo. Bez tego rozroznienia sasiedni wiersz
+        // mowil „nie widze w zadnym wierszu", co jest po prostu nieprawda.
+        const mozliwe = wyn.unia.filter(function (id) { return wyn.uzyte.indexOf(id) < 0; });
+        const pominiete = items.map(function (it) { return it.id; }).filter(function (id) {
+            return wyn.unia.indexOf(id) < 0;
+        });
+        return { ok: true, byKind: wyn.byKind, uzyte: wyn.uzyte, mozliwe: mozliwe,
+                 pominiete: pominiete, items: items, mism: mism };
     }
     // Dlaczego podzialu nie da sie zrobic — tresc bledu pod wklejka.
     function balSplitWhy(sp, label, diff, pending, kinds, penCredit, discCredit) {
@@ -12825,7 +12939,7 @@
                     return Object.keys(s).map(function (k) { return k + ' ' + balFix(s[k]); }).join(' / ');
                 }).join(' albo ') + ') i podział byłby zgadywaniem.';
         }
-        return head + 'kwoty z prologistics (' + list + ') nie składają się na nią w żadnym układzie znaków i nie ma z czego jej rozdzielić.';
+        return head + 'kwoty z prologistics (' + list + ') nie składają się na nią w żadnym układzie znaków — nawet gdy pominąć część z nich — i nie ma z czego jej rozdzielić.';
     }
     // Opisy roszczen + propozycja konta. „data" to mapa numer roszczenia -> rekord z prologistics.
     // KAZDE roszczenie dopasowujemy do SOP OSOBNO. Dopasowanie do sklejonego opisu bylo blednie
@@ -12869,6 +12983,13 @@
     function parseBalancePaste(raw, debit, credit, penCredit, discCredit, opts) {
         const lines = String(raw || '').replace(/\r/g, '').split('\n');
         const entries = [], errors = [], warns = [], groups = [], byOrder = {}, others = [];
+        // Roszczenia naleza do ORDERU, nie do wiersza, a notatka bywa przepisana do kazdego
+        // wiersza zamowienia. Zeby wiersz bez roznicy nie pytal o roszczenie rozliczone obok,
+        // zbieramy w trakcie przelotu, KTORY numer zostal naprawde uzyty i w ktorym wierszu,
+        // a zdanie dla takiego wiersza skladamy dopiero po calej wklejce.
+        const uzyteRoszcz = {};     // numer roszczenia -> { no, order } — rozliczone NA PEWNO
+        const mozliweRoszcz = {};   // jw., ale „rozliczylo sie jedno z nich, nie wiadomo ktore"
+        const bezRoznicy = [];      // { idx, no, order, cont, label, ids }
         // Numery roszczen, ktorych kwoty musimy miec z prologistics, zeby w ogole ruszyc z wierszem
         // (wiersz z kilkoma rodzajami roszczen). Panel dociaga je po tej liscie.
         const needClaims = [];
@@ -12994,11 +13115,14 @@
                 // Tu docieramy juz tylko wtedy, gdy kwoty roszczenia NIE dalo sie ustalic
                 // (inny rodzaj niz penalty/discount albo kilka rodzajow). Powody, ktore
                 // umiemy nazwac, sa zglaszane wyzej — nie powtarzamy ich drugi raz.
-                if (hasCont && label && !warns.some(function (w){ return w.indexOf('wiersz ' + no + ':') === 0; }))
-                    warns.push('wiersz ' + no + ': w opisie idzie numer kontenera (' + cont
-                        + '), a notatka wspomina też „' + label + '" bez kwoty — księguję sam przelew, '
-                        + 'więc jeśli to roszczenie potrąca coś z tego zamówienia, dopisz kwotę brutto '
-                        + 'w 6. kolumnie albo zaksięguj nogę ręcznie.');
+                if (hasCont && label && !warns.some(function (w){ return w.indexOf('wiersz ' + no + ':') === 0; })){
+                    // Zdanie ukladamy PO calej wklejce — dopiero wtedy wiadomo, czy te roszczenia
+                    // zostaly rozliczone w innym wierszu tego samego orderu. Na razie trzymamy
+                    // miejsce, zeby ostrzezenia zostaly w kolejnosci wierszy.
+                    bezRoznicy.push({ idx: warns.length, no: no, order: order, cont: cont,
+                                      label: label, ids: balClaimIds(claims) });
+                    warns.push('wiersz ' + no + ': …');
+                }
                 entries.push(Object.assign({}, base, { amount: balFix(paid), comment: desc, kind: hasCont ? 'kontener' : (claims[0] || '').split(' ')[0] }));
                 continue;
             }
@@ -13039,6 +13163,20 @@
                     }).join(', ') + ') na ' + types.map(function (t) {
                         return t + ' ' + balFix(sp.byKind[t] || 0);
                     }).join(' + ') + ' — sprawdź, czy tak ma być.');
+                // Pominiete roszczenie MUSI byc widoczne. Cicha decyzja „to nie nalezy do tego
+                // wiersza" wyglada dokladnie tak samo jak przeoczenie.
+                if ((sp.pominiete || []).length)
+                    warns.push('wiersz ' + no + ': roszcze\u0144 ' + sp.pominiete.join(', ') +
+                        ' NIE wliczy\u0142em do tego wiersza \u2014 kwoty sk\u0142adaj\u0105 si\u0119 na r\u00f3\u017cnic\u0119 bez nich. ' +
+                        'Roszczenia w notatce dotycz\u0105 ca\u0142ego orderu, wi\u0119c najpewniej nale\u017c\u0105 do innego wiersza \u2014 sprawd\u017a.');
+                // Gdy order ma tylko jeden wiersz, niepewnosc nie ma sie gdzie pokazac: zdanie
+                // o roszczeniach rozliczonych obok pada przy wierszu BEZ roznicy, a takiego nie ma.
+                // Mowimy wiec o niej tam, gdzie powstaje. To osobny fakt niz „nie wliczylem" —
+                // sklejenie obu w jedno zdanie znow dawaloby nieprawde.
+                if ((sp.mozliwe || []).length)
+                    warns.push('wiersz ' + no + ': roszcze\u0144 ' + sp.mozliwe.join(', ') +
+                        ' \u2014 jedno z nich wesz\u0142o do tej r\u00f3\u017cnicy, ale przy r\u00f3wnych kwotach nie da si\u0119 ' +
+                        'powiedzie\u0107 kt\u00f3re. Zapis jest ten sam niezale\u017cnie od wyboru.');
                 sp.mism.forEach(function (m) {
                     warns.push('wiersz ' + no + ': roszczenie nr ' + m.id + ' jest w notatce jako „' + m.note +
                         '", a w prologistics jako „' + m.prolo + '" — sprawdź numer.');
@@ -13056,6 +13194,9 @@
             let blocked = false;
             for (let ti = 0; ti < types.length && !blocked; ti++) {
                 const ty = types[ti];
+                // Rodzaj, ktory w tym wierszu nie bierze udzialu (jego roszczenia zostaly pominiete),
+                // nie ma czego ksiegowac — bez tego powstawalaby noga na 0,00.
+                if (split && !bal2(split.byKind[ty] || 0)) continue;
                 const kClaims = split ? balClaimsOfKind(claims, ty) : claims;
                 const kLabel = split ? balClaimLabel(kClaims) : label;
                 const kAmt = split ? bal2(split.byKind[ty] || 0) : diff;
@@ -13089,10 +13230,16 @@
                     // wychodzi na to samo, co bylo: |kwota| musi sie rownac |roznica|.
                     const ramts = info.recs.map(function (rc) { return Math.abs(parseFloat(rc.amt)); });
                     if (ramts.length && ramts.length <= 8 && ramts.every(function (a) { return !isNaN(a); })) {
+                        // Trzy stany, tak samo jak w balSplitKinds: roszczenie moze wejsc na plus,
+                        // na minus albo NIE WEJSC. Bez tego przy dwoch rownych kwotach (301=100,
+                        // 302=100) i roznicy 100 wychodzily tylko 200, 0 i -200, wiec kontrola
+                        // meldowala rozjazd, choc 301 albo 302 to dokladnie ta roznica.
+                        // Suma pusta (same pominiecia) daje 0, a target nigdy nie jest zerem —
+                        // rodzaj bez kwoty nie dostaje nogi — wiec nie trzeba jej odsiewac osobno.
                         let sums = [0];
                         ramts.forEach(function (a) {
                             const nx = [];
-                            sums.forEach(function (s) { nx.push(bal2(s + a)); nx.push(bal2(s - a)); });
+                            sums.forEach(function (s) { nx.push(s); nx.push(bal2(s + a)); nx.push(bal2(s - a)); });
                             sums = nx;
                         });
                         const target = Math.abs(kAmt);
@@ -13132,6 +13279,20 @@
                 }
                 legs.push({ ty: ty, credit: legCredit, amount: kAmt, label: kLabel });
             }
+            // Ten wiersz bierze te roszczenia. Rejestrujemy je PRZED sprawdzeniem blokady: wiersz
+            // czekajacy na wybor konta dla „other" tez je rozlicza, a jego wlasny problem widac
+            // osobno. Inaczej ostrzezenie przy wierszu bez roznicy bylo ruchomym celem — mowilo
+            // „nie widze w zadnym wierszu", dopoki czlowiek nie wypelnil ramki.
+            // Przy podziale na kilka rodzajow liczy sie to, co NAPRAWDE weszlo (split.uzyte to
+            // przeciecie rownowaznych ukladow) — pominiete zostaja wolne dla innych wierszy.
+            (split ? (split.uzyte || []) : balClaimIds(claims)).forEach(function (id) {
+                if (!uzyteRoszcz[id]) uzyteRoszcz[id] = { no: no, order: order };
+            });
+            // Roszczenia, ktore rozliczyly sie TUTAJ, ale nie da sie powiedziec ktore z nich —
+            // sasiedni wiersz ma o nich napisac prawde, a nie „nie widze w zadnym wierszu".
+            ((split && split.mozliwe) || []).forEach(function (id) {
+                if (!uzyteRoszcz[id] && !mozliweRoszcz[id]) mozliweRoszcz[id] = { no: no, order: order };
+            });
             if (blocked) continue;
             // Samodzielny „other" nie ma przelewu za towar: wpisu „kontener" na 0.00 nie robimy
             // i nie ostrzegamy o braku kontenera — to jego normalny uklad.
@@ -13184,6 +13345,37 @@
             if (e.plus) accs[e.credit] = bal2((accs[e.credit] || 0) + v); else bank += v;
         });
 
+        // Wiersze bez roznicy: dopiero teraz wiadomo, czy ich roszczenia rozliczyly sie gdzie indziej.
+        bezRoznicy.forEach(function (b) {
+            const rozliczone = [], niepewne = [], nigdzie = [];
+            const gdzie = function (u) {
+                return 'w wierszu ' + u.no + (String(u.order) === String(b.order) ? '' : ' (order ' + u.order + ')');
+            };
+            (b.ids || []).forEach(function (id) {
+                const u = uzyteRoszcz[id];
+                if (u) { rozliczone.push(id + ' ' + gdzie(u)); return; }
+                const m = mozliweRoszcz[id];
+                if (m) { niepewne.push(id + ' ' + gdzie(m)); return; }
+                nigdzie.push(id);
+            });
+            if (!nigdzie.length && (rozliczone.length || niepewne.length)){
+                warns[b.idx] = 'wiersz ' + b.no + ': notatka wymienia „' + b.label + '", ale te roszczenia są '
+                             + 'rozliczone w tej samej wklejce'
+                             + (rozliczone.length ? (' (' + rozliczone.join(', ') + ')') : '')
+                             + (niepewne.length ? ((rozliczone.length ? ', a ' : ' — ') + niepewne.join(', ')
+                                 + ' na pewno, tylko przy równych kwotach nie da się powiedzieć które z nich')
+                               : '')
+                             + ' — księguję sam przelew i niczego tu nie brakuje.';
+                return;
+            }
+            if (niepewne.length) rozliczone.push(niepewne.join(', ') + ' (nie wiadomo które z nich)');
+            warns[b.idx] = 'wiersz ' + b.no + ': w opisie idzie numer kontenera (' + b.cont
+                         + '), a notatka wspomina też „' + b.label + '" bez kwoty — księguję sam przelew. '
+                         + (rozliczone.length ? ('Rozliczone gdzie indziej: ' + rozliczone.join(', ') + '. ') : '')
+                         + 'Roszczeń ' + nigdzie.join(', ') + ' nie widzę w żadnym wierszu tej wklejki — '
+                         + 'jeśli potrącają coś z tego zamówienia, dopisz kwotę brutto w 6. kolumnie '
+                         + 'albo zaksięguj nogę ręcznie.';
+        });
         return { entries: entries, groups: groups, errors: errors, warns: warns, bank: bal2(bank),
                  pen: bal2(accs[penCredit] || 0), disc: bal2(accs[discCredit] || 0), accs: accs,
                  others: others, needClaims: needClaims };
@@ -41864,12 +42056,20 @@
                 && String(o.date || '') === String(j.date || '');
         })[0] || '';
     }
+    // Powod, dla ktorego zlecenia NIE WOLNO zaimportowac — pusty napis znaczy „wolno".
+    // Jedno miejsce dla checkboxa i dla samego importu: dopoki stalo to tylko w selOn,
+    // „Zaznacz wszystkie" wpisywalo `true` i blokada znikala (mkSel ma pierwszenstwo nad
+    // wartoscia domyslna). Przy Homedeco 14.09.2026 taka „blokada" nie zatrzymalaby niczego.
+    function importBlokada(j){
+        if (!j) return '';
+        if (j.kind === 'f1') return f1ImportBlokada(j) || '';
+        if (j.kind === 'hd') return hdImportBlokada(j) || '';
+        return '';
+    }
     function selOn(j){
         const v = mkSel[mkKlucz(j)];
         // Furniture 1 z blokada importu (bilans, zapora, slad bez potwierdzenia) nie zaznacza sie samo.
-        return (v === undefined) ? (j.status === 'ready'
-                                    && !(j.kind === 'f1' && f1ImportBlokada(j))
-                                    && !(j.kind === 'hd' && hdImportBlokada(j))) : !!v;
+        return (v === undefined) ? (j.status === 'ready' && !importBlokada(j)) : !!v;
     }
     function selList(){ return jobList().filter(function (j){ return j.status === 'ready' && selOn(j); }); }
     // Paczki gotowe do zaksiegowania: zaimportowane, znany numer, jeszcze niezaksiegowane.
@@ -51442,6 +51642,18 @@
     async function doImportAll(b){
         let sel = selList();
         if (!sel.length) return;
+        // ZAPORA, nie podpowiedz. Checkbox wolno zaznaczyc recznie i hurtem, ale zlecenie
+        // z niespelnionym warunkiem tedy nie przejdzie — i mowi, czego mu brakuje.
+        const zablokowane = sel.map(function (j){ return { j: j, powod: importBlokada(j) }; })
+                               .filter(function (x){ return !!x.powod; });
+        if (zablokowane.length){
+            sel = sel.filter(function (j){ return !importBlokada(j); });
+            say('Nie importuj\u0119 ' + zablokowane.length + ' z ' + (sel.length + zablokowane.length) + ': '
+              + zablokowane.map(function (x){
+                    return ((x.j.data && x.j.data.shop) || x.j.mp || x.j.ref || '?') + ' \u2014 ' + x.powod;
+                }).join(' \u00b7 '), '#c47f00');
+            if (!sel.length) return;
+        }
         // Import zapisuje status „done" — przelot w trakcie nadpisalby go starsza migawka
         // i zlecenie wrociloby do importu drugi raz (5.53).
         if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zaimportuj po jego zakończeniu.', '#c47f00'); return; }
@@ -77515,7 +77727,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '9b1f7fa · 18.09.2026 15:02';
+    const HUB_BUDOWA = '20f3886 · 29.09.2026 13:17';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
