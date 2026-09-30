@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.56
+// @version      5.57
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -68830,6 +68830,28 @@
         autoOkDo: 5,
         sufiks: 'HUF',                 // „29.09.2026 14.05 HUF.csv" — jak dotad w imporcie
         szukaj: /unicredit\s*hu\b/i    // samo /unicredit/ trafia tez w HVB UniCredit i UNICREDIT RON
+    }, {
+        id: 'raiffeisencz',
+        nazwa: 'Raiffeisen CZ',
+        opis: 'Wyciągi z Raiffeisenbank CZ, konto Beliani (SP) GmbH ' + '403699004/5500' + ' — wgrywasz oba naraz (CZK i EUR), '
+            + 'walutę biorę z treści. Z importu wyjmuję wiersze z minusem i wpływy spoza zamówień; w pliku EUR wpisuję do VS '
+            + 'numer auftragu z tytułu przelewu GLS SK i TopTrans',
+        // Decyzje uzytkownika z 30.09.2026 (analiza archiwum Desktop\CZK, 919 wyciagow):
+        //  - dwa pliki z jednego konta -> dwa importy: CZK do „Raiffeisenbank CZ Beliani SP GmbH",
+        //    EUR do „Raiffeisen SK SP EUR", oba „method 2 +name"; tylko konto SP, stare DE odrzucamy;
+        //  - minusy wyjete (podglad pod paczka), wplywy spoza zamowien wyjete i wypisane na gorze;
+        //  - GLS i TopTrans placa pojedynczo z auftragiem — to zwykle wplaty, wszystko „Book & Assign";
+        //  - TopTrans EUR: tytul SEPA lamany co 35 znakow i uciety na 140 — numer skladamy do VS, a gdy
+        //    go nie ma, przy NOT FOUND pokazujemy numer przesylki do sprawdzenia na toptrans.cz.
+        cz: true,
+        surowy: true,
+        minKol: 0, kwoty: [], daty: [],
+        konto: '',                     // konto zalezy od waluty — BK_CZ_WALUTY (1450 CZK, 1451 EUR)
+        waluta: '',
+        odbicie: 'CSCZFinance',        // skasowany auftrag: komentarz z saldem na „CS CZ/SK Finance"
+        tolerancja: 0,
+        autoOkDo: 0.05,                // CHECK z roznica do 0.05 od razu na OK (decyzja 30.09.2026)
+        szukaj: /raiffeisenbank\s*cz\s+beliani\s*sp\b/i
     }];
     function fmt(id){ return BK_FORMATY.filter(function (x){ return x.id === id; })[0] || BK_FORMATY[0]; }
 
@@ -69109,6 +69131,262 @@
         jSet(BK_HU_WYSLANE, m);
     }
 
+    // ---------- Raiffeisen CZ: wyciag ----------
+    // Uklad sprawdzony na 919 wyciagach z archiwum Desktop\CZK (06.2024–05.2026): naglowek 22 pol
+    // (z literowka banku „Accocunt Number"), separator „;", pola w cudzyslowach, „;" bywa W SRODKU
+    // pola Note (36 wierszy). Nowy eksport (od 02.2026): UTF-8 z BOM, LF, kwota z kropka; starszy:
+    // bez BOM, CRLF, „1 932,50". CZK i EUR to jedno konto — walute mowi kolumna 14, nie nazwa
+    // pliku (nazwy mylily sie w 30 plikach). Transaction ID (10 cyfr) = staly numer transakcji.
+    var BK_CZ_NAGL = ['Transaction Date', 'Booking Date', 'Account number', 'Account Name', 'Transaction Category',
+                      'Accocunt Number', 'Name of Account', 'Transaction type', 'Message', 'Note', 'VS', 'KS', 'SS',
+                      'Booked amount', 'Account Currency', 'Original Amount and Currency', 'Original Amount and Currency',
+                      'Fee', 'Transaction ID', 'Note', 'Merchant', 'City'];
+    // Importujemy wylacznie konto Beliani (SP) GmbH; stare 914814/5500 (Beliani DE, ostatni ruch
+    // 07.05.2025) odrzucamy (decyzja 30.09.2026).
+    var BK_CZ_KONTO = '403699004/5500';
+    var BK_CZ_WALUTY = {
+        CZK: { konto: '1450', sufiks: 'SP CZK', bankNazwa: 'Raiffeisenbank CZ Beliani SP GmbH',
+               szukaj: /raiffeisenbank\s*cz\s+beliani\s*sp\b/i },
+        // „SK" w nazwie ustawienia jest poprawne — tak idzie EUR z czeskiego konta (potwierdzone 30.09.2026).
+        EUR: { konto: '1451', sufiks: 'SP EUR', bankNazwa: 'Raiffeisen SK SP EUR',
+               szukaj: /raiffeisen\s*sk\s*sp\s*eur/i }
+    };
+    var BK_CZ_WYSLANE = 'bank_imp_cz_wyslane';   // Transaction ID -> data; ostrzezenie i „caly plik juz poszedl"
+    var BK_CZ_JOB = 'bank_imp_zlecenie_cz';      // { CZK: zlecenie, EUR: zlecenie } — osobno od zlecenia HU/EuPago
+    var BK_CZ_TT = 'https://www.toptrans.cz/preprava/sk/sledovani-zasilky';
+    function czId(w){ return 'raiffeisencz:' + w; }
+    function czSlotId(id){ var m = /^raiffeisencz:(CZK|EUR)$/.exec(String(id || '')); return m ? m[1] : ''; }
+    function czF(w){
+        var B = fmt('raiffeisencz'), W = BK_CZ_WALUTY[w] || {};
+        return { id: czId(w), cz: true, nazwa: 'Raiffeisen CZ ' + w, waluta: w, konto: W.konto || '', odbicie: B.odbicie,
+                 tolerancja: B.tolerancja, tolKlucz: 'bank_imp_tolerancja_cz_' + w, autoOkDo: B.autoOkDo,
+                 szukaj: W.szukaj, sufiks: W.sufiks, bankNazwa: W.bankNazwa };
+    }
+    function czBez(t){ return String(t == null ? '' : t).replace(/\s+/g, ''); }
+    function czKwota(t){
+        var s = String(t == null ? '' : t).replace(/[\s  ]/g, '').replace(',', '.');
+        return /^-?\d+(\.\d{1,2})?$/.test(s) ? Number(s) : null;
+    }
+    function czData(t){
+        var m = String(t == null ? '' : t).trim().match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        return m ? (m[3] + '-' + m[2] + '-' + m[1]) : '';
+    }
+    // Jedna linia CSV na pola. Znakow nowej linii w polach bank nie daje (0 w archiwum), wiec
+    // linia pliku = jeden wiersz. „wCudz" mowi, czy KAZDE pole stalo w cudzyslowie — tak samo
+    // zapiszemy linie, w ktorej zmieniamy VS, zeby reszta pliku zostala nietknieta.
+    function czPola(l){
+        var pola = [], f = '', q = false, start = true, cyt = false, wsz = true;
+        for (var i = 0; i < l.length; i++){
+            var c = l.charAt(i);
+            if (q){
+                if (c !== '"'){ f += c; continue; }
+                if (l.charAt(i + 1) === '"'){ f += '"'; i++; continue; }
+                q = false; continue;
+            }
+            if (c === '"' && start){ q = true; cyt = true; start = false; continue; }
+            if (c === ';'){ pola.push(f); if (!cyt) wsz = false; f = ''; start = true; cyt = false; continue; }
+            start = false; f += c;
+        }
+        pola.push(f); if (!cyt) wsz = false;
+        return { pola: pola, wCudz: wsz };
+    }
+    function czLinia(pola, wCudz){
+        return pola.map(function (v){
+            var s = String(v == null ? '' : v);
+            return (wCudz || /[;"]/.test(s)) ? ('"' + s.replace(/"/g, '""') + '"') : s;
+        }).join(';');
+    }
+    // Nazwa nadawcy przelewu SEPA siedzi w Note: „kwota/SHA//IBAN/NAZWA/tytul".
+    function czNazwaSepa(note){
+        var m = /^[\d.,]+[A-Z]{3}\/[A-Z]{2,4}\/\/[A-Z]{2}\d{2}[A-Z0-9]+\/([^\/]*)\//.exec(String(note || ''));
+        return m ? m[1].trim() : '';
+    }
+    // Przewoznicy — po koncie nadawcy albo IBAN-ie, nie po nazwie ani KS (pod nazwa „General Logistics
+    // Sy" stoi tez konto z wplatami „SAP DOCUMENT", a KS 308 maja tez klienci). Wszystkie reguly
+    // przeliczone na archiwum: GLS CZ 813/813, TopTrans CZK 384/385, GLS SK 488/488 od 09.2024.
+    function czPrzewoznik(w){
+        var n = czBez(w.note).toUpperCase();
+        if (w.kontoP === '2110374539/2700') return 'gls';
+        if (/^186688(2010|2029)\/5500$/.test(w.kontoP)) return 'toptrans';
+        if (n.indexOf('SK9602000000002802401454') >= 0) return 'glssk';
+        if (n.indexOf('TOPTRANSDOBIRKA') >= 0) return 'toptrans';
+        return '';
+    }
+    var BK_CZ_PRZEW = { gls: 'GLS CZ', glssk: 'GLS SK', toptrans: 'TopTrans' };
+    // Numer auftragu. Przewoznicy w EUR maja go w Note: bank lamie tytul SEPA spacja co 35 znakow
+    // („VS0014 549480"), wiec w ich Note spacje zdejmujemy — u klientow nie, bo tam niszczy to numer.
+    // „/VS0*(1\d{7})/" z koncowym „/": uciete „VS00145" i „VS00132395" nie daja falszywych numerow.
+    function czAuftrag(w, P){
+        var m;
+        if (P === 'glssk'){ m = /\/VS(1\d{7})\//.exec(czBez(w.note)); return m ? { nr: m[1], z: 'tytułu GLS SK', pewny: true } : null; }
+        if (P === 'toptrans' && w.waluta === 'EUR'){
+            m = /\/VS0*(1\d{7})\//.exec(czBez(w.note));
+            return m ? { nr: m[1], z: 'tytułu TopTrans', pewny: true } : null;
+        }
+        m = /^0*(1\d{7})$/.exec(w.vs);
+        if (m) return { nr: m[1], z: 'VS', pewny: true };
+        if (P) return null;
+        // Klient bez VS-auftragu: dokladnie jedna osmiocyfrowka od „1" w tresci, nie w ksztalcie daty
+        // (1 falszywe trafienie w archiwum to „PF_14022025"). To tylko podpowiedz przy NOT FOUND.
+        var t = [w.msg, w.note, w.note2].join(' '), re = /(^|\D)(1\d{7})(?!\d)/g, nums = [];
+        while ((m = re.exec(t)) !== null){
+            var n1 = m[2];
+            if (/^1[0-9](0[1-9]|1[0-2])20\d\d$/.test(n1)) continue;
+            if (nums.indexOf(n1) < 0) nums.push(n1);
+        }
+        return nums.length === 1 ? { nr: nums[0], z: 'tytułu', pewny: false } : null;
+    }
+    // Numer przesylki TopTrans — do sprawdzenia na toptrans.cz, gdy auftragu w tytule nie ma
+    // (bank ucina Note na 140 znakach: od 09.2025 35 ze 143 wplat EUR). Strona sledzenia ma
+    // reCAPTCHA — HUB jej nie odpytuje, daje tylko numer i link.
+    function czPrzesylka(w, P){
+        if (P !== 'toptrans') return '';
+        var m = /DOBIRKAPL(\d{11})/i.exec(czBez(w.note));
+        if (m) return m[1];
+        return /^\d{10,11}$/.test(w.ss) ? w.ss : '';
+    }
+    // Wplywy spoza zamowien — z importu wyjmujemy i wypisujemy na gorze (decyzja 30.09.2026).
+    function czSpoza(w){
+        var t = [w.kto, w.msg, w.note, w.note2].join(' ').toUpperCase();
+        if (/AUTOMATICKY\s*VRACENO/.test(t)) return 'odbita płatność (AUTOMATICKY VRACENO)';
+        if (/\bPAYU\b|ALLEGRO/.test(t)) return 'wypłata PayU / Allegro';
+        var kto = (w.kto || czNazwaSepa(w.note)).toUpperCase();
+        // Beliani albo faktoring Z numerem auftragu (VS albo tytul) to zaplata za zamowienie — zostaje
+        // w imporcie (przeglad 30.09.2026: CSOB Factoring zaplacil VS 11828170 za zamowienie klienta).
+        if ((kto.indexOf('BELIANI') >= 0 || kto.indexOf('FACTORING') >= 0) && czAuftrag(w, '')) return '';
+        if (kto.indexOf('BELIANI') >= 0) return 'przelew wewnętrzny Beliani';
+        if (kto.indexOf('FACTORING') >= 0) return 'faktoring';
+        return '';
+    }
+    var BK_CZ_GRUPY = { klient: 'Zwroty do klientów', beliani: 'Przelewy do Beliani i opłaty banku', inne: 'Pozostałe płatności' };
+    function czGrupaMinus(w){
+        var t = [w.kto, w.msg, w.note, w.note2].join(' ').toUpperCase();
+        if (/BELIANI|\bINT\d+M\/|\bWNT\d+|SUMMARY ITEM|POPLATEK|\bFEE\b/.test(t) || /fee|poplat/i.test(w.typ)) return 'beliani';
+        if (/TICKET|AUFTRAG|VAT\s*RETURN|VRACENI|REFUND/.test(t) || /^#?\d{7,8}$/.test(czBez(w.msg || w.note))) return 'klient';
+        return 'inne';
+    }
+    // Rozbior wyciagu. Kazdy wiersz, ktorego nie rozumiemy, blokuje wysylke (jak w HU).
+    function czAnaliza(buf){
+        var b = new Uint8Array(buf);
+        var bom = b.length >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF, txt;
+        try { txt = new TextDecoder('utf-8', { fatal: true }).decode(bom ? b.subarray(3) : b); }
+        catch (e){ return { err: 'plik nie jest w UTF-8 — to nie jest wyciąg prosto z Raiffeisenbank (przeszedł przez inny program?)' }; }
+        var surowe = txt.split('\n'), koniecNL = surowe.length > 1 && surowe[surowe.length - 1] === '';
+        if (koniecNL) surowe.pop();
+        var linie = surowe.map(function (t){ var cr = /\r$/.test(t); return { t: cr ? t.slice(0, -1) : t, cr: cr }; });
+        if (!linie.length) return { err: 'plik jest pusty' };
+        var hdr = czPola(linie[0].t).pola.map(function (x){ return x.trim(); });
+        var hOk = hdr.length === BK_CZ_NAGL.length && hdr.every(function (x, i){
+            return i === 13 ? x.replace(/\s+/g, '') === 'Bookedamount' : x === BK_CZ_NAGL[i];
+        });
+        if (!hOk) return { err: 'to nie wygląda na wyciąg Raiffeisenbank CZ — nagłówek jest inny niż „Transaction Date;Booking Date;…"' };
+        var out = { linie: linie, bom: bom, koniecNL: koniecNL, naglowek: linie[0].t, wszystkie: [], importuj: [],
+                    minus: [], spoza: [], bledy: [], waluta: '', znane: 0, puste: 0,
+                    edytowany: hdr[13] !== 'Booked amount' };
+        var znane = jGet(BK_CZ_WYSLANE), byly = {};
+        for (var i = 1; i < linie.length; i++){
+            var l = linie[i].t;
+            if (/^[;\s"]*$/.test(l)){ out.puste++; continue; }
+            if (l.charAt(0) !== '"') out.edytowany = true;
+            var p = czPola(l).pola;
+            if (p.length !== BK_CZ_NAGL.length){ out.bledy.push('wiersz ' + (i + 1) + ' ma ' + p.length + ' pól zamiast 22'); continue; }
+            var tr = function (k){ return String(p[k] == null ? '' : p[k]).trim(); };
+            var w = { i: i, tid: tr(18), data: czData(tr(0)), kontoWl: tr(2), waluta: tr(14), kwota: czKwota(tr(13)),
+                      kontoP: tr(5), kto: tr(6), typ: tr(7), msg: tr(8), note: tr(9), vs: tr(10), ks: tr(11), ss: tr(12), note2: tr(19) };
+            if (!w.tid && !w.kontoWl && w.kwota !== null){ out.bledy.push('wiersz ' + (i + 1) + ': suma bez numeru transakcji (dopisana ręcznie?)'); continue; }
+            if (!/^\d{10}$/.test(w.tid) || !w.data || w.kwota === null){
+                out.bledy.push('wiersz ' + (i + 1) + ': nie odczytałem daty, kwoty albo numeru transakcji'); continue;
+            }
+            if (byly[w.tid]){ out.bledy.push('wiersz ' + (i + 1) + ': numer transakcji ' + w.tid + ' drugi raz w pliku'); continue; }
+            byly[w.tid] = 1;
+            if (w.kontoWl !== BK_CZ_KONTO)
+                return { err: 'to wyciąg z konta ' + w.kontoWl + ' — importujemy tylko konto Beliani (SP) GmbH ' + BK_CZ_KONTO + ' (CZK i EUR)' };
+            if (!BK_CZ_WALUTY[w.waluta]){ out.bledy.push('wiersz ' + (i + 1) + ': waluta „' + w.waluta + '"'); continue; }
+            if (!out.waluta) out.waluta = w.waluta;
+            else if (w.waluta !== out.waluta){ out.bledy.push('wiersz ' + (i + 1) + ': druga waluta w pliku (' + w.waluta + ')'); continue; }
+            w.partner = w.kto || czNazwaSepa(w.note);
+            w.opis = (w.msg || w.note || w.note2).replace(/\s+/g, ' ').slice(0, 160);
+            out.wszystkie.push(w);
+            if (w.kwota < 0){ w.grupa = czGrupaMinus(w); out.minus.push(w); continue; }
+            var P = czPrzewoznik(w);
+            if (!P){
+                var sp = czSpoza(w);
+                if (sp){ w.powod = sp; out.spoza.push(w); continue; }
+            }
+            w.przew = P;
+            var a = czAuftrag(w, P);
+            if (a){ w.hint = a.nr; w.hintZ = a.z; }
+            w.przes = czPrzesylka(w, P);
+            // Plik EUR: numer z tytulu przewoznika wpisujemy W POLE NOTE zamiast calego tytulu — tak, jak
+            // recznie robiono w 09–11.2025 (203 wiersze w 14 plikach; VS w EUR nie byl wypelniony nigdy)
+            // i jak import 213 to dopasowywal. Decyzja uzytkownika 30.09.2026, po sprostowaniu pytania.
+            if (w.waluta === 'EUR' && a && a.pewny && (P === 'glssk' || P === 'toptrans')) w.nrNote = a.nr;
+            if (znane[w.tid]) out.znane++;
+            out.importuj.push(w);
+        }
+        if (!out.wszystkie.length && !out.bledy.length) out.bledy.push('w pliku nie ma ani jednej transakcji');
+        out.calyZnany = out.importuj.length > 0 && out.znane === out.importuj.length;
+        return out;
+    }
+    // Plik do importu: te same linie co z banku, bez wyjetych, a w liniach z nowym VS zmienia sie
+    // tylko to jedno pole. BOM, konce linii i cudzyslowy zostaja takie, jakie byly.
+    function czZbuduj(an){
+        var usun = {}, nt = {};
+        an.minus.concat(an.spoza).forEach(function (w){ usun[w.i] = 1; });
+        an.importuj.forEach(function (w){ if (w.nrNote) nt[w.i] = w.nrNote; });
+        var out = [];
+        an.linie.forEach(function (L, i){
+            if (usun[i]) return;
+            var t = L.t;
+            if (nt[i]){ var p = czPola(t); p.pola[9] = nt[i]; t = czLinia(p.pola, p.wCudz); }
+            out.push(t + (L.cr ? '\r' : ''));
+        });
+        var tekst = out.join('\n') + (an.koniecNL ? '\n' : '');
+        var enc = new TextEncoder().encode(tekst);
+        if (!an.bom) return enc;
+        var z = new Uint8Array(enc.length + 3);
+        z.set([0xEF, 0xBB, 0xBF], 0); z.set(enc, 3);
+        return z;
+    }
+    // Kontrola pliku do importu: ten sam naglowek, dokladnie wiersze do importu, pola bez zmian —
+    // poza VS tam, gdzie go wpisalismy. Bez tego plik moglby pojsc bez wplat klientow albo ze zwrotami.
+    function czKontrola(an, bajty){
+        var p = czAnaliza(bajty.buffer ? bajty.buffer.slice(bajty.byteOffset, bajty.byteOffset + bajty.byteLength) : bajty);
+        if (p.err) return 'plik do importu się nie czyta: ' + p.err;
+        if (p.naglowek !== an.naglowek) return 'zmienił się nagłówek';
+        if (p.minus.length || p.spoza.length) return 'w pliku do importu zostały wiersze do wyjęcia';
+        if (p.importuj.length !== an.importuj.length) return 'w pliku do importu jest ' + p.importuj.length + ' wierszy zamiast ' + an.importuj.length;
+        var po = {};
+        p.importuj.forEach(function (w){ po[w.tid] = w; });
+        var zle = an.importuj.filter(function (w){
+            var x = po[w.tid];
+            if (!x) return true;
+            var a = czPola(an.linie[w.i].t).pola, bb = czPola(p.linie[x.i].t).pola;
+            for (var k = 0; k < a.length; k++){
+                if (k === 9) continue;
+                if (a[k] !== bb[k]) return true;
+            }
+            return (bb[9] || '') !== (w.nrNote || a[9] || '');
+        });
+        return zle.length ? ('pole inne niż w wyciągu w ' + zle.length + ' wierszach (np. ' + zle[0].tid + ')') : '';
+    }
+    function czZapamietaj(wiersze){
+        var m = jGet(BK_CZ_WYSLANE), gr = new Date(Date.now() - 150 * 86400000).toISOString().slice(0, 10);
+        Object.keys(m).forEach(function (k){ if (String(m[k]) < gr) delete m[k]; });
+        (wiersze || []).forEach(function (w){ m[w.tid] = w.data; });
+        jSet(BK_CZ_WYSLANE, m);
+    }
+    // „18052026 14.28 SP CZK.csv" — jak dotad w imporcie; oba pliki pary z tym samym czasem.
+    function czNazwa(w, d){
+        return pad2(d.getDate()) + pad2(d.getMonth() + 1) + d.getFullYear() + ' ' + pad2(d.getHours()) + '.'
+             + pad2(d.getMinutes()) + ' ' + (BK_CZ_WALUTY[w] || {}).sufiks + '.csv';
+    }
+    function czMini(w){
+        return { tid: w.tid, data: w.data, kwota: w.kwota, partner: w.partner || '', opis: w.opis || '', vs: w.vs || '',
+                 nrNote: w.nrNote || '', hint: w.hint || '', hintZ: w.hintZ || '', przes: w.przes || '', przew: w.przew || '',
+                 powod: w.powod || '', grupa: w.grupa || '' };
+    }
+
     // Data platnosci per numer transakcji, prosto z przerobionego pliku. Zapisujemy ja
     // przy zleceniu, bo paczka importu daty nie oddaje, a przy ksiegowaniu wiersza
     // NOT FOUND wprost na auftragu trzeba wiedziec, na ktory dzien.
@@ -69173,8 +69451,8 @@
         // Konto ksiegowania na auftragu. Dla eupago znane z gory, dla pozostalych do
         // wpisania — zgadywanie numeru konta to zle zaksiegowana wplata. Importy pobran
         // („cod_gls" i reszta) nie sa formatami: ich konta potwierdzil uzytkownik 29.09.2026.
-        var P = przewPoUst(id);
-        if (!v.konto) v.konto = P ? P.konto : (fmt(id).konto || '');
+        var P = przewPoUst(id), Cz = czSlotId(id);
+        if (!v.konto) v.konto = P ? P.konto : (Cz ? czF(Cz).konto : (fmt(id).konto || ''));
         return v;
     }
     function ustawZapisz(id, v){
@@ -70414,7 +70692,9 @@
               // zapytania ksiegujace w locie w TEJ karcie (klucz: rodzaj + paczka/wiersz)
               lot: {},
               // ostatni komunikat operacji na paczce — rysowany w JEJ pudelku (klucz: rodzaj + numer)
-              pkMsg: {} };
+              pkMsg: {},
+              // Raiffeisen CZ: wczytana para plikow (po walucie) i ostatnie narysowane odczyty ich paczek
+              cz: {}, czD: {} };
     function job(){ var o = jGet(BK_JOB_KEY); return (o && o.impId) ? o : null; }
     function jobZapisz(o){ jSet(BK_JOB_KEY, o || {}); }
 
@@ -70437,7 +70717,7 @@
     (document.body || document.documentElement).appendChild(panel);
     btn.onclick = function (){
         panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
-        if (panel.style.display === 'block' && job()) sprawdz();
+        if (panel.style.display === 'block'){ if (fmt(S.format).cz) czSprawdzWszystkie(); else if (job()) sprawdz(); }
     };
 
     function $(s){ return panel.querySelector(s); }
@@ -70486,7 +70766,8 @@
                 });
                 return s;
             };
-            h += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+            if (F.cz) h += czUstawieniaHtml(opcje);
+            else h += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
               +  '<label style="font-size:11px;color:#750000;font-weight:700">bank_setting</label>'
               +  '<select id="bk-bank" style="font-size:11px;padding:4px;max-width:320px">' + opcje(S.banki, c.bank) + '</select>'
               +  '<label style="font-size:11px;color:#750000;font-weight:700">booking_setting</label>'
@@ -70530,11 +70811,14 @@
         // --- plik ---
         h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">3 · Plik z banku</div>'
           +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
-          +  '<input type="file" id="bk-plik" accept="' + (F.hu ? '.csv' : '.csv,.xlsx,.xls') + '" style="font-size:12px">'
-          +  '<span style="font-size:10px;color:#888">' + (F.hu ? 'CSV prosto z UniCredit (Windows-1250), wyciąg dzienny'
-                                                              : 'CSV (średnik, UTF-8) albo XLSX') + '</span></div>';
+          +  '<input type="file" id="bk-plik"' + (F.cz ? ' multiple' : '') + ' accept="' + ((F.hu || F.cz) ? '.csv' : '.csv,.xlsx,.xls') + '" style="font-size:12px">'
+          +  '<span style="font-size:10px;color:#888">' + (F.cz ? 'CSV prosto z Raiffeisenbank — zaznacz oba pliki naraz (CZK i EUR); walutę rozpoznaję z treści'
+                                                              : (F.hu ? 'CSV prosto z UniCredit (Windows-1250), wyciąg dzienny'
+                                                                      : 'CSV (średnik, UTF-8) albo XLSX')) + '</span></div>';
 
-        if (S.rows && F.hu && S.hu){
+        if (F.cz){
+            h += czPodgladHtml();
+        } else if (S.rows && F.hu && S.hu){
             var hu = S.hu, wyj = hu.minus.length + hu.ins.length + hu.docs.length;
             h += '<div style="padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:8px">'
               +  '<div style="font-size:12px;color:#0a7a2f;font-weight:700">✓ ' + esc(S.plik) + ' → ' + esc(S.nazwa) + '</div>'
@@ -70613,7 +70897,7 @@
         // Plik poszedl, a numeru paczki nie odczytalem: zlecenie stoi bez numeru i nic by go nie
         // pokazalo. Numer da sie wpisac z adresu paczki w Import payments.
         var jr = jGet(BK_JOB_KEY);
-        if (!j && jr && jr.nazwa && !jr.impId){
+        if (!F.cz && !j && jr && jr.nazwa && !jr.impId){
             h += '<div style="margin:4px 0 8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
               +  'Plik <b>' + esc(jr.nazwa) + '</b> poszedł do importu ' + esc(String(jr.czas || '').replace('T', ' ').slice(0, 16))
               +  ', ale nie odczytałem numeru paczki. Wpisz go z adresu …/import_payments/<b>NUMER</b>/: '
@@ -70621,14 +70905,15 @@
               +  '<button id="bk-imp-nr-set" style="padding:2px 8px;border:none;border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">zapisz</button></div>';
         }
         h += '<div id="bk-status" style="margin-top:4px;min-height:16px;font-size:12px;font-weight:bold"></div>';
-        h += '<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>';
+        h += F.cz ? czPudelkaHtml() : ('<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>');
         panel.innerHTML = h;
 
         $('#bk-close').onclick = function (){ panel.style.display = 'none'; };
         panel.querySelectorAll('.bk-fmt').forEach(function (b){
-            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; S.hu = null; S.huBajty = null; rysuj(); };
+            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; S.hu = null; S.huBajty = null; S.cz = {}; rysuj(); };
         });
         if (S.rows && F.hu && S.hu) huPodepnij(panel, S.hu);
+        if (F.cz) czPodepnij();
         var lb = $('#bk-listy');
         if (lb) lb.onclick = async function (){
             lb.disabled = true; say('pobieram listy ustawień…', '#666');
@@ -70648,6 +70933,17 @@
                     var P = BK_PRZEW[kk], cp = ustaw(P.ust), pp = bkPodpowiedz(b, P);
                     if (!cp.bank && pp.length === 1){ cp.bank = pp[0].id; cp.bankNm = pp[0].nm; ustawZapisz(P.ust, cp); }
                 });
+                // Raiffeisen CZ: bank_setting per waluta po nazwie i booking „method 2 +name" (tak szlo 30 z 30
+                // importow w 05–06.2026) — tylko przy jednym aktywnym trafieniu i pustym polu.
+                if (F2.cz) ['CZK', 'EUR'].forEach(function (w){
+                    var cw = ustaw(czId(w)), pw2 = bkPodpowiedz(b, czF(w));
+                    if (!cw.bank && pw2.length === 1){ cw.bank = pw2[0].id; cw.bankNm = pw2[0].nm; }
+                    if (!cw.booking){
+                        var bk2 = Object.keys(k).filter(function (id){ return !k[id].off && /^method\s*2\s*\+\s*name$/i.test(k[id].nm); });
+                        if (bk2.length === 1){ cw.booking = bk2[0]; cw.bookingNm = k[bk2[0]].nm; }
+                    }
+                    ustawZapisz(czId(w), cw);
+                });
                 rysuj();
                 say('Listy pobrane: ' + Object.keys(b).length + ' ustawień importu, ' + Object.keys(k).length + ' sposobów dopasowania.'
                     + (bkKotwicaKsieg(k) ? '' : ' ⚠ nie widzę znanej pozycji 9 „Fulfillment No”.'), '#0a7a2f');
@@ -70658,6 +70954,7 @@
         };
         var zp = $('#bk-zapisz');
         if (zp) zp.onclick = function (){
+            if (fmt(S.format).cz){ czZapiszUstawienia(); return; }
             var b = $('#bk-bank').value, k = $('#bk-book').value;
             if (!b || !k){ say('Wskaż oba ustawienia — bez nich nie wyślę pliku.', '#c47f00'); return; }
             var kn = String(($('#bk-konto') || {}).value || '').trim();
@@ -70689,6 +70986,7 @@
                         return esc(x.v.bankNm || '— nie wskazane'); }).join(', ')) : '') + '.', '#0a7a2f');
         };
         $('#bk-plik').onchange = async function (){
+            if (fmt(S.format).cz){ await czWczytaj(Array.prototype.slice.call(this.files || [])); return; }
             var f = this.files && this.files[0];
             if (!f) return;
             say('czytam plik…', '#666');
@@ -70786,7 +71084,8 @@
         };
         // Paczke (i paczki pobran) czytamy dopiero przy OTWARTYM panelu. Modul startuje na kazdej
         // stronie prologistics, a przy schowanym panelu to byly zbedne zapytania przy kazdym wejsciu.
-        if (j && panel.style.display !== 'none') sprawdz();
+        if (F.cz){ if (panel.style.display !== 'none') czSprawdzWszystkie(); }
+        else if (j && panel.style.display !== 'none') sprawdz();
         huNumerPodepnij();
     }
 
@@ -70818,6 +71117,7 @@
     function bkNumeryZajete(){
         var z = {}, j = job(), m = codWszystkie();
         if (j) z[String(j.impId)] = 'paczka wyciągu ' + (j.nazwa || '');
+        ['CZK', 'EUR'].forEach(function (w){ var c = czJob(w); if (c) z[String(c.impId)] = 'paczka Raiffeisen ' + w + ' ' + (c.nazwa || ''); });
         Object.keys(m).forEach(function (sid){
             var e = m[sid];
             if (e && e.impId) z[String(e.impId)] = 'import pobrań ' + (e.nazwa || e.plik || sid);
@@ -70909,6 +71209,402 @@
             await sprawdz();
         } catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
         finally { if ($('#bk-wyslij')) $('#bk-wyslij').disabled = false; }
+    }
+
+    // ---------- Raiffeisen CZ: zlecenia, ekran, wysylka ----------
+    // Dwa pliki (CZK i EUR) -> dwa importy -> dwa zlecenia. Trzymamy je OSOBNO od zlecenia HU/EuPago
+    // (BK_JOB_KEY): wyslanie pary CZ nie zdejmuje z panelu paczki wegierskiej i odwrotnie.
+    function czJobRaw(w){ var m = jGet(BK_CZ_JOB); return (m[w] && typeof m[w] === 'object') ? m[w] : {}; }
+    function czJob(w){ var o = czJobRaw(w); return o.impId ? o : null; }
+    function czJobZapisz(w, o){ var m = jGet(BK_CZ_JOB); m[w] = o || {}; jSet(BK_CZ_JOB, m); }
+    function zCz(impId, w){
+        var pin = String(impId || '');
+        var moj = function (){ var j = czJob(w); return (j && pin && String(j.impId) === pin) ? j : null; };
+        var pud = function (){ return $('#bk-imp-cz-' + w); };
+        return {
+            typ: 'cz', sid: w, nazwa: w,
+            box: pud,
+            get: moj,
+            set: function (o){ if (moj() && o && String(o.impId) === pin) czJobZapisz(w, o); },
+            F: function (){ return czF(w); },
+            konto: function (){ return ustaw(czId(w)).konto || czF(w).konto || ''; },
+            odswiez: function (){ return czSprawdz(w); },
+            zapomnij: function (){
+                if (!moj()) return;
+                czJobZapisz(w, {});
+                var b = pud(); if (b){ b.style.display = 'none'; b.innerHTML = ''; }
+            }
+        };
+    }
+    async function czSprawdz(w){
+        var j = czJob(w), box = $('#bk-imp-cz-' + w);
+        if (!box) return;
+        if (!j){ box.innerHTML = ''; box.style.display = 'none'; return; }
+        box.style.display = 'block';
+        box.innerHTML = '<div style="font-size:11px;color:#666">odczytuję paczkę ' + esc(j.impId) + ' (' + w + ')…</div>';
+        var Z = zCz(j.impId, w);
+        try {
+            var d = await bkPaczka(j.impId);
+            d = await huAutoOk(Z, d, box);
+            if (!Z.get()) return;
+            rysujPaczke(Z, d);
+        } catch (e){
+            box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(j.impId) + ' (' + w + '): '
+                          + esc((e && e.message) || e) + '</div>'
+                          + '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">'
+                          + '<button data-bk="err-re" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">↻ spróbuj jeszcze raz</button>'
+                          + '<button data-bk="err-zap" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">✕ Zapomnij paczkę</button></div>';
+            box.querySelector('[data-bk="err-re"]').onclick = function (){ czSprawdz(w); };
+            box.querySelector('[data-bk="err-zap"]').onclick = function (){
+                var nr0 = zNierozstrzygniete(Z.get());
+                if (!confirm('Zapomnieć paczkę ' + j.impId + ' (' + w + ')?\n\n' + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
+                    + 'W prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
+                Z.zapomnij();
+            };
+        }
+    }
+    function czSprawdzWszystkie(){ ['CZK', 'EUR'].forEach(function (w){ if (czJob(w)) czSprawdz(w); }); }
+
+    // Ustawienia importu: dwa wiersze (CZK, EUR) zamiast jednego — kazda waluta ma swoj bank_setting
+    // i swoje konto przy ksiegowaniu wprost na auftragu.
+    function czUstawieniaHtml(opcje){
+        var h = '<div style="font-size:11px;color:#750000;margin-bottom:4px">Dwa importy z jednego konta '
+              + esc(BK_CZ_KONTO) + ' — <span style="font-weight:normal">bank_setting · booking_setting · konto przy księgowaniu wprost na auftragu</span></div>';
+        ['CZK', 'EUR'].forEach(function (w){
+            var c = ustaw(czId(w)), Fw = czF(w), pB = bkPodpowiedz(S.banki, Fw);
+            h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:3px">'
+              +  '<span style="width:36px;font-size:11px;font-weight:700">' + w + '</span>'
+              +  '<select class="bk-cz-bank" data-w="' + w + '" style="font-size:11px;padding:3px;max-width:300px">' + opcje(S.banki, c.bank) + '</select>'
+              +  '<select class="bk-cz-book" data-w="' + w + '" style="font-size:11px;padding:3px;max-width:240px">' + opcje(S.ksieg, c.booking) + '</select>'
+              +  '<input class="bk-cz-konto" data-w="' + w + '" value="' + esc(c.konto || Fw.konto) + '" style="width:50px;font-size:11px;text-align:right">'
+              +  '<span style="font-size:10px;color:#888">' + (pB.length ? ('pasuje: ' + esc(pB.map(function (x){ return x.nm + ' (' + x.id + ')'; }).join(', ')))
+                                                               : ('szukaj „' + esc(Fw.bankNazwa) + '”')) + '</span></div>';
+        });
+        return h + '<div style="display:flex;gap:8px;align-items:center;margin-top:4px">'
+             + '<button id="bk-zapisz" style="padding:5px 12px;border:none;border-radius:6px;background:#0a7a2f;color:#fff;font-weight:700;cursor:pointer;font-size:11px">💾 Zapisz</button>'
+             + '<button id="bk-listy" style="padding:5px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px">↻ Odśwież listy</button>'
+             + '<span style="font-size:10px;color:#750000">Dotąd: CZK → „Raiffeisenbank CZ Beliani SP GmbH”, EUR → „Raiffeisen SK SP EUR”, oba „method 2 +name”.</span></div>';
+    }
+    function czZapiszUstawienia(){
+        var nowe = {}, zle = '';
+        ['CZK', 'EUR'].forEach(function (w){
+            var b = String((panel.querySelector('.bk-cz-bank[data-w="' + w + '"]') || {}).value || '');
+            var k = String((panel.querySelector('.bk-cz-book[data-w="' + w + '"]') || {}).value || '');
+            var kn = String((panel.querySelector('.bk-cz-konto[data-w="' + w + '"]') || {}).value || '').trim();
+            if (!b || !k) zle = zle || (w + ': wskaż oba ustawienia — bez nich nie wyślę pliku.');
+            if (kn && !/^\d{3,6}$/.test(kn)) zle = zle || (w + ': konto to sam numer z planu kont, np. ' + BK_CZ_WALUTY[w].konto + '.');
+            nowe[w] = { bank: b, bankNm: b ? ((S.banki[b] || {}).nm || '') : '', booking: k, bookingNm: k ? ((S.ksieg[k] || {}).nm || '') : '', konto: kn };
+        });
+        // Najpierw oba wiersze, potem zapis — zly numer nie moze zapisac polowy ustawien.
+        if (zle){ say(esc(zle), '#c47f00'); return; }
+        // Plik EUR w ustawieniu CZK (albo odwrotnie) zaksiegowalby euro jako korony — przeglad 30.09.2026.
+        if (nowe.CZK.bank === nowe.EUR.bank){ say('CZK i EUR mają to samo ustawienie importu — to muszą być dwa różne wpisy.', '#c00'); return; }
+        var niepas = ['CZK', 'EUR'].filter(function (w){ return !czF(w).szukaj.test(nowe[w].bankNm || ''); });
+        if (niepas.length && !confirm('Ustawienie importu nie wygląda na właściwe:\n'
+            + niepas.map(function (w){ return '  ' + w + ': ' + (nowe[w].bankNm || '?') + ' — oczekiwane „' + czF(w).bankNazwa + '”'; }).join('\n')
+            + '\n\nZapisać mimo to?')) return;
+        ['CZK', 'EUR'].forEach(function (w){ ustawZapisz(czId(w), nowe[w]); });
+        say('Zapisane: CZK → ' + esc(nowe.CZK.bankNm) + ' (' + esc(nowe.CZK.bank) + '), EUR → ' + esc(nowe.EUR.bankNm)
+            + ' (' + esc(nowe.EUR.bank) + ').', '#0a7a2f');
+    }
+    function czWierszeHtml(lista, waluta, kol){
+        var h = '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:10px;margin-top:3px">'
+              + '<tr style="color:#999"><td style="padding:1px 5px">Data</td><td style="padding:1px 5px">Kontrahent</td>'
+              + '<td style="padding:1px 5px">Tytuł</td><td style="padding:1px 5px;text-align:right">Kwota ' + esc(waluta) + '</td>'
+              + (kol ? ('<td style="padding:1px 5px">' + esc(kol.naglowek) + '</td>') : '') + '</tr>';
+        (lista || []).forEach(function (w){
+            h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:1px 5px;white-space:nowrap">' + esc(huDataPl(w.data)) + '</td>'
+              +  '<td style="padding:1px 5px">' + esc(w.partner) + '</td>'
+              +  '<td style="padding:1px 5px;max-width:360px">' + esc(w.opis) + '</td>'
+              +  '<td style="padding:1px 5px;text-align:right;white-space:nowrap">' + huTys(w.kwota) + '</td>'
+              +  (kol ? ('<td style="padding:1px 5px">' + kol.cel(w) + '</td>') : '') + '</tr>';
+        });
+        return h + '</table></div>';
+    }
+    // Wplywy spoza zamowien — NA GORZE, bo z importu zniknely (decyzja 30.09.2026).
+    function czSpozaHtml(spoza, waluta){
+        if (!spoza || !spoza.length) return '';
+        return '<div style="margin:6px 0;padding:5px 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px">'
+             + '<b style="font-size:11px;color:#c2410c">Wyjęte z importu — wpływy spoza zamówień (' + spoza.length + ', razem '
+             + huTys(huSuma(spoza)) + ' ' + esc(waluta) + ')</b>'
+             + czWierszeHtml(spoza, waluta, { naglowek: 'Powód', cel: function (w){ return esc(w.powod); } }) + '</div>';
+    }
+    function czMinusHtml(minus, waluta){
+        if (!minus || !minus.length) return '';
+        var h = '<details style="margin-top:6px"><summary style="font-size:11px;color:#750000;cursor:pointer;font-weight:700">'
+              + 'Podgląd zwrotów do klientów i płatności wychodzących (' + minus.length + ', razem '
+              + huTys(huSuma(minus)) + ' ' + esc(waluta) + ') — nie idą do importu</summary>';
+        ['klient', 'beliani', 'inne'].forEach(function (g){
+            var l = minus.filter(function (w){ return w.grupa === g; });
+            if (!l.length) return;
+            h += '<div style="margin-top:5px;font-size:11px;font-weight:700;color:#374151">' + esc(BK_CZ_GRUPY[g])
+              +  ' (' + l.length + ', razem ' + huTys(huSuma(l)) + ')</div>' + czWierszeHtml(l, waluta);
+        });
+        return h + '</details>';
+    }
+    function czPrzewOpis(lista){
+        var n = {};
+        (lista || []).forEach(function (w){ if (w.przew) n[w.przew] = (n[w.przew] || 0) + 1; });
+        return Object.keys(n).map(function (k){ return BK_CZ_PRZEW[k] + ' ' + n[k]; }).join(', ');
+    }
+    // Podglad pary plikow przed wysylka.
+    function czPodgladHtml(){
+        var sloty = ['CZK', 'EUR'].filter(function (w){ return S.cz && S.cz[w]; });
+        if (!sloty.length) return '';
+        var h = '', doWys = [];
+        sloty.forEach(function (w){
+            var s = S.cz[w], an = s.an, wyj = an.minus.length + an.spoza.length;
+            var vs = an.importuj.filter(function (x){ return x.nrNote; });
+            var ttBez = an.importuj.filter(function (x){ return x.przew === 'toptrans' && !x.hint; });
+            var pusty = !an.importuj.length;
+            if ((!an.calyZnany || s.wymus) && !pusty) doWys.push(w);
+            h += '<div style="padding:8px;background:' + ((an.calyZnany || pusty) ? '#fff7ed' : '#f0fdf4') + ';border:1px solid '
+              +  ((an.calyZnany || pusty) ? '#fed7aa' : '#bbf7d0') + ';border-radius:6px;margin-bottom:8px">'
+              +  '<div style="font-size:12px;color:' + ((an.calyZnany || pusty) ? '#c2410c' : '#0a7a2f') + ';font-weight:700">'
+              +  ((an.calyZnany || pusty) ? '⏸ ' : '✓ ') + esc(w) + ' · ' + esc(s.plik) + '</div>'
+              +  czSpozaHtml(an.spoza.map(czMini), w)
+              +  '<div style="font-size:11px;color:#166534;margin-top:2px">transakcji w pliku: <b>' + an.wszystkie.length + '</b>'
+              +  ' · do importu: <b>' + an.importuj.length + '</b> · wyjęte: <b>' + wyj + '</b> (z minusem ' + an.minus.length
+              +  ', spoza zamówień ' + an.spoza.length + ')'
+              +  (vs.length ? (' · numer auftragu wpisany w Note: <b>' + vs.length + '</b>') : '')
+              +  (czPrzewOpis(an.importuj) ? (' · przewoźnicy: ' + esc(czPrzewOpis(an.importuj))) : '') + '</div>'
+              +  (ttBez.length ? ('<div style="font-size:11px;color:#c47f00;margin-top:2px">⚠ ' + ttBez.length + ' wpłat TopTrans bez numeru '
+                                  + 'auftragu w tytule (bank uciął tytuł) — po imporcie przy NOT FOUND dostaniesz numer przesyłki do sprawdzenia.</div>') : '')
+              +  (an.znane && !an.calyZnany ? ('<div style="font-size:11px;color:#c47f00;margin-top:2px">ℹ ' + an.znane + ' z tych transakcji '
+                                  + 'było już w pliku wysłanym wcześniej — zostają; prologistics drugi raz ich nie zaimportuje.</div>') : '')
+              +  (an.calyZnany ? ('<div style="font-size:11px;color:#c2410c;margin-top:2px;font-weight:700">Cały plik był już wysłany ('
+                                  + an.znane + ' transakcji) — ' + (s.wymus ? 'wyślę go mimo to (tak wybrałeś).' : 'nie wyślę go drugi raz. ')
+                                  + (s.wymus ? '' : ('<button class="bk-cz-wymus" data-w="' + w + '" style="padding:1px 7px;border:1px solid #c2410c;'
+                                  + 'border-radius:5px;background:#fff;color:#c2410c;cursor:pointer;font-size:10px;font-weight:normal" '
+                                  + 'title="Na przykład gdy paczka z tego pliku została skasowana w Import payments.">wyślij mimo to</button>'))
+                                  + '</div>') : '')
+              +  (pusty ? '<div style="font-size:11px;color:#c2410c;margin-top:2px;font-weight:700">Po wyjęciu nic nie zostaje do importu — nie wyślę tego pliku.</div>' : '')
+              +  (an.edytowany ? ('<div style="font-size:11px;color:#c00;margin-top:2px">⚠ Plik wygląda na przerobiony w innym programie '
+                                  + '(nagłówek albo cudzysłowy inne niż z banku). Najlepiej wgraj wyciąg prosto z Raiffeisenbank.</div>') : '')
+              +  (vs.length ? ('<details style="margin-top:4px"><summary style="font-size:11px;color:#166534;cursor:pointer">Numery wpisane w Note zamiast tytułu ('
+                               + vs.length + ')</summary>' + czWierszeHtml(vs.map(czMini), w, { naglowek: 'Note', cel: function (x){ return '<b>' + esc(x.nrNote) + '</b>'; } })
+                               + '</details>') : '')
+              +  czMinusHtml(an.minus.map(czMini), w)
+              +  '<div style="margin-top:5px"><button class="bk-cz-pobierz" data-w="' + w + '" style="padding:3px 10px;border:1px solid #750000;border-radius:6px;'
+              +  'background:#fff;color:#750000;cursor:pointer;font-size:11px" title="Plik dokładnie taki, jaki pójdzie do importu.">⬇ Pobierz plik ' + w + '</button></div>'
+              +  '</div>';
+        });
+        h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
+          +  '<button id="bk-cz-wyslij"' + (doWys.length ? '' : ' disabled') + ' style="padding:8px 16px;border:none;border-radius:6px;background:'
+          +  (doWys.length ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (doWys.length ? 'pointer' : 'default') + ';font-size:12px">📤 Wyślij do importu'
+          +  (doWys.length ? (': ' + doWys.join(' i ')) : '') + '</button>'
+          +  '<span style="font-size:10px;color:#888">Każda waluta to osobny import. Nazwy: ' + esc(doWys.map(function (w){ return czNazwa(w, new Date()); }).join(', ')) + '</span></div>';
+        return h;
+    }
+    // Pudelka paczek pod krokiem 3 + pole na numer, gdy wysylka nie oddala numeru paczki.
+    function czPudelkaHtml(){
+        var h = '';
+        ['CZK', 'EUR'].forEach(function (w){
+            var jr = czJobRaw(w);
+            if (!jr.impId && jr.nazwa)
+                h += '<div style="margin:4px 0 8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
+                  +  w + ': plik <b>' + esc(jr.nazwa) + '</b> ' + (jr.stan === 'wysylka' ? 'jest wysyłany' : 'poszedł do importu') + ' '
+                  +  esc(String(jr.czas || '').replace('T', ' ').slice(0, 16))
+                  +  (jr.blad ? (', ale nie wiem, czy paczka powstała (' + esc(jr.blad) + ')') : ', ale nie odczytałem numeru paczki')
+                  +  '. Sprawdź w Import payments. Jest paczka — wpisz numer z adresu …/import_payments/<b>NUMER</b>/: '
+                  +  '<input class="bk-cz-nr" data-w="' + w + '" style="width:90px;font-size:11px"> '
+                  +  '<button class="bk-cz-nr-set" data-w="' + w + '" style="padding:2px 8px;border:none;border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">zapisz</button>'
+                  +  ' · paczki nie ma: <button class="bk-cz-nr-zap" data-w="' + w + '" style="padding:2px 8px;border:1px solid #c00;border-radius:5px;background:#fff;color:#c00;cursor:pointer;font-size:11px">↺ zapomnij</button></div>';
+            h += '<div id="bk-imp-cz-' + w + '" style="margin-top:10px' + (jr.impId ? '' : ';display:none') + '"></div>';
+        });
+        return h;
+    }
+    async function czWczytaj(pliki){
+        if (!pliki.length) return;
+        say('czytam ' + pliki.length + ' ' + (pliki.length === 1 ? 'plik' : 'pliki') + '…', '#666');
+        var nowe = {}, bledy = [];
+        for (var i = 0; i < pliki.length; i++){
+            var f = pliki[i];
+            try {
+                if (!/\.csv$/i.test(f.name)){ bledy.push(f.name + ': to nie jest CSV z banku'); continue; }
+                var an = czAnaliza(await f.arrayBuffer());
+                if (an.err){ bledy.push(f.name + ': ' + an.err); continue; }
+                if (an.bledy.length){ bledy.push(f.name + ': ' + an.bledy.slice(0, 4).join('; ') + (an.bledy.length > 4 ? ' …' : '')); continue; }
+                if (nowe[an.waluta]){ bledy.push(f.name + ': drugi plik w ' + an.waluta + ' (pierwszy: ' + nowe[an.waluta].plik + ') — jeden plik na walutę'); continue; }
+                var bajty = czZbuduj(an), kt = czKontrola(an, bajty);
+                if (kt){ bledy.push(f.name + ': nie wysyłam — ' + kt + '. Zgłoś to z tym plikiem.'); continue; }
+                nowe[an.waluta] = { plik: f.name, an: an, bajty: bajty };
+            } catch (e){ bledy.push(f.name + ': ' + ((e && e.message) || e)); }
+        }
+        S.cz = nowe;
+        rysuj();
+        var ok = Object.keys(nowe);
+        say((ok.length ? ('Wczytane: ' + ok.join(' i ') + '. Sprawdź, co idzie do importu, i wyślij.') : '')
+            + (bledy.length ? (' <span style="color:#c00">Nie przyjąłem: ' + esc(bledy.join(' · ')) + '</span>') : ''),
+            bledy.length && !ok.length ? '#c00' : '#0a7a2f');
+    }
+    async function czWyslij(b){
+        // Migawka pary: w trakcie wysylki czlowiek moze wczytac inne pliki albo zmienic zakladke —
+        // wysylamy dokladnie to, co zatwierdzil (przeglad 30.09.2026).
+        var para = S.cz || {};
+        // „Caly plik juz poszedl" liczymy w chwili klikniecia: druga karta mogla go wlasnie wyslac.
+        var znane = jGet(BK_CZ_WYSLANE);
+        ['CZK', 'EUR'].forEach(function (w){
+            var s0 = para[w]; if (!s0) return;
+            var ile = s0.an.importuj.filter(function (x){ return znane[x.tid]; }).length;
+            s0.an.znane = ile; s0.an.calyZnany = s0.an.importuj.length > 0 && ile === s0.an.importuj.length;
+        });
+        var sloty = ['CZK', 'EUR'].filter(function (w){ var s = para[w]; return s && (!s.an.calyZnany || s.wymus) && s.an.importuj.length; });
+        if (!sloty.length){ rysuj(); say('Nie ma czego wysłać — pliki były już wysłane (sprawdzone przy kliknięciu).', '#c47f00'); return; }
+        var brak = sloty.filter(function (w){ var c = ustaw(czId(w)); return !c.bank || !c.booking; });
+        if (brak.length){ say('Najpierw wskaż ustawienia importu dla ' + brak.join(' i ') + ' (krok 2) i kliknij „Zapisz”.', '#c47f00'); return; }
+        var czas = new Date(), bloki = [];
+        sloty.forEach(function (w){
+            var s = para[w], an = s.an, c = ustaw(czId(w)), nr0 = zNierozstrzygniete(czJob(w)), jr0 = czJobRaw(w);
+            // Poprzedni plik tej waluty poszedl, a numeru paczki nie znamy — nowa wysylka zdejmie go z panelu.
+            if (!jr0.impId && jr0.nazwa) nr0 = (nr0 ? (nr0 + ' ') : '') + 'Poprzedni plik ' + jr0.nazwa + ' poszedł bez odczytanego numeru paczki — sprawdź Import payments, zanim wyślesz następny.';
+            bloki.push(w + ': ' + czNazwa(w, czas) + ' (z ' + s.plik + ')\n'
+                + '  Ustawienie importu: ' + (c.bankNm || '?') + ' (' + c.bank + ') · ' + (c.bookingNm || '?') + ' (' + c.booking + ')\n'
+                + '  Do importu: ' + an.importuj.length + ' · wyjęte: ' + (an.minus.length + an.spoza.length)
+                + ' (z minusem ' + an.minus.length + ', spoza zamówień ' + an.spoza.length + ')'
+                + (an.importuj.filter(function (x){ return x.nrNote; }).length ? (' · numer w Note: ' + an.importuj.filter(function (x){ return x.nrNote; }).length) : '')
+                + (an.znane ? ('\n  ℹ ' + an.znane + ' transakcji było już w poprzednim pliku') : '')
+                + (an.calyZnany ? '\n  ⚠ CAŁY plik był już wysłany — wysyłasz go mimo to' : '')
+                + (nr0 ? ('\n  ⚠ ' + nr0) : ''));
+        });
+        if (!confirm('Wysłać do Import payments ' + (sloty.length === 2 ? 'dwa pliki (CZK i EUR)' : ('plik ' + sloty[0])) + '?\n\n'
+            + bloki.join('\n\n') + '\n\nData księgowania: z wiersza pliku (nie nadpisuję).\n'
+            + 'Każdy plik to osobna paczka. Import NIE zaksięguje jej — to osobny przycisk.')) return;
+        b.disabled = true;
+        var wyniki = [], zNumerem = 0, zle = 0;
+        for (var i = 0; i < sloty.length; i++){
+            var w = sloty[i], s = para[w], nazwa = czNazwa(w, czas), c = ustaw(czId(w));
+            // Slad PRZED zapytaniem (jak przy importach pobran HU): po F5 albo bledzie w trakcie wiadomo,
+            // ktory plik poszedl, i jest pole na numer paczki zamiast cichej ponownej wysylki.
+            var zl = { impId: '', nazwa: nazwa, format: 'raiffeisencz', slot: w, wierszy: s.an.importuj.length,
+                       czas: new Date().toISOString(), booked: false, stan: 'wysylka',
+                       cz: { plik: s.plik, wiersze: s.an.importuj.map(czMini), minus: s.an.minus.map(czMini), spoza: s.an.spoza.map(czMini) } };
+            czJobZapisz(w, zl);
+            say('wysyłam ' + w + '…', '#666');
+            try {
+                var imp = await bkWyslij(new Blob([s.bajty], { type: 'text/csv' }), nazwa, c, { bezZapasu: true });
+                zl.impId = imp; delete zl.stan;
+                czJobZapisz(w, zl);
+                // Wiersze zapamietujemy jako wyslane dopiero przy znanej paczce — inaczej plik, ktorego
+                // import nie przyjal, bylby potem blokowany jako „juz wyslany" (przeglad 30.09.2026).
+                if (imp){ czZapamietaj(s.an.importuj); zNumerem++; }
+                wyniki.push(imp ? (w + ': paczka <b>' + esc(imp) + '</b>') : (w + ': poszło, ale numeru paczki nie odczytałem — sprawdź niżej'));
+            } catch (e){
+                // Nie wiemy, czy paczka powstala (np. 502 z bramki po przyjeciu pliku) — slad zostaje z bledem,
+                // czlowiek rozstrzyga: wpisuje numer albo „zapomnij". Druga wysylka nie cofa pierwszej.
+                zl.stan = 'niepewne'; zl.blad = (e && e.message) || String(e);
+                czJobZapisz(w, zl); zle++;
+                wyniki.push('<span style="color:#c00">' + w + ': nie wiem, czy paczka powstała — ' + esc(zl.blad) + '</span>');
+            }
+        }
+        if (S.cz === para) S.cz = {};
+        rysuj();
+        say(wyniki.join(' · ') + (zNumerem ? ' — paczki jeszcze NIEZAKSIĘGOWANE.' : ''), (zle || !zNumerem) ? '#c00' : '#0a7a2f');
+    }
+    // Wiersz paczki NOT FOUND -> wiersz pliku: ta sama kwota i dzien, przy kilku kandydatach tresc.
+    function czDopasuj(j, x, num){
+        var lista = (j && j.cz && j.cz.wiersze) || [], a = num(x.amount), dz = bkDzien(String(x.payment_date || ''));
+        if (a == null) return [];
+        var k = lista.filter(function (w){ return Math.abs(w.kwota - a) < 0.005 && (!dz || w.data === dz); });
+        if (k.length > 1){
+            var nr = huNorm(x.payment_descr);
+            var t = k.filter(function (w){ var cel = huNorm(w.vs + w.nrNote + w.partner + w.opis); return nr && cel.indexOf(nr) >= 0; });
+            if (t.length) k = t;
+        }
+        return k;
+    }
+    function czPodpowiedzHtml(j, x, num){
+        var k = czDopasuj(j, x, num);
+        if (k.length > 1) return '<div style="font-size:9px;color:#888">w pliku ' + k.length + ' wpłat o tej kwocie i dacie — bez podpowiedzi</div>';
+        if (!k.length) return '';
+        var w = k[0], h = '';
+        if (w.hint)
+            h += '<div style="font-size:9px;color:#5b21b6">z ' + esc(w.hintZ) + ': <a href="#" class="bk-cz-hint" data-row="' + esc(x.id)
+              +  '" data-nr="' + esc(w.hint) + '" title="Wpisz do pola — potem „przypisz”">' + esc(w.hint) + '</a></div>';
+        else if (w.przes)
+            h += '<div style="font-size:9px;color:#c47f00;white-space:normal;max-width:230px">TopTrans, przesyłka <b>' + esc(w.przes) + '</b> '
+              +  '<a href="#" class="bk-cz-kop" data-nr="' + esc(w.przes) + '">📋 kopiuj</a> · '
+              +  '<a href="' + BK_CZ_TT + '" target="_blank">śledzenie ↗</a> — numer auftragu to „BELIANI …” w „Označenie zásielky”</div>';
+        else if (w.partner || w.opis)
+            h += '<div style="font-size:9px;color:#888;white-space:normal;max-width:230px">' + esc(w.partner) + (w.opis ? (' · ' + esc(w.opis.slice(0, 90))) : '') + '</div>';
+        return h;
+    }
+    function czPodepnijWiersze(Z, j, qa){
+        qa('.bk-cz-hint').forEach(function (a){
+            a.onclick = function (e){
+                e.preventDefault();
+                var inp = Array.prototype.filter.call(qa('.bk-auf'), function (x){ return x.getAttribute('data-row') === a.getAttribute('data-row'); })[0];
+                if (inp){ inp.value = a.getAttribute('data-nr'); inp.focus(); }
+            };
+        });
+        qa('.bk-cz-kop').forEach(function (a){
+            a.onclick = function (e){
+                e.preventDefault();
+                var t = a.getAttribute('data-nr');
+                try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); } catch (e2){}
+                zMow(Z, j, 'Skopiowane: przesyłka TopTrans ' + esc(t) + ' — wklej ją na stronie śledzenia.', '#0a7a2f');
+            };
+        });
+    }
+    function czPodepnij(){
+        var wb = $('#bk-cz-wyslij');
+        if (wb) wb.onclick = async function (){
+            try { await czWyslij(wb); }
+            catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
+            finally { if ($('#bk-cz-wyslij')) $('#bk-cz-wyslij').disabled = false; }
+        };
+        panel.querySelectorAll('.bk-cz-pobierz').forEach(function (b){
+            b.onclick = function (){
+                var w = b.getAttribute('data-w'), s = S.cz && S.cz[w]; if (!s) return;
+                var a = document.createElement('a'), nazwa = czNazwa(w, new Date());
+                a.href = URL.createObjectURL(new Blob([s.bajty], { type: 'text/csv' }));
+                a.download = nazwa;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+                say('Zapisane: ' + esc(nazwa), '#0a7a2f');
+            };
+        });
+        panel.querySelectorAll('.bk-cz-nr-set').forEach(function (b){
+            b.onclick = async function (){
+                var w = b.getAttribute('data-w');
+                var nr = String((panel.querySelector('.bk-cz-nr[data-w="' + w + '"]') || {}).value || '').trim();
+                if (!/^\d{3,9}$/.test(nr)){ say('Numer paczki to same cyfry z adresu …/import_payments/NUMER/.', '#c47f00'); return; }
+                var jr = czJobRaw(w);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                b.disabled = true; say('sprawdzam paczkę ' + esc(nr) + '…', '#666');
+                var sp;
+                try { sp = await bkSprawdzNumer(nr, jr.nazwa); }
+                catch (e){ sp = { ok: false, powod: 'nie odczytałem paczki ' + nr + ': ' + ((e && e.message) || e) }; }
+                b.disabled = false;
+                if (!sp.ok){ say('Nie przypinam: ' + esc(sp.powod) + '.', '#c00'); return; }
+                if (sp.potwierdz && !confirm(sp.potwierdz + '\n\nPrzypiąć ją do pliku ' + jr.nazwa + '?')) return;
+                jr = czJobRaw(w);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                jr.impId = nr; delete jr.stan; delete jr.blad; czJobZapisz(w, jr);
+                if (jr.cz && jr.cz.wiersze) czZapamietaj(jr.cz.wiersze);
+                say('Zapisane: paczka ' + esc(nr) + ' (' + w + '). Odczytuję…', '#0a7a2f');
+                rysuj();
+            };
+        });
+        panel.querySelectorAll('.bk-cz-nr-zap').forEach(function (b){
+            b.onclick = function (){
+                var w = b.getAttribute('data-w'), jr = czJobRaw(w);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                if (!confirm('Zapomnieć plik ' + jr.nazwa + ' (' + w + ')?\n\nZrób to TYLKO wtedy, gdy w Import payments NIE ma paczki z tego '
+                    + 'pliku — inaczej ponowna wysyłka zrobi drugą paczkę z tymi samymi wpłatami.')) return;
+                czJobZapisz(w, {});
+                rysuj();
+                say(w + ': zapomniane — możesz wysłać plik jeszcze raz.', '#0a7a2f');
+            };
+        });
+        panel.querySelectorAll('.bk-cz-wymus').forEach(function (b){
+            b.onclick = function (){
+                var w = b.getAttribute('data-w'), s = S.cz && S.cz[w]; if (!s) return;
+                if (!confirm('Wysłać ' + w + ' mimo to?\n\nWszystkie transakcje z tego pliku poszły już wcześniej do importu. '
+                    + 'Rób to tylko wtedy, gdy tamtej paczki nie ma (np. skasowana w Import payments) — inaczej wpłaty będą w dwóch paczkach.')) return;
+                s.wymus = true; rysuj();
+            };
+        });
     }
 
     // Paczka odczytana z prologistics — stan bierze sie z systemu, a nie z tego,
@@ -71055,7 +71751,7 @@
         var stop = doOk.length ? huAutoOkZnaczenie(d) : '';
         if ((j.autoOkHuStop || '') !== stop){ var os = Z.get(); if (os){ os.autoOkHuStop = stop; Z.set(os); } }
         if (!doOk.length || stop) return d;
-        var lotK = 'auto:' + (Z.typ === 'cod' ? Z.sid : 'g') + ':' + j.impId;
+        var lotK = 'auto:' + (Z.typ === 'glowna' ? 'g' : (Z.typ + ':' + Z.sid)) + ':' + j.impId;
         // W trakcie ksiegowania tej paczki statusow nie ruszamy — nastepny odczyt to zrobi.
         if (S.lot[lotK] || S.lot['ks:' + j.impId]) return d;
         S.lot[lotK] = 1;
@@ -71091,7 +71787,7 @@
     // Komunikat operacji na paczce stoi takze W JEJ pudelku: say() pisze na gorze panelu, a paczka
     // pobran bywa ekran nizej — „nic sie nie stalo" bywalo tylko tym, ze komunikatu nie widac
     // (zgloszenie 30.09.2026). Przezywa przerysowanie paczki.
-    function zMowKlucz(Z, j){ return (Z.typ === 'cod' ? ('cod:' + Z.sid) : 'glowna') + ':' + (j ? j.impId : ''); }
+    function zMowKlucz(Z, j){ return (Z.typ === 'glowna' ? 'glowna' : (Z.typ + ':' + Z.sid)) + ':' + (j ? j.impId : ''); }
     function zMowHtml(m){
         return !m ? '' : ('<div style="margin:4px 0;padding:4px 7px;border-radius:6px;border:1px solid #e5e7eb;background:#fafafa;'
                + 'font-size:11px;font-weight:700;color:' + esc(m.c || '#333') + '">'
@@ -71230,6 +71926,7 @@
         // wierszy nie rysujemy pod nowym numerem — pokazujemy to, co jest teraz.
         if (!j || (d && d.id && String(d.id) !== String(j.impId))){
             if (Z.typ === 'glowna') sprawdz();     // bez zlecenia sprawdz chowa widok
+            else if (Z.typ === 'cz') czSprawdz(Z.sid);
             else box.innerHTML = '';
             return;
         }
@@ -71237,7 +71934,7 @@
         // Narzedzia eupago (szukanie po numerze transakcji, tabelka eupago w auftragu,
         // numer zamowienia zamiast transakcji) zostaja dla EuPago i PostFinance jak dotad.
         // Wyciag HU i paczki pobran maja wlasna, prostsza sciezke NOT FOUND.
-        var euNarz = !(F.hu || F.cod);
+        var euNarz = !(F.hu || F.cod || F.cz);
         var num = euNarz ? bkNum : huNum;
         var q = function (s){ return box.querySelector(s); };
         var qa = function (s){ return box.querySelectorAll(s); };
@@ -71256,7 +71953,7 @@
         var seen = rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; });
 
         var h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;padding-top:8px;border-top:1px solid #eee">'
-              + '<b style="font-size:11px;color:#5b21b6">' + (Z.typ === 'cod' ? ('Import pobrań ' + esc(Z.nazwa || '') + ' — paczka ') : 'Paczka importu ')
+              + '<b style="font-size:11px;color:#5b21b6">' + (Z.typ === 'cod' ? ('Import pobrań ' + esc(Z.nazwa || '') + ' — paczka ') : (Z.typ === 'cz' ? ('Raiffeisen CZ ' + esc(Z.sid) + ' — paczka ') : 'Paczka importu '))
               + esc(j.impId) + '</b>'
               + '<a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
               + '<span style="font-size:11px;color:#666">wierszy ' + rows.length + '</span>';
@@ -71279,6 +71976,8 @@
               +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', '))
               +  (seen.length > 12 ? (' … +' + (seen.length - 12)) : '') + '</div></div>';
         }
+        // Raiffeisen CZ: wplywy spoza zamowien wyjete z importu — na gorze (decyzja 30.09.2026).
+        if (Z.typ === 'cz' && j.cz) h += czSpozaHtml(j.cz.spoza, Z.sid);
         // Wplaty przewoznikow — na gorze, bo pod kazda idzie plik z maila i jej import pobran.
         if (Z.typ === 'glowna' && F.hu) h += huPrzewSekcja(j, pw, num);
 
@@ -71349,6 +72048,18 @@
         var doWyj = chk.filter(function (x){
             return zNumerem.indexOf(x) < 0 && koncowki.indexOf(x) < 0;
         });
+        // „✔ ustaw OK" przy wierszu CHECK — we wszystkich bankach, „w razie czego" (decyzja 30.09.2026).
+        // Sam status nic nie ksieguje: wiersz wraca na liste „Zaksięguj OK".
+        var chkMozna = function (x){ var id = String(x.id); return !bookedM[id] && !wTokuM[id]; };
+        var kolChk = { naglowek: '', cel: function (x){
+            var id = String(x.id), z = bookedM[id], t = '';
+            if (z) t += '<b style="color:#c00">HUB ma go jako zaksięgowany' + (z === 'sub' ? ' na subkoncie' : '')
+                      + ', a w prologistics dalej CHECK</b>';
+            if (chkMozna(x)) t += '<button class="bk-chk-ok" data-row="' + esc(id) + '" title="Przestawia status wiersza na OK — '
+                      + 'pójdzie z paczką guzikiem „' + esc(bkBlokKs(Z).opis) + '”." style="padding:1px 6px;border:none;border-radius:5px;'
+                      + 'background:#0a7a2f;color:#fff;cursor:pointer;font-size:9px">✔ ustaw OK</button>';
+            return t;
+        } };
         var tolCtl = function (zGuzikiem){
             return '<div style="margin:-4px 0 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
                  + '<span style="font-size:10px;color:#666">' + (euNarz ? 'grosze do wyrównania: do'
@@ -71409,7 +72120,7 @@
         if (zNumerem.length)
             h += tab('Numer zamówienia zamiast transakcji — status się NIE zapisał', '#c47f00', zNumerem,
                      'Kwota zgadza się z open amount, więc nie ma tu czego wyjaśniać — nie udało się tylko '
-                     + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.');
+                     + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.', kolChk);
         if (koncowki.length){
             h += tab(euNarz ? 'Końcówki groszowe — do wyksięgowania na subkoncie' : 'Różnica w progu — do wyksięgowania na subkoncie',
                      '#0a7a2f', koncowki,
@@ -71420,15 +72131,17 @@
               +  tolCtl(true);
         }
         if (doWyj.length){
-            var kolZaks = chkZaks.length ? { naglowek: 'HUB', cel: function (x){
-                var z = bookedM[String(x.id)];
-                return z ? ('<b style="color:#c00">HUB ma go jako zaksięgowany' + (z === 'sub' ? ' na subkoncie' : '')
-                            + ', a w prologistics dalej CHECK</b>') : '';
-            } } : null;
             h += tab('CHECK — do wyjaśnienia', '#c47f00', doWyj,
                      'Prologistics oznaczyło te wiersze do sprawdzenia. '
                      + (euNarz ? 'Różnica 0.00' : '„Zostaje na auftragu” 0.00') + ' znaczy, że powodem '
-                     + 'NIE jest kwota — wtedy zajrzyj w auftrag.', kolZaks);
+                     + 'NIE jest kwota — wtedy zajrzyj w auftrag.', kolChk);
+            var doWyjOk = doWyj.filter(chkMozna);
+            if (doWyjOk.length > 1)
+                h += '<div style="margin:-2px 0 6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                   + '<button data-bk="chk-ok-wsz" style="padding:2px 8px;border:1px solid #0a7a2f;border-radius:5px;background:#fff;'
+                   + 'color:#0a7a2f;cursor:pointer;font-size:10px">✔ Ustaw OK na wszystkich (' + doWyjOk.length + ')</button>'
+                   + '<span style="font-size:10px;color:#888">Sam status nic nie księguje — wiersze wrócą na listę „'
+                   + esc(bkBlokKs(Z).opis) + '”.</span></div>';
             if (chkZaks.length)
                 h += '<div style="margin:-2px 0 6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
                    + '<span style="font-size:10px;color:#7c2d12">' + chkZaks.length + ' z nich HUB zapisał jako zaksięgowane, '
@@ -71548,10 +72261,12 @@
         // Wyciag HU: pod paczka to, co z pliku wyjelismy — INS, szkody GLS do docs, minusy.
         if (Z.typ === 'glowna' && F.hu && j.hu)
             h += huInsHtml(j.hu.ins) + huDocsHtml(j.hu.docs) + huMinusHtml(j.hu.minus);
+        if (Z.typ === 'cz' && j.cz) h += czMinusHtml(j.cz.minus, Z.sid);
         box.innerHTML = h;
         // Ostatni NARYSOWANY odczyt kazdej paczki — przerysowanie paczki wyciagu rysuje paczki
         // pobran z tej pamieci, wiec musi ona nadazac tez za „ustaw OK" i „cofnij".
         if (Z.typ === 'glowna') S.glownaD = d;
+        else if (Z.typ === 'cz') S.czD[Z.sid] = d;
         else S.codPaczki[Z.sid] = d;
         // Paczka pobran: ile wierszy czeka jeszcze na czlowieka (CHECK, NOT FOUND bez zapisu na
         // auftragu). Zaksiegowana paczka z takimi wierszami nie znika z „niedokonczonych".
@@ -71569,7 +72284,7 @@
         // ich guziki, bo sekcja przewoznikow stoi nad reszta tej paczki.
         var el = {};
         ['re', 'zap', 'tol', 'tol-set', 'sub', 'sub-msg', 'ksieguj', 'ksieguj-msg', 'nf', 'okno', 'rown', 'okno-set',
-         'wtoku-ok', 'wtoku-zdejmij', 'zaks-zdejmij']
+         'wtoku-ok', 'wtoku-zdejmij', 'zaks-zdejmij', 'chk-ok-wsz']
             .forEach(function (k){ el[k] = q('[data-bk="' + k + '"]'); });
         var aufInp = {};
         qa('.bk-auf').forEach(function (x){ aufInp[x.getAttribute('data-row')] = x; });
@@ -71589,6 +72304,60 @@
             zMow(Z, j, 'Trwa już księgowanie tej paczki — poczekaj na odpowiedź.', '#c47f00');
             return true;
         };
+        var chkOk = async function (lista, guz){
+            if (!zAktualne(Z, j) || wLocie()) return;
+            if (S.lot['chk:' + j.impId]){ zMow(Z, j, 'Trwa ustawianie statusów w tej paczce — poczekaj na wynik.', '#c47f00'); return; }
+            var ids = zDoWyslania(Z, lista.map(function (x){ return String(x.id); }), euNarz, false);
+            if (!ids.length) return;
+            var wyb = lista.filter(function (x){ return ids.indexOf(String(x.id)) >= 0; });
+            if (!confirm('Ustawić status OK na ' + ids.length + (ids.length === 1 ? ' wierszu' : ' wierszach') + ' CHECK?\n\n'
+                + wyb.slice(0, 25).map(function (x){ return '  • ' + String(x.payment_descr || '').slice(0, 40) + '  ' + f2(num(x.amount)); }).join('\n')
+                + (wyb.length > 25 ? '\n  …' : '')
+                + '\n\nOdpowiada to ręcznej zmianie statusu w prologistics. Sam status NIC nie księguje — wiersze '
+                + 'wracają na listę „' + bkBlokKs(Z).opis + '”.')) return;
+            var lotK = 'chk:' + j.impId;
+            if (S.lot[lotK]) return;
+            S.lot[lotK] = 1;
+            if (guz) guz.disabled = true;
+            var wyslane = false;
+            try {
+                var bl = await bkStanWiele(j.impId, ids, function (i, n){ if (guz) guz.textContent = 'ustawiam… ' + i + '/' + n; });
+                wyslane = true;
+                var d2 = await bkPaczka(j.impId), st = {};
+                d2.rows.forEach(function (r){ st[String(r.id)] = String(r.state == null ? '' : r.state).trim(); });
+                var okIds = ids.filter(function (id){ return st[id] === 'OK'; });
+                var o = Z.get();
+                if (o && okIds.length){
+                    var ro = (o.recznieOk && typeof o.recznieOk === 'object') ? o.recznieOk : {};
+                    okIds.forEach(function (id){
+                        var x = wyb.filter(function (y){ return String(y.id) === id; })[0] || {};
+                        ro[id] = { z: 'CHECK', auf: '', nr: x.payment_descr == null ? '' : String(x.payment_descr) };
+                    });
+                    o.recznieOk = ro; Z.set(o);
+                }
+                var nie = ids.length - okIds.length, b1 = ids.map(function (id){ return bl[id]; }).filter(Boolean)[0] || '';
+                delete S.lot[lotK];
+                zMow(Z, j, okIds.length
+                    ? ('Status OK: ' + okIds.length + ' z ' + ids.length + ' — wróciły na listę „' + esc(bkBlokKs(Z).opis) + '”.'
+                       + (nie ? (' Prologistics nie przestawiło ' + nie + (b1 ? (' (' + esc(b1) + ')') : '') + ' — zmień je ręcznie.') : ''))
+                    : ('Prologistics nie przestawiło żadnego z ' + ids.length + ' wierszy' + (b1 ? (' (' + esc(b1) + ')') : '') + ' — zmień status ręcznie.'),
+                    nie ? '#c47f00' : '#0a7a2f');
+                rysujPaczke(Z, d2);
+            } catch (e){
+                delete S.lot[lotK];
+                // Po wyslaniu statusow blad jest juz tylko przy ODCZYCIE paczki — statusy mogly wejsc.
+                zMow(Z, j, wyslane ? ('Statusy wysłane, ale nie odczytałem paczki (' + esc((e && e.message) || e) + ') — odśwież i sprawdź.')
+                                   : ('Nie ustawiłem statusu: ' + esc((e && e.message) || e)), '#c00');
+                try { await Z.odswiez(); } catch (e2){}
+            }
+        };
+        if (el['chk-ok-wsz']) el['chk-ok-wsz'].onclick = function (){ chkOk(doWyj.filter(chkMozna), el['chk-ok-wsz']); };
+        qa('.bk-chk-ok').forEach(function (b){
+            b.onclick = function (){
+                var x = rows.filter(function (y){ return String(y.id) === b.getAttribute('data-row'); })[0];
+                if (x) chkOk([x], b);
+            };
+        });
         if (el['zaks-zdejmij']) el['zaks-zdejmij'].onclick = function (){
             if (!zAktualne(Z, j)) return;
             if (!confirm('Zdjąć znacznik „zaksięgowane” z ' + chkZaks.length + ' wierszy CHECK?\n\nZrób to TYLKO wtedy, gdy w '
@@ -72143,6 +72912,7 @@
                                  + ' — ustawienie OK i zaksięgowanie paczki zaksięguje ją drugi raz</div>') : '')
                        + (znane ? '<div style="font-size:9px;color:#c2410c">⚠ prologistics zna już tę płatność</div>' : ''))
                     : '')
+              +  (Z.typ === 'cz' ? czPodpowiedzHtml(j, x, num) : '')
               +  '</td>'
               +  '<td style="padding:2px 6px">' + stan + '</td></tr>';
         });
@@ -72161,11 +72931,12 @@
     }
     // Ostatni narysowany odczyt tej paczki (albo podany, gdy pamiec jest o innej paczce).
     function bkOstatniOdczyt(Z, d){
-        var dd = (Z.typ === 'glowna') ? S.glownaD : S.codPaczki[Z.sid];
+        var dd = (Z.typ === 'glowna') ? S.glownaD : (Z.typ === 'cz' ? S.czD[Z.sid] : S.codPaczki[Z.sid]);
         return (dd && d && String(dd.id) === String(d.id)) ? dd : d;
     }
     function nfHuPodepnij(Z, j, d, qa){
         var odrysuj = function (){ rysujPaczke(Z, bkOstatniOdczyt(Z, d)); };
+        if (Z.typ === 'cz') czPodepnijWiersze(Z, j, qa);
         qa('.bk-hu-zaks-ok').forEach(function (b){
             b.onclick = function (){
                 if (!zAktualne(Z, j)) return;
@@ -80469,7 +81240,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '87ec5c5 · 30.09.2026 09:42';
+    const HUB_BUDOWA = 'a14474a · 30.09.2026 12:34';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
