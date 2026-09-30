@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.55
+// @version      5.56
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -25789,7 +25789,14 @@
         // O tym, ktory znak jest przecinkiem dziesietnym, decyduje OSTATNI separator
         // i liczba cyfr po nim — bez tego „1 149,97" czyta sie jako 1,14.
         function insKwota(v){
-            var s = String(v == null ? '' : v).replace(/[ \s]/g, '').replace(/[A-Za-z€$£]/g, '');
+            // Apostrof miedzy cyframi to szwajcarski separator tysiecy (1'513.90). Bez tego
+            // parseFloat urywa sie na nim i zwraca 1 — liczbe 1000 razy za mala, ktora
+            // przechodzi kazda kontrole „czy sie sparsowalo" (zmierzone 30.09.2026 na tytule
+            // przelewu POSTNORD). MIEDZY CYFRAMI, nie wszedzie: gole usuniecie apostrofu
+            // zrobiloby z nazwiska „O'Brien 5" kwote 5, a ta funkcja skanuje tez kolumny
+            // z nazwami w insParsujWklejke.
+            var s = String(v == null ? '' : v).replace(/(\d)['\u2019\u00b4](?=\d)/g, '$1')
+                        .replace(/[ \s]/g, '').replace(/[A-Za-z€$£]/g, '');
             if (!s) return null;
             var neg = /^-/.test(s) || /\)$/.test(s);
             s = s.replace(/[()+\-]/g, '');
@@ -25831,7 +25838,23 @@
         }
         function insPrzelicz(g){
             g.suma = g.poz.reduce(function (a, p){ return a + (Number(p.kwota) || 0); }, 0);
+            // Waluta pozycji: jedna dla calej grupy, „?" gdy sa rozne, puste gdy nieznana.
+            var walPoz = '';
+            g.poz.forEach(function (p){
+                var w = String(p.waluta || '').toUpperCase();
+                if (!w) return;
+                if (!walPoz) walPoz = w;
+                else if (walPoz !== w) walPoz = '?';
+            });
+            g.walPoz = walPoz;
+            // Kontrola sumy porownywala dwie GOLE LICZBY i o walucie nie wiedziala nic —
+            // stad „nie spina sie" przy wplacie na konto DKK z pozycjami w EUR. Gdy kwota
+            // przelewu niesie wlasny kod waluty (z „Amount entered") i rozni sie on od waluty
+            // pozycji, liczby sa niewspolmierne: „spina sie" byloby wtedy nieprawda, a rowna
+            // liczba w dwoch walutach to zbieg okolicznosci, nie zgodnosc.
+            g.walRozjazd = !!(g.walKwoty && walPoz && walPoz !== '?' && g.walKwoty !== walPoz);
             g.spina = (g.kwota !== null && g.kwota !== undefined)
+                    && !g.walRozjazd
                     && Math.abs(g.kwota - g.suma) < 0.005;
             return g;
         }
@@ -25855,9 +25878,123 @@
         // ---------- wklejka ----------
         // Kolumny nazywamy po tym, CO w nich stoi, a nie po numerze: wyciagi roznia sie
         // liczba pustych kolumn miedzy kwota a linkami.
+        // Arkusz cytuje pola, ktore zawieraja lamanie wiersza — adres platnika i tytul przelewu
+        // maja ich po kilka. Dzielenie na slepo po \n rozbijalo wtedy JEDEN wiersz wyciagu na
+        // piec, a linia z linkami zostawala bez kolumny daty i banku (POSTNORD / ubs dkk,
+        // 29.09.2026): kurs pytany z pusta data konczyl sie „zla data:", a konta nie bylo
+        // z czego dopasowac. Sklejamy wiec rekordy przed parsowaniem.
+        // Podwojony cudzyslow w srodku pola ("") to znak, nie koniec pola.
+        function insLinieLogiczne(raw){
+            var txt = String(raw || '');
+            // Nieparzysta liczba cudzyslowow = wklejka urwana w polowie pola. Sklejanie
+            // zlepiloby wtedy cala reszte w jedna linie, wiec wracamy do starego dzielenia.
+            if ((txt.split('"').length - 1) % 2) return txt.split(/\r?\n/);
+            var out = [], buf = '', wPolu = false;
+            for (var i = 0; i < txt.length; i++){
+                var c = txt.charAt(i);
+                if (c === '"'){
+                    if (wPolu && txt.charAt(i + 1) === '"'){ buf += '""'; i++; continue; }
+                    wPolu = !wPolu; buf += c; continue;
+                }
+                if (c === '\r') continue;
+                if (c === '\n'){
+                    if (wPolu){ buf += ' '; continue; }   // lamanie WEWNATRZ pola — zostaje spacja
+                    out.push(buf); buf = '';
+                    continue;
+                }
+                buf += c;
+            }
+            out.push(buf);
+            return out;
+        }
+        // Pole z arkusza bywa w cudzyslowie — nazwa banku i kontrahent maja z niego wyjsc czyste.
+        function insOdcudzyslow(v){
+            var t = String(v == null ? '' : v).trim();
+            if (t.length > 1 && t.charAt(0) === '"' && t.charAt(t.length - 1) === '"')
+                t = t.slice(1, -1).replace(/""/g, '"');
+            return t.trim();
+        }
+        // Kwota z czescia groszowa, z separatorem tysiecy w czterech postaciach (spacja,
+        // NBSP, kropka, przecinek, apostrof). Wymaganie groszy jest tu ISTOTNE: bez niego
+        // klasa ze spacja zzeralaby kolejna kolumne wiersza i z „1'513.90 11120,46" wyszlaby
+        // jedna liczba 15 139 011 120,46. Wzorzec swiadomie nie ma galezi „samo calkowite".
+        // Waluty, ktore ten modul spotyka. Lista jest krotka i wyliczona swiadomie: kod waluty
+        // jest jedynym swiadectwem, ze liczba obok napisu „Amount entered" to kwota, a nie data.
+        const INS_WALUTY = { EUR: 1, USD: 1, CHF: 1, GBP: 1, PLN: 1, CZK: 1, HUF: 1, DKK: 1, SEK: 1, NOK: 1, RON: 1, CAD: 1, CNY: 1, BGN: 1, HRK: 1 };
+        const INS_KW_TEKST = /\d{1,3}(?:[  .,'\u2019\u00b4]\d{3})*[.,]\d{2}|\d+[.,]\d{2}/;
+        // „Amount entered" w tytule przelewu to kwota, KTORA ZLECIL PLATNIK. Gdy konto jest
+        // w innej walucie, kolumna wyciagu niesie juz przewalutowanie po kursie BANKU —
+        // a liczy sie to, co wpisali (decyzja uzytkownika 30.09.2026: „wg innego kursu
+        // przelicza bank, wiec istotne jest to, co oni wpisza").
+        //
+        // Szukamy po TRESCI, nie po numerze kolumny: komentarz przy tej funkcji mowi wprost,
+        // ze wyciagi roznia sie liczba pustych kolumn. Dopuszczamy oba porzadki — „EUR 1'513.90"
+        // i „1'513.90 EUR" — bo widzialem TEN JEDEN tytul i nie wiem, czy bank pisze zawsze tak
+        // samo (PULAPKI/pamiec: nie zgaduj ksztaltu na jednej probce).
+        // Kwota musi stac BLISKO napisu (20 znakow), zeby nie zlapac pierwszej lepszej liczby
+        // z dalszej czesci tytulu — tam stoja daty („BEL. V. 19.01.2026").
+        function insKwotaZlecona(kom){
+            var tr = [];
+            (kom || []).forEach(function (cell){
+                // W OBREBIE JEDNEJ KOMORKI. Kwota zlecona stoi w tym samym cytowanym tytule,
+                // co napis — sklejanie logicznych wierszy zamienia lamanie w tytule na spacje.
+                // Skladanie calego wiersza w jeden napis pozwalalo oknu siegnac do SASIEDNIEJ
+                // kolumny i wziac kwote z wyciagu jako „kwote z tytulu" (zlapane testem).
+                var txt = String(cell || '');
+                var re = /amount\s+entered/gi, m;
+                while ((m = re.exec(txt)) !== null){
+                    var po = txt.slice(m.index + m[0].length, m.index + m[0].length + 40);
+                    // Kwota zlecona stoi ZARAZ za napisem. Miedzy napisem a kwota wolno stac
+                    // tylko bialym znakom, dwukropkowi i kodowi waluty — nic wiecej.
+                    //
+                    // Pierwsza wersja przegladala wszystkie liczby w oknie i brala pierwsza,
+                    // przy ktorej stal kod znanej waluty. Przeglad adwersarski pokazal, ze to
+                    // za slabe swiadectwo i konczy sie ZLA KWOTA na zielono:
+                    //   „Amount entered EUR 1'500.-- Exchange rate EUR/DKK 7.4502" -> 7,45 DKK
+                    //     (wlasciwa kwota „1'500.--" nie pasuje do wzorca, bo po kropce nie ma
+                    //      dwoch cyfr, wiec petla szla dalej i brala KURS),
+                    //   „Amount entered EUR 1500 Charges EUR 12.50" -> 12,50 EUR (oplata).
+                    // Gdy kwoty nie ma zaraz za napisem, NIE szukamy dalej — wracamy do kolumny
+                    // wyciagu. Zejscie do kolumny jest zawsze lepsze niz kwota zgadnieta.
+                    //
+                    // Kod waluty z GRANICA SLOWA: bez niej trzy ostatnie litery dowolnego slowa
+                    // przechodzily za walute i uwierzytelnialy dowolna liczbe — „valeur" i
+                    // „transporteur" jako EUR, „PATRON" i „MICRON" jako RON. Francuska koncowka
+                    // „-eur" jest w tytulach przelewow powszechna.
+                    // ZNAK jest czescia kwoty, nie separatora. Zmierzone przed ta poprawka:
+                    // „Amount entered -1'513.90 EUR" dawalo +1513.90, bo minus wpadal
+                    // w klase separatora miedzy napisem a kwota. Obciazenie zaksiegowane
+                    // jako wplata to blad, ktorego dalej nic nie lapie. insKwota zna i minus,
+                    // i nawiasy, wiec oddajemy jej caly wycinek ze znakiem.
+                    // Myslnik wypada z klasy separatora: „Amount entered - EUR 1500" zejdzie
+                    // bezpiecznie do kolumny, zamiast ryzykowac zgubieniem znaku.
+                    // INS_KW_TEKST.source to ALTERNATYWA — bez wlasnej grupy nieprzechwytujacej
+                    // znak przyklejalby sie tylko do pierwszej galezi, a zamykajacy nawias
+                    // tylko do drugiej („EUR (1'513.90)" dawalo +1513.90).
+                    var K = '((?:-\\s?|\\(\\s?)?(?:' + INS_KW_TEKST.source + ')\\)?)';
+                    var W = '([A-Za-z]{3})(?![A-Za-z])';
+                    var mk = new RegExp('^[\\s:.]{0,3}' + W + '\\s{0,3}' + K + '(?!\\d)').exec(po);
+                    var kwG = 2, walG = 1;
+                    if (!mk){
+                        mk = new RegExp('^[\\s:.]{0,3}' + K + '\\s{0,3}' + W).exec(po);
+                        kwG = 1; walG = 2;
+                    }
+                    // Kod ZNANEJ waluty jest obowiazkowy takze przy kwocie stojacej zaraz za
+                    // napisem: bez niego data „11.09.2026" pasuje do wzorca kwoty jak 11,09.
+                    if (!mk || !INS_WALUTY[mk[walG].toUpperCase()]) continue;
+                    var kw = insKwota(mk[kwG]);
+                    if (kw === null || kw === 0) continue;
+                    tr.push({ kwota: kw, waluta: mk[walG].toUpperCase() });
+                }
+            });
+            // Dwa razy „Amount entered" w jednym wierszu = nie wiadomo, ktora kwota jest ta
+            // wlasciwa. Wtedy NIE zgadujemy: zostaje kwota z kolumny wyciagu, a wiersz o tym mowi.
+            if (tr.length !== 1) return tr.length ? { wiele: tr.length } : null;
+            return tr[0];
+        }
         function insParsujWklejke(raw){
             var out = [], pary = [];
-            String(raw || '').split(/\r?\n/).forEach(function (linia, nr){
+            insLinieLogiczne(raw).forEach(function (linia, nr){
                 if (!/insurance\.php\?id=/i.test(linia)){
                     // Drugi format: „numer INS <tab albo spacje> kwota" — tak wyglada
                     // rozpiska od spedytora przeklejona z arkusza. Warunki sa ciasne
@@ -25886,7 +26023,7 @@
                 // braku kwoty za linkiem COFAL sie i robil z „id=75072" numer 7507 na 2.00.
                 // Kwota za linkiem jest nieobowiazkowa: w wyciagu bywa jeden link na wiersz,
                 // a kwota stoi we wlasnej kolumnie.
-                var poz = [], re = /insurance\.php\?id=(\d+)(?!\d)(?:[^0-9\n]{0,6}?([0-9][0-9  .,]*)\s*([A-Za-z]{3})?)?/gi, m;
+                var poz = [], re = /insurance\.php\?id=(\d+)(?!\d)(?:[^0-9\n]{0,6}?([0-9][0-9  .,'\u2019\u00b4]*)\s*([A-Za-z]{3}(?![A-Za-z]))?)?/gi, m;
                 var blob = kom.slice(iLink).join(' ');
                 while ((m = re.exec(blob)) !== null){
                     var sur = String(m[2] || '').trim(), wal = m[3] || '';
@@ -25900,19 +26037,64 @@
                 // Jeden link w wierszu i brak kwoty za nim — cala wplata dotyczy tego
                 // jednego INS-a. To nie jest domysl: przy jednej pozycji zadna inna liczba
                 // nie moglaby zepiac sumy z kwota przelewu.
+                // Kwota z kolumny wyciagu jest juz PRZELICZONA po kursie banku, gdy konto stoi
+                // w innej walucie niz przelew. Kwota zlecona z tytulu ma wiec pierwszenstwo —
+                // kolumna zostaje jako informacja (kwotaWyc), bo to jedyny slad tego, ile
+                // naprawde zdjeto z konta.
+                var kwotaWyc = kwota, walKwoty = '', kwotaZrodlo = 'wyciag', kwotaUwaga = '';
+                var zlec = insKwotaZlecona(kom);
+                if (zlec && zlec.wiele){
+                    kwotaUwaga = 'w tytule jest ' + zlec.wiele + ' razy „Amount entered" — '
+                               + 'nie wiem, ktora kwota jest ta wlasciwa, wziąłem kwotę z wyciągu';
+                } else if (zlec && kwota !== null && (zlec.kwota < 0) !== (kwota < 0)){
+                    // Przeciwny znak to nie roznica kursowa, tylko INNA OPERACJA: kolumna mowi
+                    // o obciazeniu, tytul o wplacie (albo odwrotnie). Ksiegowanie wplaty zamiast
+                    // obciazenia to blad, ktorego dalsze kontrole w tym module nie lapia.
+                    kwotaUwaga = 'tytuł podaje ' + insFmt(zlec.kwota) + (zlec.waluta ? (' ' + zlec.waluta) : '')
+                               + ', czyli kwotę o PRZECIWNYM ZNAKU niż wyciąg (' + insFmt(kwota)
+                               + ') — zostawiam kwotę z wyciągu';
+                } else if (zlec){
+                    var sumaPoz = poz.reduce(function (a, p){ return a + (Number(p.kwota) || 0); }, 0);
+                    var wycSpina = kwota !== null && Math.abs(kwota - sumaPoz) < 0.005;
+                    var zlecSpina = Math.abs(zlec.kwota - sumaPoz) < 0.005;
+                    // Bezpiecznik na ksztalt, ktorego jeszcze nie widzialem: gdyby spinala sie
+                    // kolumna, a nie tytul, nie odbieramy dzialajacego przypadku. Wybieramy te
+                    // kwote, ktora sie spina, i MOWIMY o tym — cicha podmiana byla by gorsza.
+                    if (wycSpina && !zlecSpina){
+                        kwotaUwaga = 'tytuł podaje ' + insFmt(zlec.kwota) + (zlec.waluta ? (' ' + zlec.waluta) : '')
+                                   + ', ale z sumą pozycji zgadza się kwota z wyciągu — zostawiam wyciąg';
+                    } else {
+                        kwota = zlec.kwota;
+                        walKwoty = zlec.waluta;
+                        kwotaZrodlo = 'tytul';
+                        // Waluta z tytulu UZUPELNIA pozycje, ktore nie maja zadnej (link bez kodu
+                        // waluty). Nigdy nie nadpisuje waluty odczytanej z linku — ta jest bliżej
+                        // sprawy i rozstrzyga o przewalutowaniu.
+                        if (walKwoty) poz.forEach(function (p){ if (!p.waluta) p.waluta = walKwoty; });
+                    }
+                }
                 if (poz.length === 1 && poz[0].kwota === null && kwota !== null){
                     poz[0].kwota = kwota;
                     poz[0].zWiersza = true;
                 }
-                out.push(insGrupa({
+                // insGrupa przepisuje tylko znane pola — nowe ustawiamy na zwroconym obiekcie,
+                // tak samo jak most z Bank Importu robi z g.sid i g.waluta. Potem PONOWNY
+                // insPrzelicz, bo kontrola sumy patrzy teraz takze na walute kwoty.
+                var gr = insGrupa({
                     nr: nr + 1,
                     zrodlo: 'wyciag',
                     data: iData >= 0 ? insDataYmd(kom[iData]) : '',
-                    bank: iData >= 0 && kom[iData + 1] ? String(kom[iData + 1]).trim() : '',
-                    kontr: iData >= 0 && kom[iData + 2] ? String(kom[iData + 2]).trim() : '',
+                    bank: iData >= 0 ? insOdcudzyslow(kom[iData + 1]) : '',
+                    kontr: iData >= 0 ? insOdcudzyslow(kom[iData + 2]) : '',
                     kwota: kwota,
                     poz: poz
-                }));
+                });
+                gr.kwotaWyc = kwotaWyc;
+                gr.walKwoty = walKwoty;
+                gr.kwotaZrodlo = kwotaZrodlo;
+                gr.kwotaUwaga = kwotaUwaga;
+                insPrzelicz(gr);
+                out.push(gr);
             });
             if (pary.length) out.push(insGrupa({ zrodlo: 'pary', kontr: 'wklejone pary INS + kwota', poz: pary }));
             return out;
@@ -26035,7 +26217,11 @@
                 if (!/^\d{4}-\d{2}-\d{2}$/.test(tds[0])) continue;
                 wiersze.push({ data: tds[0], konto: tds[1], kwota: insKwota(tds[2]), user: tds[7] });
             }
-            var mo = /Open amount[^:]*:\s*([A-Z]{3})?\s*([\-0-9., ]+)/i.exec(insTxt(tab));
+            // Apostrof w klasie, inaczej „Open amount : CHF 1'513.90" uciela by sie na nim
+            // i oddala 1 JESZCZE PRZED insKwota. To bliznik usterki crOpen (pamiec:
+            // crOpen-separator-tysiecy) — tam ten sam blad mial dwie kopie i druga naprawila
+            // sie dopiero w 5.23. Gdy apostrofu w tekscie nie ma, klasa po prostu go nie uzywa.
+            var mo = /Open amount[^:]*:\s*([A-Z]{3})?\s*([\-0-9., '\u2019\u00b4]+)/i.exec(insTxt(tab));
             // Waluta z „Open amount : SEK 0.00" byla w tym wzorcu lapana i wyrzucana.
             // To najpewniejsze zrodlo waluty SPRAWY — potrzebne przy przewalutowaniu.
             return { wiersze: wiersze, open: mo ? insKwota(mo[2]) : null,
@@ -26086,7 +26272,9 @@
         // z separatorem tysiecy i kazda przeliczamy. Porownanie napisow gubi zapis
         // „488,26” wobec „488.26”, a jeszcze gorzej — znajduje 88.26 w srodku 488,26
         // i podstawia nie te osobe.
-        const INS_LICZBA = /\d{1,3}(?:[  .,]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d+/g;
+        // Apostrof wsrod separatorow tysiecy: bez niego „5'000.00" z komentarza rozpada sie
+        // na 5 i szukanie osoby po kwocie chybia (dzis cicho, bo nie znajduje nikogo).
+        const INS_LICZBA = /\d{1,3}(?:[  .,'\u2019\u00b4]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d+/g;
         function insKtoOKwocie(koment, kwota){
             for (var i = koment.length - 1; i >= 0; i--){
                 if (insBot(koment[i].user)) continue;
@@ -26587,12 +26775,25 @@
             INS_GRUPY.forEach(function (g, gi){
                 var tlo = g.bezKontroli ? '#fff8e6' : (g.spina ? '#eef7ee' : '#fdecec');
                 var kolorK = g.bezKontroli ? '#c47f00' : (g.spina ? '#0a7a2f' : '#c00');
-                var kontrola = g.bezKontroli
+                // Waluta kwoty przelewu: z tytulu (wklejka) albo z mostu (Bank Import).
+                // Bez niej dwie liczby w dwoch walutach sa na ekranie nierozroznialne.
+                var walK = String(g.walKwoty || g.waluta || '');
+                var walKtxt = walK ? (' ' + insEsc(walK)) : '';
+                var kontrola = g.walRozjazd
+                    ? ('✗ kwota przelewu w ' + insEsc(walK) + ', pozycje w ' + insEsc(g.walPoz || '?')
+                       + ' — nie porównuję liczb w dwóch walutach')
+                    : (g.bezKontroli
                     ? ('⚠ brak niezależnej kwoty przelewu — sumy ' + insFmt(g.suma) + ' nie ma z czym porównać')
                     : (g.spina
-                       ? ('✓ ' + insFmt(g.kwota) + ' = suma pozycji')
-                       : ('✗ przelew ' + insFmt(g.kwota) + ', suma pozycji ' + insFmt(g.suma)
-                          + ' — różnica ' + insFmt(g.kwota - g.suma)));
+                       ? ('✓ ' + insFmt(g.kwota) + walKtxt + ' = suma pozycji')
+                       : ('✗ przelew ' + insFmt(g.kwota) + walKtxt + ', suma pozycji ' + insFmt(g.suma)
+                          + ' — różnica ' + insFmt(g.kwota - g.suma))));
+                // Kwota z kolumny wyciagu nie ma prawa zniknac z oczu: to jedyny slad tego,
+                // ile bank naprawde zdjal z konta po swoim kursie.
+                if (g.kwotaWyc !== null && g.kwotaWyc !== undefined
+                    && Math.abs(g.kwotaWyc - g.kwota) >= 0.005)
+                    kontrola += ' · z wyciągu ' + insFmt(g.kwotaWyc) + ' (kurs banku)';
+                if (g.kwotaUwaga) kontrola += ' · ' + insEsc(g.kwotaUwaga);
                 h += '<tr style="background:' + tlo + '"><td colspan="8" style="padding:6px;border:1px solid #e5e7eb">'
                    + '<b>' + insEsc(g.kontr || g.bank || 'przelew') + '</b>'
                    + (g.bank ? (' · ' + insEsc(g.bank)) : '')
@@ -26600,6 +26801,12 @@
                    +   insEsc(g.data || '') + '" style="font-size:11px" title="Ustawia datę we wszystkich wierszach tego przelewu">'
                    + ' &nbsp; kwota przelewu: <input type="text" class="ins-gkwota" data-g="' + gi + '" value="'
                    +   insFmt(g.kwota) + '" style="width:90px;text-align:right;font-size:11px">'
+                   +   (walKtxt ? ('<span style="color:#555;font-size:11px">' + walKtxt + '</span>') : '')
+                   +   (g.kwotaZrodlo === 'tytul'
+                        ? ('<span style="color:#888;font-size:10px;margin-left:4px" title="Kwota wzięta'
+                           + ' z tytułu przelewu („Amount entered”). Konto jest w innej walucie, więc'
+                           + ' kolumna wyciągu niesie już przeliczenie po kursie BANKU.">↤ z tytułu</span>')
+                        : '')
                    + ' &nbsp; <span style="color:' + kolorK + '">' + kontrola + '</span>'
                    + '</td></tr>';
                 g.poz.forEach(function (p, pi){
@@ -26667,7 +26874,11 @@
                        +   (p.kwota === null ? '' : insFmt(p.kwota)) + '" style="width:74px;text-align:right;font-size:11px">'
                        +   ' ' + insEsc(p.waluta)
                        +   (p.kwotaEdyt ? ' <span title="kwota zmieniona ręcznie" style="color:#c47f00">✎</span>' : '')
-                       +   (p.zWiersza ? ' <span title="Przy linku nie było kwoty, a link jest w wierszu jeden — wzięta kwota przelewu z wyciągu." style="color:#888;font-size:10px">↤ z wiersza</span>' : '')
+                       +   (p.zWiersza ? (' <span title="Przy linku nie było kwoty, a link jest w wierszu jeden — wzięta kwota przelewu '
+                             + (g.kwotaZrodlo === 'tytul' ? 'z tytułu przelewu („Amount entered”).' : 'z wyciągu.')
+                             + '" style="color:#888;font-size:10px">↤ '
+                             + (g.kwotaZrodlo === 'tytul' ? 'z tytułu' : 'z wiersza') + '</span>') : '')
+                       +   (p.zOpen ? ' <span title="Wpłata z Bank Importu miała kilka numerów INS — podzielona po open amount spraw, bo ich suma równa się wpłacie." style="color:#888;font-size:10px">↤ z open amount</span>' : '')
                        +   (p.kwota === null ? ' <span style="color:#c00;font-size:10px">brak kwoty przy linku — wpisz ją</span>' : '')
                        // Przewalutowanie musi byc widoczne PRZED zapisem: na sprawe idzie
                        // inna liczba niz ta z wyciagu i nie wolno, zeby to byla niespodzianka.
@@ -26686,7 +26897,13 @@
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + kontoHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + dataHtml + '</td>'
                        + '<td style="padding:5px 6px;border:1px solid #e5e7eb">' + ktoHtml + '</td>'
-                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;color:' + kolor + '">' + insEsc(p.status || '') + '</td>'
+                       + '<td style="padding:5px 6px;border:1px solid #e5e7eb;color:' + kolor + '">'
+                       +   ((p.stan === 'uwaga' || p.stan === 'blad')
+                             ? ('<a href="#" class="ins-znowu" data-g="' + gi + '" data-p="' + pi + '"'
+                                + ' title="sprawdź ten wiersz jeszcze raz"'
+                                + ' style="color:#2563eb;text-decoration:none;margin-right:5px">\u21bb</a>')
+                             : '')
+                       +   insEsc(p.status || '') + '</td>'
                        + '</tr>';
                 });
             });
@@ -26696,20 +26913,51 @@
         }
 
         // ---------- sprawdzanie ----------
+        // Wiersz zmieniony reka wraca do „nowy" — i tylko wtedy zostanie policzony jeszcze raz.
+        // Sprawdzane sa wylacznie wiersze „nowy" i „blad" (insSprawdzGrupy), a insKsieguj liczy
+        // zaznaczone „nowe" przed zapisem, wiec ten jeden zapis stanu daje i przeliczenie na
+        // zadanie, i przeliczenie w ostatniej chwili.
+        function insDoPonownegoSprawdzenia(p){
+            p.stan = 'nowy';
+            p.status = '';
+            // Kurs zalezy od DATY, wiec po jej zmianie stary przelicznik jest nieprawda —
+            // a pokazany obok kwoty wygladalby na aktualny.
+            p.kwotaFx = null; p.kurs = null; p.kursData = ''; p.kursZamk = ''; p.fxBlad = '';
+            // „Juz zaksiegowane" porownuje kwote PO przewalutowaniu, wiec razem z kursem traci
+            // waznosc. Open amount zostaje: to cecha sprawy, nie daty — i niech bedzie widoczny,
+            // dopoki wiersz czeka na sprawdzenie.
+            p.juzJest = null;
+            // Uwagi kasujemy tym samym sitem, co insSprawdzJedna: notatka „… na liście
+            // przelewowej" pochodzi z wgranego listu PDF, nie ze sprawdzenia, i musi przezyc.
+            // Gole p.uwagi = [] kasowaloby ja na zawsze.
+            p.uwagi = (p.uwagi || []).filter(function (u){ return /na liście/.test(u); });
+        }
         async function insSprawdzJedna(p, g){
             var html = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id));
             var konta = insKontaZeStrony(html);
             p.konta = konta;
             if (!konta.length){ p.stan = 'blad'; p.status = 'nie widzę listy kont — czy jesteś zalogowany?'; return; }
             var dop = insDopasujKonto(g.bank, konta);
-            p.konto = dop.nr;
-            p.kontoZrodlo = dop.zrodlo;
+            // Konto i osoba wybrane RECZNIE przezywaja ponowne sprawdzenie — wiersz poprawiony
+            // w tabeli wraca do „nowy" i sprawdza sie jeszcze raz, a wybor czlowieka nie moze
+            // przy tym po cichu wrocic do automatu. Konto tylko wtedy, gdy nadal jest na liscie.
+            var kontoR = (p.kontoZrodlo === 'wybrane ręcznie' && p.konto
+                          && konta.some(function (k){ return k.nr === p.konto; })) ? p.konto : '';
+            p.konto = kontoR || dop.nr;
+            p.kontoZrodlo = kontoR ? 'wybrane ręcznie' : dop.zrodlo;
+            // Konto, dla ktorego liczymy „juz zaksiegowane" — zmiana konta po sprawdzeniu
+            // uniewaznia te kontrole (handler ins-konto).
+            p.kontoSpr = p.konto;
             p.kand = dop.kand || [];
             p.kandLuz = dop.luz || '';
             var kom = insKomentarze(html);
             p.osoby = insOsoby(kom);
-            var kto = insKtoOKwocie(kom, p.kwota);
-            if (kto){ p.kto = kto; p.ktoZrodlo = 'z komentarza'; }
+            // Bez kwoty (wplata z kilkoma numerami INS przed podzialem) nie zgadujemy osoby
+            // „po kwocie" — Math.abs(v - null) trafialo w kazde „0" z godziny w komentarzu.
+            var ktoR = (p.ktoZrodlo === 'wybrane ręcznie') ? p.kto : '';
+            var kto = (p.kwota !== null) ? insKtoOKwocie(kom, p.kwota) : '';
+            if (ktoR){ p.kto = ktoR; }
+            else if (kto){ p.kto = kto; p.ktoZrodlo = 'z komentarza'; }
             else {
                 var resp = insResponsible(html);
                 if (resp && !insBot(resp)){ p.kto = resp; p.ktoZrodlo = 'Responsible'; }
@@ -26717,10 +26965,7 @@
             }
             var pl = insPlatnosci(html);
             p.open = pl.open;
-            var juz = pl.wiersze.filter(function (w){
-                return Math.abs((w.kwota || 0) - p.kwota) < 0.005 && (!p.konto || String(w.konto) === String(p.konto));
-            })[0];
-            p.juzJest = juz || null;
+            p.juzJest = null;
             // Waluta SPRAWY: napis przy polu kwoty albo wiersz „Open amount : SEK 0.00".
             var wal = insWalutaStrony(html) || pl.openWal || '';
             p.walSprawy = wal;
@@ -26730,7 +26975,8 @@
             // z dnia WPLATY i tylko z tego dnia; brak kursu blokuje wiersz, bo kwota na
             // domysl jest gorsza niz brak kwoty.
             p.kwotaFx = null; p.kurs = null; p.kursData = ''; p.fxBlad = '';
-            if (p.waluta && wal && p.waluta !== wal){
+            // Bez kwoty nie ma czego przeliczac (null × kurs dawalo 0).
+            if (p.kwota !== null && p.waluta && wal && p.waluta !== wal){
                 try {
                     var fx = await insKursOanda(p.waluta, wal, p.data);
                     p.kurs = fx.rate;
@@ -26762,6 +27008,15 @@
             } else if (p.waluta && wal && p.waluta !== wal){
                 p.uwagi.push('waluta z wyciągu ' + p.waluta + ', na sprawie ' + wal);
             }
+            // „Juz zaksiegowane" liczymy PO przewalutowaniu i porownujemy takze z kwota, ktora
+            // naprawde idzie na sprawe: platnosc zaksiegowana jako 380,12 EUR nie rowna sie
+            // 150 000 z wyciagu, wiec dawna kontrola jej nie widziala i puszczala drugi zapis.
+            var juz = (doZap === null) ? null : pl.wiersze.filter(function (w){
+                var k = w.kwota || 0;
+                return (Math.abs(k - doZap) < 0.005 || Math.abs(k - p.kwota) < 0.005)
+                    && (!p.konto || String(w.konto) === String(p.konto));
+            })[0];
+            p.juzJest = juz || null;
             if (juz){
                 p.stan = 'uwaga';
                 p.wybrany = false;
@@ -26784,22 +27039,85 @@
             }
         }
 
+        // Podzial wplaty z Bank Importu (UniCredit HU) na kilka spraw INS. Regula od uzytkownika
+        // (29.09.2026): jest kilka numerow — sprawdz, czy suma open amount sie zgadza, i wtedy
+        // przypisz kazdej sprawie jej open amount. Dzielimy TYLKO, gdy kazda sprawa ma odczytany
+        // dodatni open amount, wszystkie sa w walucie wplaty i suma rowna sie wplacie co do grosza.
+        // Inaczej kwoty zostaja puste i wpisuje je czlowiek — przelew i tak nie przejdzie, dopoki
+        // suma sie nie spina.
+        function insPodzielPoOpen(){
+            var doSpr = [];
+            INS_GRUPY.forEach(function (g){
+                if (g.zrodlo !== 'bank' || g.poz.length < 2) return;
+                if (!g.poz.every(function (p){ return p.kwota === null && p.stan !== 'nowy'; })) return;
+                var wal = String(g.waluta || '').toUpperCase();
+                var czyt = g.poz.every(function (p){ return p.open !== null && p.open > 0; });
+                var walOk = !!wal && g.poz.every(function (p){ return String(p.walSprawy || '').toUpperCase() === wal; });
+                var suma = g.poz.reduce(function (a, p){ return a + (Number(p.open) || 0); }, 0);
+                if (czyt && walOk && Math.abs(suma - g.kwota) < 0.005){
+                    g.poz.forEach(function (p){
+                        p.kwota = p.open; p.waluta = wal; p.zOpen = true; p.stan = 'nowy';
+                        doSpr.push({ g: g, p: p });
+                    });
+                    insPrzelicz(g);
+                } else {
+                    var why = !czyt ? 'nie przy każdej sprawie odczytałem open amount'
+                            : (!walOk ? ('nie wszystkie sprawy są w ' + (wal || 'walucie wpłaty'))
+                                      : ('suma open amount ' + insFmt(suma) + ' ≠ wpłata ' + insFmt(g.kwota)));
+                    g.poz.forEach(function (p){
+                        if (String(p.status || '').indexOf('nie dzielę') >= 0) return;
+                        if (p.stan === 'gotowy') p.stan = 'uwaga';
+                        // „gotowe do księgowania" by tu klamalo: bez kwoty przelew sie nie spina.
+                        var dotad = /^gotowe do księgowania/.test(String(p.status || '')) ? '' : String(p.status || '');
+                        p.status = 'nie dzielę wpłaty sam: ' + why + ' — wpisz kwoty ręcznie'
+                                 + (dotad ? (' · ' + dotad) : '');
+                    });
+                }
+            });
+            return doSpr;
+        }
+
+        // Tekst wklejki, z ktorego zbudowane sa obecne grupy. Ten sam tekst = te same grupy:
+        // przebudowa kasowalaby poprawki zrobione w tabeli (kwota przy linku, numer INS,
+        // konto, odznaczenia), a panel wprost kaze je tam robic.
+        let insWklejkaTxt = null;
         async function insSprawdz(){
             if (insBusy) return;
             // Grupy z wgranych listow zostaja — one nie pochodza z pola tekstowego
             // i ponowne „Sprawdź" nie ma prawa ich skasowac.
-            var zPliku = INS_GRUPY.filter(function (g){ return g.zrodlo === 'pdf'; });
-            INS_GRUPY = insParsujWklejke(panel.querySelector('#ins-input').value).concat(zPliku);
+            // To samo dotyczy wplat przekazanych z Bank Importu (zrodlo „bank").
+            var txt = panel.querySelector('#ins-input').value;
+            if (txt !== insWklejkaTxt){
+                var zPliku = INS_GRUPY.filter(function (g){ return g.zrodlo === 'pdf' || g.zrodlo === 'bank'; });
+                INS_GRUPY = insParsujWklejke(txt).concat(zPliku);
+                insWklejkaTxt = txt;
+            }
             if (!INS_GRUPY.length){
                 insMow('Nie mam czego sprawdzić — wklej wiersze albo wgraj list przelewowy.', '#c00');
                 return;
             }
+            await insSprawdzGrupy(INS_GRUPY);
+        }
+        // Sprawdzenie WSKAZANYCH grup: po „Sprawdź" wszystkich, po moscie z Bank Importu tylko
+        // nowych. Most nie ma prawa przebudowac grup z wklejki — kasowalby reczne poprawki
+        // numeru INS i odznaczenia, a uzytkownik pracuje wtedy w innym module.
+        async function insSprawdzGrupy(grupy){
             insBusy = true;
             insRysuj();
             var zad = [], mapa = [];
-            INS_GRUPY.forEach(function (g){
+            grupy.forEach(function (g){
                 g.poz.forEach(function (p){
                     mapa.push({ g: g, p: p });
+                    // Wiersz z bledem dostaje kolejna szanse — kazdy, nie tylko z Bank Importu
+                    // (wiersz z listu PDF po bledzie sieci nie mial inaczej zadnej drogi).
+                    // Po PROBIE zapisu (odpowiedz nie przyszla, zapis niepotwierdzony) rozstrzyga
+                    // kontrola „juz zaksiegowane", a zaznaczenie zostaje zdjete: ponowny zapis
+                    // wymaga swiadomego klikniecia. Wplata z Bank Importu, ktorej tylko ODCZYT sie
+                    // nie udal, wraca zaznaczona — inaczej podzial po open amount bylby stracony.
+                    if (p.stan === 'blad'){
+                        if (!p.proba && g.zrodlo === 'bank') p.wybrany = true;
+                        p.stan = 'nowy';
+                    }
                     // Tylko to, czego jeszcze nie sprawdzalismy. Wiersz poprawiony reka
                     // wraca do stanu „nowy", wiec i tak zostanie sprawdzony ponownie.
                     if (p.stan !== 'nowy') return;
@@ -26807,21 +27125,46 @@
                         p.status = 'sprawdzam…';
                         try { await insSprawdzJedna(p, g); }
                         catch (e){ p.stan = 'blad'; p.status = 'błąd odczytu: ' + String(e && e.message || e); }
+                        // Wynik wczesniejszej proby zapisu nie moze zniknac z oczu: „już zaksięgowane"
+                        // bez tego nie mowi, ze np. komentarz nie doszedl.
+                        if (p.proba && p.statusProby) p.status = String(p.status || '') + ' · próba zapisu: ' + p.statusProby;
                         return null;
                     });
                 });
             });
-            if (!zad.length){ insBusy = false; insRysuj(); insMow('Wszystko już sprawdzone.', '#0a7a2f'); return; }
-            var zrobione = 0;
-            insMow('Sprawdzam 0/' + zad.length + '…');
-            await insPula(zad, 5, function (){
-                zrobione++;
-                insMow('Sprawdzam ' + zrobione + '/' + zad.length + '…');
+            if (zad.length){
+                var zrobione = 0;
+                insMow('Sprawdzam 0/' + zad.length + '…');
+                await insPula(zad, 5, function (){
+                    zrobione++;
+                    insMow('Sprawdzam ' + zrobione + '/' + zad.length + '…');
+                    insRysuj();
+                });
                 insRysuj();
-            });
-            insRysuj();
+            }
+            // Wplata z Bank Importu z kilkoma numerami INS: kwoty przy numerach nie ma, wiec
+            // dzielimy ja po open amount spraw — a sprawy, ktore dostaly kwote, sprawdzamy
+            // jeszcze raz (konto, „juz zaksiegowane", przewalutowanie liczy sie od kwoty).
+            var dzielone = insPodzielPoOpen();
+            if (dzielone.length){
+                insMow('Podzieliłem wpłaty po open amount — sprawdzam jeszcze raz ' + dzielone.length + ' spraw…');
+                await insPula(dzielone.map(function (x){
+                    return async function (){
+                        x.p.status = 'sprawdzam…';
+                        try { await insSprawdzJedna(x.p, x.g); }
+                        catch (e){
+                            // Kwota jest, ale kontroli dla niej nie bylo — taki wiersz nie idzie.
+                            x.p.stan = 'blad'; x.p.wybrany = false;
+                            x.p.status = 'błąd odczytu: ' + String(e && e.message || e);
+                        }
+                        return null;
+                    };
+                }), 5, function (){ insRysuj(); });
+                insRysuj();
+            }
+            if (!zad.length && !dzielone.length){ insBusy = false; insRysuj(); insMow('Wszystko już sprawdzone.', '#0a7a2f'); return; }
             var gotowe = mapa.filter(function (x){ return x.p.stan === 'gotowy' && x.g.spina; }).length;
-            var blokada = INS_GRUPY.filter(function (g){ return !g.spina; }).length;
+            var blokada = grupy.filter(function (g){ return !g.spina; }).length;
             insMow('Sprawdzone. Gotowych do księgowania: ' + gotowe + '/' + mapa.length
                  + (blokada ? (' · przelewów zablokowanych (nie spina się suma): ' + blokada) : ''),
                  blokada ? '#c00' : '#0a7a2f');
@@ -26833,24 +27176,41 @@
             p.status = 'księguję…';
             insRysuj();
             var w, przed = null;
-            if (insSzybko()){
-                var html0 = '';
-                try { html0 = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id)); }
-                catch (e){
-                    p.stan = 'blad';
-                    p.status = 'nie udało się otworzyć sprawy: ' + String(e && e.message || e);
-                    return;
+            try {
+                if (insSzybko()){
+                    var html0 = '';
+                    try { html0 = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id)); }
+                    catch (e){
+                        p.stan = 'blad';
+                        p.status = 'nie udało się otworzyć sprawy: ' + String(e && e.message || e);
+                        return;
+                    }
+                    // Zdjecie stanu SPRZED zapisu — po zapisie porownamy, czy nie ubylo
+                    // wierszy zwrotu kosztow transportu.
+                    przed = { sh: insShIds(html0) };
+                    var ping = await insPing(p.id);
+                    // Wiersz przestaje byc zaznaczony PRZED zapytaniem: gdy POST dojdzie, a odpowiedz
+                    // nie wroci (zerwane polaczenie), nastepne „Zaksięguj zaznaczone" nie moze
+                    // wyslac go drugi raz. Ponowny zapis wymaga sprawdzenia i swiadomego zaznaczenia.
+                    p.wybrany = false; p.proba = true;
+                    w = await insZapiszPost(p.id, p.data, p.konto, insDoZapisu(p),
+                                            { html: html0, sh: przed.sh, resp: insResponsible(html0), ping: ping });
+                } else {
+                    p.wybrany = false; p.proba = true;
+                    w = await insZaksieguj(ctx, p.id, p.data, p.konto, insDoZapisu(p));
                 }
-                // Zdjecie stanu SPRZED zapisu — po zapisie porownamy, czy nie ubylo
-                // wierszy zwrotu kosztow transportu.
-                przed = { sh: insShIds(html0) };
-                var ping = await insPing(p.id);
-                w = await insZapiszPost(p.id, p.data, p.konto, insDoZapisu(p),
-                                        { html: html0, sh: przed.sh, resp: insResponsible(html0), ping: ping });
-            } else {
-                w = await insZaksieguj(ctx, p.id, p.data, p.konto, insDoZapisu(p));
+            } catch (e){
+                p.stan = 'blad';
+                p.status = 'nie wiem, czy zapis doszedł (' + String(e && e.message || e)
+                         + ') — „Sprawdź” pokaże, czy płatność jest na sprawie';
+                return;
             }
-            if (!w.ok){ p.stan = 'blad'; p.status = 'nie zaksięgowało: ' + w.blad; return; }
+            if (!w.ok){
+                p.stan = 'blad';
+                p.status = 'nie zaksięgowało: ' + w.blad + ' — „Sprawdź” pokaże, czy płatność jednak weszła';
+                return;
+            }
+            p.wyslane = true;
             var komOk = false;
             if (p.kto){
                 p.status = 'dopisuję komentarz…';
@@ -26862,8 +27222,10 @@
             var html = '';
             try { html = await insPobierz(BASE + '/insurance.php?id=' + encodeURIComponent(p.id)); } catch (e){ html = ''; }
             if (!html){
-                p.stan = 'uwaga';
-                p.status = 'wysłane, ale nie udało się otworzyć sprawy do sprawdzenia';
+                // Zapis niepotwierdzony to „blad", nie „uwaga": „uwaga" przechodzi przez filtr
+                // ksiegowania i ponowna proba poszlaby bez zadnej kontroli.
+                p.stan = 'blad';
+                p.status = 'wysłane, ale nie udało się otworzyć sprawy do sprawdzenia — „Sprawdź” pokaże, czy płatność jest';
                 return;
             }
             var pl = insPlatnosci(html);
@@ -26901,11 +27263,31 @@
 
         async function insKsieguj(){
             if (insBusy) return;
-            var doZrobienia = [];
+            // Wiersze zaznaczone, ale zmienione po sprawdzeniu (kwota, numer INS, konto) maja
+            // nieaktualna kontrole „juz zaksiegowane" — sprawdzamy je teraz, zanim cokolwiek
+            // pojdzie. Wiersz, ktory wyszedl z tego z uwagami, czeka: czlowiek ma je zobaczyc.
+            var zmienione = [];
+            INS_GRUPY.forEach(function (g){
+                if (!g.spina) return;
+                g.poz.forEach(function (p){ if (p.wybrany && p.stan === 'nowy') zmienione.push(p); });
+            });
+            if (zmienione.length){
+                await insSprawdzGrupy(INS_GRUPY.filter(function (g){
+                    return g.poz.some(function (p){ return zmienione.indexOf(p) >= 0; });
+                }));
+                if (insBusy) return;
+            }
+            var doZrobienia = [], czeka = 0, zBledem = 0;
             INS_GRUPY.forEach(function (g){
                 if (!g.spina) return;
                 g.poz.forEach(function (p){
                     if (!p.wybrany) return;
+                    // Tylko wiersze SPRAWDZONE: „nowy" to wiersz zmieniony po sprawdzeniu (kontrola
+                    // „juz zaksiegowane" i konto sa nieaktualne), „blad" — nieodczytany albo
+                    // niepotwierdzony zapis, „ok" — juz zaksiegowany.
+                    if (p.stan === 'blad'){ zBledem++; return; }
+                    if (p.stan !== 'gotowy' && p.stan !== 'uwaga') return;
+                    if (p.stan === 'uwaga' && zmienione.indexOf(p) >= 0){ czeka++; return; }
                     if (p.juzJest) return;
                     // Wiersz bez kursu jest zablokowany: przeliczenie „na oko" byloby
                     // ksiegowaniem kwoty, ktorej nikt nie policzyl.
@@ -26914,8 +27296,10 @@
                     doZrobienia.push({ g: g, p: p });
                 });
             });
+            var powod = (czeka ? (czeka + ' zmienionych wierszy po sprawdzeniu ma uwagi — przejrzyj je i kliknij jeszcze raz') : '');
+            if (zBledem) powod += (powod ? ' · ' : '') + zBledem + ' zaznaczonych wierszy ma błąd — „Sprawdź” sprawdzi je jeszcze raz';
             if (!doZrobienia.length){
-                insMow('Nie ma czego księgować: brakuje konta, daty albo suma się nie spina.', '#c00');
+                insMow('Nie ma czego księgować: ' + (powod || 'brakuje konta, daty albo suma się nie spina.'), '#c00');
                 return;
             }
             var ile = parseInt(panel.querySelector('#ins-workers').value, 10) || 5;
@@ -26929,11 +27313,14 @@
                 insMow('Księguję ' + zrobione + '/' + doZrobienia.length + '…');
                 insRysuj();
             });
+            // Wynik proby zapisu zostaje przy wierszu — kolejne „Sprawdź" go dopisze.
+            doZrobienia.forEach(function (x){ if (x.p.proba) x.p.statusProby = String(x.p.status || ''); });
             insRysuj();
             var ok = doZrobienia.filter(function (x){ return x.p.stan === 'ok'; }).length;
-            var zle = doZrobienia.filter(function (x){ return x.p.stan === 'blad'; }).length;
+            var zle = doZrobienia.filter(function (x){ return x.p.stan !== 'ok'; }).length;
             insMow('Zaksięgowane i potwierdzone: ' + ok + '/' + doZrobienia.length
-                 + (zle ? (' · do sprawdzenia ręcznie: ' + zle) : ''), zle ? '#c00' : '#0a7a2f');
+                 + (zle ? (' · do sprawdzenia ręcznie: ' + zle) : '')
+                 + (powod ? (' · pominięte: ' + powod) : ''), (zle || powod) ? '#c00' : '#0a7a2f');
             insBusy = false;
         }
 
@@ -26945,7 +27332,7 @@
             var pliki = Array.prototype.slice.call((e.target && e.target.files) || []);
             e.target.value = '';
             if (!pliki.length || insBusy) return;
-            var dodane = 0, bledy = [];
+            var dodane = 0, bledy = [], noweGr = [];
             for (var i = 0; i < pliki.length; i++){
                 st.textContent = 'Czytam ' + pliki[i].name + '…';
                 st.style.color = '#666';
@@ -26955,6 +27342,7 @@
                     if (!gr){ bledy.push(pliki[i].name + ': nie znalazłem pozycji INS'); continue; }
                     gr.kontr = gr.kontr || pliki[i].name;
                     INS_GRUPY.push(gr);
+                    noweGr.push(gr);
                     dodane += gr.poz.length;
                 } catch (err){
                     bledy.push(pliki[i].name + ': ' + String(err && err.message || err));
@@ -26964,17 +27352,91 @@
                            + (bledy.length ? bledy.join(' · ') : '');
             st.style.color = bledy.length ? '#c00' : '#0a7a2f';
             insRysuj();
-            if (dodane) insSprawdz();
+            // Tylko nowe listy — „Sprawdź" calosci przebudowaloby wklejke i skasowalo poprawki.
+            if (dodane) insSprawdzGrupy(noweGr);
         };
         panel.querySelector('#ins-run').onclick = function (){ insKsieguj(); };
         panel.querySelector('#ins-clear').onclick = function (){
             if (insBusy) return;
             INS_GRUPY = [];
+            insWklejkaTxt = null;
             panel.querySelector('#ins-input').value = '';
             panel.querySelector('#ins-parse').textContent = '';
             insRysuj();
             insMow('');
         };
+        // ---------- most z Bank Importu (UniCredit HU) ----------
+        // Wplaty INS z wyciagu HU przychodza jako gotowe grupy: data, bank, platnik, kwota
+        // i numery spraw z tytulu („INS71882" = insurance.php?id=71882). Nie przez pole
+        // tekstowe, bo przy kilku numerach w jednej wplacie kwoty przy numerach nie ma,
+        // a do podzialu po open amount potrzebna jest waluta wplaty. Most tylko DODAJE grupy
+        // i je SPRAWDZA (odczyt spraw) — ksiegujesz guzikiem, jak zawsze.
+        // Tylko w glownym oknie: modul montuje sie tez w ramkach (sam otwiera w nich sprawy),
+        // a egzemplarz w ramce przejalby wplaty do panelu, ktorego nikt nie widzi.
+        const INS_MOST_Z = 'bank_imp_do_ins', INS_MOST_O = 'bank_imp_do_ins_odp';
+        let insMostOst = '';
+        // Zlecenie jest ADRESOWANE do karty nadawcy: Bank Import i ten modul dzialaja w tym
+        // samym oknie, wiec widza ten sam identyfikator w sessionStorage. Inaczej pierwsza
+        // lepsza karta prologistics w tle zabieralaby wplaty do panelu, ktorego nikt nie widzi.
+        // Karta schowana (np. zduplikowana, z tym samym sessionStorage) tez nie przyjmuje.
+        // Identyfikator karty z sessionStorage + identyfikator DOKUMENTU (wspolny dla modulow
+        // skryptu w tym oknie) — dokladnie tak samo jak bkKartaDok w Bank Imporcie. Sam
+        // sessionStorage kopiuje sie przy „Duplikuj karte" i dwie widoczne kopie przyjmowaly
+        // to samo zlecenie (przeglad 29.09.2026).
+        function insKarta(){
+            try {
+                let k = sessionStorage.getItem('hub_karta');
+                if (!k){ k = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); sessionStorage.setItem('hub_karta', k); }
+                if (!window.__hubDok) window.__hubDok = Math.random().toString(36).slice(2, 10);
+                return k + ':' + window.__hubDok;
+            } catch (e){ return ''; }
+        }
+        if (window.top === window.self) setInterval(function (){
+            let z = null;
+            try { z = JSON.parse(GM_getValue(INS_MOST_Z, '') || 'null'); } catch (e){ z = null; }
+            if (!z || !z.id || z.id === insMostOst) return;
+            if (Date.now() - (z.kiedy || 0) > 180000) return;    // przeterminowanego nie ruszamy
+            if (!z.karta || z.karta !== insKarta() || document.visibilityState === 'hidden') return;
+            insMostOst = z.id;
+            try { GM_setValue(INS_MOST_Z, ''); } catch (e){}
+            try {
+                if (insBusy) throw new Error('moduł INS właśnie sprawdza albo księguje — spróbuj za chwilę');
+                const juz = {};
+                INS_GRUPY.forEach(function (g){ if (g.sid) juz[g.sid] = 1; });
+                const nowe = (z.grupy || [])
+                    .filter(function (x){ return x && x.sid && !juz[x.sid] && (x.ids || []).length && isFinite(Number(x.kwota)); })
+                    .map(function (x, i){
+                        const jeden = x.ids.length === 1;
+                        // Waluta wplaty takze przy kilku numerach: kwota wpisana potem recznie
+                        // (gdy podzialu nie ma) musi sie przeliczyc na walute sprawy.
+                        const poz = x.ids.map(function (id){
+                            const p = insPozycja(id, jeden ? Number(x.kwota) : null, String(x.waluta || ''));
+                            if (jeden) p.zWiersza = true;
+                            return p;
+                        });
+                        const g = insGrupa({ nr: INS_GRUPY.length + i + 1, zrodlo: 'bank', data: x.data || '', bank: x.bank || '',
+                                             kontr: String(x.kontr || '') + (x.tytul ? (' · ' + x.tytul) : ''),
+                                             kwota: Number(x.kwota), poz: poz });
+                        g.sid = x.sid;
+                        g.waluta = String(x.waluta || '').toUpperCase();
+                        return g;
+                    });
+                INS_GRUPY = INS_GRUPY.concat(nowe);
+                panel.style.display = 'block';
+                insRysuj();
+                GM_setValue(INS_MOST_O, JSON.stringify({ id: z.id, ok: true, n: nowe.length,
+                    pominiete: (z.grupy || []).length - nowe.length, kiedy: Date.now() }));
+                if (nowe.length){
+                    insMow('Z Bank Importu przyszło ' + nowe.length + ' wpłat INS — sprawdzam sprawy…', '#0a7a2f');
+                    insSprawdzGrupy(nowe);
+                }
+            } catch (e){
+                try {
+                    GM_setValue(INS_MOST_O, JSON.stringify({ id: z.id, ok: false,
+                        blad: String((e && e.message) || e), kiedy: Date.now() }));
+                } catch (e2){}
+            }
+        }, 500);
         // Wybory w tabeli lapiemy przez delegacje, bo tabela przerysowuje sie po kazdym
         // kroku workera — wiazanie po id zginaloby przy pierwszym odswiezeniu.
         panel.addEventListener('change', function (e){
@@ -26983,13 +27445,29 @@
             var gg = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
             if (gg && t.classList.contains('ins-gkwota')){
                 var nk = insKwota(t.value);
-                if (nk !== null){ gg.kwota = nk; gg.bezKontroli = false; insPrzelicz(gg); }
+                if (nk !== null){
+                    gg.kwota = nk;
+                    gg.bezKontroli = false;
+                    // Kwota wpisana reka jest brana za dobra monete: nie wiemy, w jakiej walucie
+                    // czlowiek ja podal, wiec kontrola rozjazdu walut musi zamilknac. Inaczej
+                    // poprawienie kwoty konczylo by sie blokada „nie porownuje dwoch walut".
+                    gg.walKwoty = '';
+                    gg.kwotaZrodlo = 'recznie';
+                    insPrzelicz(gg);
+                }
                 insRysuj();
                 return;
             }
             if (gg && t.classList.contains('ins-gdata')){
                 gg.data = t.value;
-                gg.poz.forEach(function (pp){ pp.data = t.value; });
+                // Data przelewu to data KURSU. Dotad zmiana daty tylko przerysowywala tabele,
+                // wiec po bledzie „zla data" poprawienie dnia nic nie dawalo, a kolejne
+                // „Sprawdz" meldowalo „Wszystko juz sprawdzone" (29.09.2026).
+                gg.poz.forEach(function (pp){
+                    if (pp.stan === 'ok') return;   // zaksiegowanego nie ruszamy
+                    pp.data = t.value;
+                    insDoPonownegoSprawdzenia(pp);
+                });
                 insRysuj();
                 return;
             }
@@ -26997,7 +27475,12 @@
             var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
             if (!p) return;
             if (t.classList.contains('ins-chk')){ p.wybrany = t.checked; return; }
-            if (t.classList.contains('ins-data')){ p.data = t.value; insRysuj(); return; }
+            if (t.classList.contains('ins-data')){
+                p.data = t.value;
+                if (p.stan !== 'ok') insDoPonownegoSprawdzenia(p);
+                insRysuj();
+                return;
+            }
             if (t.classList.contains('ins-id')){
                 var ni = String(t.value || '').replace(/\D+/g, '');
                 if (!ni || ni === p.id){ insRysuj(); return; }
@@ -27058,6 +27541,14 @@
             if (t.classList.contains('ins-konto')){
                 p.konto = t.value;
                 p.kontoZrodlo = 'wybrane ręcznie';
+                // „Juz zaksiegowane" liczylismy dla innego konta — platnosc na nowym mogla juz
+                // byc. Wiersz wraca do sprawdzenia (zrobi to „Zaksięguj", zanim cokolwiek wysle).
+                if (p.konto && p.kontoSpr && p.konto !== p.kontoSpr && !p.wyslane
+                    && (p.stan === 'gotowy' || p.stan === 'uwaga')){
+                    p.stan = 'nowy';
+                    p.juzJest = null;
+                    p.status = 'konto zmienione — sprawdzę jeszcze raz przed księgowaniem';
+                }
                 if (p.konto){
                     // Zapamietujemy tylko wtedy, gdy jest CO zapamietac. Przy zrodle bez
                     // nazwy banku (list spedytora, wklejone pary) kluczem bylby pusty
@@ -27092,11 +27583,22 @@
             if (!t || !t.classList) return;
             var kontoZm = t.classList.contains('ins-konto-zmien');
             var ktoZm = t.classList.contains('ins-kto-zmien');
-            if (!kontoZm && !ktoZm) return;
+            var znowu = t.classList.contains('ins-znowu');
+            if (!kontoZm && !ktoZm && !znowu) return;
             e.preventDefault();
             var g = INS_GRUPY[parseInt(t.getAttribute('data-g'), 10)];
             var p = g && g.poz[parseInt(t.getAttribute('data-p'), 10)];
             if (!p) return;
+            // Jeden wiersz, bez ruszania reszty. Potrzebne nie tylko po naszej poprawce:
+            // uwaga bywa z powodu, ktory zniknal W PROLOGISTICS (ktos dopisal komentarz,
+            // domknal open amount) — dotad taki wiersz nie mial drogi powrotnej.
+            if (znowu){
+                if (insBusy){ insMow('Chwila — moduł właśnie sprawdza albo księguje.', '#c47f00'); return; }
+                insDoPonownegoSprawdzenia(p);
+                insRysuj();
+                insSprawdzGrupy([g]);
+                return;
+            }
             if (kontoZm){ p.konto = ''; p.kontoZrodlo = ''; }
             else { p.kto = ''; p.ktoZrodlo = ''; }
             insRysuj();
@@ -53253,9 +53755,18 @@
         const total = snapTotal(S);
         const wiek = Math.floor((Date.now() - S.ts) / 86400000);
         const m = S.mark;
-        const zrobione = !!(m && m.done && m.dir === 'exported' && !(m.bad || []).length);
+        // Konto odznaczone recznie (a.skip) i jeszcze nieoznaczone trzyma pudelko
+        // otwarte — mozna je dooznaczyc pozniej, gdy okaze sie, ze jednak gra.
+        const czeka = (S.accs || []).filter(function (a){ return !a.bad && a.skip && !a.marked; });
+        const zrobione = !!(m && m.done && m.dir === 'exported' && !(m.bad || []).length && !czeka.length);
         const doCofniecia = (S.accs || []).some(function (a){ return (a.flipped || []).length; });
         const krotkie = (S.accs || []).filter(function (a){ return a.bad; });
+        // a.marked jest od 5.55 — starsze migawki go nie maja, wtedy licznik z S.mark.
+        const perKonto = (S.accs || []).some(function (a){ return a.marked; });
+        const oznN = perKonto ? S.accs.filter(function (a){ return a.marked; })
+                                     .reduce(function (n, a){ return n + a.vals.length; }, 0) : (m ? m.ok : 0);
+        const oznZ = perKonto ? S.accs.filter(function (a){ return !a.bad; })
+                                     .reduce(function (n, a){ return n + a.vals.length; }, 0) : (m ? m.need : 0);
 
         let h = '<div style="border:1px solid ' + (zrobione ? '#86efac' : '#99f6e4') + ';border-radius:8px;'
               + 'background:' + (zrobione ? '#f0fdf4' : '#f0fdfa') + ';padding:8px">'
@@ -53269,12 +53780,36 @@
               + '</div>';
 
         if (zrobione){
-            h += '<div style="font-weight:700;color:#0a7a2f">✔ oznaczone ' + m.ok + ' z ' + m.need + '</div>';
+            h += '<div style="font-weight:700;color:#0a7a2f">✔ oznaczone ' + oznN + ' z ' + oznZ + '</div>';
         } else {
             h += '<button id="exp-mark" style="padding:8px 14px;border:none;border-radius:8px;background:#0f766e;'
                + 'color:#fff;font:bold 12px Arial,sans-serif;cursor:pointer">✔ Oznacz jako wyeksportowane</button>';
         }
         h += '</div>';
+
+        // Lista kont z ptaszkami: gdy po pobraniu okaze sie, ze jedno konto ma blad,
+        // odznacza sie je i oznacza tylko reszte. Wybor zyje w migawce, nie w DOM-ie,
+        // wiec przetrwa przerysowanie i powrot nastepnego dnia.
+        if (!zrobione && S.accs.length > 1){
+            h += '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11px">';
+            S.accs.forEach(function (a, i){
+                const n = a.vals.length;
+                const ile = ' <span style="color:#888">(' + n + ')</span>';
+                if (a.bad)
+                    h += '<label style="color:#c00" title="' + esc(a.bad) + '"><input type="checkbox" disabled> '
+                       + esc(a.label) + ile + ' — plik krótszy</label>';
+                else if (a.marked)
+                    h += '<span style="color:#0a7a2f">✔ ' + esc(a.label) + ile + ' — oznaczone</span>';
+                else
+                    h += '<label style="cursor:pointer' + (a.skip ? ';color:#999;text-decoration:line-through' : '') + '">'
+                       + '<input type="checkbox" class="exp-mk" data-i="' + i + '"' + (a.skip ? '' : ' checked') + '> '
+                       + esc(a.label) + ile + '</label>';
+            });
+            h += '</div>';
+            if (czeka.length)
+                h += '<div style="margin-top:4px;font-size:11px;color:#c47f00">Odznaczone — zostaną NIE oznaczone: '
+                   + esc(czeka.map(function (a){ return a.label; }).join(', ')) + '</div>';
+        }
 
         // Ostrzezenia — kazde mowi wprost, co z tym zrobic.
         if (krotkie.length)
@@ -53304,6 +53839,22 @@
 
         const bm = $('#exp-mark');   if (bm) bm.onclick = function (){ expDoMark(false, this); };
         const bu = $('#exp-unmark'); if (bu) bu.onclick = function (){ expDoMark(true,  this); };
+        box.querySelectorAll('.exp-mk').forEach(function (c){
+            c.onchange = function (){
+                if (running){ this.checked = !this.checked; return; }
+                // Zapis z dysku, nie z pamieci — druga karta mogla zrobic nowy eksport.
+                const d = snapLoad();
+                if (!d || d.ts !== S.ts){
+                    EXP_SNAP = d; markRender();
+                    say('W innej karcie zrobiono nowy eksport — odświeżyłem opis. Wybierz konta jeszcze raz.', '#c47f00');
+                    return;
+                }
+                const a = d.accs[+this.dataset.i];
+                if (a) a.skip = !this.checked;
+                snapSave(d);
+                markRender();
+            };
+        });
     }
 
     function render(){
@@ -53602,10 +54153,17 @@
             }
         } else {
             const skipped = S.accs.filter(function (a){ return a.bad; });
-            plan = S.accs.filter(function (a){ return !a.bad; })
+            plan = S.accs.filter(function (a){ return !a.bad && !a.skip && !a.marked; })
                          .map(function (a){ return { a: a, vals: a.vals.slice() }; });
             if (!plan.length){
-                say('Żadnego konta nie wolno oznaczyć: ' + skipped.map(function (a){ return a.label + ' — ' + a.bad; }).join('; '), '#c00');
+                const reczne = S.accs.filter(function (a){ return !a.bad && a.skip && !a.marked; });
+                if (reczne.length)
+                    say('Wszystkie pozostałe konta są odznaczone (' + reczne.map(function (a){ return a.label; }).join(', ')
+                        + ') — zaznacz te, które mają zostać oznaczone.', '#c47f00');
+                else if (skipped.length && !S.accs.some(function (a){ return a.marked; }))
+                    say('Żadnego konta nie wolno oznaczyć: ' + skipped.map(function (a){ return a.label + ' — ' + a.bad; }).join('; '), '#c00');
+                else
+                    say('Nie ma czego oznaczać — wybrane konta są już oznaczone.', '#c47f00');
                 return;
             }
             if (skipped.length)
@@ -53629,6 +54187,8 @@
         plan.forEach(function (x){ x.vals.forEach(function (v){ if (expWeak(v)) weak.push(v); }); });
 
         const total = plan.reduce(function (n, x){ return n + x.vals.length; }, 0);
+        const pomijane = S.accs.filter(function (a){ return !a.bad && a.skip && !a.marked; })
+                               .map(function (a){ return a.label; });
         const czas = expWhen(S.ts);
         if (!confirm((undo ? 'Cofnąć oznaczenie ' : 'Oznaczyć jako wyeksportowane ')
                    + total + ' ' + plural(total, 'wiersz', 'wiersze', 'wierszy') + '?\n\n'
@@ -53638,6 +54198,7 @@
                    + 'Profil: ' + S.profName + '\n'
                    + (weak.length ? ('\n' + weak.length + ' ' + plural(weak.length, 'wiersz nie ma', 'wiersze nie mają', 'wierszy nie ma')
                                      + ' numeru płatności — te dopasuję po całej treści wiersza.\n') : '')
+                   + (!undo && pomijane.length ? ('\nOdznaczone, NIE oznaczę: ' + pomijane.join(', ') + '\n') : '')
                    + '\n'
                    + (undo ? 'Cofnę wyłącznie te wiersze, które ten panel wcześniej oznaczył.'
                            : 'To zmienia stan w prologistics. Rób to dopiero wtedy,\n'
@@ -53691,6 +54252,7 @@
                 if (!todo.length){
                     lines.push(head + '<span style="color:#0a7a2f">wszystkie ' + x.vals.length
                              + ' już ' + (undo ? 'nieoznaczone' : 'oznaczone') + ' — nic nie wysyłałem</span></div>');
+                    a.marked = !undo;
                     okAll += x.vals.length;
                     draw(''); continue;
                 }
@@ -53725,8 +54287,13 @@
                     if ((AFTER.get(k) || 0) >= (NEED.get(k) || 0)) good.push(v); else bad.push(v);
                 });
                 // Cofac wolno tylko to, co to klikniecie naprawde przestawilo.
-                if (!undo) a.flipped = good.slice();
+                // Przy oznaczaniu dopisujemy do tego, co juz bylo przestawione: po
+                // dooznaczeniu odznaczonego konta wczesniejsze wiersze wracaja jako
+                // „juz oznaczone" i nie wolno im odebrac prawa do cofniecia.
+                if (!undo) a.flipped = (a.flipped || []).concat(good.filter(function (v){
+                    return (a.flipped || []).indexOf(v) < 0; }));
                 else a.flipped = (a.flipped || []).filter(function (v){ return bad.indexOf(v) >= 0; });
+                a.marked = !undo && !bad.length;
                 okAll += good.length + already;
                 if (bad.length){
                     badAll.push({ label: a.label, kind: 'nieudane', n: bad.length,
@@ -68117,9 +68684,13 @@
     // Ile groszy roznicy w „open amount" wolno wyrownac. Zaokraglenia rzedu 0.01–0.04 to
     // normalny szum; wieksza roznica to juz realny rozjazd i zostaje CHECK-iem.
     var BK_TOL_KEY = 'bank_imp_tolerancja';
-    function tolGet(){
-        var v = Number(gmGet(BK_TOL_KEY, 0.05));
-        return (isFinite(v) && v >= 0) ? v : 0.05;
+    // Prog jest per format. Przy UniCredit HU domyslnie 0 — kwota ma sie zgadzac (decyzja
+    // 29.09.2026), a na subkonto idzie tylko to, na co czlowiek sam podniesie prog.
+    function tolGet(F){
+        var klucz = (F && F.tolKlucz) || BK_TOL_KEY;
+        var dom = (F && F.tolerancja != null) ? F.tolerancja : 0.05;
+        var v = Number(gmGet(klucz, dom));
+        return (isFinite(v) && v >= 0) ? v : dom;
     }
     // = przycisk „Book on sub-account". Resztki ZAWSZE bez przypisania (decyzja 14.09.2026).
     var BK_BLOCK_SUB = 'booking_sub_without_assign';
@@ -68135,6 +68706,16 @@
     //   booking_alt_without_assign  Book on alternative account
     var BK_BLOCK   = 'booking';
     var BK_BLOCK_OPIS = 'Book & Assign on main account';
+    // Import pobran przewoznika (UniCredit HU: GLS, Futar, HDT) — „Book on main account", BEZ
+    // przypisania. Decyzja uzytkownika 29.09.2026: pobranie to zaplata za towar JUZ WYSLANY,
+    // a assign sluzy do wysylki — potrzebny tylko przy wplatach klientow (paczka wyciagu,
+    // EuPago, PostFinance zostaja na BK_BLOCK).
+    var BK_BLOCK_COD      = 'booking_without_assign';
+    var BK_BLOCK_COD_OPIS = 'Book on main account';
+    function bkBlokKs(Z){
+        return (Z && Z.typ === 'cod') ? { blok: BK_BLOCK_COD, opis: BK_BLOCK_COD_OPIS }
+                                      : { blok: BK_BLOCK, opis: BK_BLOCK_OPIS };
+    }
 
     function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
     function f2(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2); }
@@ -68203,6 +68784,8 @@
         kolData: 9,
         konto: '1232',                 // EUPAGO PT Beliani DE — konto ksiegowania na auftragu
         waluta: 'EUR',                 // do szukania po otwartej kwocie
+        eupago: true,                  // szukanie po numerze transakcji i tabelce eupago w auftragu
+        odbicie: 'CSPTFinance',        // skasowany auftrag: komentarz z saldem idzie na CS PT Finance
         szukaj: /eupago|eu\s*pago/i    // po tym podpowiadamy ustawienie importu
     }, {
         id: 'postfinance',
@@ -68221,6 +68804,32 @@
         konto: '',                     // konto w planie kont — wpisz w ustawieniach
         waluta: 'CHF',
         szukaj: /post\s*finance/i
+    }, {
+        id: 'unicredithu',
+        nazwa: 'UniCredit HU',
+        opis: 'Wyciąg z UniCredit HU — CSV prosto z banku (Windows-1250). Do importu idzie bez przeróbki; '
+            + 'HUB wyjmuje z niego tylko wiersze z minusem i wpłaty INS, a wpłaty przewoźników zostawia '
+            + 'i pod każdą daje miejsce na plik z maila',
+        // Przeplyw wegierski (decyzje uzytkownika z 29.09.2026):
+        //  - plik idzie do importu bajt w bajt taki, jaki wyszedl z banku, bez nadpisywania daty,
+        //    ale BEZ wierszy z minusem (zwroty do klientow, platnosci do dostawcow, oplaty)
+        //    i bez wplat INS (te ksieguje modul „Ksiegowanie INS" albo ida do listy w docs);
+        //  - wplaty pobran (GLS, Futar, HDT) ZOSTAJA w pliku — pod kazda HUB daje miejsce na
+        //    plik z maila przewoznika i robi z niego osobny import pobran;
+        //  - paczke wyciagu ksiegujemy „Book & Assign on main account" (BK_BLOCK), importy
+        //    pobran „Book on main account" bez przypisania (BK_BLOCK_COD, decyzja 29.09.2026).
+        hu: true,
+        surowy: true,
+        kodowanie: 'windows-1250',     // UniCredit nie eksportuje w UTF-8; 1252 zepsulby ő/ű
+        minKol: 0, kwoty: [], daty: [],
+        konto: '1216',                 // Unicredit Beliani DE HUF — ksiegowanie wprost na auftragu
+        waluta: 'HUF',
+        odbicie: 'CSHUFinance',        // skasowany auftrag: komentarz z saldem idzie na CS HU Finance
+        tolerancja: 0, tolKlucz: 'bank_imp_tolerancja_hu',
+        // CHECK z roznica do tylu HUF HUB od razu przestawia na OK (decyzja 30.09.2026).
+        autoOkDo: 5,
+        sufiks: 'HUF',                 // „29.09.2026 14.05 HUF.csv" — jak dotad w imporcie
+        szukaj: /unicredit\s*hu\b/i    // samo /unicredit/ trafia tez w HVB UniCredit i UNICREDIT RON
     }];
     function fmt(id){ return BK_FORMATY.filter(function (x){ return x.id === id; })[0] || BK_FORMATY[0]; }
 
@@ -68228,8 +68837,19 @@
     // Stara aplikacja czyta CSV przez pandas z encoding='utf-8-sig' — czyli UTF-8
     // ze zdjetym BOM-em. Robimy to samo; gdyby plik przyszedl w innym kodowaniu,
     // mowimy o tym wprost zamiast po cichu wstawiac znaki zastepcze.
-    function bkDekoduj(buf){
+    // Format z wlasnym kodowaniem (UniCredit HU: Windows-1250) dekodujemy tym kodowaniem \u2014
+    // jednobajtowym, wiec znakow zastepczych nie bedzie nigdy i kontrola UTF-8 go nie dotyczy.
+    function bkDekoduj(buf, F){
+        if (F && F.kodowanie) return new TextDecoder(F.kodowanie).decode(buf);
         return new TextDecoder('utf-8').decode(buf).replace(/^\ufeff/, '');
+    }
+    // Czy bajty sa POPRAWNYM UTF-8 i maja cokolwiek poza ASCII. Plik UniCredit w UTF-8 znaczy,
+    // ze ktos go przepuscil przez inny program \u2014 Windows-1250 po cichu zrobilby z \u0151 krzaczki.
+    function bkToUtf8(buf){
+        var b = new Uint8Array(buf), nie = false;
+        for (var i = 0; i < b.length; i++) if (b[i] > 0x7f){ nie = true; break; }
+        if (!nie) return false;
+        try { new TextDecoder('utf-8', { fatal: true }).decode(b); return true; } catch (e){ return false; }
     }
     // Sredniki wewnatrz pol w cudzyslowach sa normalne (surowy plik z eupago ma
     // KAZDE pole w cudzyslowie), wiec parsujemy znak po znaku, nie splitem.
@@ -68262,6 +68882,19 @@
                 try {
                     var buf = rd.result;
                     S.buf = buf;          // oryginalne bajty — formaty „surowe" wysylaja wlasnie je
+                    var F = fmt(S.format);
+                    if (F.kodowanie){
+                        if (/\.xlsx?$/i.test(file.name)){
+                            zle(new Error('dla formatu ' + F.nazwa + ' wgraj CSV prosto z banku, nie arkusz')); return;
+                        }
+                        if (bkToUtf8(buf)){
+                            zle(new Error('plik jest w UTF-8, a ' + F.nazwa + ' eksportuje w ' + F.kodowanie
+                                        + ' — to nie jest plik prosto z banku (przeszedł przez inny program?)'));
+                            return;
+                        }
+                        ok(bkCsvRows(bkDekoduj(buf, F)));
+                        return;
+                    }
                     if (/\.xlsx?$/i.test(file.name)){
                         if (typeof XLSX === 'undefined'){ zle(new Error('brak biblioteki XLSX — odśwież stronę')); return; }
                         var wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
@@ -68319,6 +68952,8 @@
     function bkBlob(rows){
         // Format „surowy": wysylamy ORYGINALNE bajty pliku. Sklejenie CSV od nowa
         // zgubiloby blok naglowkowy i stopke, a import PostFinance ich oczekuje.
+        // UniCredit HU: te same bajty, tylko bez wyjetych linii (huWytnij).
+        if (fmt(S.format).hu) return new Blob([S.huBajty], { type: 'text/csv' });
         if (fmt(S.format).surowy && S.buf) return new Blob([S.buf], { type: 'text/csv' });
         return new Blob(['\ufeff' + bkCsvText(rows)], { type: 'text/csv;charset=utf-8' });
     }
@@ -68326,7 +68961,152 @@
     function bkNazwa(F){
         var d = new Date();
         return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear()
-             + ' ' + pad2(d.getHours()) + '.' + pad2(d.getMinutes()) + ' ' + F.id + '.csv';
+             + ' ' + pad2(d.getHours()) + '.' + pad2(d.getMinutes()) + ' ' + (F.sufiks || F.id) + '.csv';
+    }
+
+    // ---------- UniCredit HU: wyciag ----------
+    // Uklad sprawdzony na 218 plikach (06.2024–09.2026): jeden naglowek, 9 pol w cudzyslowach,
+    // data RRRRMMDD, kwota „        155831,00", Spectra unique ID = staly numer transakcji
+    // (ta sama transakcja w porannym i popoludniowym wyciagu ma ten sam numer).
+    var BK_HU_NAGL = ['Account Number', 'Currency', 'Value date', 'Order type', 'Partner',
+                      'Account number of partner', 'Amount', 'Details', 'Spectra unique ID'];
+    var BK_HU_BANK = 'Unicredit HUF';          // nazwa banku w liscie INS w docs i w module INS
+    var BK_HU_WYSLANE = 'bank_imp_hu_wyslane'; // Spectra ID -> data waluty; wylacznie do ostrzezenia
+    // Porownania robimy na tekscie BEZ SPACJI: bank tnie tytul na kawalki (GLS po 35 znakow,
+    // HDT od 07.2026 po 32 — „elle nértéke"), wiec sklejanie po dlugosci bloku tu nie dziala.
+    function huNorm(t){ return String(t == null ? '' : t).toUpperCase().replace(/\s+/g, ''); }
+    function huKwota(t){
+        var s = String(t == null ? '' : t).replace(/\s+/g, '');
+        if (!/^-?\d+(,\d+)?$/.test(s)) return null;
+        return Number(s.replace(',', '.'));
+    }
+    function huData(t){
+        var m = String(t == null ? '' : t).trim().match(/^(\d{4})(\d{2})(\d{2})$/);
+        return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
+    }
+    function huDataPl(iso){
+        var m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1]) : '';
+    }
+    function huTys(n){ return (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
+    // Przewoznicy z pobraniami. Regula sprawdzona na 5020 transakcjach: 324 trafienia (GLS 195,
+    // Futar 36, HDT 93), 0 falszywych. „GELOGISZTIKA", a nie samo „LOGISZT", bo to drugie lapie
+    // klienta LOG-INFORM LOGISZTIKAI. GLS ma dwa ksztalty tytulu („See payment advi…" przy wielu
+    // paczkach i „No.<nr>/…" przy 1–3) — wspolny jest tylko znacznik COD-RRRR.MM.DD.
+    var BK_PRZEW = {
+        gls:   { id: 'gls',   nazwa: 'GLS',   ust: 'cod_gls',   konto: '1086', bankNazwa: 'COD GLS HUF', szukaj: /cod\s*gls\s*huf/i },
+        futar: { id: 'futar', nazwa: 'Futár', ust: 'cod_futar', konto: '1085', bankNazwa: 'COD FUTAR',   szukaj: /cod\s*futar/i },
+        hdt:   { id: 'hdt',   nazwa: 'HDT',   ust: 'cod_hdt',   konto: '1372', bankNazwa: 'COD HDT HUF', szukaj: /cod\s*hdt/i }
+    };
+    function przewPoUst(id){
+        var k = Object.keys(BK_PRZEW).filter(function (x){ return BK_PRZEW[x].ust === id; })[0];
+        return k ? BK_PRZEW[k] : null;
+    }
+    function huPrzewoznik(w){
+        if (!(w.kwota > 0)) return '';
+        var N = huNorm(w.partner), D = huNorm(w.opis);
+        if (N.indexOf('GLS') >= 0 && /COD-\d{4}\.\d{2}\.\d{2}/.test(D)) return 'gls';
+        if (N.indexOf('FUTAR') >= 0 && /^\d{9,10}$/.test(D)) return 'futar';
+        if (N.indexOf('GELOGISZTIKA') >= 0 && D.indexOf('HDTUTÁNVÉT') >= 0) return 'hdt';
+        return '';
+    }
+    // Odszkodowania od tych samych przewoznikow. „INS71882" w tytule to numer sprawy
+    // (insurance.php?id=71882) — takie wplaty ksieguje modul „Ksiegowanie INS". GLS placi szkody
+    // z innego konta, z tytulem „No.4559/2026/23." — numeru sprawy tam nie ma, wiec wiersz idzie
+    // na liste INS w docs, gdzie ktos wskazuje sprawe (decyzje z 29.09.2026).
+    function huIns(w){
+        if (!(w.kwota > 0)) return null;
+        var N = huNorm(w.partner);
+        if (N.indexOf('GLS') < 0 && N.indexOf('FUTAR') < 0 && N.indexOf('GELOGISZTIKA') < 0) return null;
+        var ids = [], re = /\bINS[\s:.\-]*(\d{3,7})\b/gi, m;
+        while ((m = re.exec(w.opis)) !== null) if (ids.indexOf(m[1]) < 0) ids.push(m[1]);
+        if (ids.length) return { rodzaj: 'ins', ids: ids };
+        if (N.indexOf('GLS') >= 0 && /No\.\s*\d+\/\d{4}\/\d+/i.test(w.opis)) return { rodzaj: 'docs', ids: [] };
+        return null;
+    }
+    // Wiersze z minusem nie ida do importu (decyzja 29.09.2026) — sa tylko do podgladu.
+    var BK_HU_GRUPY = { klient: 'Zwroty do klientów', dostawca: 'Płatności do dostawców',
+                        bank: 'Opłaty bankowe i przelewy do Beliani International' };
+    function huGrupaMinus(w){
+        var N = huNorm(w.partner);
+        if (/^\+IZV/.test(N)) return 'klient';
+        if (!w.typ || /DEVIZA|KÖLTSÉGELSZÁMOLÁS/.test(huNorm(w.typ)) || N.indexOf('BELIANI') >= 0) return 'bank';
+        if (/TICKET|AUFTRAG/.test(huNorm(w.opis)) || /^#?\d{7,8}$/.test(huNorm(w.opis))) return 'klient';
+        return 'dostawca';
+    }
+    // Rozbior wyciagu. Kazdy wiersz, ktorego nie rozumiemy, blokuje wysylke: plik idzie do
+    // importu prawie bez zmian, ale o tym, co z niego wyjmujemy, decyduje wlasnie ten rozbior.
+    function huAnaliza(aoa){
+        var hdr = (aoa[0] || []).map(function (c){ return String(c == null ? '' : c).trim(); });
+        if (hdr.join('|') !== BK_HU_NAGL.join('|'))
+            return { err: 'To nie wygląda na wyciąg UniCredit HU — nagłówek jest inny niż „'
+                        + BK_HU_NAGL.join(';') + '".' };
+        var out = { wiersze: [], bledy: [], konto: '', przew: [], ins: [], docs: [], minus: [], izv: 0, znane: 0 };
+        var znane = jGet(BK_HU_WYSLANE), byly = {};
+        for (var i = 1; i < aoa.length; i++){
+            var r = aoa[i] || [];
+            if (r.length !== 9){ out.bledy.push('wiersz ' + (i + 1) + ' ma ' + r.length + ' pól zamiast 9'); continue; }
+            var w = { data: huData(r[2]), typ: String(r[3]).trim(), waluta: String(r[1]).trim(),
+                      partner: String(r[4]).replace(/\s+/g, ' ').trim(), kontoP: String(r[5]).trim(),
+                      kwota: huKwota(r[6]), opis: String(r[7]).replace(/\s+/g, ' ').trim(), sid: String(r[8]).trim() };
+            if (!w.data || w.kwota === null || !/^\d{20}$/.test(w.sid)){
+                out.bledy.push('wiersz ' + (i + 1) + ': nie odczytałem daty, kwoty albo numeru transakcji'); continue;
+            }
+            if (byly[w.sid]){ out.bledy.push('wiersz ' + (i + 1) + ': numer transakcji ' + w.sid + ' drugi raz w pliku'); continue; }
+            byly[w.sid] = 1;
+            if (w.waluta !== 'HUF'){ out.bledy.push('wiersz ' + (i + 1) + ': waluta ' + w.waluta + ' zamiast HUF'); continue; }
+            var kt = String(r[0]).trim();
+            if (!out.konto) out.konto = kt;
+            else if (kt !== out.konto){ out.bledy.push('wiersz ' + (i + 1) + ': inne konto (' + kt + ')'); continue; }
+            // Ksztalt okrojony: bank tak eksportuje przelewy krajowe starsze niz ok. 120 dni —
+            // bez tytulu, konta i z nazwa sklejona z numerem. Import nie dopasuje po nim niczego.
+            if (/^\+IZV\s/.test(w.partner)) out.izv++;
+            if (znane[w.sid]) out.znane++;
+            out.wiersze.push(w);
+            var p = huPrzewoznik(w);
+            if (p){ w.przew = p; out.przew.push(w); continue; }
+            var ins = huIns(w);
+            if (ins){ w.ins = ins.ids; (ins.rodzaj === 'ins' ? out.ins : out.docs).push(w); continue; }
+            if (w.kwota < 0){ w.grupa = huGrupaMinus(w); out.minus.push(w); }
+        }
+        if (!out.wiersze.length && !out.bledy.length) out.bledy.push('w pliku nie ma ani jednej transakcji');
+        return out;
+    }
+    // Plik do importu: te same bajty co z banku, bez linii wskazanych numerem transakcji.
+    // Windows-1250 jest jednobajtowy, wiec linia tekstu to dokladnie linia bajtow — niczego
+    // nie przekodowujemy i nic poza wyjetymi liniami sie nie zmienia (kolejnosc, cudzyslowy, LF).
+    function huWytnij(buf, doWyjecia){
+        var b = new Uint8Array(buf), czesci = [], start = 0, linia = 0, wyjete = 0, dl = 0;
+        var dec = new TextDecoder('windows-1250');
+        for (var k = 0; k <= b.length; k++){
+            if (k < b.length && b[k] !== 10) continue;
+            var koniec = (k === b.length) ? k : k + 1;
+            if (koniec > start){
+                var m = linia > 0 ? dec.decode(b.subarray(start, k)).match(/"(\d{20})"\s*$/) : null;
+                if (m && doWyjecia[m[1]]) wyjete++;
+                else { czesci.push(b.subarray(start, koniec)); dl += koniec - start; }
+            }
+            start = koniec; linia++;
+        }
+        var out = new Uint8Array(dl), o = 0;
+        czesci.forEach(function (c){ out.set(c, o); o += c.length; });
+        return { bajty: out, wyjete: wyjete };
+    }
+    // Wiersze do wklejenia na liste INS w docs: data, bank, platnik, tytul, kwota — w tej
+    // kolejnosci, oddzielone tabulatorem. „booked" i link dopisuja ludzie, wiec ich nie ma:
+    // wklejka nie nadpisze tego, co ktos juz wpisal obok.
+    function huDocsTekst(lista){
+        return (lista || []).map(function (w){
+            return [huDataPl(w.data), BK_HU_BANK, w.partner, w.opis, Number(w.kwota).toFixed(2)].join('\t');
+        }).join('\n');
+    }
+    // Numery transakcji wyslanych juz do importu. Tylko do ostrzezenia — prologistics sam
+    // drugi raz tej samej platnosci nie zaimportuje (decyzja 29.09.2026: ostrzegac, nie wycinac).
+    function huZapamietaj(wiersze){
+        var m = jGet(BK_HU_WYSLANE), gr = new Date(Date.now() - 150 * 86400000).toISOString().slice(0, 10);
+        Object.keys(m).forEach(function (k){ if (String(m[k]) < gr) delete m[k]; });
+        (wiersze || []).forEach(function (w){ m[w.sid] = w.data; });
+        jSet(BK_HU_WYSLANE, m);
     }
 
     // Data platnosci per numer transakcji, prosto z przerobionego pliku. Zapisujemy ja
@@ -68391,8 +69171,10 @@
     function ustaw(id){
         var o = jGet(BK_SET_KEY), v = o[id] || { bank: '', bankNm: '', booking: '', bookingNm: '' };
         // Konto ksiegowania na auftragu. Dla eupago znane z gory, dla pozostalych do
-        // wpisania — zgadywanie numeru konta to zle zaksiegowana wplata.
-        if (!v.konto) v.konto = fmt(id).konto || '';
+        // wpisania — zgadywanie numeru konta to zle zaksiegowana wplata. Importy pobran
+        // („cod_gls" i reszta) nie sa formatami: ich konta potwierdzil uzytkownik 29.09.2026.
+        var P = przewPoUst(id);
+        if (!v.konto) v.konto = P ? P.konto : (fmt(id).konto || '');
         return v;
     }
     function ustawZapisz(id, v){
@@ -68442,14 +69224,19 @@
     }
 
     // ---------- paczka importu ----------
-    async function bkWyslij(blob, nazwa, cfg){
+    // „opcje.data" (RRRR-MM-DD) nadpisuje date calej paczki — tylko przy imporcie pobran, gdzie
+    // jedna wplata przewoznika to jeden dzien (decyzja 29.09.2026: data wplywu z wyciagu).
+    // „opcje.bezZapasu": nie bierz „najnowszej paczki tego banku", gdy nazwa nie trafi.
+    async function bkWyslij(blob, nazwa, cfg, opcje){
+        opcje = opcje || {};
         var fd = new FormData();
         fd.append('imgs[]', blob, nazwa);
         // date_overwrite_to zostaje PUSTE: kazdy wiersz eupago ma wlasna date platnosci
         // (kolumna J), wiec jedna data nadpisalaby cala paczke na jeden dzien — dokladnie
-        // ten sam powod, dla ktorego pole zostaje puste przy Allegro.
+        // ten sam powod, dla ktorego pole zostaje puste przy Allegro. Wyciag UniCredit HU
+        // tez niesie date w kazdym wierszu, wiec i tam pole zostaje puste.
         fd.append('data', JSON.stringify({
-            booking_setting: cfg.booking, date_overwrite_to: '',
+            booking_setting: cfg.booking, date_overwrite_to: opcje.data || '',
             bank_setting: cfg.bank, import_type: 'manual'
         }));
         var r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
@@ -68461,10 +69248,10 @@
         var mu = String(r.url || '').match(/import_payments\/(\d+)/);
         if (mu) imp = mu[1];
         if (!imp){ var mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
-        if (!imp){ try { imp = await bkZnajdz(nazwa, cfg.bank); } catch (e){} }
+        if (!imp){ try { imp = await bkZnajdz(nazwa, cfg.bank, opcje.bezZapasu); } catch (e){} }
         return imp;
     }
-    async function bkZnajdz(nazwa, bank){
+    async function bkZnajdz(nazwa, bank, bezZapasu){
         var r = await fetch('/api/importPayments/index/?', { credentials: 'same-origin',
             headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
         if (!r.ok) return '';
@@ -68473,6 +69260,9 @@
             .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
         var hit = list.filter(function (x){ return nazwa && String(x.filename || '').indexOf(nazwa) >= 0; });
         if (hit.length) return String(hit[0].file_id || '');
+        // Zapas „najnowsza paczka tego banku" przy dwoch paczkach jednego dnia (dwie wplaty GLS)
+        // przypinalby cudza paczke — dlatego import pobran i wyciag HU go nie uzywaja.
+        if (bezZapasu) return '';
         var alt = list.filter(function (x){ return bank && String(x.bank_id || '') === String(bank); });
         return alt.length ? String(alt[0].file_id || '') : '';
     }
@@ -68481,10 +69271,12 @@
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy odczycie paczki ' + id);
         var j = await r.json();
-        return { rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
+        // id: z KTOREJ paczki sa te wiersze — widok odrzuca odczyt, ktory nie nalezy do
+        // zlecenia, pod ktore mialby sie narysowac (spozniona odpowiedz po zmianie paczki).
+        return { id: String(id), rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
     }
-    async function bkKsieguj(id, ids){
-        var body = 'file_id=' + encodeURIComponent(id) + '&block=' + BK_BLOCK
+    async function bkKsieguj(id, ids, blok){
+        var body = 'file_id=' + encodeURIComponent(id) + '&block=' + (blok || BK_BLOCK)
                  + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
         var r = await fetch('/api/importPayments/save/', {
             method: 'POST', credentials: 'same-origin',
@@ -68535,15 +69327,17 @@
     // „recznieOk" (ktory wiersz przestawil czlowiek) i „zaksAuf" (ktora wplata poszla
     // wprost na auftrag). Ulotna pamiec BK_NF ginie po F5 — a wlasnie po F5 najlatwiej
     // zaksiegowac te same pieniadze drugi raz.
-    function jobMapa(pole){
-        var o = job() || {}, m = o[pole];
+    // „Z" to zlecenie: paczka wyciagu (zGlowne) albo paczka pobran przewoznika (zCod) —
+    // kazde ze swoja pamiecia, zeby jedna paczka nie nadpisala drugiej.
+    function zMapa(Z, pole){
+        var o = Z.get() || {}, m = o[pole];
         return (m && typeof m === 'object') ? m : {};
     }
-    function jobMapaZapisz(pole, klucz, wpis){
-        var o = job(); if (!o) return;
+    function zMapaZapisz(Z, pole, klucz, wpis){
+        var o = Z.get(); if (!o) return;
         var m = (o[pole] && typeof o[pole] === 'object') ? o[pole] : {};
         if (wpis) m[String(klucz)] = wpis; else delete m[String(klucz)];
-        o[pole] = m; jobZapisz(o);
+        o[pole] = m; Z.set(o);
     }
     // Numer auftragu z tresci wiersza. Tylko postaci JEDNOZNACZNE — sama osmiocyfrowka
     // w wyciagu bywa numerem referencyjnym banku, a nie zamowienia. To podpowiedz do
@@ -69149,8 +69943,10 @@
         var da = Date.UTC(+pa[0], +pa[1] - 1, +pa[2]), db = Date.UTC(+pb[0], +pb[1] - 1, +pb[2]);
         return Math.round((da - db) / 86400000);
     }
-    // ---------- skasowany auftrag: slad dla CS PT Finance ----------
-    // eupago obsluguje wylacznie rynek portugalski, wiec odbiorca jest zawsze ten sam.
+    // ---------- skasowany auftrag: slad dla CS Finance danego rynku ----------
+    // eupago obsluguje wylacznie rynek portugalski, wiec przy nim odbiorca jest zawsze ten sam.
+    // Odbiorca stoi w formacie („odbicie"): EuPago -> CSPTFinance, UniCredit HU -> CSHUFinance
+    // (decyzja 29.09.2026). BK_CS zostaje domyslnym, gdyby format go nie podal.
     var BK_CS = 'CSPTFinance';
     // obj_id to WEWNETRZNY identyfikator obiektu, nie numer auftragu (11754877 przy
     // auftragu 15631632). Strona czyta go z data-obj-id tabeli komentarzy.
@@ -69176,12 +69972,12 @@
         return ost;
     }
     // Jedno zapytanie dopisuje komentarz I przestawia odpowiedzialnego.
-    async function bkOdbij(tekst, objId){
+    async function bkOdbij(tekst, objId, kto){
         // Spacje jako „+", a nie „%20" — tak koduje je przegladarka w ciele formularza
         // i tak wygladalo zapytanie podejrzane na stronie. PHP zrozumie oba, ale nie ma
         // powodu wysylac czegos innego niz panel.
         var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
-        var body = 'fn=reassignComment&username=' + enc(BK_CS)
+        var body = 'fn=reassignComment&username=' + enc(kto || BK_CS)
                  + '&obj=auction&obj_id=' + enc(objId)
                  + '&comment=' + enc(tekst) + '&field=responsible';
         var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
@@ -69193,7 +69989,7 @@
     }
     // Calosc: odczyt auftragu po ksiegowaniu, wyjecie salda, odbicie. Kazdy krok moze sie
     // nie udac osobno — i wtedy mowimy DOKLADNIE ktory, bo ksiegowania to nie cofa.
-    async function bkPoDelete(num){
+    async function bkPoDelete(num, kto){
         var html = '';
         try {
             var res = await fetch('/auction.php?number=' + encodeURIComponent(num) + '&txnid=3',
@@ -69206,8 +70002,8 @@
                                 + '— odbij ręcznie' };
         var oid = bkObjId(d, html);
         if (!oid) return { err: 'nie odczytałem obj_id auftragu — odbij ręcznie' };
-        try { await bkOdbij(tekst, oid); } catch (e){ return { err: (e && e.message) || String(e) }; }
-        return { ok: true, tekst: tekst, objId: oid };
+        try { await bkOdbij(tekst, oid, kto); } catch (e){ return { err: (e && e.message) || String(e) }; }
+        return { ok: true, tekst: tekst, objId: oid, kto: kto || BK_CS };
     }
 
     function po_kolor(st){ return (st && st.odbiteBlad) ? '#c47f00' : '#0a7a2f'; }
@@ -69459,9 +70255,166 @@
              + guzik('💾 Zaksięguj na tym auftragu', '#0a7a2f');
     }
 
+    // ---------- UniCredit HU: ekran ----------
+    function huWierszeTab(lista){
+        var h = '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:10px;margin-top:3px">'
+              + '<tr style="color:#999"><td style="padding:1px 5px">Data</td><td style="padding:1px 5px">Kontrahent</td>'
+              + '<td style="padding:1px 5px">Tytuł</td><td style="padding:1px 5px;text-align:right">Kwota HUF</td></tr>';
+        (lista || []).forEach(function (w){
+            h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:1px 5px;white-space:nowrap">' + esc(huDataPl(w.data)) + '</td>'
+              +  '<td style="padding:1px 5px">' + esc(w.partner) + '</td>'
+              +  '<td style="padding:1px 5px">' + esc(w.opis) + '</td>'
+              +  '<td style="padding:1px 5px;text-align:right;white-space:nowrap">' + huTys(w.kwota) + '</td></tr>';
+        });
+        return h + '</table></div>';
+    }
+    function huSuma(lista){ return (lista || []).reduce(function (a, w){ return a + (Number(w.kwota) || 0); }, 0); }
+    // Podglad tego, co wyjelismy z importu, w trzech grupach (decyzja 29.09.2026).
+    function huMinusHtml(minus){
+        if (!minus || !minus.length) return '';
+        var h = '<details style="margin-top:6px"><summary style="font-size:11px;color:#750000;cursor:pointer;font-weight:700">'
+              + 'Podgląd zwrotów do klientów i płatności do dostawców (' + minus.length + ', razem '
+              + huTys(huSuma(minus)) + ' HUF) — nie idą do importu</summary>';
+        ['klient', 'dostawca', 'bank'].forEach(function (g){
+            var l = minus.filter(function (w){ return w.grupa === g; });
+            if (!l.length) return;
+            h += '<div style="margin-top:5px;font-size:11px;font-weight:700;color:#374151">' + esc(BK_HU_GRUPY[g])
+              +  ' (' + l.length + ', razem ' + huTys(huSuma(l)) + ')</div>' + huWierszeTab(l);
+        });
+        return h + '</details>';
+    }
+    function huDocsHtml(docs){
+        if (!docs || !docs.length) return '';
+        return '<div style="margin-top:6px;padding:6px 8px;background:#faf7f6;border:1px solid #DBD9D7;border-radius:6px">'
+             + '<b style="font-size:11px;color:#750000">Szkody GLS na listę INS w docs (' + docs.length + ', razem '
+             + huTys(huSuma(docs)) + ' HUF) — z importu wyjęte</b>'
+             + '<div style="font-size:10px;color:#888;margin:2px 0 4px">Tytuł „No.…” nie mówi, której sprawy dotyczy wpłata. '
+             + 'Wiersze mają kolumny: data, bank, płatnik, tytuł, kwota — wklejone w kolumnę daty pustego wiersza '
+             + 'rozejdą się po kolumnach; „booked” i link zostają do dopisania.</div>'
+             + '<textarea class="bk-hu-docs" readonly style="width:100%;height:' + Math.min(130, 24 + docs.length * 15)
+             + 'px;font-size:10px;font-family:monospace;box-sizing:border-box;white-space:pre">' + esc(huDocsTekst(docs)) + '</textarea>'
+             + '<button class="bk-hu-docs-kop" style="margin-top:3px;padding:2px 8px;border:1px solid #750000;border-radius:5px;'
+             + 'background:#fff;color:#750000;cursor:pointer;font-size:10px">📋 Kopiuj wiersze</button></div>';
+    }
+    // Wplaty INS: ksieguje je modul „Ksiegowanie INS" (przekazanie mostem, jak przy Marketplace's).
+    var BK_INS_Z = 'bank_imp_do_ins', BK_INS_O = 'bank_imp_do_ins_odp';
+    var BK_HU_INS_KEY = 'bank_imp_hu_ins_przek';   // Spectra ID -> kiedy przekazane
+    function huInsHtml(ins){
+        if (!ins || !ins.length) return '';
+        var przek = jGet(BK_HU_INS_KEY), ile = ins.filter(function (w){ return przek[w.sid]; }).length;
+        var h = '<div style="margin-top:6px;padding:6px 8px;background:#faf7f6;border:1px solid #DBD9D7;border-radius:6px">'
+              + '<b style="font-size:11px;color:#750000">🛡️ Wpłaty INS (' + ins.length + ', razem ' + huTys(huSuma(ins))
+              + ' HUF) — z importu wyjęte, księguje moduł „Księgowanie INS”</b>'
+              + '<div style="font-size:10px;color:#888;margin:2px 0 4px">Numer sprawy stoi w tytule. Przy kilku numerach w jednej '
+              + 'wpłacie moduł INS dzieli ją po open amount spraw — tylko wtedy, gdy ich suma równa się wpłacie; '
+              + 'inaczej kwoty wpisujesz tam ręcznie.</div>'
+              + '<table style="border-collapse:collapse;font-size:10px">';
+        ins.forEach(function (w){
+            h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:1px 5px;white-space:nowrap">' + esc(huDataPl(w.data)) + '</td>'
+              +  '<td style="padding:1px 5px">' + esc(w.partner) + '</td>'
+              +  '<td style="padding:1px 5px">' + (w.ins || []).map(function (n){
+                        return '<a href="/insurance.php?id=' + esc(n) + '" target="_blank">INS ' + esc(n) + '</a>'; }).join(', ') + '</td>'
+              +  '<td style="padding:1px 5px;text-align:right;white-space:nowrap">' + huTys(w.kwota) + '</td>'
+              +  '<td style="padding:1px 5px;color:#0a7a2f">' + (przek[w.sid] ? '✔ przekazane' : '') + '</td></tr>';
+        });
+        return h + '</table>'
+             + '<div style="margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+             + '<button class="bk-hu-ins" style="padding:3px 10px;border:none;border-radius:6px;background:#750000;color:#fff;'
+             + 'cursor:pointer;font-size:11px;font-weight:700">↪ Przekaż do Księgowania INS'
+             + (ile ? (' (przekazane już ' + ile + ')') : '') + '</button>'
+             + '<span class="bk-hu-ins-msg" style="font-size:10px;color:#666">Moduł INS sam sprawdzi sprawy; '
+             + 'księgujesz tam guzikiem „Zaksięguj zaznaczone”.</span></div></div>';
+    }
+    // Identyfikator TEJ karty (wspolny z modulem INS przez sessionStorage) — zlecenie mostu
+    // odbiera tylko modul INS w tej samej karcie, a nie pierwsza lepsza karta w tle.
+    // sessionStorage przezywa F5 (slad zapisu z tej karty po F5 nadal jest „moj"), ale kopiuje
+    // sie przy „Duplikuj karte". Dlatego most dokleja jeszcze identyfikator DOKUMENTU, wspolny
+    // dla modulow tego skryptu w tym samym oknie: dwie widoczne kopie karty nie przyjma obie
+    // tego samego zlecenia (przeglad 29.09.2026).
+    function bkKarta(){
+        try {
+            var k = sessionStorage.getItem('hub_karta');
+            if (!k){ k = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); sessionStorage.setItem('hub_karta', k); }
+            return k;
+        } catch (e){ return ''; }
+    }
+    function bkKartaDok(){
+        var k = bkKarta(); if (!k) return '';
+        try { if (!window.__hubDok) window.__hubDok = Math.random().toString(36).slice(2, 10); return k + ':' + window.__hubDok; }
+        catch (e){ return k; }
+    }
+    async function huDoIns(ins){
+        var id = 'i' + Date.now().toString(36), karta = bkKartaDok();
+        if (!karta) throw new Error('przeglądarka nie daje sessionStorage — przekaż wpłaty ręcznie (wiersze do docs)');
+        gmSet(BK_INS_O, '');
+        gmSet(BK_INS_Z, JSON.stringify({ id: id, karta: karta, kiedy: Date.now(), grupy: ins.map(function (w){
+            return { sid: w.sid, data: w.data, bank: BK_HU_BANK, kontr: w.partner, tytul: w.opis,
+                     kwota: w.kwota, waluta: 'HUF', ids: w.ins || [] };
+        }) }));
+        return await new Promise(function (ok, zle){
+            var start = Date.now();
+            var zegar = setInterval(function (){
+                var o = null;
+                try { o = JSON.parse(gmGet(BK_INS_O, '') || 'null'); } catch (e){ o = null; }
+                if (o && o.id === id){
+                    clearInterval(zegar);
+                    gmSet(BK_INS_O, '');
+                    if (o.ok) ok(o); else zle(new Error(o.blad || 'moduł INS nie przyjął wpłat'));
+                    return;
+                }
+                if (Date.now() - start > 30000){
+                    clearInterval(zegar);
+                    // Zlecenie zdejmujemy, zeby nie podjal go nikt pozniej, gdy uzytkownik juz
+                    // wie, ze przekazanie sie nie udalo.
+                    try { var zz = JSON.parse(gmGet(BK_INS_Z, '') || 'null'); if (zz && zz.id === id) gmSet(BK_INS_Z, ''); } catch (e){}
+                    zle(new Error('moduł „Księgowanie INS" nie odpowiedział w 30 s — sprawdź, czy jest włączony w ⚙ Moduły'));
+                }
+            }, 400);
+        });
+    }
+    // Guziki sekcji INS i docs — te same na ekranie pliku i pod paczka.
+    function huPodepnij(root, hu){
+        root.querySelectorAll('.bk-hu-docs-kop').forEach(function (b){
+            b.onclick = function (){
+                var t = huDocsTekst(hu.docs);
+                try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); }
+                catch (e){}
+                say('Skopiowane: ' + (hu.docs || []).length + ' wierszy — wklej je na listę INS w docs.', '#0a7a2f');
+            };
+        });
+        root.querySelectorAll('.bk-hu-ins').forEach(function (b){
+            b.onclick = async function (){
+                var przek = jGet(BK_HU_INS_KEY), juz = (hu.ins || []).filter(function (w){ return przek[w.sid]; });
+                if (!confirm('Przekazać ' + hu.ins.length + ' wpłat INS do modułu „Księgowanie INS”?\n\n'
+                    + hu.ins.map(function (w){ return '  • ' + huDataPl(w.data) + '  ' + huTys(w.kwota) + '  INS ' + (w.ins || []).join(', '); }).join('\n')
+                    + (juz.length ? ('\n\n⚠ ' + juz.length + ' z nich przekazałeś już wcześniej — moduł INS pokaże przy '
+                                     + 'sprawie, jeśli płatność już na niej jest.') : '')
+                    + '\n\nModuł INS tylko je SPRAWDZI. Księgujesz tam osobnym guzikiem.')) return;
+                b.disabled = true;
+                try {
+                    var o = await huDoIns(hu.ins);
+                    var m = jGet(BK_HU_INS_KEY), teraz = new Date().toISOString();
+                    hu.ins.forEach(function (w){ m[w.sid] = teraz; });
+                    jSet(BK_HU_INS_KEY, m);
+                    say('Moduł „Księgowanie INS” przyjął ' + (o.n || 0) + ' wpłat i je sprawdza — dokończ tam.'
+                        + (o.pominiete ? (' Pominął ' + o.pominiete + ' — ma je już na liście.') : ''), '#0a7a2f');
+                    // Panel INS otwiera sie sam; chowamy ten, zeby nie zaslanial tamtego.
+                    if (o.n) panel.style.display = 'none';
+                } catch (e){ say('Nie przekazałem: ' + esc((e && e.message) || e), '#c00'); b.disabled = false; }
+            };
+        });
+    }
+
     // ---------- stan ----------
     var S = { format: BK_FORMATY[0].id, plik: null, rows: null, zmKwot: 0, zmDat: 0,
-              nazwa: '', banki: null, ksieg: null };
+              nazwa: '', banki: null, ksieg: null, hu: null, huBajty: null,
+              // UniCredit HU: pliki z maili czekajace na import (po Spectra ID wplaty),
+              // ostatnio odczytane paczki pobran i ostatnia paczka wyciagu.
+              codPliki: {}, codPaczki: {}, glownaD: null,
+              // zapytania ksiegujace w locie w TEJ karcie (klucz: rodzaj + paczka/wiersz)
+              lot: {},
+              // ostatni komunikat operacji na paczce — rysowany w JEJ pudelku (klucz: rodzaj + numer)
+              pkMsg: {} };
     function job(){ var o = jGet(BK_JOB_KEY); return (o && o.impId) ? o : null; }
     function jobZapisz(o){ jSet(BK_JOB_KEY, o || {}); }
 
@@ -69482,7 +70435,10 @@
                         + 'max-height:calc(100vh - 224px);overflow-y:auto';
     (document.body || document.documentElement).appendChild(btn);
     (document.body || document.documentElement).appendChild(panel);
-    btn.onclick = function (){ panel.style.display = (panel.style.display === 'none') ? 'block' : 'none'; };
+    btn.onclick = function (){
+        panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
+        if (panel.style.display === 'block' && job()) sprawdz();
+    };
 
     function $(s){ return panel.querySelector(s); }
     function say(t, c){ var e = $('#bk-status'); if (e){ e.innerHTML = t; e.style.color = c || '#333'; } }
@@ -69495,7 +70451,8 @@
               + '<span id="bk-close" style="cursor:pointer;color:#888;font-size:18px;line-height:1">×</span></div>'
               + '<div style="font-size:11px;color:#666;margin-bottom:10px">Plik przerabiam tak samo jak stara aplikacja '
               + '(moduł Bank), a potem wysyłam go do <b>Import payments</b> w prologistics. Import sam nie księguje — '
-              + 'tworzy paczkę, a księguje dopiero „Zaksięguj OK”, czyli przycisk „Book on main account”.</div>';
+              + 'tworzy paczkę, a księguje dopiero „Zaksięguj OK”: przy wyciągach to przycisk „Book &amp; Assign on main account”, '
+              + 'przy importach pobrań przewoźników „Book on main account” (bez przypisania).</div>';
 
         // --- format ---
         h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">1 · Format pliku</div>'
@@ -69545,16 +70502,64 @@
               +  'booking_setting mówi, PO CZYM prologistics dopasowuje wiersze do auftragów; zły kończy się paczką, w której nic się nie dopasowało.'
               +  (bkKotwicaBank(S.banki) ? '' : ' <span style="color:#c00">⚠ na liście banków nie ma znanej pozycji 157 „Vente Unique DE” — sprawdź, czy to ta lista.</span>')
               +  '</div>';
+            // UniCredit HU: osobne ustawienia dla importow pobran. Booking domyslnie ten sam co
+            // wyciagu — dzis wszystkie te importy ida z „method 2 +name" — ale zapisuje sie dopiero
+            // po „Zapisz", jak wszystko inne tutaj.
+            if (F.hu){
+                h += '<div style="margin-top:8px;padding-top:6px;border-top:1px dashed #FFCCB7">'
+                  +  '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">Importy pobrań — plik z maila przewoźnika '
+                  +  '<span style="font-weight:normal">(bank_setting · booking_setting · konto przy księgowaniu wprost na auftragu)</span></div>';
+                Object.keys(BK_PRZEW).forEach(function (k){
+                    var P = BK_PRZEW[k], cp = ustaw(P.ust);
+                    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:3px">'
+                      +  '<span style="width:44px;font-size:11px;font-weight:700">' + esc(P.nazwa) + '</span>'
+                      +  '<select class="bk-cod-bank" data-p="' + k + '" style="font-size:11px;padding:3px;max-width:280px">'
+                      +  opcje(S.banki, cp.bank) + '</select>'
+                      +  '<select class="bk-cod-book" data-p="' + k + '" style="font-size:11px;padding:3px;max-width:240px">'
+                      +  opcje(S.ksieg, cp.booking || c.booking) + '</select>'
+                      +  '<input class="bk-cod-konto" data-p="' + k + '" value="' + esc(cp.konto || P.konto)
+                      +  '" style="width:50px;font-size:11px;text-align:right">'
+                      +  '</div>';
+                });
+                h += '<div style="font-size:10px;color:#888">Zapisuje się tym samym „💾 Zapisz”. Dotąd ręcznie szło to do '
+                  +  '„COD GLS HUF”, „COD FUTAR” i „COD HDT HUF”.</div></div>';
+            }
         }
         h += '</div>';
 
         // --- plik ---
         h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">3 · Plik z banku</div>'
           +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
-          +  '<input type="file" id="bk-plik" accept=".csv,.xlsx,.xls" style="font-size:12px">'
-          +  '<span style="font-size:10px;color:#888">CSV (średnik, UTF-8) albo XLSX</span></div>';
+          +  '<input type="file" id="bk-plik" accept="' + (F.hu ? '.csv' : '.csv,.xlsx,.xls') + '" style="font-size:12px">'
+          +  '<span style="font-size:10px;color:#888">' + (F.hu ? 'CSV prosto z UniCredit (Windows-1250), wyciąg dzienny'
+                                                              : 'CSV (średnik, UTF-8) albo XLSX') + '</span></div>';
 
-        if (S.rows){
+        if (S.rows && F.hu && S.hu){
+            var hu = S.hu, wyj = hu.minus.length + hu.ins.length + hu.docs.length;
+            h += '<div style="padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:8px">'
+              +  '<div style="font-size:12px;color:#0a7a2f;font-weight:700">✓ ' + esc(S.plik) + ' → ' + esc(S.nazwa) + '</div>'
+              +  '<div style="font-size:11px;color:#166534;margin-top:2px">transakcji w pliku: <b>' + hu.wiersze.length + '</b>'
+              +  ' · do importu: <b>' + (hu.wiersze.length - wyj) + '</b> · wyjęte: <b>' + wyj + '</b>'
+              +  ' (z minusem ' + hu.minus.length + ', INS ' + hu.ins.length + ', szkody GLS ' + hu.docs.length + ')'
+              +  ' · reszta idzie bajt w bajt tak, jak wyszła z banku</div>'
+              +  (hu.izv ? ('<div style="font-size:11px;color:#c00;margin-top:3px">⚠ ' + hu.izv + ' wierszy w kształcie okrojonym '
+                            + '„+IZV …” — bez tytułu przelewu i konta nadawcy, więc import nie dopasuje ich do auftragów. '
+                            + 'Bank tak eksportuje historię starszą niż ok. 120 dni; do codziennego importu bierz wyciąg dzienny.</div>') : '')
+              +  (hu.znane ? ('<div style="font-size:11px;color:#c47f00;margin-top:3px">ℹ ' + hu.znane + ' z tych transakcji '
+                            + 'było już w wyciągu wysłanym wcześniej — prologistics drugi raz ich nie zaimportuje.</div>') : '')
+              +  (hu.przew.length
+                    ? ('<div style="font-size:11px;color:#166534;margin-top:3px">🚚 Wpłaty przewoźników (zostają w imporcie; plik '
+                       + 'z maila dodasz pod każdą po wysłaniu): ' + hu.przew.map(function (w){
+                            return '<b>' + esc(BK_PRZEW[w.przew].nazwa) + '</b> ' + esc(huDataPl(w.data)) + ' ' + huTys(w.kwota);
+                        }).join(' · ') + '</div>') : '')
+              +  huInsHtml(hu.ins) + huDocsHtml(hu.docs) + huMinusHtml(hu.minus)
+              +  '</div>'
+              +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
+              +  '<button id="bk-wyslij" style="padding:8px 16px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:12px">📤 Wyślij do importu</button>'
+              +  '<button id="bk-pobierz" style="padding:8px 14px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;font-weight:700;cursor:pointer;font-size:12px" '
+              +  'title="Plik dokładnie taki, jaki pójdzie do importu — bez wyjętych wierszy.">⬇ Pobierz plik</button>'
+              +  '</div>';
+        } else if (S.rows){
             var d = S.rows;
             h += '<div style="padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:8px">'
               +  '<div style="font-size:12px;color:#0a7a2f;font-weight:700">✓ ' + esc(S.plik) + ' → ' + esc(S.nazwa) + '</div>'
@@ -69605,14 +70610,25 @@
                     : '');
         }
 
+        // Plik poszedl, a numeru paczki nie odczytalem: zlecenie stoi bez numeru i nic by go nie
+        // pokazalo. Numer da sie wpisac z adresu paczki w Import payments.
+        var jr = jGet(BK_JOB_KEY);
+        if (!j && jr && jr.nazwa && !jr.impId){
+            h += '<div style="margin:4px 0 8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
+              +  'Plik <b>' + esc(jr.nazwa) + '</b> poszedł do importu ' + esc(String(jr.czas || '').replace('T', ' ').slice(0, 16))
+              +  ', ale nie odczytałem numeru paczki. Wpisz go z adresu …/import_payments/<b>NUMER</b>/: '
+              +  '<input id="bk-imp-nr" style="width:90px;font-size:11px"> '
+              +  '<button id="bk-imp-nr-set" style="padding:2px 8px;border:none;border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">zapisz</button></div>';
+        }
         h += '<div id="bk-status" style="margin-top:4px;min-height:16px;font-size:12px;font-weight:bold"></div>';
         h += '<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>';
         panel.innerHTML = h;
 
         $('#bk-close').onclick = function (){ panel.style.display = 'none'; };
         panel.querySelectorAll('.bk-fmt').forEach(function (b){
-            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; rysuj(); };
+            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; S.hu = null; S.huBajty = null; rysuj(); };
         });
+        if (S.rows && F.hu && S.hu) huPodepnij(panel, S.hu);
         var lb = $('#bk-listy');
         if (lb) lb.onclick = async function (){
             lb.disabled = true; say('pobieram listy ustawień…', '#666');
@@ -69626,6 +70642,12 @@
                 // gorsze niz puste pole.
                 var cc = ustaw(S.format), F2 = fmt(S.format), p = bkPodpowiedz(b, F2);
                 if (!cc.bank && p.length === 1){ cc.bank = p[0].id; cc.bankNm = p[0].nm; ustawZapisz(S.format, cc); }
+                // Importy pobran: ta sama zasada — tylko jedno aktywne trafienie po nazwie
+                // („COD FUTAR" ma nieaktywny duplikat 127, ktory odpada na „off").
+                if (F2.hu) Object.keys(BK_PRZEW).forEach(function (kk){
+                    var P = BK_PRZEW[kk], cp = ustaw(P.ust), pp = bkPodpowiedz(b, P);
+                    if (!cp.bank && pp.length === 1){ cp.bank = pp[0].id; cp.bankNm = pp[0].nm; ustawZapisz(P.ust, cp); }
+                });
                 rysuj();
                 say('Listy pobrane: ' + Object.keys(b).length + ' ustawień importu, ' + Object.keys(k).length + ' sposobów dopasowania.'
                     + (bkKotwicaKsieg(k) ? '' : ' ⚠ nie widzę znanej pozycji 9 „Fulfillment No”.'), '#0a7a2f');
@@ -69640,25 +70662,74 @@
             if (!b || !k){ say('Wskaż oba ustawienia — bez nich nie wyślę pliku.', '#c47f00'); return; }
             var kn = String(($('#bk-konto') || {}).value || '').trim();
             if (kn && !/^\d{3,6}$/.test(kn)){ say('Konto to sam numer z planu kont, np. 1232.', '#c47f00'); return; }
+            // Importy pobran sprawdzamy PRZED zapisem czegokolwiek — zly numer konta nie moze
+            // zapisac polowy ustawien.
+            var cody = [];
+            if (fmt(S.format).hu){
+                var zle = '';
+                Object.keys(BK_PRZEW).forEach(function (kk){
+                    var P = BK_PRZEW[kk];
+                    var cb = String((panel.querySelector('.bk-cod-bank[data-p="' + kk + '"]') || {}).value || '');
+                    var ck = String((panel.querySelector('.bk-cod-book[data-p="' + kk + '"]') || {}).value || '');
+                    var cn = String((panel.querySelector('.bk-cod-konto[data-p="' + kk + '"]') || {}).value || '').trim();
+                    if (cn && !/^\d{3,6}$/.test(cn)) zle = P.nazwa + ': konto to sam numer z planu kont, np. ' + P.konto + '.';
+                    cody.push({ ust: P.ust, v: { bank: cb, bankNm: cb ? ((S.banki[cb] || {}).nm || '') : '',
+                                                 booking: ck, bookingNm: ck ? ((S.ksieg[ck] || {}).nm || '') : '',
+                                                 konto: cn } });
+                });
+                if (zle){ say(esc(zle), '#c47f00'); return; }
+            }
             ustawZapisz(S.format, { bank: b, bankNm: (S.banki[b] || {}).nm || '',
                                     booking: k, bookingNm: (S.ksieg[k] || {}).nm || '',
                                     konto: kn });
+            cody.forEach(function (x){ ustawZapisz(x.ust, x.v); });
             say('Zapisane: ' + esc((S.banki[b] || {}).nm || b) + ' (' + esc(b) + ') · '
-                + esc((S.ksieg[k] || {}).nm || k) + ' (' + esc(k) + ').', '#0a7a2f');
+                + esc((S.ksieg[k] || {}).nm || k) + ' (' + esc(k) + ')'
+                + (cody.length ? (' · importy pobrań: ' + cody.map(function (x){
+                        return esc(x.v.bankNm || '— nie wskazane'); }).join(', ')) : '') + '.', '#0a7a2f');
         };
         $('#bk-plik').onchange = async function (){
             var f = this.files && this.files[0];
             if (!f) return;
             say('czytam plik…', '#666');
             try {
+                S.hu = null; S.huBajty = null;
                 var aoa = await bkCzytaj(f);
-                var w = bkPrzerob(aoa, fmt(S.format));
+                var F0 = fmt(S.format);
+                var w = bkPrzerob(aoa, F0);
                 if (w.err){ S.rows = null; rysuj(); say(esc(w.err), '#c00'); return; }
+                if (F0.hu){
+                    var hu = huAnaliza(w.rows);
+                    if (hu.err || hu.bledy.length){
+                        S.rows = null; rysuj();
+                        say(esc(hu.err || ('Nie wysyłam — w pliku są wiersze, których nie rozumiem: '
+                                           + hu.bledy.slice(0, 5).join('; ') + (hu.bledy.length > 5 ? ' …' : ''))), '#c00');
+                        return;
+                    }
+                    var doWyj = {};
+                    hu.minus.concat(hu.ins, hu.docs).forEach(function (x){ doWyj[x.sid] = 1; });
+                    var cut = huWytnij(S.buf, doWyj);
+                    // Kontrola wycinania: wyszlo dokladnie tyle linii, ile mialo, zadna wyjeta nie
+                    // zostala, a naglowek i reszta wierszy sa te same. Bez tego plik moglby pojsc
+                    // do importu ze zwrotami, ktore mialy z niego wypasc — albo bez wplat klientow.
+                    var po = bkCsvRows(bkDekoduj(cut.bajty, F0));
+                    var poSid = po.slice(1).map(function (r){ return String(r[8] || '').trim(); });
+                    var zostalo = poSid.filter(function (s){ return doWyj[s]; }).length;
+                    if (cut.wyjete !== Object.keys(doWyj).length || zostalo
+                        || po.length !== w.rows.length - cut.wyjete || (po[0] || []).join('|') !== (w.rows[0] || []).join('|')){
+                        S.rows = null; rysuj();
+                        say('Nie wysyłam — wycinanie wierszy nie zgadza się z rozbiorem pliku (wyjęte ' + cut.wyjete
+                            + ' z ' + Object.keys(doWyj).length + '). Zgłoś to z tym plikiem.', '#c00');
+                        return;
+                    }
+                    S.hu = hu; S.huBajty = cut.bajty;
+                }
                 S.plik = f.name; S.rows = w.rows; S.zmKwot = w.zmKwot; S.zmDat = w.zmDat;
-                S.nazwa = bkNazwa(fmt(S.format));
+                S.nazwa = bkNazwa(F0);
                 rysuj();
-                say('Przerobione. Sprawdź podgląd i wyślij do importu.', '#0a7a2f');
-            } catch (e){ S.rows = null; rysuj(); say('Nie przerobiłem pliku: ' + esc((e && e.message) || e), '#c00'); }
+                say(F0.hu ? 'Plik rozebrany. Sprawdź, co idzie do importu, i wyślij.'
+                          : 'Przerobione. Sprawdź podgląd i wyślij do importu.', '#0a7a2f');
+            } catch (e){ S.rows = null; S.hu = null; rysuj(); say('Nie przerobiłem pliku: ' + esc((e && e.message) || e), '#c00'); }
         };
         var pb = $('#bk-pobierz');
         if (pb) pb.onclick = function (){
@@ -69689,9 +70760,12 @@
         };
         var wb = $('#bk-wyslij');
         if (wb) wb.onclick = async function (){
-            var cfg = ustaw(S.format);
+            var cfg = ustaw(S.format), Fw = fmt(S.format);
             if (!cfg.bank || !cfg.booking){ say('Najpierw wskaż ustawienia importu (krok 2).', '#c47f00'); return; }
+            if (Fw.hu){ await huWyslij(cfg, wb); return; }
+            var nr0 = zNierozstrzygniete(jGet(BK_JOB_KEY));
             if (!confirm('Wysłać ' + (S.rows.length - 1) + ' wierszy do Import payments?\n\n'
+                + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
                 + 'Plik: ' + S.nazwa + '\n'
                 + 'Ustawienie importu: ' + (cfg.bankNm || '?') + ' (' + cfg.bank + ')\n'
                 + 'Dopasowanie: ' + (cfg.bookingNm || '?') + ' (' + cfg.booking + ')\n'
@@ -69703,29 +70777,185 @@
                 jobZapisz({ impId: imp, nazwa: S.nazwa, format: S.format, wierszy: S.rows.length - 1,
                             czas: new Date().toISOString(), booked: false,
                             daty: bkMapaDat(S.rows, fmt(S.format)) });
-                if (!imp){ say('Plik poszedł, ale nie odczytałem numeru paczki — wejdź na Import payments ręcznie.', '#c47f00'); return; }
+                // rysuj() — bez tego pole na recznie wpisany numer pojawialo sie dopiero po F5.
+                if (!imp){ rysuj(); say('Plik poszedł, ale nie odczytałem numeru paczki — wpisz go niżej z adresu paczki w Import payments.', '#c47f00'); return; }
                 say('Paczka <b>' + esc(imp) + '</b> utworzona — jeszcze NIEZAKSIĘGOWANA. Odczytuję…', '#0a7a2f');
                 await sprawdz();
             } catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
             finally { if ($('#bk-wyslij')) $('#bk-wyslij').disabled = false; }
         };
-        if (j) sprawdz();
+        // Paczke (i paczki pobran) czytamy dopiero przy OTWARTYM panelu. Modul startuje na kazdej
+        // stronie prologistics, a przy schowanym panelu to byly zbedne zapytania przy kazdym wejsciu.
+        if (j && panel.style.display !== 'none') sprawdz();
+        huNumerPodepnij();
+    }
+
+    function huNumerPodepnij(){
+        var b = $('#bk-imp-nr-set'); if (!b) return;
+        b.onclick = async function (){
+            var nr = String(($('#bk-imp-nr') || {}).value || '').trim();
+            if (!/^\d{3,9}$/.test(nr)){ say('Numer paczki to same cyfry z adresu …/import_payments/NUMER/.', '#c47f00'); return; }
+            var jr = jGet(BK_JOB_KEY);
+            if (!jr || jr.impId){ rysuj(); return; }
+            b.disabled = true; say('sprawdzam paczkę ' + esc(nr) + '…', '#666');
+            var sp;
+            try { sp = await bkSprawdzNumer(nr, jr.nazwa); }
+            catch (e){ sp = { ok: false, powod: 'nie odczytałem paczki ' + nr + ': ' + ((e && e.message) || e) }; }
+            b.disabled = false;
+            if (!sp.ok){ say('Nie przypinam: ' + esc(sp.powod) + '.', '#c00'); return; }
+            if (sp.potwierdz && !confirm(sp.potwierdz + '\n\nPrzypiąć ją do pliku ' + (jr.nazwa || '') + '?')) return;
+            jr = jGet(BK_JOB_KEY);
+            if (!jr || jr.impId){ rysuj(); return; }
+            jr.impId = nr; jobZapisz(jr);
+            say('Zapisane: paczka ' + esc(nr) + '. Odczytuję…', '#0a7a2f');
+            rysuj();
+        };
+    }
+    // Recznie wpisany numer paczki sprawdzamy, ZANIM cokolwiek do niego przypniemy. Literowka
+    // o jedna cyfre trafia w sasiednia, istniejaca paczke (np. paczke wyciagu zamiast pobran),
+    // a HUB rysowalby i ksiegowal jej wiersze (przeglad 29.09.2026). Rozstrzyga nazwa pliku na
+    // liscie importow; paczke spoza listy (starsza niz ~doba) potwierdza czlowiek.
+    function bkNumeryZajete(){
+        var z = {}, j = job(), m = codWszystkie();
+        if (j) z[String(j.impId)] = 'paczka wyciągu ' + (j.nazwa || '');
+        Object.keys(m).forEach(function (sid){
+            var e = m[sid];
+            if (e && e.impId) z[String(e.impId)] = 'import pobrań ' + (e.nazwa || e.plik || sid);
+        });
+        return z;
+    }
+    async function bkSprawdzNumer(nr, nazwa){
+        nr = String(nr);
+        var zaj = bkNumeryZajete();
+        if (zaj[nr]) return { ok: false, powod: 'paczka ' + nr + ' to już ' + zaj[nr] };
+        var list = [];
+        try {
+            var r = await fetch('/api/importPayments/index/?', { credentials: 'same-origin',
+                headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+            if (r.ok){ var js = await r.json(); list = Array.isArray(js.parsing_list) ? js.parsing_list : []; }
+        } catch (e){ list = []; }
+        var x = list.filter(function (p){ return String(p.file_id) === nr; })[0];
+        if (x){
+            var fn = String(x.filename || '');
+            if (nazwa && fn.indexOf(nazwa) >= 0) return { ok: true, plik: fn };
+            return { ok: false, powod: 'paczka ' + nr + ' to plik „' + fn + '”, a nie „' + (nazwa || '?') + '”' };
+        }
+        var d = await bkPaczka(nr);
+        if (!d.rows.length) return { ok: false, powod: 'paczki ' + nr + ' nie ma albo jest pusta' };
+        return { ok: true, potwierdz: 'Paczki ' + nr + ' nie widzę na liście najnowszych importów, więc nie sprawdzę, '
+                                    + 'z jakiego pliku jest. Ma ' + d.rows.length + ' wierszy — otwórz ją w Import payments i porównaj.' };
+    }
+    // Nierozstrzygniete slady zlecenia: ksiegowanie paczki bez odpowiedzi i zapisy „Zaksięguj tutaj"
+    // bez potwierdzenia. Nowy import albo „Zapomnij" nadpisuje zlecenie — czlowiek ma o nich
+    // wiedziec, zanim znikna z panelu (przeglad 29.09.2026).
+    function zNierozstrzygniete(o){
+        if (!o || !o.impId) return '';
+        var wt = Object.keys((o.ksWToku && typeof o.ksWToku === 'object') ? o.ksWToku : {}).length;
+        var za = (o.zaksAuf && typeof o.zaksAuf === 'object') ? o.zaksAuf : {};
+        var zn = Object.keys(za).filter(function (k){ var st = (za[k] || {}).stan; return st === 'wysylka' || st === 'niepewne'; });
+        var t = [];
+        if (wt) t.push(wt + ' wierszy księgowanych paczką bez potwierdzenia');
+        if (zn.length) t.push(zn.length + ' zapisów wprost na auftragu bez potwierdzenia ('
+                              + zn.map(function (k){ return za[k].num; }).join(', ') + ')');
+        return t.length ? ('Paczka ' + o.impId + ' ma nierozstrzygnięte: ' + t.join('; ')
+                           + '. Po tej operacji zniknie z panelu — sprawdź je najpierw w prologistics.') : '';
+    }
+    // Wysylka wyciagu HU. Zlecenie niesie tu wiecej niz przy eupago: wplaty przewoznikow (pod
+    // nimi pojda pliki z maili), INS i to, co z pliku wyjelismy — czyli wszystko, czego paczka
+    // importu nie oddaje, a co ma byc widac takze po odswiezeniu strony.
+    async function huWyslij(cfg, wb){
+        var hu = S.hu, wyj = hu.minus.length + hu.ins.length + hu.docs.length, n = hu.wiersze.length - wyj;
+        var jr0 = jGet(BK_JOB_KEY), nr0 = zNierozstrzygniete(jr0);
+        // Ten sam plik poszedl juz, a numeru paczki nie znamy — druga wysylka zrobi druga paczke.
+        var bylo = (jr0 && !jr0.impId && jr0.nazwa && jr0.nazwa === S.nazwa)
+            ? ('⚠ Ten plik poszedł już ' + String(jr0.czas || '').replace('T', ' ').slice(0, 16)
+               + ', a numeru paczki nie znam. Sprawdź w Import payments, czy paczka nie powstała — wtedy wpisz jej numer zamiast wysyłać drugi raz.\n\n')
+            : '';
+        if (!confirm('Wysłać ' + n + ' transakcji do Import payments?\n\n'
+            + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '') + bylo
+            + 'Plik: ' + S.nazwa + ' (z ' + S.plik + ')\n'
+            + 'Ustawienie importu: ' + (cfg.bankNm || '?') + ' (' + cfg.bank + ')\n'
+            + 'Dopasowanie: ' + (cfg.bookingNm || '?') + ' (' + cfg.booking + ')\n'
+            + 'Data księgowania: z wiersza pliku (nie nadpisuję)\n'
+            + 'Wyjęte z pliku: ' + wyj + ' (z minusem ' + hu.minus.length + ', INS ' + hu.ins.length
+            + ', szkody GLS ' + hu.docs.length + ')\n'
+            + (hu.przew.length ? ('Wpłaty przewoźników zostają w pliku: ' + hu.przew.length + '\n') : '')
+            + (hu.izv ? ('\n⚠ ' + hu.izv + ' wierszy bez tytułu („+IZV”) — import ich nie dopasuje.\n') : '')
+            + (hu.znane ? ('\nℹ ' + hu.znane + ' transakcji było już w poprzednim wyciągu.\n') : '')
+            + '\nImport utworzy paczkę. NIE zaksięguje jej — to osobny przycisk.')) return;
+        wb.disabled = true; say('wysyłam…', '#666');
+        try {
+            var imp = await bkWyslij(bkBlob(S.rows), S.nazwa, cfg, { bezZapasu: true });
+            var mini = function (w){
+                return { sid: w.sid, data: w.data, kwota: w.kwota, partner: w.partner, opis: w.opis,
+                         przew: w.przew || '', ins: w.ins || [], grupa: w.grupa || '' };
+            };
+            var wyjete = {};
+            hu.minus.concat(hu.ins, hu.docs).forEach(function (w){ wyjete[w.sid] = 1; });
+            huZapamietaj(hu.wiersze.filter(function (w){ return !wyjete[w.sid]; }));
+            // Wplaty przewoznikow trafiaja do pamieci importow pobran OD RAZU: nastepny wyciag
+            // (albo brak numeru paczki) nie odbiera im miejsca na plik z maila.
+            hu.przew.forEach(function (w){
+                if (codGet(w.sid)) return;
+                codSet(w.sid, { sid: w.sid, przew: w.przew, kwota: w.kwota, data: w.data, partner: w.partner, opis: w.opis,
+                                wyciag: S.nazwa, czas: new Date().toISOString(), stan: 'czeka' });
+            });
+            jobZapisz({ impId: imp, nazwa: S.nazwa, format: S.format, wierszy: n,
+                        czas: new Date().toISOString(), booked: false, daty: {},
+                        hu: { konto: hu.konto, plik: S.plik, przew: hu.przew.map(mini), ins: hu.ins.map(mini),
+                              docs: hu.docs.map(mini), minus: hu.minus.map(mini), izv: hu.izv } });
+            if (!imp){ rysuj(); say('Plik poszedł, ale nie odczytałem numeru paczki — wpisz go niżej z adresu paczki w Import payments.', '#c47f00'); return; }
+            say('Paczka <b>' + esc(imp) + '</b> utworzona — jeszcze NIEZAKSIĘGOWANA. Odczytuję…', '#0a7a2f');
+            await sprawdz();
+        } catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
+        finally { if ($('#bk-wyslij')) $('#bk-wyslij').disabled = false; }
     }
 
     // Paczka odczytana z prologistics — stan bierze sie z systemu, a nie z tego,
     // co sami wyslalismy.
     async function sprawdz(){
-        var j = job(); if (!j) return;
-        var box = $('#bk-imp'); if (!box) return;
+        var j = job(), box = $('#bk-imp');
+        // Zlecenia nie ma (zapomniane albo zastapione w innej karcie) — stary widok z aktywnymi
+        // guzikami nie moze zostac na ekranie.
+        if (!j){ if (box){ box.innerHTML = ''; box.style.display = 'none'; } return; }
+        if (!box) return;
         box.style.display = 'block';
         box.innerHTML = '<div style="font-size:11px;color:#666">odczytuję paczkę ' + esc(j.impId) + '…</div>';
+        // Odswiezenie paczki wyciagu czyta od nowa takze paczki pobran pod nia.
+        S.codPaczki = {};
         try {
             var d = await bkPaczka(j.impId);
-            if (!j.booked) d = await bkProstujNumery(j, d, box);
-            rysujPaczke(j, d);
+            // Prostowanie numerow to regula eupago (Multibanco). Wyciagu HU nie dotyczy.
+            if (!j.booked && !fmt(j.format).hu) d = await bkProstujNumery(j, d, box);
+            if (fmt(j.format).hu) d = await huAutoOk(zGlowne(j.impId), d, box);
+            rysujPaczke(zGlowne(j.impId), d);
         }
-        catch (e){ box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(j.impId)
-                                 + ': ' + esc((e && e.message) || e) + '</div>'; }
+        catch (e){
+            // Blad odczytu (takze zle wpisany numer) nie moze zostawic samego napisu — wyjscia:
+            // ponow, popraw numer (zlecenie zostaje, znika tylko numer), zapomnij.
+            box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(j.impId)
+                          + ': ' + esc((e && e.message) || e) + '</div>'
+                          + '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">'
+                          + '<button data-bk="err-re" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">↻ spróbuj jeszcze raz</button>'
+                          + '<button data-bk="err-nr" style="padding:2px 8px;border:1px solid #5b21b6;border-radius:5px;background:#fff;color:#5b21b6;cursor:pointer;font-size:10px">✎ to zły numer — wpiszę inny</button>'
+                          + '<button data-bk="err-zap" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">✕ Zapomnij paczkę</button></div>';
+            var Ze = zGlowne(j.impId), qe = function (k){ return box.querySelector('[data-bk="' + k + '"]'); };
+            qe('err-re').onclick = function (){ sprawdz(); };
+            qe('err-nr').onclick = function (){
+                var o = Ze.get(); if (!o){ sprawdz(); return; }
+                var nr0 = zNierozstrzygniete(o);
+                if (!confirm('Zdjąć numer ' + o.impId + ' z pliku ' + (o.nazwa || '') + '?\n\n'
+                    + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
+                    + 'Zlecenie (wpłaty przewoźników, INS, minusy) zostaje — wpiszesz tylko właściwy numer paczki.')) return;
+                o.impId = ''; jobZapisz(o); rysuj();
+            };
+            qe('err-zap').onclick = function (){
+                var o = Ze.get(), nr0 = zNierozstrzygniete(o);
+                if (!confirm('Zapomnieć paczkę ' + j.impId + '?\n\n' + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
+                    + 'W prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
+                Ze.zapomnij();
+            };
+        }
     }
 
     // Wiersze z numerem zamowienia zamiast transakcji ustawiamy na OK od razu po odczycie
@@ -69733,7 +70963,8 @@
     // zleceniu — dzieki temu „↻ Odśwież" nie krazy w kolko, a wiersz, ktoremu zapis nie
     // wyszedl, dostaje kolejna szanse przy nastepnym odswiezeniu.
     async function bkProstujNumery(j, d, box){
-        var zrobione = (job() || {}).autoOk || [];
+        var Zp = zGlowne(j.impId);
+        var zrobione = (Zp.get() || j).autoOk || [];
         var doOk = d.rows.filter(function (x){
             return String(x.state) === 'CHECK' && bkToNumerZamowienia(x)
                 && zrobione.indexOf(String(x.id)) < 0;
@@ -69746,37 +70977,300 @@
             try { await bkStan(j.impId, doOk[i].id, 'OK'); udane.push(String(doOk[i].id)); }
             catch (e){ bledy.push(String(doOk[i].payment_descr) + ' — ' + ((e && e.message) || e)); }
         }
-        var o = job() || j;
-        o.autoOk = zrobione.concat(udane);
-        o.autoOkOpis = { ile: udane.length, bledy: bledy };
-        jobZapisz(o);
-        j.autoOk = o.autoOk; j.autoOkOpis = o.autoOkOpis;
+        // Zapis wylacznie do TEJ paczki: w trakcie petli zlecenie moglo zostac zapomniane albo
+        // zastapione nowym — stara migawka nie ma prawa go wskrzesic ani nadpisac.
+        j.autoOk = zrobione.concat(udane);
+        j.autoOkOpis = { ile: udane.length, bledy: bledy };
+        var o = Zp.get();
+        if (o){ o.autoOk = j.autoOk; o.autoOkOpis = j.autoOkOpis; Zp.set(o); }
         // Stan czytamy z systemu jeszcze raz: pokazujemy to, co prologistics NAPRAWDE ma,
         // a nie to, co sami wyslalismy.
         return await bkPaczka(j.impId);
     }
 
-    function rysujPaczke(j, d){
-        var box = $('#bk-imp'); if (!box) return;
+    // Status OK na wielu wierszach naraz — po cztery zapytania rownolegle (92 wiersze GLS jedno
+    // po drugim to byla dluga chwila bez zmiany na ekranie). Bledy zbieramy, nie przerywamy:
+    // i tak rozstrzyga odczyt paczki PO zapisie, a nie kod odpowiedzi.
+    async function bkStanWiele(impId, ids, postep){
+        var kol = ids.slice(), bledy = {}, zrobione = 0;
+        var pracuj = async function (){
+            while (kol.length){
+                var id = String(kol.shift());
+                try { await bkStan(impId, id, 'OK'); }
+                catch (e){ bledy[id] = (e && e.message) || String(e); }
+                zrobione++;
+                if (postep) try { postep(zrobione, ids.length); } catch (e2){}
+            }
+        };
+        await Promise.all([pracuj(), pracuj(), pracuj(), pracuj()]);
+        return bledy;
+    }
+    // UniCredit HU (wyciag i pobrania): CHECK z roznica do F.autoOkDo HUF ustawiamy na OK od razu
+    // po odczycie paczki — decyzja uzytkownika 30.09.2026. Przy pobraniach to zaokraglenie gotowki
+    // do 5 Ft; po zaksiegowaniu ewentualna roznice i tak widac w prologistics i da sie ja dac na
+    // subkonto. Status NIC nie ksieguje: wiersz wraca tylko na liste „Zaksięguj OK".
+    // open_amount w paczce HU to reszta PO tej wplacie: w paczce GLS 2197925 29 z 121 wierszy
+    // bylo dokladnych, reszta ±1/±2 — dokladnie rozklad zaokraglenia do 5 Ft.
+    // Po zapisie paczke czytamy jeszcze raz i liczymy tylko to, co prologistics NAPRAWDE ma jako OK.
+    // Wiersz, ktoremu sie nie udalo, dostaje szanse przy kolejnym odczycie — najwyzej dwa razy.
+    var BK_AUTO_OK_PROB = 2;
+    // Samokontrola znaczenia open_amount na TEJ paczce: gdy open to reszta po wplacie, wiersz OK
+    // (wplata zgodna) ma open 0.00. Jesli wiersze OK maja open rowny wplacie albo nie ma czym tego
+    // sprawdzic, statusow nie ruszamy — CHECK z „open 3" moglby wtedy znaczyc przelew na auftrag
+    // juz prawie zaplacony (przeglad 30.09.2026; dowod na resztke jest tylko z paczki pobran GLS).
+    function huAutoOkZnaczenie(d){
+        var zero = 0, rowne = 0;
+        d.rows.forEach(function (x){
+            if (String(x.state) !== 'OK' || !String(x.auction_number || '').trim()) return;
+            var a = huNum(x.amount), o = huNum(x.open_amount);
+            if (a == null || o == null) return;
+            if (Math.abs(o) < 0.005) zero++;
+            else if (Math.abs(o - a) < 0.005) rowne++;
+        });
+        if (rowne) return 'w tej paczce ' + rowne + ' wierszy OK ma open amount równe wpłacie — nie wiem, czy open to reszta po wpłacie';
+        if (!zero) return 'w tej paczce nie ma wiersza OK z open amount 0.00, więc nie sprawdzę, czy open to reszta po wpłacie';
+        return '';
+    }
+    function huAutoOkKandydaci(Z, d){
+        var j = Z.get(), F = Z.F(), lim = Number(F.autoOkDo) || 0;
+        if (!j || !(lim > 0) || !d || !d.rows) return [];
+        var pw = (Z.typ === 'glowna') ? huPrzewWPaczce(j, d.rows, huNum).mapa : {};
+        var bk = zMapa(Z, 'bookedIds'), wt = zMapa(Z, 'ksWToku'), so = zMapa(Z, 'subOk');
+        var ao = zMapa(Z, 'autoOkHu'), nie = zMapa(Z, 'autoOkHuNie');
+        return d.rows.filter(function (x){
+            var id = String(x.id);
+            // Wiersze wplat przewoznikow w paczce wyciagu ksieguje import pobran — nie ruszamy ich.
+            if (String(x.state) !== 'CHECK' || pw[id] || bk[id] || wt[id] || so[id] || ao[id]) return false;
+            if ((Number(nie[id]) || 0) >= BK_AUTO_OK_PROB) return false;
+            if (!String(x.auction_number || '').trim()) return false;
+            var o = huNum(x.open_amount);
+            return o != null && Math.abs(o) > 0.0001 && Math.abs(o) <= lim + 0.0001;
+        });
+    }
+    async function huAutoOk(Z, d, box){
+        var j = Z.get();
+        // Odczyt nie tej paczki (w miedzyczasie inna w pamieci) — statusow nie ruszamy.
+        if (!j || !d || String(d.id) !== String(j.impId)) return d;
+        var doOk = huAutoOkKandydaci(Z, d);
+        var stop = doOk.length ? huAutoOkZnaczenie(d) : '';
+        if ((j.autoOkHuStop || '') !== stop){ var os = Z.get(); if (os){ os.autoOkHuStop = stop; Z.set(os); } }
+        if (!doOk.length || stop) return d;
+        var lotK = 'auto:' + (Z.typ === 'cod' ? Z.sid : 'g') + ':' + j.impId;
+        // W trakcie ksiegowania tej paczki statusow nie ruszamy — nastepny odczyt to zrobi.
+        if (S.lot[lotK] || S.lot['ks:' + j.impId]) return d;
+        S.lot[lotK] = 1;
+        var F = Z.F();
+        try {
+            var bledy = await bkStanWiele(j.impId, doOk.map(function (x){ return String(x.id); }), function (i, n){
+                if (box) box.innerHTML = '<div style="font-size:11px;color:#666">CHECK z różnicą do ' + f2(F.autoOkDo) + ' '
+                                       + esc(F.waluta || '') + ' — ustawiam OK… ' + i + '/' + n + '</div>';
+            });
+            var d2;
+            try { d2 = await bkPaczka(j.impId); } catch (e){ return d; }
+            var stan = {};
+            d2.rows.forEach(function (r){ stan[String(r.id)] = String(r.state == null ? '' : r.state).trim(); });
+            var o = Z.get(); if (!o) return d2;
+            var ao = (o.autoOkHu && typeof o.autoOkHu === 'object') ? o.autoOkHu : {};
+            var nie = (o.autoOkHuNie && typeof o.autoOkHuNie === 'object') ? o.autoOkHuNie : {};
+            var teraz = new Date().toISOString(), potw = 0, nieOpis = [];
+            doOk.forEach(function (x){
+                var id = String(x.id);
+                if (stan[id] === 'OK'){ ao[id] = { czas: teraz, open: huNum(x.open_amount) }; delete nie[id]; potw++; }
+                else {
+                    nie[id] = (Number(nie[id]) || 0) + 1;
+                    nieOpis.push(String(x.payment_descr == null ? id : x.payment_descr) + ' — '
+                                 + (bledy[id] || ('prologistics ma nadal ' + (stan[id] || 'pusty status'))));
+                }
+            });
+            o.autoOkHu = ao; o.autoOkHuNie = nie;
+            o.autoOkHuOpis = { ile: potw, nie: nieOpis.slice(0, 8), nieIle: nieOpis.length, czas: teraz };
+            Z.set(o);
+            return d2;
+        } finally { delete S.lot[lotK]; }
+    }
+    // Komunikat operacji na paczce stoi takze W JEJ pudelku: say() pisze na gorze panelu, a paczka
+    // pobran bywa ekran nizej — „nic sie nie stalo" bywalo tylko tym, ze komunikatu nie widac
+    // (zgloszenie 30.09.2026). Przezywa przerysowanie paczki.
+    function zMowKlucz(Z, j){ return (Z.typ === 'cod' ? ('cod:' + Z.sid) : 'glowna') + ':' + (j ? j.impId : ''); }
+    function zMowHtml(m){
+        return !m ? '' : ('<div style="margin:4px 0;padding:4px 7px;border-radius:6px;border:1px solid #e5e7eb;background:#fafafa;'
+               + 'font-size:11px;font-weight:700;color:' + esc(m.c || '#333') + '">'
+               + '<span style="color:#888;font-weight:normal">' + esc(m.czas || '') + '</span> ' + m.t + '</div>');
+    }
+    function zMow(Z, j, t, c){
+        say(t, c);
+        var m = { t: t, c: c || '#333', czas: new Date().toTimeString().slice(0, 5) };
+        S.pkMsg[zMowKlucz(Z, j)] = m;
+        var b = Z.box(), el = b && b.querySelector(':scope > [data-bk="pk-msg"]');
+        if (el) el.innerHTML = zMowHtml(m);
+    }
+
+    // ---------- zlecenie paczki wyciagu ----------
+    // Zlecenie „Z" to paczka importu z wlasna pamiecia. Widok paczki (rysujPaczke) jest jeden
+    // dla paczki wyciagu i dla paczek pobran — rysuje sie WYLACZNIE w pudelku swojego
+    // zlecenia i tam szuka swoich guzikow, wiec dwie paczki na jednym ekranie nie wchodza
+    // sobie w droge.
+    // Slad ksiegowania paczki zapisywany PRZED zapytaniem (ksWToku) i zdejmowany po odpowiedzi.
+    // znak: 1 = konto glowne (wyciag: z przypisaniem, pobrania: bez), 'sub' = subkonto,
+    // null = zdjecie bez ksiegowania.
+    function zWTokuZapisz(Z, ids, blok){
+        var o = Z.get(); if (!o) return;
+        var m = (o.ksWToku && typeof o.ksWToku === 'object') ? o.ksWToku : {}, t = new Date().toISOString();
+        ids.forEach(function (id){ m[String(id)] = { czas: t, blok: blok, karta: bkKarta() }; });
+        o.ksWToku = m; Z.set(o);
+    }
+    function zWTokuZdejmij(Z, ids, znak){
+        var o = Z.get(); if (!o) return;
+        var m = (o.ksWToku && typeof o.ksWToku === 'object') ? o.ksWToku : {};
+        var b = (o.bookedIds && typeof o.bookedIds === 'object') ? o.bookedIds : {};
+        var so = (o.subOk && typeof o.subOk === 'object') ? o.subOk : {};
+        ids.forEach(function (id){ delete m[String(id)]; if (znak){ b[String(id)] = znak; delete so[String(id)]; } });
+        o.ksWToku = m; o.bookedIds = b; o.subOk = so;
+        if (znak === 1 && ids.length) o.booked = true;
+        Z.set(o);
+    }
+    // Wiersze, ktorym guzik subkonta ustawil juz OK, a na subkoncie nic nie poszlo (blad w trakcie,
+    // „Nie są — zdejmij blokadę"). Wracaja pod guzik SUBKONTA — jako zwykle OK poszlyby pod
+    // „Zaksięguj OK" na konto glowne i roznica zostalaby na auftragu (przeglad 29.09.2026).
+    function zSubOk(Z, ids){
+        var o = Z.get(); if (!o || !ids.length) return;
+        var so = (o.subOk && typeof o.subOk === 'object') ? o.subOk : {};
+        ids.forEach(function (id){ so[String(id)] = 1; });
+        o.subOk = so; Z.set(o);
+    }
+    // Lista do wyslania liczona w chwili KLIKNIECIA ze swiezej pamieci zlecenia, nie z widoku:
+    // guzik narysowany przed ksiegowaniem w innej karcie (albo przed wlasnym, ktore wlasnie
+    // skonczylo) mialby w domknieciu wiersze juz zaksiegowane. glowne = „Zaksięguj OK".
+    function zDoWyslania(Z, ids, euNarz, glowne){
+        var bk = zMapa(Z, 'bookedIds'), wt = zMapa(Z, 'ksWToku'), so = zMapa(Z, 'subOk');
+        var za = euNarz ? {} : zMapa(Z, 'zaksAuf');
+        return ids.filter(function (id){
+            id = String(id);
+            return !bk[id] && !wt[id] && !za['w' + id] && !(glowne && so[id]);
+        });
+    }
+    // Slad z INNEJ karty, swiezy (do 5 min) i bez bledu: tamta karta moze wlasnie czekac na
+    // odpowiedz. Guzikow rozstrzygniecia wtedy nie dajemy — „Nie ma — zdejmij" w trakcie
+    // trwajacego zapisu prowadzilo do drugiego zapisu (przeglad 29.09.2026).
+    function bkObcyWToku(w){
+        if (!w || w.blad || !w.karta || w.karta === bkKarta()) return false;
+        var t = Date.parse(w.czas || '');
+        return isFinite(t) && Date.now() - t < 5 * 60000;
+    }
+    function zWTokuBlad(Z, ids, blad){
+        var o = Z.get(); if (!o || !o.ksWToku) return;
+        ids.forEach(function (id){ if (o.ksWToku[String(id)]) o.ksWToku[String(id)].blad = blad; });
+        Z.set(o);
+    }
+    // Zlecenie jest PRZYPIETE do numeru paczki: gdy w miedzyczasie w pamieci stoi inna paczka
+    // (nowy import, druga karta), get() oddaje null, set() nic nie zapisuje, a widok i guziki
+    // odmawiaja. Bez tego spozniona odpowiedz rysowala wiersze paczki A pod numerem paczki B
+    // i ksiegowala je z file_id B (przeglad 29.09.2026 — dotyczylo tez EuPago).
+    function zGlowne(impId){
+        var pin = impId ? String(impId) : '';
+        var moj = function (){ var j = job(); return (j && (!pin || String(j.impId) === pin)) ? j : null; };
+        return {
+            typ: 'glowna',
+            box: function (){ return $('#bk-imp'); },
+            get: moj,
+            set: function (o){ if (moj() && o && (!pin || String(o.impId) === pin)) jobZapisz(o); },
+            F: function (){ var j = moj() || job(); return fmt((j && j.format) || S.format); },
+            konto: function (){
+                var j = moj() || job() || {}, id = j.format || S.format;
+                return ustaw(id).konto || fmt(id).konto || '';
+            },
+            odswiez: function (){ return sprawdz(); },
+            zapomnij: function (){
+                if (!moj()) return;
+                jobZapisz({});
+                var b = $('#bk-imp'); if (b){ b.style.display = 'none'; b.innerHTML = ''; }
+            }
+        };
+    }
+    // Wspolna kontrola przed kazdym zapisem z widoku paczki: czy to nadal ta paczka.
+    function zAktualne(Z, j){
+        var t = Z.get();
+        if (t && j && String(t.impId) === String(j.impId)) return true;
+        if (Z.typ === 'glowna' && !job())
+            zMow(Z, j, 'Tej paczki nie ma już w panelu — zapomniana albo zastąpiona w innej karcie. Nic nie wysłałem.', '#c47f00');
+        else zMow(Z, j, 'Ta paczka nie jest już bieżąca — zmieniła się w międzyczasie (nowy import albo druga karta). '
+            + 'Odświeżam widok, nic nie wysłałem.', '#c47f00');
+        try { Z.odswiez(); } catch (e){}
+        return false;
+    }
+    // Kwota z paczki przy forintach. bkNum bierze OSTATNI separator za dziesietny, wiec
+    // „15,855" czytalby jako 15.855. Tu separator jest dziesietny tylko wtedy, gdy stoja za
+    // nim dokladnie dwie cyfry — inaczej to separator tysiecy.
+    // Przeglad 29.09.2026: „12345.5" dawalo 123455. Teraz separator jest TYSIECY tylko wtedy,
+    // gdy stoja za nim dokladnie 3 cyfry, a przed nim grupa 1–3 cyfr (albo kolejne grupy tym
+    // samym znakiem) — „15,855", „4,443,420". Kazdy inny to separator dziesietny.
+    function huNum(v){
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        var s = String(v == null ? '' : v).replace(/[^\d.,-]/g, '');
+        if (!/\d/.test(s)) return null;
+        var neg = s.charAt(0) === '-';
+        s = s.replace(/-/g, '');
+        var m = s.match(/^(.*?)([.,])(\d+)$/), n;
+        if (!m) n = Number(s);
+        else {
+            var przed = m[1], sep = m[2], po = m[3];
+            var tysiace = po.length === 3 && (przed.indexOf(sep) >= 0
+                ? new RegExp('^\\d{1,3}(\\' + sep + '\\d{3})*$').test(przed)
+                : /^\d{1,3}$/.test(przed));
+            n = tysiace ? Number((przed + po).replace(/[.,]/g, '')) : Number(przed.replace(/[.,]/g, '') + '.' + po);
+        }
+        if (!isFinite(n)) return null;
+        return neg ? -n : n;
+    }
+
+    function rysujPaczke(Z, d){
+        var box = Z.box(); if (!box) return;
+        var j = Z.get();
+        // Odczyt nie z tego zlecenia (spozniona odpowiedz, inna paczka w pamieci): starych
+        // wierszy nie rysujemy pod nowym numerem — pokazujemy to, co jest teraz.
+        if (!j || (d && d.id && String(d.id) !== String(j.impId))){
+            if (Z.typ === 'glowna') sprawdz();     // bez zlecenia sprawdz chowa widok
+            else box.innerHTML = '';
+            return;
+        }
+        var F = Z.F();
+        // Narzedzia eupago (szukanie po numerze transakcji, tabelka eupago w auftragu,
+        // numer zamowienia zamiast transakcji) zostaja dla EuPago i PostFinance jak dotad.
+        // Wyciag HU i paczki pobran maja wlasna, prostsza sciezke NOT FOUND.
+        var euNarz = !(F.hu || F.cod);
+        var num = euNarz ? bkNum : huNum;
+        var q = function (s){ return box.querySelector(s); };
+        var qa = function (s){ return box.querySelectorAll(s); };
         var rows = d.rows, col = d.colours || {};
-        var by = {};
-        rows.forEach(function (x){ var s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
+        // Wyciag HU: wiersze wplat przewoznikow nie trafiaja do list OK / CHECK / NOT FOUND.
+        // Ksieguje je import pobran, wiec tu nie wolno ich przypisac, przestawic ani zaksiegowac.
+        var pw = (Z.typ === 'glowna' && F.hu) ? huPrzewWPaczce(j, rows, num) : { mapa: {}, lista: [] };
+        if (Z.typ === 'glowna' && F.hu) pw.wszystkie = huPrzewWszystkie(j, pw);
+        var wlasne = rows.filter(function (x){ return !pw.mapa[String(x.id)]; });
+        var by = {}, byWsz = {};
+        rows.forEach(function (x){ var s = String(x.state || '?'); (byWsz[s] = byWsz[s] || []).push(x); });
+        wlasne.forEach(function (x){ var s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
         var ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
         // Prologistics samo oznacza pozycje, ktore juz kiedys wczytano — to jedyna
         // kontrola dzialajaca niezaleznie od tego, kto i czym je wprowadzil.
         var seen = rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; });
 
         var h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;padding-top:8px;border-top:1px solid #eee">'
-              + '<b style="font-size:11px;color:#5b21b6">Paczka importu ' + esc(j.impId) + '</b>'
+              + '<b style="font-size:11px;color:#5b21b6">' + (Z.typ === 'cod' ? ('Import pobrań ' + esc(Z.nazwa || '') + ' — paczka ') : 'Paczka importu ')
+              + esc(j.impId) + '</b>'
               + '<a href="/react/settings_page/import_payments/' + esc(j.impId) + '/" target="_blank" style="font-size:11px">otwórz w prologistics ↗</a>'
               + '<span style="font-size:11px;color:#666">wierszy ' + rows.length + '</span>';
-        Object.keys(by).sort().forEach(function (s){
+        Object.keys(byWsz).sort().forEach(function (s){
             h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">'
-              +  esc(s) + ': ' + by[s].length + '</span>';
+              +  esc(s) + ': ' + byWsz[s].length + '</span>';
         });
-        h += '<button id="bk-imp-re" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
-          +  '<button id="bk-imp-zap" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="Zapomnij tę paczkę — panel przestanie ją pokazywać. W prologistics nic się nie zmieni.">✕ Zapomnij paczkę</button>'
-          +  '</div>';
+        h += '<button data-bk="re" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">↻ Odśwież</button>'
+          +  '<button data-bk="zap" style="padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" title="'
+          +  (Z.typ === 'cod' ? 'Zapomnij ten import pobrań — pod wpłatą znów dodasz plik z maila. W prologistics nic się nie zmieni.'
+                              : 'Zapomnij tę paczkę — panel przestanie ją pokazywać. W prologistics nic się nie zmieni.') + '">'
+          +  (Z.typ === 'cod' ? '✕ Zapomnij import pobrań' : (F.hu ? '✕ Zapomnij paczkę wyciągu' : '✕ Zapomnij paczkę')) + '</button>'
+          +  '</div>'
+          +  '<div data-bk="pk-msg">' + zMowHtml(S.pkMsg[zMowKlucz(Z, j)]) + '</div>';
 
         if (seen.length){
             h += '<div style="margin:6px 0;padding:5px 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px">'
@@ -69785,32 +71279,42 @@
               +  esc(seen.slice(0, 12).map(function (x){ return x.payment_descr; }).join(', '))
               +  (seen.length > 12 ? (' … +' + (seen.length - 12)) : '') + '</div></div>';
         }
+        // Wplaty przewoznikow — na gorze, bo pod kazda idzie plik z maila i jej import pobran.
+        if (Z.typ === 'glowna' && F.hu) h += huPrzewSekcja(j, pw, num);
+
         // „kol" to DODATKOWA kolumna na koncu wiersza: { naglowek, cel(x) }. Bez niej
         // tabela wyglada dokladnie tak, jak wygladala — kubelki CHECK niczego nie zauwaza.
         // Pusty „tytul" znaczy, ze naglowek stoi juz wyzej (np. w <summary> zwinietej listy).
         var tab = function (tytul, kolor, lista, opis, kol){
+            // HU (wyciag i pobrania): open_amount to reszta PO wplacie, wiec „Różnica" liczona jako
+            // wplata minus open pokazywala bzdure (33 256 przy reszcie -1). Jedna kolumna mowi
+            // wprost, ile zostaje na auftragu. EuPago i PostFinance zostaja jak byly.
             var t = '<div style="margin:6px 0">'
                   + (tytul ? ('<b style="font-size:11px;color:' + kolor + '">' + tytul + ' (' + lista.length + ')</b>') : '')
                   + (opis ? ('<div style="font-size:10px;color:#888;margin-top:2px">' + opis + '</div>') : '')
                   + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
                   + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer w pliku</td>'
                   + '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
-                  + '<td style="padding:1px 6px;text-align:right">Open amount</td>'
-                  + '<td style="padding:1px 6px;text-align:right">Różnica</td>'
+                  + (euNarz ? ('<td style="padding:1px 6px;text-align:right">Open amount</td>'
+                               + '<td style="padding:1px 6px;text-align:right">Różnica</td>')
+                            : '<td style="padding:1px 6px;text-align:right">Zostaje na auftragu</td>')
                   + '<td style="padding:1px 6px">Auftrag</td>'
                   + (kol ? ('<td style="padding:1px 6px">' + kol.naglowek + '</td>') : '')
                   + '</tr>';
             lista.forEach(function (x){
-                var a = bkNum(x.amount), o = bkNum(x.open_amount);
+                var a = num(x.amount), o = num(x.open_amount);
                 var df = (a != null && o != null) ? r2(a - o) : null;
                 var au = bkAukcja(x);
                 // Zero na czerwono klamalo: przy wierszu OK roznica 0.00 to nie usterka,
                 // tylko zgodnosc co do grosza.
                 var kolRoz = (df == null) ? '#888' : (Math.abs(df) < 0.005 ? '#0a7a2f' : '#c00');
+                var kolZost = (o == null) ? '#888' : (Math.abs(o) < 0.005 ? '#0a7a2f' : '#c00');
                 t += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolRoz + '">' + (df == null ? '—' : f2(df)) + '</td>'
+                  +  (euNarz
+                        ? ('<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
+                           + '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolRoz + '">' + (df == null ? '—' : f2(df)) + '</td>')
+                        : ('<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolZost + '">' + (o == null ? '—' : f2(o)) + '</td>'))
                   +  '<td style="padding:2px 6px">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
                   +  (kol ? ('<td style="padding:2px 6px;white-space:nowrap">' + kol.cel(x) + '</td>') : '')
                   +  '</tr>';
@@ -69820,19 +71324,46 @@
         // CHECK to nie zawsze rozjazd kwoty — przy numerze zamowienia zamiast transakcji
         // kwota zgadza sie co do grosza. Rozdzielamy wiec oba przypadki, zeby naglowek
         // nie mowil czegos, czego w tabeli nie widac.
-        var zNumerem = chk.filter(bkToNumerZamowienia);
+        var zNumerem = euNarz ? chk.filter(bkToNumerZamowienia) : [];
         // Koncowki groszowe: na auftragu zostaje tyle, ile mozna wyrownac na subkoncie.
         // Musi byc numer auftragu — bez niego nie ma czego przypisac.
-        var tol = tolGet();
+        var tol = tolGet(F);
+        var subOkM = zMapa(Z, 'subOk'), wTokuM = zMapa(Z, 'ksWToku'), bookedM = zMapa(Z, 'bookedIds');
+        // CHECK, ktory HUB ma juz zapisany jako zaksiegowany (np. subkonto „poszlo", a status w
+        // prologistics sie nie zmienil), NIE wraca pod guzik subkonta: przy kliknieciu i tak by
+        // odpadl w zDoWyslania, a guzik odmawialby w kolko bez widocznego powodu (30.09.2026).
+        // Stoi w „do wyjaśnienia" z droga zdjecia znacznika.
+        var chkZaks = chk.filter(function (x){ return !!bookedM[String(x.id)]; });
         var koncowki = chk.filter(function (x){
             if (zNumerem.indexOf(x) >= 0) return false;
-            var o = bkNum(x.open_amount);
+            if (wTokuM[String(x.id)]) return false;     // wyslane, bez potwierdzenia
+            if (bookedM[String(x.id)]) return false;    // HUB ma go jako zaksiegowany
+            var o = num(x.open_amount);
             return o != null && Math.abs(o) > 0.0001 && Math.abs(o) <= tol
                 && String(x.auction_number || '').trim();
-        });
+        }).concat(ok.filter(function (x){
+            // OK ustawione przez guzik subkonta, a na subkoncie jeszcze nic — wracaja tutaj.
+            var id = String(x.id);
+            return subOkM[id] && !wTokuM[id] && !bookedM[id] && String(x.auction_number || '').trim();
+        }));
         var doWyj = chk.filter(function (x){
             return zNumerem.indexOf(x) < 0 && koncowki.indexOf(x) < 0;
         });
+        var tolCtl = function (zGuzikiem){
+            return '<div style="margin:-4px 0 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                 + '<span style="font-size:10px;color:#666">' + (euNarz ? 'grosze do wyrównania: do'
+                                                                       : 'różnica do wyksięgowania na subkoncie: do') + '</span>'
+                 + '<input data-bk="tol" value="' + tol.toFixed(2) + '" style="width:56px;font-size:10px;text-align:right">'
+                 + (euNarz ? '' : ('<span style="font-size:10px;color:#666">' + esc(F.waluta || '') + '</span>'))
+                 + '<button data-bk="tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
+                 + (zGuzikiem
+                      ? ('<button data-bk="sub" style="padding:4px 10px;border:none;border-radius:6px;background:#0a7a2f;'
+                         + 'color:#fff;font-weight:700;cursor:pointer;font-size:11px">✔ Ustaw OK i wyksięguj na subkoncie ('
+                         + koncowki.length + ')</button>'
+                         + '<span data-bk="sub-msg" style="font-size:11px;color:#666"></span>')
+                      : '')
+                 + '</div>';
+        };
         var ao = j.autoOkOpis;
         if (ao && (ao.ile || (ao.bledy && ao.bledy.length))){
             h += '<div style="margin:6px 0;padding:5px 7px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px">'
@@ -69845,110 +71376,75 @@
                        + esc(ao.bledy.join(' · ')) + ' — „↻ Odśwież" spróbuje jeszcze raz.</div>') : '')
               +  '</div>';
         }
+        // Baner liczony z BIEZACEGO odczytu, nie z zapisu z chwili proby: po ksiegowaniu nie mowi juz
+        // „idą z Zaksięguj OK", wiersz przestawiony potem recznie nie wisi jako „nieprzyjęty", a po
+        // wyczerpaniu prob nie obiecuje ponowienia (przeglad 30.09.2026).
+        var aohM = euNarz ? {} : zMapa(Z, 'autoOkHu'), aohIle = Object.keys(aohM).length;
+        var aohNie = euNarz ? {} : zMapa(Z, 'autoOkHuNie'), aohStop = euNarz ? '' : String(j.autoOkHuStop || '');
+        var aohCzeka = ok.filter(function (x){ var id = String(x.id); return aohM[id] && !bookedM[id] && !wTokuM[id]; }).length;
+        var aohZle = chk.filter(function (x){ var id = String(x.id); return (Number(aohNie[id]) || 0) > 0 && !aohM[id] && !bookedM[id]; });
+        var aohKoniec = aohZle.filter(function (x){ return (Number(aohNie[String(x.id)]) || 0) >= BK_AUTO_OK_PROB; }).length;
+        if (!euNarz && (aohIle || aohZle.length || aohStop)){
+            h += '<div style="margin:6px 0;padding:5px 7px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#0a7a2f">CHECK z różnicą do ' + f2(F.autoOkDo) + ' ' + esc(F.waluta || '')
+              +  (aohIle ? (' — HUB ustawił OK na ' + aohIle + ' wierszach'
+                           + (aohCzeka ? (' · do zaksięgowania: ' + aohCzeka) : ' · wszystkie już zaksięgowane')) : '') + '</b>'
+              +  (aohIle ? ('<div style="font-size:10px;color:#166534;margin-top:2px">Były CHECK tylko przez drobną różnicę'
+                            + (Z.typ === 'cod' ? ' (przy pobraniach to zaokrąglenie gotówki do 5 Ft)' : '') + '. '
+                            + (aohCzeka ? 'Idą z „Zaksięguj OK” niżej; ' : '')
+                            + 'różnica zostaje na auftragu — po zaksięgowaniu widać ją w prologistics i da się ją dać na subkonto. '
+                            + 'Odpowiada to ręcznej zmianie statusu na OK.</div>') : '')
+              +  (aohZle.length
+                    ? ('<div style="font-size:10px;color:#c00;margin-top:2px">Prologistics nie przyjęło zmiany na '
+                       + aohZle.length + ' wierszach: ' + esc(aohZle.slice(0, 8).map(function (x){ return x.payment_descr; }).join(' · '))
+                       + (aohZle.length > 8 ? ' …' : '')
+                       + (aohZle.length > aohKoniec ? ' — „↻ Odśwież” spróbuje jeszcze raz' : '')
+                       + (aohKoniec ? (' — przy ' + aohKoniec + ' HUB już nie próbuje (' + BK_AUTO_OK_PROB + ' próby): zmień status ręcznie w prologistics') : '')
+                       + '.</div>')
+                    : '')
+              +  (aohStop ? ('<div style="font-size:10px;color:#c00;margin-top:2px">Nie ustawiam OK automatycznie: '
+                             + esc(aohStop) + '. Zostaje jak dotąd: próg subkonta albo zmiana statusu ręcznie.</div>') : '')
+              +  '</div>';
+        }
         if (zNumerem.length)
             h += tab('Numer zamówienia zamiast transakcji — status się NIE zapisał', '#c47f00', zNumerem,
                      'Kwota zgadza się z open amount, więc nie ma tu czego wyjaśniać — nie udało się tylko '
                      + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.');
         if (koncowki.length){
-            h += tab('Końcówki groszowe — do wyksięgowania na subkoncie', '#0a7a2f', koncowki,
-                     'Na auftragu zostaje mniej niż ' + f2(tol) + ' — to zaokrąglenie, nie rozjazd. '
+            h += tab(euNarz ? 'Końcówki groszowe — do wyksięgowania na subkoncie' : 'Różnica w progu — do wyksięgowania na subkoncie',
+                     '#0a7a2f', koncowki,
+                     'Na auftragu zostaje nie więcej niż ' + f2(tol) + ' — '
+                     + (euNarz ? 'to zaokrąglenie, nie rozjazd. ' : 'tyle ustawiłeś jako próg. ')
                      + 'Guzik niżej ustawia im status OK i księguje na subkoncie, czyli odpowiada '
                      + 'przyciskowi „' + esc(BK_BLOCK_SUB_OPIS) + '".')
-              +  '<div style="margin:-4px 0 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-              +  '<span style="font-size:10px;color:#666">grosze do wyrównania: do</span>'
-              +  '<input id="bk-tol" value="' + tol.toFixed(2) + '" style="width:46px;font-size:10px;text-align:right">'
-              +  '<button id="bk-tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
-              +  '<button id="bk-sub" style="padding:4px 10px;border:none;border-radius:6px;background:#0a7a2f;'
-              +  'color:#fff;font-weight:700;cursor:pointer;font-size:11px">✔ Ustaw OK i wyksięguj na subkoncie ('
-              +  koncowki.length + ')</button>'
-              +  '<span id="bk-sub-msg" style="font-size:11px;color:#666"></span></div>';
+              +  tolCtl(true);
         }
-        if (doWyj.length)
+        if (doWyj.length){
+            var kolZaks = chkZaks.length ? { naglowek: 'HUB', cel: function (x){
+                var z = bookedM[String(x.id)];
+                return z ? ('<b style="color:#c00">HUB ma go jako zaksięgowany' + (z === 'sub' ? ' na subkoncie' : '')
+                            + ', a w prologistics dalej CHECK</b>') : '';
+            } } : null;
             h += tab('CHECK — do wyjaśnienia', '#c47f00', doWyj,
-                     'Prologistics oznaczyło te wiersze do sprawdzenia. Różnica 0.00 znaczy, że powodem '
-                     + 'NIE jest kwota — wtedy zajrzyj w auftrag.');
+                     'Prologistics oznaczyło te wiersze do sprawdzenia. '
+                     + (euNarz ? 'Różnica 0.00' : '„Zostaje na auftragu” 0.00') + ' znaczy, że powodem '
+                     + 'NIE jest kwota — wtedy zajrzyj w auftrag.', kolZaks);
+            if (chkZaks.length)
+                h += '<div style="margin:-2px 0 6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                   + '<span style="font-size:10px;color:#7c2d12">' + chkZaks.length + ' z nich HUB zapisał jako zaksięgowane, '
+                   + 'choć status się nie zmienił — sprawdź w prologistics, czy naprawdę są zaksięgowane.</span>'
+                   + '<button data-bk="zaks-zdejmij" style="padding:2px 8px;border:1px solid #c00;border-radius:5px;background:#fff;'
+                   + 'color:#c00;cursor:pointer;font-size:10px">↺ Nie są zaksięgowane — zdejmij znacznik (' + chkZaks.length + ')</button></div>';
+            // Przy HU kwota ma sie zgadzac (prog 0), ale roznice da sie dac na subkonto:
+            // podniesienie progu przenosi wiersz wyzej, do guzika „na subkoncie".
+            if (!euNarz && !koncowki.length)
+                h += '<div style="font-size:10px;color:#888;margin:-2px 0 2px">Kwota ma się zgadzać. Jeśli różnicę '
+                   + 'trzeba dać na subkonto, podnieś próg — wiersze w progu przejdą wyżej, do guzika „'
+                   + esc(BK_BLOCK_SUB_OPIS) + '”.</div>' + tolCtl(false);
+        }
         if (nf.length){
-            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND — prologistics nie znalazł auftragu ('
-              +  nf.length + ')</b>'
-              +  ' <button id="bk-nf" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" '
-              +  'title="Szuka auftragu w wyszukiwarce prologistics po numerze transakcji z eupago — kryterium „payment comment”.">'
-              +  '🔍 Szukaj auftragów po numerze transakcji</button>'
-              +  '<div style="font-size:10px;color:#888;margin-top:2px">Przy eupago to najczęściej zamówienie '
-              +  '<b>skasowane</b> — import po numerze fulfilmentu takiego nie widzi. Numer transakcji z pliku '
-              +  'siedzi natomiast w komentarzu płatności, więc wyszukiwarka go zna: to dokładnie to, co robisz '
-              +  'ręcznie w <span style="font-family:monospace">search.php?express</span>, wpisując numer w pole '
-              +  '„payment comment”.</div>'
-              +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
-              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer transakcji</td>'
-              +  '<td style="padding:1px 6px">Data płatności</td>'
-              +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
-              +  '<td style="padding:1px 6px">Przypisz auftrag</td>'
-              +  '<td style="padding:1px 6px">Auftrag po numerze transakcji</td></tr>';
-            nf.forEach(function (x){
-                var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
-                var a = bkNum(x.amount);
-                // Data platnosci pochodzi z PLIKU (kolumna Payment Date przy tym numerze) —
-                // paczka importu daty nie oddaje.
-                var iso = ((j && j.daty) || {})[nr] || '';
-                // Numer auftragu, ktory JUZ stoi przy tym wierszu paczki — wpisany
-                // guzikiem „przypisz" albo doklejony wczesniej. Dopiero on daje prawo
-                // do „ustaw OK": status przestawia sie na czyms, a nie w powietrzu.
-                var auNf = bkAukcja(x);
-                var juzAuf = bkZaks(j, nr);
-                var znane = (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1');
-                h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
-                  +  (nr ? esc(nr) : '<span style="color:#c00">brak numeru w paczce</span>') + '</td>'
-                  +  '<td style="padding:2px 6px;white-space:nowrap">'
-                  +  (iso ? esc(iso)
-                          : (fmt(j.format || S.format).kolKlucz == null
-                                ? '<span style="color:#888" title="Ten format nie niesie pary numer→data, więc daty płatności nie znam.">—</span>'
-                                : '<span style="color:#c47f00">— (wgraj plik jeszcze raz)</span>'))
-                  +  '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
-                  // Przypisanie auftragu wprost do wiersza paczki — to samo, co ołówek
-                  // przy wierszu w prologistics. Numer podpowiadany z treści, nigdy
-                  // wysyłany bez kliknięcia.
-                  +  '<td style="padding:2px 6px;white-space:nowrap">'
-                  // W polu stoi numer JUZ przypisany do wiersza, a dopiero gdy go nie ma —
-                  // podpowiedz z tresci. Inaczej podpowiedz nadpisywalaby na ekranie to,
-                  // co naprawde siedzi w paczce.
-                  +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="'
-                  +  esc(auNf ? auNf.label : bkAufZTekstu(nr)) + '" '
-                  +  'placeholder="15629079/3" style="width:96px;font-size:10px">'
-                  +  ' <button class="bk-auf-set" data-row="' + esc(x.id) + '" style="padding:2px 7px;border:none;'
-                  +  'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">przypisz</button>'
-                  // Status na OK — to samo, co reczna zmiana w prologistics. Sam guzik
-                  // NIC nie ksieguje: wraca tylko wiersz na liste „Zaksięguj OK".
-                  +  (auNf
-                        ? (' <button class="bk-nf-ok" data-row="' + esc(x.id) + '" data-num="' + esc(auNf.num)
-                           + '" data-lab="' + esc(auNf.label) + '"'
-                           + ' data-amt="' + esc(a == null ? '' : String(a)) + '" data-nr="' + esc(nr) + '"'
-                           + ' data-imp="' + (znane ? '1' : '0') + '"'
-                           + ' title="Przestawia status tego wiersza na OK — to samo, co ręczna zmiana statusu '
-                           + 'w prologistics. Wiersz wraca na listę do zaksięgowania; samo księgowanie to osobny przycisk."'
-                           + ' style="padding:2px 7px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;'
-                           + 'cursor:pointer;font-size:10px">✔ ustaw OK</button>'
-                           + (juzAuf ? ('<div style="font-size:9px;color:#c00;white-space:normal;max-width:190px">'
-                                        + '⚠ ta wpłata poszła już wprost na auftrag ' + esc(juzAuf.num)
-                                        + ' — ustawienie OK i zaksięgowanie paczki zaksięguje ją drugi raz</div>') : '')
-                           + (znane ? '<div style="font-size:9px;color:#c2410c">⚠ prologistics zna już tę płatność</div>' : ''))
-                        : ' <span style="font-size:9px;color:#888" title="Status przestawia się na czymś, nie w '
-                          + 'powietrzu — najpierw wpisz numer auftragu i kliknij „przypisz”.">— najpierw przypisz</span>')
-                  +  '</td>'
-                  +  '<td style="padding:2px 6px">' + bkNfKom(j, nr, a) + '</td></tr>';
-            });
-            h += '</table></div>'
-              +  '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-              +  '<span style="font-size:10px;color:#666">okno dat przy szukaniu po kwocie: ±</span>'
-              +  '<input id="bk-okno" value="' + oknoDni() + '" style="width:34px;font-size:10px;text-align:right">'
-              +  '<span style="font-size:10px;color:#666">dni</span>'
-              +  '<span style="font-size:10px;color:#666;margin-left:8px">czytaj po</span>'
-              +  '<input id="bk-rown" value="' + rownolegle() + '" style="width:30px;font-size:10px;text-align:right">'
-              +  '<span style="font-size:10px;color:#666">auftragów naraz</span>'
-              +  '<button id="bk-okno-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
-              +  '</div>'
-              +  bkPropozycje(j, nf)
-              +  '</div>';
+            if (euNarz) h += nfEupagoHtml(j, nf, F);
+            else h += nfHuHtml(Z, j, nf, num);
         }
 
         // Ksiegowanie bierze WYLACZNIE wiersze, ktorych z tego panelu jeszcze nie
@@ -69957,25 +71453,64 @@
         // NOT FOUND na OK) zostawal wtedy bez drogi do ksiegowania. Zaksiegowane id-y
         // pamieta zlecenie; przy starym zleceniu, ktore ich nie zna, zostaje dawne
         // zachowanie: paczka zaksiegowana = guzik wylaczony.
-        var zaksId = jobMapa('bookedIds');
+        var zaksId = zMapa(Z, 'bookedIds');
         var znaId  = Object.keys(zaksId).length > 0;
-        var doKs   = (j.booked && !znaId) ? [] : ok.filter(function (x){ return !zaksId[String(x.id)]; });
+        // Wiersze, ktorych ksiegowanie juz WYSLALISMY, a odpowiedzi nie ma (w locie, F5 w trakcie,
+        // blad sieci): slad powstaje PRZED zapytaniem, wiec takie wiersze nie wracaja pod guzik,
+        // dopoki czlowiek nie sprawdzi ich w prologistics (przeglad 29.09.2026).
+        var wToku = zMapa(Z, 'ksWToku'), wTokuIds = Object.keys(wToku);
+        // Czym „Zaksięguj OK" ksieguje TA paczke (wyciag z przypisaniem, pobrania bez).
+        var BK = bkBlokKs(Z);
+        // W locie w tej karcie albo swiezo wyslane z innej — w obu razach bez guzikow rozstrzygniecia.
+        var obcyKs = wTokuIds.some(function (k){ return bkObcyWToku(wToku[k]); });
+        var lotKs = !!S.lot['ks:' + j.impId] || obcyKs;
+        // HU: wiersz zaksiegowany wprost na auftragu („Zaksięguj tutaj") nie idzie z paczka —
+        // klucz to wiersz paczki, wiec blokada jest dokladna. Eupago bez zmian (ostrzega).
+        var zaksAufM = euNarz ? {} : zMapa(Z, 'zaksAuf');
+        var doKs   = (j.booked && !znaId) ? [] : ok.filter(function (x){
+            var id = String(x.id);
+            return !zaksId[id] && !wToku[id] && !zaksAufM['w' + id] && !subOkM[id];
+        });
         var znaneKs = doKs.filter(function (x){
             return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; }).length;
+        if (wTokuIds.length){
+            var wt0 = wToku[wTokuIds[0]] || {};
+            var bladWt = wTokuIds.map(function (k){ return wToku[k] && wToku[k].blad; }).filter(Boolean)[0] || '';
+            h += '<div style="margin:6px 0;padding:5px 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px">'
+              +  '<b style="font-size:11px;color:#c2410c">' + (lotKs ? (obcyKs && !S.lot['ks:' + j.impId] ? '⏳ Księgowanie w innej karcie: ' : '⏳ Księguję ')
+                                                                 : '⚠ Księgowanie bez potwierdzenia: ')
+              +  wTokuIds.length + ' wierszy</b>'
+              +  '<div style="font-size:10px;color:#7c2d12;margin-top:2px">Wysłane ' + esc(String(wt0.czas || '').replace('T', ' ').slice(0, 16))
+              +  (wt0.blok ? (' (' + esc(wt0.blok) + ')') : '')
+              +  (lotKs ? (obcyKs && !S.lot['ks:' + j.impId] ? ' — tamta karta czeka na odpowiedź. Kliknij „↻ Odśwież” za chwilę.' : ' — czekam na odpowiedź.')
+                        : (' — odpowiedzi nie dostałem' + (bladWt ? (' (' + esc(bladWt) + ')') : ' (odświeżenie strony w trakcie?)')
+                           + '. Te wiersze nie pójdą drugi raz, dopóki nie sprawdzisz w prologistics, czy są zaksięgowane.'))
+              +  '</div>'
+              +  (lotKs ? '' : ('<div style="margin-top:3px;display:flex;gap:6px;flex-wrap:wrap">'
+                   + '<button data-bk="wtoku-ok" style="padding:2px 8px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;cursor:pointer;font-size:10px">✔ Są zaksięgowane</button>'
+                   + '<button data-bk="wtoku-zdejmij" style="padding:2px 8px;border:1px solid #c00;border-radius:5px;background:#fff;color:#c00;cursor:pointer;font-size:10px">↺ Nie są — zdejmij blokadę</button></div>'))
+              +  '</div>';
+        }
 
         // Lista OK — to, co pojdzie guzikiem nizej. Wczesniej OK bylo w panelu wylacznie
         // liczba, wiec wiersz przestawiony recznie z NOT FOUND znikal z oczu tuz przed
         // zaksiegowaniem. Kolumna „Status" mowi, skad ten OK sie wzial.
         if (ok.length){
-            var recOk = jobMapa('recznieOk');
+            var recOk = zMapa(Z, 'recznieOk');
             var kolOk = { naglowek: 'Status', cel: function (x){
-                var id = String(x.id), w = recOk[id];
+                var id = String(x.id), w = recOk[id], au = aohM[id];
                 var t = w ? ('<span style="color:#0a7a2f">przestawione ręcznie z ' + esc(w.z || 'NOT FOUND') + '</span>')
-                          : '<span style="color:#888">z importu</span>';
+                          : (au ? ('<span style="color:#0a7a2f">ustawione automatycznie z CHECK (zostaje '
+                                   + (au.open == null ? '?' : f2(au.open)) + ')</span>')
+                                : '<span style="color:#888">z importu</span>');
                 if (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1')
                     t += ' <b style="color:#c2410c" title="Prologistics zna już tę płatność — '
                        + 'sprawdź, czy nie księgujesz drugi raz.">znane</b>';
-                if (zaksId[id]) return t + ' <b style="color:#5b21b6">✔ zaksięgowane</b>';
+                if (zaksId[id]) return t + ' <b style="color:#5b21b6">' + (zaksId[id] === 'sub' ? '✔ zaksięgowane na subkoncie' : '✔ zaksięgowane') + '</b>';
+                if (wToku[id]) return t + ' <b style="color:#c2410c">⏳ księgowanie wysłane — bez potwierdzenia</b>';
+                if (subOkM[id]) return t + ' <b style="color:#0a7a2f">→ na subkonto (guzik wyżej), nie z tą listą</b>';
+                if (zaksAufM['w' + id]) return t + ' <b style="color:#c00">✔ zaksięgowane wprost na auftragu '
+                    + esc(zaksAufM['w' + id].num) + ' — z paczką NIE pójdzie</b>';
                 if (w) t += ' <button class="bk-ok-cof" data-row="' + esc(id) + '" data-z="' + esc(w.z || 'NOT FOUND') + '"'
                           + ' data-nr="' + esc(x.payment_descr == null ? '' : x.payment_descr) + '"'
                           + ' title="Cofa status na poprzedni. Numeru auftragu to nie zdejmuje."'
@@ -69983,7 +71518,7 @@
                           + 'background:#fff;color:#c00;cursor:pointer;font-size:9px">↩ cofnij</button>';
                 return t;
             } };
-            var opisOk = 'To pójdzie przyciskiem niżej („' + esc(BK_BLOCK_OPIS) + '"). Wiersz przestawiony '
+            var opisOk = 'To pójdzie przyciskiem niżej („' + esc(BK.opis) + '"). Wiersz przestawiony '
                        + 'ręcznie można cofnąć — dopóki nie został zaksięgowany.';
             // Przy duzej paczce tabela zepchnelaby guzik ksiegowania daleko w dol, wiec
             // od 30 wierszy zwija sie pod jedna linijke. Liczba jest widoczna zawsze.
@@ -69996,82 +71531,182 @@
 
         var moge = doKs.length > 0;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          +  '<button id="bk-ksieguj"' + (moge ? '' : ' disabled')
+          +  '<button data-bk="ksieguj"' + (moge ? '' : ' disabled')
           +  ' style="padding:6px 14px;border:none;border-radius:6px;background:' + (moge ? '#5b21b6' : '#c7c7c7')
           +  ';color:#fff;font-weight:700;cursor:' + (moge ? 'pointer' : 'default') + ';font-size:12px">'
           +  (moge ? ('▶ Zaksięguj OK (' + doKs.length + ')')
                    : (j.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : '▶ Zaksięguj OK (0)')) + '</button>'
-          +  '<span style="font-size:10px;color:#888">Odpowiada przyciskowi „' + esc(BK_BLOCK_OPIS)
-          +  '". CHECK i NOT FOUND zostają nietknięte.</span>'
+          +  '<span style="font-size:10px;color:#888">Odpowiada przyciskowi „' + esc(BK.opis)
+          +  '"' + (Z.typ === 'cod' ? ' (bez przypisania — pobranie za towar już wysłany)' : '')
+          +  '. CHECK i NOT FOUND zostają nietknięte.</span>'
           +  (moge && j.booked
                 ? ('<span style="font-size:10px;color:#c47f00">Paczka była już księgowana — te '
                    + doKs.length + ' pozycji doszły później.</span>') : '')
           +  (znaneKs ? ('<span style="font-size:10px;color:#c2410c">⚠ ' + znaneKs
                          + ' z nich prologistics już zna</span>') : '')
-          +  '<span id="bk-ksieguj-msg" style="font-size:11px;color:#666"></span></div>';
+          +  '<span data-bk="ksieguj-msg" style="font-size:11px;color:#666"></span></div>';
+        // Wyciag HU: pod paczka to, co z pliku wyjelismy — INS, szkody GLS do docs, minusy.
+        if (Z.typ === 'glowna' && F.hu && j.hu)
+            h += huInsHtml(j.hu.ins) + huDocsHtml(j.hu.docs) + huMinusHtml(j.hu.minus);
         box.innerHTML = h;
+        // Ostatni NARYSOWANY odczyt kazdej paczki — przerysowanie paczki wyciagu rysuje paczki
+        // pobran z tej pamieci, wiec musi ona nadazac tez za „ustaw OK" i „cofnij".
+        if (Z.typ === 'glowna') S.glownaD = d;
+        else S.codPaczki[Z.sid] = d;
+        // Paczka pobran: ile wierszy czeka jeszcze na czlowieka (CHECK, NOT FOUND bez zapisu na
+        // auftragu). Zaksiegowana paczka z takimi wierszami nie znika z „niedokonczonych".
+        if (Z.typ === 'cod'){
+            // Do „otwartych" wchodza tez wiersze OK, ktore czekaja na „Zaksięguj OK" albo na subkonto:
+            // po auto-OK paczka zaksiegowana wczesniej ma zero CHECK, a jej OK nie sa zaksiegowane —
+            // bez tego znikala z „niedokończonych" na stale (przeglad 30.09.2026).
+            var otw = chk.length + nf.filter(function (x){ var z = zaksAufM['w' + x.id]; return !(z && z.stan === 'ok'); }).length
+                    + doKs.length
+                    + ok.filter(function (x){ var id = String(x.id); return subOkM[id] && !zaksId[id] && !wToku[id]; }).length;
+            if (j.otwarte !== otw){ var oo = Z.get(); if (oo){ oo.otwarte = otw; Z.set(oo); } }
+        }
+        // Elementy TEJ paczki lapiemy teraz — zanim pod wplatami przewoznikow narysuja sie
+        // paczki pobran. Szukanie w pudelku dopiero przy kliknieciu trafialoby najpierw na
+        // ich guziki, bo sekcja przewoznikow stoi nad reszta tej paczki.
+        var el = {};
+        ['re', 'zap', 'tol', 'tol-set', 'sub', 'sub-msg', 'ksieguj', 'ksieguj-msg', 'nf', 'okno', 'rown', 'okno-set',
+         'wtoku-ok', 'wtoku-zdejmij', 'zaks-zdejmij']
+            .forEach(function (k){ el[k] = q('[data-bk="' + k + '"]'); });
+        var aufInp = {};
+        qa('.bk-auf').forEach(function (x){ aufInp[x.getAttribute('data-row')] = x; });
 
-        $('#bk-imp-re').onclick = function (){ sprawdz(); };
-        var ts = $('#bk-tol-set');
+        el.re.onclick = function (){ Z.odswiez(); };
+        // Przerysowanie po akcji bierze OSTATNI narysowany odczyt tej paczki, nie ten z chwili
+        // rysowania guzika — inaczej cofaloby swiezsze „ustaw OK" albo „↻ Odśwież".
+        var dTeraz = function (){ return bkOstatniOdczyt(Z, d); };
+        var ts = el['tol-set'];
         if (ts) ts.onclick = function (){
-            var v = Number(String(($('#bk-tol') || {}).value || '').replace(',', '.'));
-            if (!isFinite(v) || v < 0){ say('Podaj liczbę, np. 0.05.', '#c47f00'); return; }
-            gmSet(BK_TOL_KEY, v); rysujPaczke(j, d);
+            var v = Number(String((el.tol || {}).value || '').replace(',', '.'));
+            if (!isFinite(v) || v < 0){ zMow(Z, j, 'Podaj liczbę, np. ' + (euNarz ? '0.05' : '5') + '.', '#c47f00'); return; }
+            gmSet(F.tolKlucz || BK_TOL_KEY, v); rysujPaczke(Z, dTeraz());
         };
-        var sb = $('#bk-sub');
+        var wLocie = function (){
+            if (!S.lot['ks:' + j.impId]) return false;
+            zMow(Z, j, 'Trwa już księgowanie tej paczki — poczekaj na odpowiedź.', '#c47f00');
+            return true;
+        };
+        if (el['zaks-zdejmij']) el['zaks-zdejmij'].onclick = function (){
+            if (!zAktualne(Z, j)) return;
+            if (!confirm('Zdjąć znacznik „zaksięgowane” z ' + chkZaks.length + ' wierszy CHECK?\n\nZrób to TYLKO wtedy, gdy w '
+                + 'prologistics (paczka ' + j.impId + ') widzisz, że NIE są zaksięgowane — potem HUB znów zaproponuje je do '
+                + 'księgowania.')) return;
+            var o = Z.get(); if (!o) return;
+            var b = (o.bookedIds && typeof o.bookedIds === 'object') ? o.bookedIds : {};
+            chkZaks.forEach(function (x){ delete b[String(x.id)]; });
+            o.bookedIds = b; Z.set(o);
+            zMow(Z, j, 'Zdjąłem znacznik z ' + chkZaks.length + ' wierszy — odczytuję paczkę jeszcze raz.', '#0a7a2f');
+            Z.odswiez();
+        };
+        var sb = el.sub;
         if (sb) sb.onclick = async function (){
-            var m = $('#bk-sub-msg');
+            if (!zAktualne(Z, j) || wLocie()) return;
+            var m = el['sub-msg'];
             if (!confirm('Ustawić status OK i zaksięgować ' + koncowki.length + ' pozycji na subkoncie?\n\n'
                 + koncowki.map(function (x){
                       return '  • ' + String(x.payment_descr || '').slice(0, 40)
-                           + '  open ' + f2(bkNum(x.open_amount)); }).join('\n')
+                           + '  open ' + f2(num(x.open_amount)); }).join('\n')
                 + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „'
                 + BK_BLOCK_SUB_OPIS + '".\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-            sb.disabled = true; m.style.color = '#666';
+            if (!zAktualne(Z, j) || wLocie()) return;
+            var ids = zDoWyslania(Z, koncowki.map(function (x){ return String(x.id); }), euNarz, false);
+            if (ids.length !== koncowki.length){
+                zMow(Z, j, 'Część tych wierszy została w międzyczasie zaksięgowana albo jest w toku (ta albo inna karta). '
+                    + 'Odświeżam widok, nic nie wysłałem.', '#c47f00');
+                Z.odswiez(); return;
+            }
+            // Slad PRZED zapytaniami: te wiersze przejda na OK, a po przerwaniu (F5, blad) nie
+            // moga wrocic pod „Zaksięguj OK" jako zwykle wiersze do ksiegowania.
+            zWTokuZapisz(Z, ids, BK_BLOCK_SUB);
+            S.lot['ks:' + j.impId] = 1;
+            // Na czas operacji stoja OBA guziki ksiegowania paczki.
+            sb.disabled = true; if (el.ksieguj) el.ksieguj.disabled = true; m.style.color = '#666';
+            var faza = 'stan', doSub = ids;
             try {
-                for (var i = 0; i < koncowki.length; i++){
-                    m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + koncowki.length;
-                    await bkStan(j.impId, koncowki[i].id, 'OK');
+                // Statusy rownolegle; o tym, co dalej, rozstrzyga odczyt paczki, nie kod odpowiedzi.
+                var bledyS = await bkStanWiele(j.impId, ids, function (i, n){ m.textContent = 'ustawiam statusy… ' + i + '/' + n; });
+                m.textContent = 'sprawdzam statusy w prologistics…';
+                var dS = await bkPaczka(j.impId), stS = {};
+                dS.rows.forEach(function (r){ stS[String(r.id)] = String(r.state == null ? '' : r.state).trim(); });
+                doSub = ids.filter(function (id){ return stS[id] === 'OK'; });
+                var nieOk = ids.filter(function (id){ return stS[id] !== 'OK'; });
+                // Tych prologistics nie przestawilo — nic ksiegujacego dla nich nie poszlo, slad zdejmujemy.
+                // Wiersz z BLEDEM zapisu statusu moze przejsc na OK pozniej (bramka 5xx, a zapis na zapleczu
+                // trwa) — zostaje pod guzikiem subkonta, nie pojdzie z „Zaksięguj OK" na konto glowne.
+                zSubOk(Z, nieOk.filter(function (id){ return bledyS[id]; }));
+                if (nieOk.length) zWTokuZdejmij(Z, nieOk, null);
+                var bladPierwszy = nieOk.map(function (id){ return bledyS[id]; }).filter(Boolean)[0] || '';
+                if (!doSub.length){
+                    delete S.lot['ks:' + j.impId];
+                    zMow(Z, j, 'Nic nie zaksięgowałem na subkoncie: prologistics nie przyjęło zmiany statusu na OK na żadnym z '
+                        + ids.length + ' wierszy' + (bladPierwszy ? (' (' + esc(bladPierwszy) + ')') : '')
+                        + '. Zmień status ręcznie w prologistics albo spróbuj jeszcze raz.', '#c00');
+                    await Z.odswiez();
+                    return;
                 }
-                m.textContent = 'księguję na subkoncie…';
-                await bkKsiegujSub(j.impId, koncowki.map(function (x){ return x.id; }));
-                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
-                await sprawdz();
+                faza = 'ksieguj';
+                m.textContent = 'księguję na subkoncie ' + doSub.length + '…';
+                await bkKsiegujSub(j.impId, doSub);
+                // Wyksiegowane na subkoncie ida do bookedIds — inaczej wracalyby jako OK
+                // pod „Zaksięguj OK" i szly drugi raz, tym razem na konto glowne.
+                zWTokuZdejmij(Z, doSub, 'sub');
+                delete S.lot['ks:' + j.impId];
+                zMow(Z, j, 'Wyksięgowane na subkoncie: ' + doSub.length + ' z ' + ids.length + ' wierszy.'
+                    + (nieOk.length ? (' ' + nieOk.length + ' prologistics nie przestawiło na OK' + (bladPierwszy ? (' (' + esc(bladPierwszy) + ')') : '')
+                                       + ' — zostają pod guzikiem subkonta.') : ''),
+                    nieOk.length ? '#c47f00' : '#0a7a2f');
+                await Z.odswiez();
             } catch (e){
-                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
-                sb.disabled = false;
+                delete S.lot['ks:' + j.impId];
+                if (faza === 'stan'){
+                    // Nie odczytalem paczki po zmianie statusow: nic ksiegujacego nie poszlo, wiec slad
+                    // zdejmujemy. Wiersze, ktorym status mogl juz przejsc na OK, zostaja pod guzikiem
+                    // subkonta — nie ida z „Zaksięguj OK" na konto glowne.
+                    zSubOk(Z, ids);
+                    zWTokuZdejmij(Z, ids, null);
+                    zMow(Z, j, 'Nic nie zaksięgowałem na subkoncie: po zmianie statusów nie odczytałem paczki (' + esc((e && e.message) || e)
+                        + '). Wiersze zostają pod guzikiem subkonta — spróbuj jeszcze raz.', '#c00');
+                } else {
+                    zWTokuBlad(Z, doSub, (e && e.message) || String(e));
+                    zMow(Z, j, 'Wyksięgowanie na subkoncie nie potwierdzone: ' + esc((e && e.message) || e)
+                        + ' — sprawdź w prologistics. Do tego czasu te wiersze są zablokowane.', '#c00');
+                }
+                try { await Z.odswiez(); } catch (e2){}
             }
         };
-        var nfb = $('#bk-nf');
-        if (nfb) nfb.onclick = function (){
-            var lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
-                          .filter(function (x){ return x; });
-            if (!lista.length){ say('Te wiersze nie mają numeru w paczce — nie ma czego szukać.', '#c47f00'); return; }
-            bkSzukajNf(lista, nfb, function (){ rysujPaczke(j, d); });
+        if (el['wtoku-ok']) el['wtoku-ok'].onclick = function (){
+            if (!zAktualne(Z, j)) return;
+            if (!confirm('Uznać ' + wTokuIds.length + ' wierszy za zaksięgowane?\n\nSprawdź najpierw w prologistics '
+                + '(paczka ' + j.impId + '), że naprawdę są zaksięgowane. Potem HUB nie zaproponuje ich więcej.')) return;
+            var o = Z.get() || {}, wt = o.ksWToku || {};
+            zWTokuZdejmij(Z, wTokuIds.filter(function (k){ return (wt[k] || {}).blok !== BK_BLOCK_SUB; }), 1);
+            zWTokuZdejmij(Z, wTokuIds.filter(function (k){ return (wt[k] || {}).blok === BK_BLOCK_SUB; }), 'sub');
+            rysujPaczke(Z, dTeraz());
         };
-        var ok2 = $('#bk-okno-set');
-        if (ok2) ok2.onclick = function (){
-            var v = parseInt(String($('#bk-okno').value || ''), 10);
-            if (!isFinite(v) || v < 0 || v > 30){ say('Podaj liczbę dni od 0 do 30.', '#c47f00'); return; }
-            var r = parseInt(String(($('#bk-rown') || {}).value || ''), 10);
-            if (!isFinite(r) || r < 1 || r > 8){ say('Podaj, ile auftragów naraz — od 1 do 8.', '#c47f00'); return; }
-            gmSet(BK_OKNO_KEY, v); gmSet(BK_ROWN_KEY, r); rysujPaczke(j, d);
-            say('Okno ±' + v + ' dni, czytam po ' + r + ' auftragów naraz.', '#0a7a2f');
+        if (el['wtoku-zdejmij']) el['wtoku-zdejmij'].onclick = function (){
+            if (!zAktualne(Z, j)) return;
+            var o = Z.get() || {}, wt = o.ksWToku || {};
+            var zSub = wTokuIds.filter(function (k){ return (wt[k] || {}).blok === BK_BLOCK_SUB; });
+            if (!confirm('Zdjąć blokadę z ' + wTokuIds.length + ' wierszy?\n\nZrób to TYLKO wtedy, gdy w prologistics '
+                + 'widzisz, że NIE są zaksięgowane — inaczej „Zaksięguj OK" zaksięguje je drugi raz.'
+                + (zSub.length ? ('\n\n' + zSub.length + ' z nich szło na subkonto — wrócą pod guzik subkonta, nie pod „Zaksięguj OK”.') : ''))) return;
+            zSubOk(Z, zSub);
+            zWTokuZdejmij(Z, wTokuIds, null);
+            rysujPaczke(Z, dTeraz());
         };
-        box.querySelectorAll('.bk-nf-kw').forEach(function (b){
-            b.onclick = function (){
-                var nr = b.getAttribute('data-nr'), kw = Number(b.getAttribute('data-amt'));
-                var iso = ((j && j.daty) || {})[nr] || '';
-                bkSzukajPoKwocieIDacie(nr, kw, iso, fmt(j.format || S.format), b, function (){ rysujPaczke(j, d); });
-            };
-        });
-        box.querySelectorAll('.bk-auf-set').forEach(function (b){
+        if (euNarz) nfEupagoPodepnij(Z, j, d, nf, F, el, qa);
+        else nfHuPodepnij(Z, j, d, qa);
+        qa('.bk-auf-set').forEach(function (b){
             b.onclick = async function (){
+                if (!zAktualne(Z, j)) return;
                 var rid = b.getAttribute('data-row');
-                var inp = box.querySelector('.bk-auf[data-row="' + rid + '"]');
+                var inp = aufInp[rid];
                 var nrA = String((inp || {}).value || '').trim();
                 if (!/^\d{6,9}(\/\d+)?$/.test(nrA)){
-                    say('Numer auftragu wpisz jako „15629079/3" albo sam numer.', '#c47f00'); return;
+                    zMow(Z, j, 'Numer auftragu wpisz jako „15629079/3" albo sam numer.', '#c47f00'); return;
                 }
                 if (nrA.indexOf('/') < 0) nrA += '/3';
                 if (!confirm('Przypisać auftrag ' + nrA + ' do tego wiersza paczki ' + j.impId + '?\n\n'
@@ -70080,10 +71715,10 @@
                 b.disabled = true; b.textContent = 'przypisuję…';
                 try {
                     await bkPrzypisz(j.impId, rid, nrA);
-                    say('Przypisane: ' + esc(nrA) + '. Odczytuję paczkę jeszcze raz…', '#0a7a2f');
-                    await sprawdz();
+                    zMow(Z, j, 'Przypisane: ' + esc(nrA) + '. Odczytuję paczkę jeszcze raz…', '#0a7a2f');
+                    await Z.odswiez();
                 } catch (e){
-                    say('Nie przypisałem: ' + esc((e && e.message) || e), '#c00');
+                    zMow(Z, j, 'Nie przypisałem: ' + esc((e && e.message) || e), '#c00');
                     b.disabled = false; b.textContent = 'przypisz';
                 }
             };
@@ -70091,16 +71726,23 @@
         // NOT FOUND -> OK. Nic nie ksieguje: przestawia status wiersza, zeby wrocil na
         // liste „Zaksięguj OK". Przed pytaniem czytamy auftrag i pokazujemy, co na nim
         // widac — to sprawdzenie, a nie blokada: decyzje podejmuje czlowiek.
-        box.querySelectorAll('.bk-nf-ok').forEach(function (b){
+        qa('.bk-nf-ok').forEach(function (b){
             b.onclick = async function (){
-                var rid = b.getAttribute('data-row'), num = b.getAttribute('data-num');
-                var lab = b.getAttribute('data-lab') || num, nr = b.getAttribute('data-nr') || '';
+                if (!zAktualne(Z, j)) return;
+                // W trakcie „Zaksięguj tutaj" na tym wierszu status zostaje, jaki jest.
+                if (!euNarz && S.lot['hu:' + j.impId + ':' + (b.getAttribute('data-k') || '')]){
+                    zMow(Z, j, 'Na tym wierszu trwa zapis wprost na auftragu — poczekaj na wynik.', '#c47f00'); return;
+                }
+                var rid = b.getAttribute('data-row'), num1 = b.getAttribute('data-num');
+                var lab = b.getAttribute('data-lab') || num1, nr = b.getAttribute('data-nr') || '';
                 var kw = Number(b.getAttribute('data-amt'));
                 var znaneW = b.getAttribute('data-imp') === '1';
-                var juz = bkZaks(j, nr);
+                // Wplata poszla juz wprost na auftrag? Eupago pamieta to po numerze transakcji,
+                // HU — po wierszu paczki (tytul przelewu nie jest unikalny).
+                var juz = euNarz ? bkZaks(j, nr) : zMapa(Z, 'zaksAuf')[b.getAttribute('data-k') || ''];
                 b.disabled = true; b.textContent = 'czytam auftrag…';
                 var a = null;
-                try { a = await bkCzytajAuftrag(num); }
+                try { a = await bkCzytajAuftrag(num1); }
                 catch (e){ a = { ok: false, err: (e && e.message) || String(e) }; }
                 var uw = [];
                 if (juz) uw.push('TA WPŁATA JEST JUŻ ZAKSIĘGOWANA wprost na auftragu ' + juz.num
@@ -70117,23 +71759,23 @@
                     + 'Open amount na auftragu: ' + (a && a.open != null ? f2(a.open) : '—') + '\n'
                     + (uw.length ? ('\nUWAGA:\n  • ' + uw.join('\n  • ') + '\n') : '')
                     + '\nOdpowiada to ręcznej zmianie statusu w prologistics. Sam status NIC nie księguje '
-                    + '— wiersz wraca tylko na listę „' + BK_BLOCK_OPIS + '".')){
+                    + '— wiersz wraca tylko na listę „' + BK.opis + '".')){
                     b.disabled = false; b.textContent = '✔ ustaw OK'; return;
                 }
                 b.textContent = 'ustawiam…';
                 try {
                     var r = await bkStanZKontrola(j.impId, rid, 'OK');
                     if (r.ok){
-                        jobMapaZapisz('recznieOk', rid, { z: 'NOT FOUND', auf: lab, nr: nr });
-                        say('Wiersz ' + esc(nr || rid) + ' ma status OK — wrócił na listę do zaksięgowania.', '#0a7a2f');
+                        zMapaZapisz(Z, 'recznieOk', rid, { z: 'NOT FOUND', auf: lab, nr: nr });
+                        zMow(Z, j, 'Wiersz ' + esc(nr || rid) + ' ma status OK — wrócił na listę do zaksięgowania.', '#0a7a2f');
                     } else {
-                        say('Prologistics NIE przyjęło zmiany statusu — wiersz ' + esc(nr || rid) + ' ma nadal „'
+                        zMow(Z, j, 'Prologistics NIE przyjęło zmiany statusu — wiersz ' + esc(nr || rid) + ' ma nadal „'
                           + esc(r.jest ? (r.stan || 'pusty status') : 'nie ma go już w paczce')
                           + '". Zmień status ręcznie w prologistics.', '#c00');
                     }
-                    rysujPaczke(job() || j, r.d);
+                    rysujPaczke(Z, r.d);
                 } catch (e){
-                    say('Nie ustawiłem statusu: ' + esc((e && e.message) || e), '#c00');
+                    zMow(Z, j, 'Nie ustawiłem statusu: ' + esc((e && e.message) || e), '#c00');
                     b.disabled = false; b.textContent = '✔ ustaw OK';
                 }
             };
@@ -70143,8 +71785,9 @@
         // DOKLADNIE ten napis, ktory sam system podal przy tym wierszu, i po zapisie
         // sprawdzamy, czy wszedl. Jesli nie wszedl — mowimy to wprost, zamiast meldowac
         // sukces, ktorego nie bylo.
-        box.querySelectorAll('.bk-ok-cof').forEach(function (b){
+        qa('.bk-ok-cof').forEach(function (b){
             b.onclick = async function (){
+                if (!zAktualne(Z, j)) return;
                 var rid = b.getAttribute('data-row'), z = b.getAttribute('data-z') || 'NOT FOUND';
                 var nr = b.getAttribute('data-nr') || rid;
                 if (!confirm('Cofnąć status wiersza ' + nr + ' z OK na ' + z + '?\n\n'
@@ -70156,26 +71799,199 @@
                 try {
                     var r = await bkStanZKontrola(j.impId, rid, z);
                     if (r.ok){
-                        jobMapaZapisz('recznieOk', rid, null);
-                        say('Wiersz ' + esc(nr) + ' ma z powrotem status ' + esc(z) + '.', '#0a7a2f');
+                        zMapaZapisz(Z, 'recznieOk', rid, null);
+                        zMow(Z, j, 'Wiersz ' + esc(nr) + ' ma z powrotem status ' + esc(z) + '.', '#0a7a2f');
                     } else {
-                        say('Prologistics NIE przyjęło cofnięcia — wiersz ' + esc(nr) + ' ma nadal „'
+                        zMow(Z, j, 'Prologistics NIE przyjęło cofnięcia — wiersz ' + esc(nr) + ' ma nadal „'
                           + esc(r.jest ? (r.stan || 'pusty status') : 'nie ma go już w paczce')
                           + '". Zmień status ręcznie w prologistics.', '#c00');
                     }
-                    rysujPaczke(job() || j, r.d);
+                    rysujPaczke(Z, r.d);
                 } catch (e){
-                    say('Nie cofnąłem statusu: ' + esc((e && e.message) || e), '#c00');
+                    zMow(Z, j, 'Nie cofnąłem statusu: ' + esc((e && e.message) || e), '#c00');
                     b.disabled = false; b.textContent = '↩ cofnij';
                 }
             };
         });
-        box.querySelectorAll('.bk-eu-st').forEach(function (b){
+        el.zap.onclick = function (){
+            if (Z.typ === 'cod'){
+                if (!confirm(codZapomnijPytanie(Z.get() || j))) return;
+                Z.zapomnij();
+                return;
+            }
+            var nr0 = zNierozstrzygniete(Z.get());
+            if (!confirm('Zapomnieć paczkę ' + j.impId + '?\n\n' + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
+                + (F.hu ? ('Razem z nią zniknie sekcja wpłat przewoźników i miejsca na pliki z maili — wrócą dopiero pod '
+                           + 'następnym wyciągiem jako „niedokończone”. Żeby dodać plik przewoźnika jeszcze raz, użyj „✕ Zapomnij '
+                           + 'import pobrań” przy tej wpłacie, nie tego guzika.\n\n') : '')
+                + 'W prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
+            Z.zapomnij();
+        };
+        var bb = el.ksieguj;
+        if (bb) bb.onclick = async function (){
+            if (!zAktualne(Z, j) || wLocie()) return;
+            var m = el['ksieguj-msg'];
+            if (!confirm('Zaksięgować ' + doKs.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
+                + (Z.typ === 'cod' ? ('Import pobrań ' + (Z.nazwa || '') + ' · ') : '')
+                + 'Paczka ' + j.impId + ' · ' + (j.nazwa || '') + '\n'
+                + (znaneKs ? ('⚠ ' + znaneKs + ' z nich prologistics już zna (były wczytane wcześniej)\n') : '')
+                + 'Odpowiada to przyciskowi „' + BK.opis + '"'
+                + (Z.typ === 'cod' ? ' — bez przypisania (pobranie za towar już wysłany)' : '')
+                + '.\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            if (!zAktualne(Z, j) || wLocie()) return;
+            var ids = zDoWyslania(Z, doKs.map(function (x){ return String(x.id); }), euNarz, true);
+            if (ids.length !== doKs.length){
+                zMow(Z, j, 'Część tych wierszy została w międzyczasie zaksięgowana albo jest w toku (ta albo inna karta). '
+                    + 'Odświeżam widok, nic nie wysłałem.', '#c47f00');
+                Z.odswiez(); return;
+            }
+            // Slad PRZED zapytaniem. Po F5 w trakcie albo po bledzie sieci te wiersze nie wroca
+            // pod guzik — czlowiek rozstrzyga w prologistics, czy poszly (przeglad 29.09.2026).
+            zWTokuZapisz(Z, ids, BK.blok);
+            S.lot['ks:' + j.impId] = 1;
+            bb.disabled = true; if (el.sub) el.sub.disabled = true;
+            m.style.color = '#666'; m.textContent = 'księguję…';
+            try {
+                await bkKsieguj(j.impId, ids, BK.blok);
+                // Ktore id-y poszly — zeby drugie klikniecie nie zaksiegowalo ich znowu,
+                // a wiersz naprawiony pozniej mial jeszcze droge do ksiegowania.
+                zWTokuZdejmij(Z, ids, 1);
+                delete S.lot['ks:' + j.impId];
+                zMow(Z, j, 'Wysłane do księgowania: ' + ids.length + ' wierszy („' + esc(BK.opis) + '”).', '#0a7a2f');
+                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
+                await Z.odswiez();
+            } catch (e){
+                zWTokuBlad(Z, ids, (e && e.message) || String(e));
+                delete S.lot['ks:' + j.impId];
+                zMow(Z, j, 'Księgowanie nie potwierdzone: ' + esc((e && e.message) || e) + ' — sprawdź w prologistics '
+                    + '(paczka ' + esc(j.impId) + '). Do tego czasu te wiersze są zablokowane.', '#c00');
+                try { await Z.odswiez(); } catch (e2){}
+            }
+        };
+        if (Z.typ === 'glowna' && F.hu && j.hu){
+            huPodepnij(box, j.hu);
+            huPrzewPodepnij(j, pw, box);
+        }
+    }
+
+    // ---------- NOT FOUND: sciezka eupago (EuPago, PostFinance) ----------
+    // Bez zmian wzgledem tego, co bylo — tylko wyjete z rysujPaczke, zeby wyciag HU mogl
+    // miec obok wlasna, prostsza sciezke.
+    function nfEupagoHtml(j, nf, F){
+        var h = '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND — prologistics nie znalazł auftragu ('
+              +  nf.length + ')</b>'
+              +  ' <button data-bk="nf" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px" '
+              +  'title="Szuka auftragu w wyszukiwarce prologistics po numerze transakcji z eupago — kryterium „payment comment”.">'
+              +  '🔍 Szukaj auftragów po numerze transakcji</button>'
+              +  '<div style="font-size:10px;color:#888;margin-top:2px">Przy eupago to najczęściej zamówienie '
+              +  '<b>skasowane</b> — import po numerze fulfilmentu takiego nie widzi. Numer transakcji z pliku '
+              +  'siedzi natomiast w komentarzu płatności, więc wyszukiwarka go zna: to dokładnie to, co robisz '
+              +  'ręcznie w <span style="font-family:monospace">search.php?express</span>, wpisując numer w pole '
+              +  '„payment comment”.</div>'
+              +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer transakcji</td>'
+              +  '<td style="padding:1px 6px">Data płatności</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px">Przypisz auftrag</td>'
+              +  '<td style="padding:1px 6px">Auftrag po numerze transakcji</td></tr>';
+        nf.forEach(function (x){
+            var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+            var a = bkNum(x.amount);
+            // Data platnosci pochodzi z PLIKU (kolumna Payment Date przy tym numerze) —
+            // paczka importu daty nie oddaje.
+            var iso = ((j && j.daty) || {})[nr] || '';
+            // Numer auftragu, ktory JUZ stoi przy tym wierszu paczki — wpisany
+            // guzikiem „przypisz" albo doklejony wczesniej. Dopiero on daje prawo
+            // do „ustaw OK": status przestawia sie na czyms, a nie w powietrzu.
+            var auNf = bkAukcja(x);
+            var juzAuf = bkZaks(j, nr);
+            var znane = (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1');
+            h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
+              +  (nr ? esc(nr) : '<span style="color:#c00">brak numeru w paczce</span>') + '</td>'
+              +  '<td style="padding:2px 6px;white-space:nowrap">'
+              +  (iso ? esc(iso)
+                      : (F.kolKlucz == null
+                            ? '<span style="color:#888" title="Ten format nie niesie pary numer→data, więc daty płatności nie znam.">—</span>'
+                            : '<span style="color:#c47f00">— (wgraj plik jeszcze raz)</span>'))
+              +  '</td>'
+              +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+              // Przypisanie auftragu wprost do wiersza paczki — to samo, co ołówek
+              // przy wierszu w prologistics. Numer podpowiadany z treści, nigdy
+              // wysyłany bez kliknięcia.
+              +  '<td style="padding:2px 6px;white-space:nowrap">'
+              // W polu stoi numer JUZ przypisany do wiersza, a dopiero gdy go nie ma —
+              // podpowiedz z tresci. Inaczej podpowiedz nadpisywalaby na ekranie to,
+              // co naprawde siedzi w paczce.
+              +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="'
+              +  esc(auNf ? auNf.label : bkAufZTekstu(nr)) + '" '
+              +  'placeholder="15629079/3" style="width:96px;font-size:10px">'
+              +  ' <button class="bk-auf-set" data-row="' + esc(x.id) + '" style="padding:2px 7px;border:none;'
+              +  'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">przypisz</button>'
+              // Status na OK — to samo, co reczna zmiana w prologistics. Sam guzik
+              // NIC nie ksieguje: wraca tylko wiersz na liste „Zaksięguj OK".
+              +  (auNf
+                    ? (' <button class="bk-nf-ok" data-row="' + esc(x.id) + '" data-num="' + esc(auNf.num)
+                       + '" data-lab="' + esc(auNf.label) + '"'
+                       + ' data-amt="' + esc(a == null ? '' : String(a)) + '" data-nr="' + esc(nr) + '"'
+                       + ' data-imp="' + (znane ? '1' : '0') + '"'
+                       + ' title="Przestawia status tego wiersza na OK — to samo, co ręczna zmiana statusu '
+                       + 'w prologistics. Wiersz wraca na listę do zaksięgowania; samo księgowanie to osobny przycisk."'
+                       + ' style="padding:2px 7px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;'
+                       + 'cursor:pointer;font-size:10px">✔ ustaw OK</button>'
+                       + (juzAuf ? ('<div style="font-size:9px;color:#c00;white-space:normal;max-width:190px">'
+                                    + '⚠ ta wpłata poszła już wprost na auftrag ' + esc(juzAuf.num)
+                                    + ' — ustawienie OK i zaksięgowanie paczki zaksięguje ją drugi raz</div>') : '')
+                       + (znane ? '<div style="font-size:9px;color:#c2410c">⚠ prologistics zna już tę płatność</div>' : ''))
+                    : ' <span style="font-size:9px;color:#888" title="Status przestawia się na czymś, nie w '
+                      + 'powietrzu — najpierw wpisz numer auftragu i kliknij „przypisz”.">— najpierw przypisz</span>')
+              +  '</td>'
+              +  '<td style="padding:2px 6px">' + bkNfKom(j, nr, a) + '</td></tr>';
+        });
+        h += '</table></div>'
+          +  '<div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+          +  '<span style="font-size:10px;color:#666">okno dat przy szukaniu po kwocie: ±</span>'
+          +  '<input data-bk="okno" value="' + oknoDni() + '" style="width:34px;font-size:10px;text-align:right">'
+          +  '<span style="font-size:10px;color:#666">dni</span>'
+          +  '<span style="font-size:10px;color:#666;margin-left:8px">czytaj po</span>'
+          +  '<input data-bk="rown" value="' + rownolegle() + '" style="width:30px;font-size:10px;text-align:right">'
+          +  '<span style="font-size:10px;color:#666">auftragów naraz</span>'
+          +  '<button data-bk="okno-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
+          +  '</div>'
+          +  bkPropozycje(j, nf)
+          +  '</div>';
+        return h;
+    }
+    function nfEupagoPodepnij(Z, j, d, nf, F, el, qa){
+        var nfb = el.nf;
+        if (nfb) nfb.onclick = function (){
+            var lista = nf.map(function (x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); })
+                          .filter(function (x){ return x; });
+            if (!lista.length){ say('Te wiersze nie mają numeru w paczce — nie ma czego szukać.', '#c47f00'); return; }
+            bkSzukajNf(lista, nfb, function (){ rysujPaczke(Z, d); });
+        };
+        var ok2 = el['okno-set'];
+        if (ok2) ok2.onclick = function (){
+            var v = parseInt(String((el.okno || {}).value || ''), 10);
+            if (!isFinite(v) || v < 0 || v > 30){ say('Podaj liczbę dni od 0 do 30.', '#c47f00'); return; }
+            var r = parseInt(String((el.rown || {}).value || ''), 10);
+            if (!isFinite(r) || r < 1 || r > 8){ say('Podaj, ile auftragów naraz — od 1 do 8.', '#c47f00'); return; }
+            gmSet(BK_OKNO_KEY, v); gmSet(BK_ROWN_KEY, r); rysujPaczke(Z, d);
+            say('Okno ±' + v + ' dni, czytam po ' + r + ' auftragów naraz.', '#0a7a2f');
+        };
+        qa('.bk-nf-kw').forEach(function (b){
             b.onclick = function (){
-                bkEuStatusy(b.getAttribute('data-nr'), b, function (){ rysujPaczke(j, d); });
+                var nr = b.getAttribute('data-nr');
+                var kw = Number(b.getAttribute('data-amt'));
+                var iso = ((j && j.daty) || {})[nr] || '';
+                bkSzukajPoKwocieIDacie(nr, kw, iso, F, b, function (){ rysujPaczke(Z, d); });
             };
         });
-        box.querySelectorAll('.bk-kop').forEach(function (b){
+        qa('.bk-eu-st').forEach(function (b){
+            b.onclick = function (){
+                bkEuStatusy(b.getAttribute('data-nr'), b, function (){ rysujPaczke(Z, d); });
+            };
+        });
+        qa('.bk-kop').forEach(function (b){
             b.onclick = function (){
                 var t = b.getAttribute('data-t');
                 try { if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(t, 'text'); else navigator.clipboard.writeText(t); }
@@ -70183,18 +71999,19 @@
                 say('Skopiowane: ' + esc(t) + ' — wklej w eupago w „Consult Transactions → Identifier".', '#0a7a2f');
             };
         });
-        box.querySelectorAll('.bk-nf-ks').forEach(function (b){
+        qa('.bk-nf-ks').forEach(function (b){
             b.onclick = async function (){
-                var nr = b.getAttribute('data-nr'), num = b.getAttribute('data-num');
+                if (!zAktualne(Z, j)) return;
+                var nr = b.getAttribute('data-nr'), num1 = b.getAttribute('data-num');
                 var kw = Number(b.getAttribute('data-amt')), iso = b.getAttribute('data-iso');
                 var skasowany = b.getAttribute('data-del') === '1';
-                var F = fmt(j.format || S.format);
-                var konto = ustaw(j.format || S.format).konto || F.konto;
+                var konto = Z.konto();
+                var kto = F.odbicie || BK_CS;
                 if (!konto){
                     say('Nie wiem, na które konto księgować — wpisz numer konta w ustawieniach (krok 2).', '#c47f00');
                     return;
                 }
-                if (!confirm('Zaksięgować wpłatę na auftragu ' + num + '?\n\n'
+                if (!confirm('Zaksięgować wpłatę na auftragu ' + num1 + '?\n\n'
                     + 'Numer transakcji: ' + nr + '\n'
                     + 'Kwota: ' + f2(kw) + '\n'
                     + 'Konto: ' + konto + '\n'
@@ -70203,66 +72020,991 @@
                     + (skasowany
                         ? ('\nAuftrag jest SKASOWANY, więc zaraz po zaksięgowaniu dopiszę komentarz\n'
                            + 'z saldem („Auftrag value - Total of Payments: …") i odbiję go na '
-                           + BK_CS + '.\n')
+                           + kto + '.\n')
                         : '')
                     + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
                     + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
                 b.disabled = true; b.textContent = 'księguję…';
-                var r = await bkKsiegujAuftrag(num, iso, konto, kw);
+                var r = await bkKsiegujAuftrag(num1, iso, konto, kw);
                 if (r.ok){
                     var st2 = BK_NF[nr] || (BK_NF[nr] = {});
-                    st2.zaks = num;
+                    st2.zaks = num1;
                     // Slad NA TRWALE, przy zleceniu. Pamiec modulu ginie po odswiezeniu
                     // strony, a wtedy nic juz nie mowilo, ze ta wplata poszla na auftrag —
                     // i latwo bylo przestawic wiersz na OK, czyli zaksiegowac ja drugi raz.
-                    jobMapaZapisz('zaksAuf', nr, { num: num, kwota: kw, iso: iso, konto: konto });
+                    zMapaZapisz(Z, 'zaksAuf', nr, { num: num1, kwota: kw, iso: iso, konto: konto });
                     var dop = '';
                     if (skasowany){
                         b.textContent = 'odbijam komentarz…';
-                        var po = await bkPoDelete(num);
+                        var po = await bkPoDelete(num1, kto);
                         st2.odbite = po.ok ? po.tekst : '';
                         st2.odbiteBlad = po.err || '';
                         // Nieudane odbicie NIE cofa ksiegowania — mowimy o tym wprost,
                         // zeby bylo wiadomo, co zostalo do zrobienia ręcznie.
-                        dop = po.ok ? (' Komentarz „' + po.tekst + '" odbity na ' + BK_CS + '.')
+                        dop = po.ok ? (' Komentarz „' + po.tekst + '" odbity na ' + kto + '.')
                                     : (' UWAGA: komentarza nie odbiłem — ' + po.err);
                     }
-                    say('Zaksięgowane na auftragu ' + esc(num) + ' — ' + f2(kw) + ' na koncie '
+                    say('Zaksięgowane na auftragu ' + esc(num1) + ' — ' + f2(kw) + ' na koncie '
                         + esc(konto) + '.' + esc(dop), po_kolor(st2));
                 } else {
-                    say('Nie zaksięgowałem na auftragu ' + esc(num) + ': ' + esc(r.err || '?'), '#c00');
+                    say('Nie zaksięgowałem na auftragu ' + esc(num1) + ': ' + esc(r.err || '?'), '#c00');
                     b.disabled = false;
                 }
-                rysujPaczke(j, d);
+                rysujPaczke(Z, d);
             };
         });
-        $('#bk-imp-zap').onclick = function (){
-            if (!confirm('Zapomnieć paczkę ' + j.impId + '?\n\nW prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
-            jobZapisz({}); box.style.display = 'none'; box.innerHTML = '';
-        };
-        var bb = $('#bk-ksieguj');
-        if (bb) bb.onclick = async function (){
-            var m = $('#bk-ksieguj-msg');
-            if (!confirm('Zaksięgować ' + doKs.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
-                + 'Paczka ' + j.impId + ' · ' + (j.nazwa || '') + '\n'
-                + (znaneKs ? ('⚠ ' + znaneKs + ' z nich prologistics już zna (były wczytane wcześniej)\n') : '')
-                + 'Odpowiada to przyciskowi „' + BK_BLOCK_OPIS + '".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-            bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
-            try {
-                await bkKsieguj(j.impId, doKs.map(function (x){ return x.id; }));
-                // Ktore id-y poszly — zeby drugie klikniecie nie zaksiegowalo ich znowu,
-                // a wiersz naprawiony pozniej mial jeszcze droge do ksiegowania.
-                var o = job() || j; o.booked = true;
-                var mId = (o.bookedIds && typeof o.bookedIds === 'object') ? o.bookedIds : {};
-                doKs.forEach(function (x){ mId[String(x.id)] = 1; });
-                o.bookedIds = mId; jobZapisz(o);
-                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
-                await sprawdz();
-            } catch (e){
-                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
-                bb.disabled = false;
+    }
+
+    // ---------- NOT FOUND: sciezka HU (wyciag UniCredit HU i paczki pobran) ----------
+    // „Dopisywanie" = przypisanie auftragu do wiersza (olowek) i „ustaw OK" — jak przy eupago.
+    // „Delete" = ksiegowanie wprost na auftragu, takze skasowanym, z odbiciem komentarza
+    // z saldem na CS Finance rynku. Do tej sciezki eupago dochodzilo tylko przez wyszukiwanie
+    // po numerze transakcji; tu wchodzi sie z pola „przypisz" (decyzja 29.09.2026).
+    // Podpowiedzi numeru z tresci tu NIE ma: w tytulach wegierskich numery faktur (10–11,8 mln
+    // od 03.2026) wygladaja jak auftragi z 2024/25, a w paczkach pobran „/1" przy numerze HDT
+    // nie jest numerem transakcji. Pole stoi puste, dopoki czlowiek nie wpisze numeru.
+    function nfHuHtml(Z, j, nf, num){
+        var zk = zMapa(Z, 'zaksAuf'), F = Z.F();
+        var h = '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND — prologistics nie znalazł auftragu ('
+              +  nf.length + ')</b>'
+              +  '<div style="font-size:10px;color:#888;margin-top:2px">Wpisz numer auftragu i kliknij „przypisz” — to samo, '
+              +  'co ołówek przy wierszu w prologistics. Potem albo „✔ ustaw OK” (wiersz pójdzie z paczką guzikiem „'
+              +  esc(bkBlokKs(Z).opis) + '”), albo „💾 Zaksięguj tutaj” — wprost na auftragu, konto <b>' + esc(Z.konto() || '?')
+              +  '</b>. Na skasowanym auftragu księguję mimo delete i odbijam komentarz z saldem na <b>'
+              +  esc(F.odbicie || BK_CS) + '</b>.</div>'
+              +  '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+              +  '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Opis w paczce</td>'
+              +  '<td style="padding:1px 6px">Data</td>'
+              +  '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
+              +  '<td style="padding:1px 6px">Przypisz auftrag</td>'
+              +  '<td style="padding:1px 6px">Wprost na auftragu</td></tr>';
+        nf.forEach(function (x){
+            var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
+            var a = num(x.amount), klucz = 'w' + x.id;
+            var iso = bkDzien(String(x.payment_date || ''));
+            var auNf = bkAukcja(x), juz = zk[klucz];
+            var znane = (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1');
+            var stan, lot = !!S.lot['hu:' + j.impId + ':' + klucz];
+            var lnkJ = juz ? ('<a href="/auction.php?number=' + esc(juz.num) + '&txnid=3" target="_blank">' + esc(juz.num) + '</a>') : '';
+            if (lot && !(juz && juz.stan === 'ok')){
+                // Operacja trwa w tej karcie (odczyt auftragu, pytanie, zapis) — zamiast aktywnego
+                // guzika, ktory po kliknieciu po cichu by odmowil.
+                stan = '<span style="color:#666;font-size:10px">⏳ księguję na auftragu ' + (lnkJ || esc(auNf ? auNf.num : '')) + '…</span>';
+            } else if (juz && juz.stan === 'wysylka' && bkObcyWToku(juz)){
+                stan = '<span style="color:#666;font-size:10px">⏳ zapis na auftragu ' + lnkJ + ' trwa w innej karcie — kliknij „↻ Odśwież” za chwilę</span>';
+            } else if (juz && (juz.stan === 'wysylka' || juz.stan === 'niepewne')){
+                // Slad zapisany PRZED zapisem na auftragu, a odpowiedzi nie ma (F5 w trakcie,
+                // blad sieci). Nie wiadomo, czy poszlo — rozstrzyga czlowiek na stronie auftragu.
+                stan = lot ? ('<span style="color:#666;font-size:10px">⏳ księguję na auftragu ' + lnkJ + '…</span>')
+                     : ('<span style="color:#c00;font-size:10px;font-weight:700">⚠ zapis na auftragu ' + lnkJ + ' wysłany '
+                        + esc(String(juz.czas || '').replace('T', ' ').slice(0, 16)) + ' bez potwierdzenia'
+                        + (juz.blad ? (' (' + esc(juz.blad) + ')') : ' (odświeżenie strony w trakcie?)') + ' — sprawdź auftrag</span>'
+                        + '<div style="margin-top:2px;white-space:nowrap"><button class="bk-hu-zaks-ok" data-k="' + esc(klucz) + '" '
+                        + 'style="padding:1px 6px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;cursor:pointer;font-size:9px">✔ Jest na auftragu</button> '
+                        + '<button class="bk-hu-zaks-zdejmij" data-k="' + esc(klucz) + '" style="padding:1px 6px;border:1px solid #c00;'
+                        + 'border-radius:5px;background:#fff;color:#c00;cursor:pointer;font-size:9px">↺ Nie ma — zdejmij</button></div>');
+            } else if (juz){
+                stan = '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu ' + lnkJ.replace('<a ', '<a style="color:#0a7a2f" ') + '</span>'
+                     + (juz.kontrola === 0 ? '<div style="font-size:10px;color:#c00">⚠ po zapisie nie widać nowej płatności na auftragu — sprawdź ręcznie</div>' : '')
+                     + (juz.odbicie === 'w toku' && !lot ? ('<div style="font-size:10px;color:#c00">↪ komentarz z saldem na ' + esc(juz.kto || '')
+                                      + ' mógł nie pójść (przerwane) — sprawdź komentarze auftragu</div>') : '')
+                     + (juz.odbite ? ('<div style="font-size:10px;color:#0a7a2f">↪ komentarz „' + esc(juz.odbite)
+                                      + '" odbity na ' + esc(juz.kto || '') + '</div>') : '')
+                     + (juz.odbiteBlad ? ('<div style="font-size:10px;color:#c00">↪ komentarza NIE odbiłem: '
+                                          + esc(juz.odbiteBlad) + '</div>') : '');
+            } else if (auNf){
+                stan = '<button class="bk-hu-ks" data-row="' + esc(x.id) + '" data-num="' + esc(auNf.num) + '"'
+                     + ' data-amt="' + esc(a == null ? '' : String(a)) + '" data-iso="' + esc(iso) + '" data-k="' + esc(klucz) + '"'
+                     + ' data-nr="' + esc(nr) + '" data-imp="' + (znane ? '1' : '0') + '"'
+                     + ' title="Księguje wpłatę wprost na przypisanym auftragu (formularz „Make payment”). Najpierw czyta auftrag: '
+                     + 'skasowany — księguje mimo delete i odbija komentarz z saldem; żywy — tylko gdy open amount pokrywa wpłatę."'
+                     + ' style="padding:2px 8px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;cursor:pointer;font-size:10px">'
+                     + '💾 Zaksięguj tutaj</button>';
+            } else stan = '<span style="color:#888;font-size:10px">— najpierw przypisz</span>';
+            h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;max-width:260px">'
+              +  (nr ? esc(nr) : '<span style="color:#888">—</span>') + '</td>'
+              +  '<td style="padding:2px 6px;white-space:nowrap">' + (iso ? esc(iso) : '<span style="color:#c47f00">—</span>') + '</td>'
+              +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
+              +  '<td style="padding:2px 6px;white-space:nowrap">'
+              +  '<input class="bk-auf" data-row="' + esc(x.id) + '" value="' + esc(auNf ? auNf.label : '') + '" '
+              +  'placeholder="15629079/3" style="width:96px;font-size:10px">'
+              +  ' <button class="bk-auf-set" data-row="' + esc(x.id) + '" style="padding:2px 7px;border:none;'
+              +  'border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:10px">przypisz</button>'
+              +  (auNf
+                    ? (' <button class="bk-nf-ok" data-row="' + esc(x.id) + '" data-num="' + esc(auNf.num)
+                       + '" data-lab="' + esc(auNf.label) + '" data-k="' + esc(klucz) + '"'
+                       + ' data-amt="' + esc(a == null ? '' : String(a)) + '" data-nr="' + esc(nr) + '"'
+                       + ' data-imp="' + (znane ? '1' : '0') + '"'
+                       + ' title="Przestawia status wiersza na OK — pójdzie z paczką guzikiem „' + esc(bkBlokKs(Z).opis) + '”."'
+                       + ' style="padding:2px 7px;border:none;border-radius:5px;background:#0a7a2f;color:#fff;'
+                       + 'cursor:pointer;font-size:10px">✔ ustaw OK</button>'
+                       + (juz ? ('<div style="font-size:9px;color:#c00;white-space:normal;max-width:190px">'
+                                 + '⚠ ta wpłata poszła już wprost na auftrag ' + esc(juz.num)
+                                 + ' — ustawienie OK i zaksięgowanie paczki zaksięguje ją drugi raz</div>') : '')
+                       + (znane ? '<div style="font-size:9px;color:#c2410c">⚠ prologistics zna już tę płatność</div>' : ''))
+                    : '')
+              +  '</td>'
+              +  '<td style="padding:2px 6px">' + stan + '</td></tr>';
+        });
+        return h + '</table></div></div>';
+    }
+    // Slad „Zaksięguj tutaj" niezalezny od paczki: ta sama wplata (data, kwota, opis) wraca
+    // w nastepnym wyciagu, a zlecenie paczki jest wtedy juz inne — sam slad przy zleceniu by
+    // tego nie zlapal (przeglad 29.09.2026). Tylko do ostrzezenia w potwierdzeniu.
+    var BK_HU_ZAKS = 'bank_imp_hu_zaks';
+    function huZaksKlucz(iso, kw, nr){ return String(iso) + '|' + Number(kw).toFixed(2) + '|' + huNorm(nr).slice(0, 60); }
+    function huZaksZapisz(k, wpis){
+        var m = jGet(BK_HU_ZAKS), gr = new Date(Date.now() - 150 * 86400000).toISOString();
+        Object.keys(m).forEach(function (x){ if (String((m[x] || {}).czas || '') < gr) delete m[x]; });
+        if (wpis) m[k] = wpis; else delete m[k];
+        jSet(BK_HU_ZAKS, m);
+    }
+    // Ostatni narysowany odczyt tej paczki (albo podany, gdy pamiec jest o innej paczce).
+    function bkOstatniOdczyt(Z, d){
+        var dd = (Z.typ === 'glowna') ? S.glownaD : S.codPaczki[Z.sid];
+        return (dd && d && String(dd.id) === String(d.id)) ? dd : d;
+    }
+    function nfHuPodepnij(Z, j, d, qa){
+        var odrysuj = function (){ rysujPaczke(Z, bkOstatniOdczyt(Z, d)); };
+        qa('.bk-hu-zaks-ok').forEach(function (b){
+            b.onclick = function (){
+                if (!zAktualne(Z, j)) return;
+                var k = b.getAttribute('data-k'), w = zMapa(Z, 'zaksAuf')[k];
+                if (!w) return;
+                if (!confirm('Uznać, że wpłata ' + f2(w.kwota) + ' jest zaksięgowana na auftragu ' + w.num + '?\n\n'
+                    + 'Sprawdź to najpierw na stronie auftragu (tabela Payments).')) return;
+                w.stan = 'ok'; w.potwReczne = true;
+                zMapaZapisz(Z, 'zaksAuf', k, w);
+                huZaksZapisz(huZaksKlucz(w.iso, w.kwota, w.nr || ''), { num: w.num, czas: new Date().toISOString(), stan: 'ok' });
+                odrysuj();
+            };
+        });
+        qa('.bk-hu-zaks-zdejmij').forEach(function (b){
+            b.onclick = function (){
+                if (!zAktualne(Z, j)) return;
+                var k = b.getAttribute('data-k'), w = zMapa(Z, 'zaksAuf')[k];
+                if (!w) return;
+                if (!confirm('Zdjąć ślad zapisu na auftragu ' + w.num + '?\n\nZrób to TYLKO wtedy, gdy na auftragu NIE ma '
+                    + 'tej płatności — inaczej „Zaksięguj tutaj" zaksięguje ją drugi raz.')) return;
+                zMapaZapisz(Z, 'zaksAuf', k, null);
+                huZaksZapisz(huZaksKlucz(w.iso, w.kwota, w.nr || ''), null);
+                odrysuj();
+            };
+        });
+        qa('.bk-hu-ks').forEach(function (b){
+            b.onclick = async function (){
+                if (!zAktualne(Z, j)) return;
+                var F = Z.F();
+                var num1 = b.getAttribute('data-num'), kw = Number(b.getAttribute('data-amt'));
+                var iso = b.getAttribute('data-iso'), klucz = b.getAttribute('data-k'), nr = b.getAttribute('data-nr') || '';
+                var rid = b.getAttribute('data-row'), znane = b.getAttribute('data-imp') === '1';
+                var konto = Z.konto(), kto = F.odbicie || BK_CS;
+                var lotK = 'hu:' + j.impId + ':' + klucz;
+                if (S.lot[lotK]) return;
+                if (!konto){ zMow(Z, j, 'Nie wiem, na które konto księgować — wpisz konto w ustawieniach (krok 2).', '#c47f00'); return; }
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')){ zMow(Z, j, 'Nie znam daty tej wpłaty (paczka jej nie podała) — nie księguję.', '#c47f00'); return; }
+                if (!isFinite(kw) || kw <= 0){ zMow(Z, j, 'Nie odczytałem kwoty wpłaty — nie księguję.', '#c47f00'); return; }
+                if (zMapa(Z, 'zaksAuf')[klucz]){ zMow(Z, j, 'Ta wpłata jest już zaksięgowana wprost na auftragu.', '#c47f00'); return; }
+                if (zMapa(Z, 'recznieOk')[rid] || zMapa(Z, 'bookedIds')[rid] || zMapa(Z, 'ksWToku')[rid]){
+                    zMow(Z, j, 'Ten wiersz był już przestawiony na OK albo księgowany paczką — nie księguję go drugi raz.', '#c00'); return;
+                }
+                // Blokada na czas calej operacji (odczyt, pytanie, zapis) — przerysowanie w tym
+                // czasie pokazuje „księguję…" zamiast swiezego, aktywnego guzika.
+                S.lot[lotK] = 1;
+                b.disabled = true; b.textContent = 'czytam auftrag…';
+                try {
+                    var a = null;
+                    try { a = await bkCzytajAuftrag(num1); } catch (e){ a = { ok: false, err: (e && e.message) || String(e) }; }
+                    var skas = !!a && a.deleted === true;
+                    if (!a || (!a.ok && !skas)){ zMow(Z, j, 'Nie księguję: ' + esc((a && a.err) || 'nie odczytałem auftragu'), '#c00'); return; }
+                    if (!skas && a.open == null){ zMow(Z, j, 'Nie odczytałem open amount auftragu ' + esc(num1) + ' — księguj ręcznie.', '#c47f00'); return; }
+                    // Zywy auftrag: ksiegowac wolno tylko wtedy, gdy JEST NA CZYM — inaczej jedno
+                    // klikniecie zrobiloby nadplate (ta sama zasada co przy eupago).
+                    if (!skas && a.open + 0.005 < kw){
+                        zMow(Z, j, 'Open amount ' + f2(a.open) + ' na auftragu ' + esc(num1) + ' nie pokrywa wpłaty ' + f2(kw)
+                            + ' — księguj ręcznie.', '#c00'); return;
+                    }
+                    // Jeszcze raz PO odczycie, pelny komplet: w tym czasie wiersz mogl przejsc na OK
+                    // i pojsc paczka albo zaksiegowac sie wprost z innej karty.
+                    if (!zAktualne(Z, j)) return;
+                    if (zMapa(Z, 'zaksAuf')[klucz]){ zMow(Z, j, 'Ta wpłata została w międzyczasie zaksięgowana wprost na auftragu.', '#c47f00'); return; }
+                    if (zMapa(Z, 'recznieOk')[rid] || zMapa(Z, 'bookedIds')[rid] || zMapa(Z, 'ksWToku')[rid]){
+                        zMow(Z, j, 'Ten wiersz został w międzyczasie przestawiony na OK albo księgowany paczką — nie księguję go drugi raz.', '#c00'); return;
+                    }
+                    var gk = huZaksKlucz(iso, kw, nr), g0 = jGet(BK_HU_ZAKS)[gk];
+                    var uw = [];
+                    if (znane) uw.push('prologistics zna już tę płatność (była wczytana wcześniej)');
+                    if (g0 && (g0.stan === 'wysylka' || g0.stan === 'niepewne'))
+                        uw.push('zapis wpłaty z tą datą, kwotą i opisem na auftragu ' + g0.num + ' wysłano '
+                                + String(g0.czas || '').replace('T', ' ').slice(0, 16) + ' BEZ POTWIERDZENIA — sprawdź tamten auftrag');
+                    else if (g0) uw.push('wpłatę z tą datą, kwotą i opisem zaksięgowałeś już wprost na auftragu ' + g0.num + ' ('
+                                   + String(g0.czas || '').replace('T', ' ').slice(0, 16) + ') — to może być ta sama wpłata z innego wyciągu');
+                    if (!confirm('Zaksięgować wpłatę wprost na auftragu ' + num1 + '?\n\n'
+                        + (nr ? ('Opis w paczce: ' + nr + '\n') : '')
+                        + 'Kwota: ' + f2(kw) + ' ' + (F.waluta || '') + '\n'
+                        + 'Konto: ' + konto + '\n'
+                        + 'Data: ' + iso + ' (data płatności z paczki)\n'
+                        + 'Komentarz płatności: pusty\n'
+                        + (skas ? ('\nAuftrag jest SKASOWANY — księguję mimo delete, a zaraz potem dopiszę komentarz z saldem\n'
+                                   + '(„Auftrag value - Total of Payments: …") i odbiję go na ' + kto + '.\n')
+                                : ('Open amount na auftragu: ' + f2(a.open) + '\n'))
+                        + (uw.length ? ('\nUWAGA:\n  • ' + uw.join('\n  • ') + '\n') : '')
+                        + '\nWiersz w paczce zostaje NOT FOUND — nie przestawiaj go potem na OK, bo zaksięgujesz drugi raz.'
+                        + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
+                        + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+                    // Slad PRZED zapisem: po F5 w trakcie guzik nie wroci, dopoki czlowiek nie
+                    // sprawdzi auftragu (przeglad 29.09.2026).
+                    var wpis = { num: num1, kwota: kw, iso: iso, konto: konto, rid: rid, kto: kto, nr: nr,
+                                 stan: 'wysylka', czas: new Date().toISOString(), skas: skas, karta: bkKarta() };
+                    zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                    // Slad globalny tez PRZED zapisem — nowy wyciag nadpisuje zlecenie, a ta sama
+                    // wplata moze w nim wrocic.
+                    huZaksZapisz(gk, { num: num1, czas: wpis.czas, stan: 'wysylka' });
+                    b.textContent = 'księguję…';
+                    var r = await bkKsiegujAuftrag(num1, iso, konto, kw);
+                    if (!r.ok){
+                        // Rozstrzyga liczba platnosci na zywym auftragu: przybyla = zapis wszedl mimo
+                        // bledu. Odmowa jest pewna tylko przy 4xx — 5xx (bramka, blad po zapisie) i brak
+                        // odpowiedzi to „nie wiadomo" (przeglad 29.09.2026).
+                        var kod = Number((String(r.err || '').match(/^HTTP (\d+)/) || [])[1] || 0), weszlo = false;
+                        if (!skas && a.nPay != null){
+                            try { var po0 = await bkCzytajAuftrag(num1); weszlo = !!po0.ok && po0.nPay != null && po0.nPay > a.nPay; }
+                            catch (e){ weszlo = false; }
+                        }
+                        if (!weszlo && kod >= 400 && kod < 500){
+                            zMapaZapisz(Z, 'zaksAuf', klucz, null);
+                            huZaksZapisz(gk, null);
+                            zMow(Z, j, 'Nie zaksięgowałem na auftragu ' + esc(num1) + ': ' + esc(r.err) + ' (serwer odmówił).', '#c00');
+                            return;
+                        }
+                        if (!weszlo){
+                            wpis.stan = 'niepewne'; wpis.blad = r.err || '?';
+                            zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                            huZaksZapisz(gk, { num: num1, czas: wpis.czas, stan: 'niepewne' });
+                            zMow(Z, j, 'Nie wiem, czy zapis na auftragu ' + esc(num1) + ' przeszedł (' + esc(r.err || '?')
+                                + ') — sprawdź auftrag i rozstrzygnij przy wierszu.', '#c00');
+                            return;
+                        }
+                        wpis.bladHttp = r.err;
+                    }
+                    wpis.stan = 'ok';
+                    zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                    huZaksZapisz(gk, { num: num1, czas: wpis.czas, stan: 'ok' });
+                    // Kontrola zapisu: HTTP 200 to jeszcze nie dowod. Na zywym auftragu liczymy
+                    // wiersze platnosci przed i po; na skasowanym formularza (i tej listy) nie ma,
+                    // wiec tam dowodem jest dopiero komentarz z saldem po ksiegowaniu.
+                    if (!skas){
+                        try { var po1 = await bkCzytajAuftrag(num1); if (po1.ok && a.nPay != null) wpis.kontrola = po1.nPay - a.nPay; }
+                        catch (e){}
+                        zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                    }
+                    var dop = '';
+                    if (skas){
+                        wpis.odbicie = 'w toku'; zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                        b.textContent = 'odbijam komentarz…';
+                        var po = await bkPoDelete(num1, kto);
+                        wpis.odbicie = po.ok ? 'ok' : 'blad';
+                        wpis.odbite = po.ok ? po.tekst : '';
+                        wpis.odbiteBlad = po.err || '';
+                        zMapaZapisz(Z, 'zaksAuf', klucz, wpis);
+                        dop = po.ok ? (' Komentarz „' + po.tekst + '" odbity na ' + kto + '.')
+                                    : (' UWAGA: komentarza nie odbiłem — ' + po.err);
+                    }
+                    zMow(Z, j, 'Zaksięgowane na auftragu ' + esc(num1) + ' — ' + f2(kw) + ' na koncie ' + esc(konto) + '.' + esc(dop)
+                        + (wpis.kontrola === 0 ? ' <span style="color:#c00">Ale na auftragu nie przybyła płatność — sprawdź ręcznie.</span>' : ''),
+                        (wpis.odbiteBlad || wpis.kontrola === 0) ? '#c47f00' : '#0a7a2f');
+                } finally {
+                    delete S.lot[lotK];
+                    odrysuj();
+                }
+            };
+        });
+    }
+
+    // ---------- UniCredit HU: wplaty przewoznikow w paczce wyciagu ----------
+    // Wiersz paczki odpowiadajacy wplacie przewoznika z pliku: ta sama kwota i ten sam dzien
+    // platnosci. Przy kilku kandydatach rozstrzyga tresc (tytul albo nazwa); gdy dalej jest
+    // kilka, blokujemy wszystkie i mowimy o tym — lepiej zablokowac jeden wiersz za duzo niz
+    // dac zaksiegowac pobranie z paczki wyciagu (to byloby drugie ksiegowanie tych pieniedzy).
+    function huPrzewWPaczce(j, rows, num){
+        var mapa = {}, lista = [];
+        ((j.hu && j.hu.przew) || []).forEach(function (w){
+            var poKw = rows.filter(function (x){ var a = num(x.amount); return a != null && Math.abs(a - w.kwota) < 0.005; });
+            var poDniu = poKw.filter(function (x){ return bkDzien(String(x.payment_date || '')) === w.data; });
+            var kand = poDniu.length ? poDniu
+                     : ((poKw.length === 1 && !String(poKw[0].payment_date || '').trim()) ? poKw : []);
+            if (kand.length > 1){
+                var ot = huNorm(w.opis).slice(0, 24), pn = huNorm(w.partner).slice(0, 12);
+                var t = kand.filter(function (x){
+                    var o = huNorm(x.payment_descr);
+                    return o && ((ot && o.indexOf(ot) >= 0) || (pn && o.indexOf(pn) >= 0));
+                });
+                if (t.length) kand = t;
             }
+            kand.forEach(function (x){ mapa[String(x.id)] = w.sid; });
+            lista.push({ w: w, wiersze: kand });
+        });
+        return { mapa: mapa, lista: lista };
+    }
+
+    // Zlecenia importow pobran: Spectra ID wplaty -> wpis. Stany wpisu:
+    //   czeka    — wplata przewoznika z wyslanego wyciagu, pliku z maila jeszcze nie bylo;
+    //   wysylka  — plik poszedl do importu, odpowiedzi jeszcze nie ma (slad PRZED zapytaniem);
+    //   niepewne — wysylka bez odpowiedzi albo bez numeru paczki: nie wiadomo, czy paczka powstala;
+    //   import   — paczka pobran znana (impId).
+    // „ukryty" chowa wpis z widoku, ale ZOSTAWIA odcisk pliku (hash), wiec ten sam plik nie pojdzie
+    // drugi raz. Przeglad 29.09.2026: kasowanie wpisu bylo jedynym zabezpieczeniem i znikalo.
+    // Wplaty „czeka" przezywaja nowy wyciag — nie gina, gdy przyjdzie nastepny plik z banku.
+    var BK_COD_KEY = 'bank_imp_cod';
+    function codWszystkie(){ return jGet(BK_COD_KEY); }
+    function codGet(sid){ var m = codWszystkie(); return m[sid] || null; }
+    // „import" bez numeru paczki nie istnieje — taki wpis traktujemy jak nieznany numer (inaczej
+    // widok paczki bez paczki przerysowywalby sie w kolko).
+    function codStan(e){
+        if (!e) return '';
+        var st = e.stan || (e.impId ? 'import' : 'niepewne');
+        return (st === 'import' && !e.impId) ? 'niepewne' : st;
+    }
+    function codSet(sid, o){
+        var m = codWszystkie();
+        if (o) m[sid] = o; else delete m[sid];
+        // Starsze niz 120 dni sprzatamy — pamiec skryptu nie jest bez dna.
+        var gr = Date.now() - 120 * 86400000;
+        Object.keys(m).forEach(function (k){
+            var t = Date.parse((m[k] && m[k].czas) || '');
+            if (isFinite(t) && t < gr) delete m[k];
+        });
+        jSet(BK_COD_KEY, m);
+    }
+    function codF(przew){
+        var P = BK_PRZEW[przew] || {}, H = fmt('unicredithu');
+        return { id: P.ust, nazwa: P.bankNazwa || '', cod: true, waluta: 'HUF', odbicie: H.odbicie,
+                 tolerancja: H.tolerancja, tolKlucz: H.tolKlucz, autoOkDo: H.autoOkDo, konto: P.konto };
+    }
+    function odrysujGlowna(){
+        if (S.glownaD && S.glownaD.id) rysujPaczke(zGlowne(S.glownaD.id), S.glownaD);
+        else sprawdz();
+    }
+    // Przypiete do numeru paczki pobran, jak zGlowne — wpis z innym impId (albo ukryty) to
+    // „nie ta paczka": widok i guziki odmawiaja.
+    function zCod(sid){
+        var e0 = codGet(sid) || {}, P = BK_PRZEW[e0.przew] || {}, pin = String(e0.impId || '');
+        var moj = function (){ var e = codGet(sid); return (e && pin && String(e.impId) === pin && !e.ukryty) ? e : null; };
+        return {
+            typ: 'cod', sid: sid, nazwa: P.nazwa || '',
+            box: function (){ return panel.querySelector('.bk-cod-imp[data-sid="' + sid + '"]'); },
+            get: moj,
+            set: function (o){ if (moj() && o && String(o.impId) === pin) codSet(sid, o); },
+            F: function (){ return codF(e0.przew); },
+            konto: function (){ return ustaw(P.ust).konto || P.konto || ''; },
+            odswiez: function (){ return codSprawdz(sid); },
+            zapomnij: function (){ if (moj()) codZapomnij(sid); }
         };
+    }
+    // „Zapomnij paczkę" przy pobraniach ZAPOMINA naprawde (zgloszenie 30.09.2026): wplata wraca do
+    // stanu „czeka", a razem z paczka znika odcisk pliku — pod wplata znow da sie dodac plik z maila.
+    // Wczesniej wpis byl tylko ukrywany (przeglad 29.09.2026, ochrona przed druga paczka z tego
+    // samego pliku) i nie bylo drogi, zeby dodac plik jeszcze raz. Ochrona zostaje w potwierdzeniu.
+    function codUkryj(sid){
+        var e = codGet(sid); if (!e) return;
+        e.ukryty = true; codSet(sid, e);
+        delete S.codPaczki[sid];
+        odrysujGlowna();
+    }
+    function codZapomnij(sid){
+        var e = codGet(sid); if (!e) return;
+        codSet(sid, { sid: sid, przew: e.przew, kwota: e.kwota, data: e.data, partner: e.partner || '', opis: e.opis || '',
+                      wyciag: e.wyciag || '', czas: e.czas || new Date().toISOString(), stan: 'czeka' });
+        delete S.codPaczki[sid]; delete S.codPliki[sid];
+        odrysujGlowna();
+    }
+    function codZapomnijPytanie(e){
+        e = e || {};
+        var ile = Object.keys((e.bookedIds && typeof e.bookedIds === 'object') ? e.bookedIds : {}).length;
+        var za = (e.zaksAuf && typeof e.zaksAuf === 'object') ? e.zaksAuf : {};
+        var wprost = Object.keys(za).filter(function (k){ return (za[k] || {}).stan === 'ok'; })
+                           .map(function (k){ return za[k].num; });
+        var nr0 = zNierozstrzygniete(e);
+        return 'Zapomnieć import pobrań ' + (e.impId || '') + ' (plik ' + (e.plik || e.nazwa || '?') + ')?\n\n'
+             + 'HUB zapomni tę paczkę i odcisk pliku — pod wpłatą znów dodasz plik z maila.\n\n'
+             + 'W prologistics nic się nie zmieni. Jeśli paczka ' + (e.impId || '') + ' tam zostaje, a wyślesz ten sam plik '
+             + 'jeszcze raz, powstanie druga paczka i pobrania mogą się zaksięgować dwa razy — usuń ją najpierw w Import payments.'
+             + (ile ? ('\n\n⚠ Z tej paczki HUB zaksięgował już ' + ile + ' wierszy.') : '')
+             + (wprost.length ? ('\n\n⚠ ' + wprost.length + ' wpłat z tej paczki HUB zaksięgował wprost na auftragu ('
+                                 + wprost.slice(0, 6).join(', ') + (wprost.length > 6 ? ' …' : '')
+                                 + ') — po zapomnieniu nie będzie tego pamiętał przy wierszach nowej paczki.') : '')
+             + (nr0 ? ('\n\n⚠ ' + nr0) : '');
+    }
+    async function codSprawdz(sid){
+        var Z = zCod(sid), e = Z.get(), box = Z.box();
+        // Wpis ukryty albo bez paczki (np. zmieniony w innej karcie) — stary widok znika,
+        // a sekcja przewoznikow rysuje sie od nowa z pamieci.
+        if (!e){ if (box){ box.innerHTML = ''; odrysujGlowna(); } return; }
+        if (!box) return;
+        box.innerHTML = '<div style="font-size:11px;color:#666">odczytuję import pobrań ' + esc(e.impId) + '…</div>';
+        try {
+            var d = await bkPaczka(e.impId);
+            d = await huAutoOk(Z, d, box);
+            // W czasie odczytu wpis mogl dostac inna paczke (zapomnij + nowy plik, druga karta) —
+            // ten odczyt jest wtedy nieaktualny: nie zapamietujemy go i nie rysujemy.
+            if (!Z.get()) return;
+            S.codPaczki[sid] = d;
+            rysujPaczke(Z, d);
+        } catch (err){
+            // Blad odczytu (takze zle wpisany numer) ma wyjscia: ponow, zdejmij numer, ukryj.
+            // Numer zdejmujemy tylko z paczki, z ktorej nic nie ksiegowalismy.
+            var czysta = !e.booked && !Object.keys(e.ksWToku || {}).length && !Object.keys(e.zaksAuf || {}).length;
+            box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(e.impId) + ': '
+                          + esc((err && err.message) || err) + '</div>'
+                          + '<div style="margin-top:3px;display:flex;gap:6px;flex-wrap:wrap">'
+                          + '<button data-bk="cerr-re" style="padding:1px 7px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">↻ spróbuj jeszcze raz</button>'
+                          + (czysta ? '<button data-bk="cerr-nr" style="padding:1px 7px;border:1px solid #5b21b6;border-radius:5px;background:#fff;color:#5b21b6;cursor:pointer;font-size:10px">✎ to zły numer — wpiszę inny</button>' : '')
+                          + '<button data-bk="cerr-ukryj" style="padding:1px 7px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">✕ ukryj</button></div>';
+            var qc = function (k){ return box.querySelector('[data-bk="' + k + '"]'); };
+            qc('cerr-re').onclick = function (){ codSprawdz(sid); };
+            if (qc('cerr-nr')) qc('cerr-nr').onclick = function (){
+                var e1 = Z.get(); if (!e1){ odrysujGlowna(); return; }
+                if (!confirm('Zdjąć numer ' + e1.impId + ' z importu pobrań (plik ' + (e1.nazwa || '') + ')?\n\n'
+                    + 'Wpis wróci do stanu „numer paczki nieznany” — wpiszesz właściwy. Nic nie idzie do prologistics.')) return;
+                e1.impId = ''; e1.stan = 'niepewne'; e1.blad = 'numer ' + (e.impId || '') + ' zdjęty — nie dało się odczytać paczki';
+                codSet(sid, e1); delete S.codPaczki[sid]; odrysujGlowna();
+            };
+            // „ukryj" UKRYWA: paczka, odcisk pliku i slady zostaja, wpis przechodzi do „ukryty ·
+            // pokaż · zapomnij". Zapomnienie (z ostrzezeniami) to osobny guzik — przeglad 30.09.2026:
+            // po zmianie „Zapomnij" na prawdziwe zapominanie ten guzik po cichu kasowal pamiec paczki.
+            qc('cerr-ukryj').onclick = function (){
+                if (!confirm('Ukryć import pobrań ' + e.impId + '?\n\nHUB zachowa paczkę, odcisk pliku i ślady księgowania — '
+                    + 'pod wpłatą zostanie „ukryty · pokaż · zapomnij”. W prologistics nic się nie zmieni.')) return;
+                codUkryj(sid);
+            };
+        }
+    }
+    // Paczka pobran zaksiegowana, ale z czyms do zrobienia: slad ksiegowania bez odpowiedzi,
+    // zapis na auftragu bez potwierdzenia albo wiersze CHECK / NOT FOUND z ostatniego odczytu.
+    // Taka nie znika z listy „niedokonczonych" po nastepnym wyciagu (przeglad 29.09.2026).
+    function codNiedokonczony(e){
+        if (!e) return false;
+        var za = (e.zaksAuf && typeof e.zaksAuf === 'object') ? e.zaksAuf : {};
+        return Object.keys((e.ksWToku && typeof e.ksWToku === 'object') ? e.ksWToku : {}).length > 0
+            || Object.keys(za).some(function (k){ var st = (za[k] || {}).stan; return st === 'wysylka' || st === 'niepewne'; })
+            || Number(e.otwarte) > 0;
+    }
+    // Wszystkie wplaty przewoznikow do pokazania pod paczka wyciagu: z tego wyciagu (z jego
+    // wierszami) i niedokonczone z wczesniejszych — bez pliku, w wysylce albo z paczka pobran
+    // jeszcze niezaksiegowana. Inaczej nastepny wyciag zabieralby im miejsce na plik z maila.
+    function huPrzewWszystkie(j, pw){
+        var byl = {}, out = [];
+        pw.lista.forEach(function (it){ byl[it.w.sid] = 1; out.push({ w: it.w, wiersze: it.wiersze, biezacy: true }); });
+        var m = codWszystkie(), wcz = [];
+        Object.keys(m).forEach(function (sid){
+            var e = m[sid];
+            if (byl[sid] || !e || !e.przew) return;
+            // Wplata schowana guzikiem „ukryj" (bez paczki) znika z listy. Paczka pobran ukryta
+            // dawnym „Zapomnij paczkę" (do 30.09.2026) zostaje widoczna jako „ukryty · pokaż ·
+            // zapomnij" — inaczej przy wplacie z wczesniejszego wyciagu nie bylo drogi, zeby dodac
+            // plik jeszcze raz (zgloszenie 30.09.2026).
+            if (e.ukryty && !e.impId) return;
+            if (codStan(e) === 'import' && e.booked && !codNiedokonczony(e)) return;
+            wcz.push({ w: { sid: sid, przew: e.przew, kwota: e.kwota, data: e.data, partner: e.partner || '', opis: e.opis || '' },
+                       wiersze: [], biezacy: false, wyciag: e.wyciag || '' });
+        });
+        wcz.sort(function (a, b){ return a.w.data < b.w.data ? -1 : (a.w.data > b.w.data ? 1 : 0); });
+        return out.concat(wcz);
+    }
+
+    // ---------- pliki z maili przewoznikow ----------
+    // Rozpoznajemy je po TRESCI, nie po nazwie pliku:
+    //  GLS   — xlsx z arkuszem „Daily": A5 „Bankszámlaszám", A6 „Utalás dátuma" (= dzien wplaty),
+    //          naglowek w wierszu 8, C „Utánvét hivatkozás" (auftrag), E „Utánvét összeg",
+    //          na dole wiersz sumy bez numeru;
+    //  HDT   — xlsx z arkuszem „COD REPORT": DATE (= dzien wplaty), FOREIGN_ID, CASH;
+    //  Futar — txt w UTF-8 z tabulatorami, „R.szám … Azonosító … Utánvét … Utalási nap"
+    //          (wplata w banku dzien po „Utalási nap").
+    // Przyjmujemy tez to, co dotad szlo do importu recznie (CSV z makra GLS, CSV z Excela) —
+    // zeby dalo sie wrzucic plik juz przerobiony.
+    // Plik do importu ma DOKLADNIE ten ksztalt, ktory dotad przyjmowaly „COD GLS HUF",
+    // „COD HDT HUF" i „COD FUTAR": GLS — „auftrag;kwota" jak z makra GLSver1.1, HDT i Futar —
+    // te same kolumny ze srednikiem, z naglowkiem. Wartosci przepisane 1:1, bez wiersza sumy.
+    var BK_HDT_NAGL = ['DATE', 'SERIAL', 'FOREIGN_ID', 'ORDER_ID', 'INVOICE_CUSTOMERS', 'DELIVERY_CUSTOMERS',
+                       'CASH', 'VALUTA', 'BANK', 'FOREIGN_BILL_NUMBER', 'COMMENT'];
+    // Windows-1250 w strone bajtow — tak zapisuje CSV Excel na tym komputerze i tak wyglada
+    // wyciag. Znak spoza strony kodowej zamienia sie w „?", jak w Excelu.
+    var BK_CP1250 = null;
+    function bkNaCp1250(s){
+        if (!BK_CP1250){
+            BK_CP1250 = {};
+            var dec = new TextDecoder('windows-1250'), b1 = new Uint8Array(1);
+            for (var k = 0x80; k <= 0xff; k++){ b1[0] = k; var ch = dec.decode(b1); if (ch !== '\ufffd') BK_CP1250[ch] = k; }
+        }
+        var t = String(s || ''), out = new Uint8Array(t.length);
+        for (var i = 0; i < t.length; i++){
+            var c = t.charCodeAt(i);
+            if (c < 0x80) out[i] = c;
+            else { var v = BK_CP1250[t.charAt(i)]; out[i] = (v != null) ? v : 0x3f; }
+        }
+        return out;
+    }
+    function codTekst(buf){
+        var u8 = new Uint8Array(buf);
+        try { return new TextDecoder('utf-8', { fatal: true }).decode(u8).replace(/^\ufeff/, ''); }
+        catch (e){ return new TextDecoder('windows-1250').decode(u8); }
+    }
+    function codLiczba(v){
+        if (typeof v === 'number') return isFinite(v) ? v : null;
+        var s = String(v == null ? '' : v).replace(/[\s\u00a0]/g, '');
+        if (!s) return null;
+        if (/^-?\d+$/.test(s)) return Number(s);
+        if (/^-?\d+[.,]\d{1,2}$/.test(s)) return Number(s.replace(',', '.'));
+        if (/^-?\d{1,3}([.,]\d{3})+([.,]\d{2})?$/.test(s)) return huNum(s);
+        return null;
+    }
+    // Kwota tak, jak wypisywalo ja makro Excela: calkowita bez przecinka, ulamek z przecinkiem.
+    function codKwotaTxt(n){ return Number.isInteger(n) ? String(n) : String(r2(n)).replace('.', ','); }
+    function codKom(v){
+        if (v == null) return '';
+        if (typeof v === 'number') return Number.isInteger(v) ? String(v) : String(v).replace('.', ',');
+        return String(v);
+    }
+    function codDataIso(t){
+        var s = String(t == null ? '' : t).trim(), m;
+        if ((m = s.match(/^(\d{4})[.\/-]\s*(\d{1,2})[.\/-]\s*(\d{1,2})\.?$/))) return m[1] + '-' + pad2(+m[2]) + '-' + pad2(+m[3]);
+        if ((m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/))) return m[3] + '-' + pad2(+m[2]) + '-' + pad2(+m[1]);
+        return '';
+    }
+    function codCsv(wiersze){
+        var qt = function (v){
+            var s = String(v == null ? '' : v);
+            return /[;"\r\n]/.test(s) ? ('"' + s.replace(/"/g, '""') + '"') : s;
+        };
+        return wiersze.map(function (r){ return r.map(qt).join(';'); }).join('\r\n') + '\r\n';
+    }
+    function codWynik(nazwa){
+        return { nazwaPliku: nazwa, przew: '', rodzaj: '', poz: [], wiersze: [], bledy: [], uwagi: [],
+                 pominiete: [], data: '', dataZrodlo: '', konto: '' };
+    }
+    function codKoniec(wyn){
+        wyn.suma = r2(wyn.poz.reduce(function (a, p){ return a + p.kwota; }, 0));
+        wyn.n = wyn.poz.length;
+        if (!wyn.n && !wyn.bledy.length) wyn.bledy.push('w pliku nie ma ani jednej pozycji');
+        var byl = {}, dup = [];
+        wyn.poz.forEach(function (p){ if (byl[p.nr]) dup.push(p.nr); byl[p.nr] = 1; });
+        if (dup.length) wyn.uwagi.push('ten sam numer kilka razy w pliku: ' + dup.slice(0, 5).join(', '));
+        // Wiersz sumy sam w sobie jest kontrola: musi sie rownac pozycjom.
+        wyn.pominiete.forEach(function (p){
+            if (Math.abs(p.kwota - wyn.suma) >= 0.005)
+                wyn.bledy.push(p.opis + ' mówi ' + huTys(p.kwota) + ', a pozycje dają ' + huTys(wyn.suma));
+        });
+        wyn.csv = codCsv(wyn.wiersze);
+        wyn.bajty = bkNaCp1250(wyn.csv);
+        wyn.hash = wyn.przew + ':' + wyn.poz.map(function (p){ return p.nr + '=' + p.kwota; }).sort().join(',');
+        return wyn;
+    }
+    function codGlsNaglowek(aoa){
+        for (var i = 0; i < Math.min(aoa.length, 40); i++){
+            var r = aoa[i] || [];
+            if (/ut[aá]nv[eé]t\s*hivatkoz[aá]s/i.test(String(r[2] == null ? '' : r[2]))
+                && /ut[aá]nv[eé]t\s*[oö]sszeg/i.test(String(r[4] == null ? '' : r[4]))) return i;
+        }
+        return -1;
+    }
+    function codGlsXlsx(aoa, wyn){
+        wyn.przew = 'gls'; wyn.rodzaj = 'GLS — raport „Daily” (xlsx z maila)';
+        var h = codGlsNaglowek(aoa);
+        if (h < 0){ wyn.bledy.push('w arkuszu nie ma nagłówka „Utánvét hivatkozás … Utánvét összeg” w kolumnach C i E'); return codKoniec(wyn); }
+        for (var i = 0; i < h; i++){
+            var t = String((aoa[i] || [])[0] == null ? '' : aoa[i][0]);
+            var mk = t.match(/Banksz[aá]mlasz[aá]m:\s*([\d-]+)/i); if (mk) wyn.konto = mk[1];
+            var md = t.match(/Utal[aá]s d[aá]tuma:\s*(.+)$/i);
+            if (md){ wyn.data = codDataIso(md[1]); wyn.dataZrodlo = 'Utalás dátuma'; }
+        }
+        for (var k = h + 1; k < aoa.length; k++){
+            var r = aoa[k] || [], nr = String(r[2] == null ? '' : r[2]).trim(), kw = codLiczba(r[4]);
+            if (!nr && kw == null) continue;
+            if (!nr){ wyn.pominiete.push({ opis: 'wiersz sumy (' + (k + 1) + ')', kwota: kw }); continue; }
+            if (!/^\d{6,9}$/.test(nr)){ wyn.bledy.push('wiersz ' + (k + 1) + ': „' + nr + '” nie wygląda na numer auftragu'); continue; }
+            if (kw == null){ wyn.bledy.push('wiersz ' + (k + 1) + ': nie odczytałem kwoty'); continue; }
+            wyn.poz.push({ nr: nr, kwota: kw });
+            wyn.wiersze.push([nr, codKwotaTxt(kw)]);
+        }
+        return codKoniec(wyn);
+    }
+    function codGlsCsv(linie, wyn){
+        wyn.przew = 'gls'; wyn.rodzaj = 'GLS — plik z makra (numer;kwota)';
+        linie.forEach(function (l, i){
+            var t = String(l).replace(/^\ufeff/, '').trim(); if (!t) return;
+            var p = t.split(';');
+            if (p.length !== 2 || !/^\d{6,9}$/.test(p[0].trim())){
+                wyn.bledy.push('linia ' + (i + 1) + ': „' + t.slice(0, 40) + '” nie ma postaci numer;kwota'); return;
+            }
+            var kw = codLiczba(p[1]);
+            if (kw == null){ wyn.bledy.push('linia ' + (i + 1) + ': nie odczytałem kwoty'); return; }
+            wyn.poz.push({ nr: p[0].trim(), kwota: kw });
+            wyn.wiersze.push([p[0].trim(), codKwotaTxt(kw)]);
+        });
+        wyn.uwagi.push('plik z makra nie niesie daty wypłaty — daty nie sprawdzam');
+        return codKoniec(wyn);
+    }
+    function codToHdt(r){
+        return (r || []).slice(0, 11).map(function (c){ return String(c == null ? '' : c).trim().toUpperCase(); }).join('|')
+            === BK_HDT_NAGL.join('|');
+    }
+    function codHdt(aoa, wyn, zXlsx){
+        wyn.przew = 'hdt'; wyn.rodzaj = zXlsx ? 'HDT — „COD REPORT” (xlsx z maila)' : 'HDT — CSV z Excela';
+        if (!codToHdt(aoa[0])){ wyn.bledy.push('nagłówek jest inny niż ' + BK_HDT_NAGL.join(';')); return codKoniec(wyn); }
+        wyn.wiersze.push(BK_HDT_NAGL.slice());
+        var daty = {};
+        for (var k = 1; k < aoa.length; k++){
+            var r = aoa[k] || [];
+            if (r.every(function (c){ return String(c == null ? '' : c).trim() === ''; })) continue;
+            var fid = String(r[2] == null ? '' : r[2]).trim(), kw = codLiczba(r[6]), dt = String(r[0] == null ? '' : r[0]).trim();
+            if (!fid && !dt){ if (kw != null) wyn.pominiete.push({ opis: 'wiersz sumy (' + (k + 1) + ')', kwota: kw }); continue; }
+            if (!/^\d{6,9}(\/\d+)?$/.test(fid)){ wyn.bledy.push('wiersz ' + (k + 1) + ': FOREIGN_ID „' + fid + '” nie wygląda na numer auftragu'); continue; }
+            if (kw == null){ wyn.bledy.push('wiersz ' + (k + 1) + ': nie odczytałem kwoty CASH'); continue; }
+            var wal = String(r[7] == null ? '' : r[7]).trim().toUpperCase();
+            if (wal && wal !== 'HUF') wyn.bledy.push('wiersz ' + (k + 1) + ': waluta ' + wal + ' zamiast HUF');
+            if (typeof r[0] === 'number'){ wyn.bledy.push('wiersz ' + (k + 1) + ': DATE jest liczbą Excela, nie tekstem — nie przerabiam'); continue; }
+            var di = codDataIso(dt); if (di) daty[di] = 1;
+            wyn.poz.push({ nr: fid, kwota: kw });
+            var out = [];
+            for (var c = 0; c < 11; c++) out.push(codKom(r[c]));
+            out[6] = codKwotaTxt(kw);     // do pliku idzie DOKLADNIE ta kwota, ktora sprawdzilismy
+            wyn.wiersze.push(out);
+        }
+        var dk = Object.keys(daty);
+        if (dk.length === 1){ wyn.data = dk[0]; wyn.dataZrodlo = 'DATE'; }
+        else if (dk.length > 1) wyn.uwagi.push('w pliku jest kilka dat: ' + dk.join(', '));
+        return codKoniec(wyn);
+    }
+    function codFutar(rows, wyn, zTxt){
+        wyn.przew = 'futar'; wyn.rodzaj = zTxt ? 'Futár — txt z maila' : 'Futár — CSV z Excela';
+        var hdr = (rows[0] || []).map(function (c){ return String(c == null ? '' : c).trim(); });
+        if (hdr.length < 9 || !/^R\.sz[aá]m$/i.test(hdr[0]) || !/^Azonos[ií]t[oó]$/i.test(hdr[3]) || !/^Ut[aá]nv[eé]t$/i.test(hdr[4])){
+            wyn.bledy.push('nagłówek nie ma „R.szám … Azonosító … Utánvét” na swoich miejscach'); return codKoniec(wyn);
+        }
+        wyn.wiersze.push(hdr.slice(0, 9));
+        var daty = {};
+        for (var k = 1; k < rows.length; k++){
+            var r = rows[k] || [];
+            if (r.every(function (c){ return String(c == null ? '' : c).trim() === ''; })) continue;
+            var az = String(r[3] == null ? '' : r[3]).trim(), kw = codLiczba(r[4]), fuv = codLiczba(r[5]);
+            if (!/^\d{6,9}(\/\d+){1,2}$/.test(az)){ wyn.bledy.push('wiersz ' + (k + 1) + ': Azonosító „' + az + '” nie wygląda na numer auftragu'); continue; }
+            if (kw == null){ wyn.bledy.push('wiersz ' + (k + 1) + ': nie odczytałem kwoty Utánvét'); continue; }
+            if (fuv) wyn.uwagi.push('wiersz ' + (k + 1) + ': Bruttó Fuvardíj ' + huTys(fuv) + ' — dotąd było zawsze 0');
+            var di = codDataIso(r[7]); if (di) daty[di] = 1;
+            wyn.poz.push({ nr: az, kwota: kw });
+            var out = [];
+            for (var c = 0; c < 9; c++) out.push(String(r[c] == null ? '' : r[c]));
+            out[4] = codKwotaTxt(kw);     // do pliku idzie DOKLADNIE ta kwota, ktora sprawdzilismy
+            wyn.wiersze.push(out);
+        }
+        var dk = Object.keys(daty);
+        if (dk.length === 1){ wyn.data = dk[0]; wyn.dataZrodlo = 'Utalási nap'; }
+        else if (dk.length > 1) wyn.uwagi.push('w pliku jest kilka dat przelewu: ' + dk.join(', '));
+        return codKoniec(wyn);
+    }
+    // Raport GLS ma w xlsx ZLY wymiar arkusza: „A1:A130", choc dane siegaja kolumny G.
+    // SheetJS trzyma sie tego wymiaru i oddaje sama kolumne A (komorki dalej sa wczytane,
+    // tylko poza zakresem), a openpyxl wymiar ignoruje — dlatego w Pythonie tego nie widac.
+    // Zakres liczymy wiec od nowa z komorek, zawsze od A1, zeby indeksy kolumn zostaly
+    // bezwzgledne (C = 2, E = 4).
+    function codZakres(ws){
+        if (!ws) return ws;
+        var r = null;
+        Object.keys(ws).forEach(function (k){
+            if (k.charAt(0) === '!') return;
+            var c = XLSX.utils.decode_cell(k);
+            if (!r) r = { s: { r: 0, c: 0 }, e: { r: c.r, c: c.c } };
+            else { r.e.r = Math.max(r.e.r, c.r); r.e.c = Math.max(r.e.c, c.c); }
+        });
+        if (r) ws['!ref'] = XLSX.utils.encode_range(r);
+        return ws;
+    }
+    async function codCzytaj(file){
+        var buf = await file.arrayBuffer(), u8 = new Uint8Array(buf), wyn = codWynik(file.name);
+        var zip = u8.length > 3 && u8[0] === 0x50 && u8[1] === 0x4b;      // PK — xlsx
+        var ole = u8.length > 7 && u8[0] === 0xd0 && u8[1] === 0xcf;      // stary .xls
+        if (zip || ole){
+            if (typeof XLSX === 'undefined') throw new Error('brak biblioteki XLSX — odśwież stronę');
+            var wb = XLSX.read(u8, { type: 'array' });
+            var nazwy = wb.SheetNames || [];
+            // raw:true — liczby jako liczby. Z raw:false dostalibysmy tekst sformatowany
+            // wedlug komorki („68,545.00"), a numery ponad int32 w zapisie wykladniczym.
+            var ark = function (n){ return XLSX.utils.sheet_to_json(codZakres(wb.Sheets[n]), { header: 1, raw: true, defval: '' }); };
+            var daily = nazwy.filter(function (n){ return /^daily$/i.test(String(n).trim()); })[0];
+            if (daily) return codGlsXlsx(ark(daily), wyn);
+            var rep = nazwy.filter(function (n){ return /cod\s*report/i.test(String(n)); })[0] || nazwy[0];
+            var aoa = ark(rep);
+            if (codToHdt(aoa[0])) return codHdt(aoa, wyn, true);
+            if (codGlsNaglowek(aoa) >= 0) return codGlsXlsx(aoa, wyn);
+            throw new Error('nie rozpoznaję arkusza — to nie jest raport GLS („Daily”) ani HDT („COD REPORT”)');
+        }
+        var txt = codTekst(buf);
+        var pierwsza = (txt.split(/\r?\n/)[0] || '');
+        if (/^R\.sz[aá]m\t/i.test(pierwsza))
+            return codFutar(txt.split(/\r?\n/).map(function (l){ return l.split('\t'); }), wyn, true);
+        if (/^R\.sz[aá]m;/i.test(pierwsza)) return codFutar(bkCsvRows(txt), wyn, false);
+        if (/^DATE;SERIAL;FOREIGN_ID;/i.test(pierwsza)) return codHdt(bkCsvRows(txt), wyn, false);
+        if (/^\s*\d{6,9};\s*\d/.test(pierwsza)) return codGlsCsv(txt.split(/\r?\n/), wyn);
+        throw new Error('nie rozpoznaję pliku — oczekuję raportu GLS (xlsx „Daily”), HDT (xlsx „COD REPORT”) albo Futár (txt z tabulatorami)');
+    }
+    // Plik wobec wplaty, pod ktora go wrzucono. Bledy blokuja import, uwagi ida do potwierdzenia.
+    // Suma musi sie zgadzac co do forinta: tak bylo w 108 na 108 dopasowan z lat 2024–2026,
+    // a jedna wplata to zawsze jeden plik — bez potracen i bez laczenia.
+    function codOcen(wyn, w, sid, kontoWyciagu){
+        var b = wyn.bledy.slice(), u = wyn.uwagi.slice();
+        var Pw = BK_PRZEW[w.przew] || {}, Pp = BK_PRZEW[wyn.przew] || {};
+        if (wyn.przew !== w.przew) b.push('to plik ' + (Pp.nazwa || '?') + ', a wpłata jest od ' + (Pw.nazwa || '?'));
+        if (Math.abs(wyn.suma - w.kwota) >= 0.005)
+            b.push('suma pozycji ' + huTys(wyn.suma) + ' ≠ wpłata ' + huTys(w.kwota) + ' (różnica ' + huTys(r2(w.kwota - wyn.suma)) + ')');
+        if (wyn.konto && kontoWyciagu && wyn.konto.replace(/\D/g, '') !== String(kontoWyciagu).replace(/\D/g, ''))
+            b.push('plik dotyczy konta ' + wyn.konto + ', a wyciąg jest z ' + kontoWyciagu);
+        if (wyn.data){
+            var df = bkDniRoznica(w.data, wyn.data);
+            var dobrze = (w.przew === 'futar') ? (df != null && df >= 0 && df <= 3) : (df === 0);
+            if (!dobrze) u.push('data w pliku („' + wyn.dataZrodlo + '”) ' + huDataPl(wyn.data) + ', a wpłata z ' + huDataPl(w.data)
+                              + (w.przew === 'futar' ? ' — Futár płaci zwykle dzień po „Utalási nap”' : ''));
+        } else if (wyn.rodzaj.indexOf('makra') < 0) u.push('w pliku nie znalazłem daty wypłaty');
+        var m = codWszystkie();
+        Object.keys(m).forEach(function (k){
+            if (k !== sid && m[k] && m[k].hash && m[k].hash === wyn.hash)
+                b.push('ten sam plik poszedł już do importu pobrań przy wpłacie z ' + huDataPl(m[k].data) + ' ('
+                       + huTys(m[k].kwota) + ', paczka ' + (m[k].impId || '?') + ')');
+        });
+        return { bledy: b, uwagi: u };
+    }
+    function codNazwa(w){
+        var d = new Date(), P = BK_PRZEW[w.przew] || {};
+        return 'COD ' + String(P.id || w.przew).toUpperCase() + ' HUF ' + huDataPl(w.data) + ' '
+             + pad2(d.getHours()) + '.' + pad2(d.getMinutes()) + '.csv';
+    }
+
+    function huPrzewSekcja(j, pw, num){
+        var lista = pw.wszystkie || [];
+        if (!lista.length) return '';
+        var bie = lista.filter(function (x){ return x.biezacy; }), wcz = lista.filter(function (x){ return !x.biezacy; });
+        var h = '<div style="margin:6px 0;padding:6px 8px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px">'
+              + '<b style="font-size:11px;color:#5b21b6">🚚 Wpłaty przewoźników (' + bie.length + ')</b>'
+              + '<div style="font-size:10px;color:#6b7280;margin-top:2px">Zostają w paczce wyciągu, ale tu nie da się ich przypisać, '
+              + 'przestawić ani zaksięgować. Pod każdą wrzuć plik z maila przewoźnika (GLS: xlsx „Daily”, HDT: xlsx „COD REPORT”, '
+              + 'Futár: txt). HUB sprawdzi, czy suma zgadza się co do forinta, i zrobi z pliku import pobrań.</div>';
+        bie.forEach(function (it){ h += huPrzewPozycja(it, j); });
+        if (wcz.length){
+            h += '<div style="margin-top:8px;padding-top:5px;border-top:1px dashed #c4b5fd;font-size:11px;font-weight:700;color:#5b21b6">'
+              +  'Z wcześniejszych wyciągów — niedokończone (' + wcz.length + ')</div>';
+            wcz.forEach(function (it){ h += huPrzewPozycja(it, j); });
+        }
+        return h + '</div>';
+    }
+    function huPrzewPozycja(it, j){
+        var w = it.w, P = BK_PRZEW[w.przew] || { nazwa: w.przew }, e = codGet(w.sid), st = codStan(e);
+        var pl = S.codPliki[w.sid], sid = esc(w.sid), lot = !!S.lot['cod:' + w.sid];
+        var gdzie = it.biezacy
+            ? (it.wiersze.length
+                ? ('w paczce wyciągu: ' + it.wiersze.map(function (x){ return esc(x.state || '?'); }).join(', ')
+                   + (it.wiersze.length > 1 ? ' <b style="color:#c00">(kilka wierszy o tej kwocie i dacie — wszystkie zablokowane)</b>' : ''))
+                : '<span style="color:#c47f00">w paczce wyciągu nie widzę tego wiersza</span>')
+            : ('z wyciągu ' + esc((e && e.wyciag) || it.wyciag || '?'));
+        var h = '<div style="border-top:1px solid #e9e5ff;margin-top:5px;padding-top:5px">'
+              + '<div style="font-size:11px"><b>' + esc(P.nazwa) + '</b> · ' + esc(huDataPl(w.data)) + ' · <b>' + huTys(w.kwota) + ' HUF</b>'
+              + ' · <span style="font-size:10px;color:#6b7280">' + esc(w.opis) + '</span>'
+              + ' · <span style="font-size:10px">' + gdzie + '</span></div>';
+        var btn = function (kl, napis, tlo, kolor){
+            return '<button class="' + kl + '" data-sid="' + sid + '" style="padding:1px 7px;border:1px solid ' + kolor
+                 + ';border-radius:5px;background:' + tlo + ';color:' + (tlo === '#fff' ? kolor : '#fff')
+                 + ';cursor:pointer;font-size:10px">' + napis + '</button>';
+        };
+        if (e && e.ukryty){
+            h += '<div style="font-size:10px;color:#6b7280;margin-top:2px">import pobrań ' + esc(e.impId || '') + ' ukryty · '
+              +  btn('bk-cod-pokaz', 'pokaż', '#fff', '#5b21b6')
+              +  (e.impId ? (' ' + btn('bk-cod-zapomnij', '✕ zapomnij — dodam plik jeszcze raz', '#fff', '#c00')) : '') + '</div>';
+        } else if (st === 'import'){
+            h += '<div style="font-size:10px;color:#6b7280;margin-top:2px">plik z maila: ' + esc(e.plik || '?') + ' · pozycji '
+              +  esc(e.n) + ' · suma ' + huTys(e.suma) + ' · data paczki ' + esc(huDataPl(e.data)) + '</div>'
+              +  '<div class="bk-cod-imp" data-sid="' + sid + '" style="margin-left:12px"></div>';
+        } else if (st === 'wysylka' || st === 'niepewne'){
+            h += (lot || (st === 'wysylka' && bkObcyWToku(e)))
+                ? ('<div style="font-size:11px;color:#666;margin-top:2px">⏳ ' + (lot ? 'wysyłam import pobrań…'
+                   : 'import pobrań wysyła się w innej karcie — kliknij „↻ Odśwież” za chwilę') + '</div>')
+                : ('<div style="font-size:11px;color:#c47f00;margin-top:2px">Plik ' + esc(e.plik || '') + ' poszedł do importu '
+                   + esc(String(e.czas || '').replace('T', ' ').slice(0, 16)) + ', ale '
+                   + (e.blad ? ('odpowiedź: ' + esc(e.blad)) : 'numeru paczki nie znam')
+                   + '. Sprawdź w Import payments (plik ' + esc(e.nazwa || '') + ').</div>'
+                   + '<div style="margin-top:3px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:10px">'
+                   + 'jest paczka — numer z adresu …/import_payments/<b>NUMER</b>/: '
+                   + '<input class="bk-cod-nr" data-sid="' + sid + '" style="width:80px;font-size:10px">'
+                   + btn('bk-cod-nr-set', 'zapisz', '#5b21b6', '#5b21b6')
+                   + ' · paczki NIE ma: ' + btn('bk-cod-zap', '↺ zdejmij ślad', '#fff', '#c00') + '</div>');
+        } else if (pl){
+            var oc = codOcen(pl, w, w.sid, j.hu && j.hu.konto), cfg = ustaw(P.ust);
+            var zgodna = Math.abs(pl.suma - w.kwota) < 0.005;
+            h += '<div style="font-size:11px;margin-top:3px">📄 <b>' + esc(pl.nazwaPliku) + '</b> — ' + esc(pl.rodzaj)
+              +  ' · pozycji <b>' + pl.n + '</b> · suma <b style="color:' + (zgodna ? '#0a7a2f' : '#c00') + '">' + huTys(pl.suma) + '</b>'
+              +  (zgodna ? ' ✓ = wpłata' : ' ✗ ≠ wpłata')
+              +  (pl.data ? (' · ' + esc(pl.dataZrodlo) + ': ' + esc(huDataPl(pl.data))) : '')
+              +  (pl.pominiete.length ? (' · pominięte: ' + esc(pl.pominiete.map(function (x){ return x.opis; }).join(', '))) : '')
+              +  '</div>'
+              +  (oc.bledy.length ? ('<div style="font-size:10px;color:#c00">✗ ' + oc.bledy.map(esc).join('<br>✗ ') + '</div>') : '')
+              +  (oc.uwagi.length ? ('<div style="font-size:10px;color:#c47f00">⚠ ' + oc.uwagi.map(esc).join('<br>⚠ ') + '</div>') : '')
+              +  '<details style="margin-top:2px"><summary style="font-size:10px;color:#6b7280;cursor:pointer">plik do importu — pierwsze wiersze</summary>'
+              +  '<pre style="font-size:10px;margin:2px 0;white-space:pre;overflow-x:auto">'
+              +  esc(pl.csv.split('\r\n').slice(0, 6).join('\n')) + '</pre></details>'
+              +  '<div style="margin-top:3px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+              +  '<button class="bk-cod-wyslij" data-sid="' + sid + '"' + (oc.bledy.length ? ' disabled' : '')
+              +  ' style="padding:4px 12px;border:none;border-radius:6px;background:' + (oc.bledy.length ? '#c7c7c7' : '#5b21b6')
+              +  ';color:#fff;font-weight:700;cursor:' + (oc.bledy.length ? 'default' : 'pointer') + ';font-size:11px">📤 Utwórz import pobrań</button>'
+              +  btn('bk-cod-inny', '✕ inny plik', '#fff', '#888')
+              +  '<span style="font-size:10px;color:#6b7280">→ ' + esc(cfg.bankNm || ('„' + (P.bankNazwa || '') + '” — nie wskazane w kroku 2'))
+              +  (cfg.bookingNm ? (' · ' + esc(cfg.bookingNm)) : '') + '</span></div>';
+        } else {
+            h += '<label style="display:inline-block;margin-top:3px;padding:3px 10px;border:1px dashed #5b21b6;border-radius:6px;'
+              +  'color:#5b21b6;cursor:pointer;font-size:11px;font-weight:700">📎 Dodaj plik z maila ' + esc(P.nazwa)
+              +  '<input type="file" class="bk-cod-plik" data-sid="' + sid + '" accept=".xlsx,.xls,.txt,.csv" style="display:none"></label>'
+              +  (it.biezacy ? '' : (' ' + btn('bk-cod-ukryj', 'ukryj', '#fff', '#888')));
+        }
+        return h + '</div>';
+    }
+    function huPrzewPodepnij(j, pw, box){
+        var lista = pw.wszystkie || [];
+        var wplata = function (sid){ var it = lista.filter(function (x){ return x.w.sid === sid; })[0]; return it ? it.w : null; };
+        var baza = function (w, e){
+            return { sid: w.sid, przew: w.przew, kwota: w.kwota, data: w.data, partner: w.partner, opis: w.opis,
+                     wyciag: (e && e.wyciag) || '', czas: (e && e.czas) || new Date().toISOString(), stan: 'czeka' };
+        };
+        box.querySelectorAll('.bk-cod-plik').forEach(function (inp){
+            inp.onchange = async function (){
+                var sid = inp.getAttribute('data-sid'), f = inp.files && inp.files[0];
+                if (!f) return;
+                say('czytam plik przewoźnika…', '#666');
+                try {
+                    var pl = await codCzytaj(f);
+                    S.codPliki[sid] = pl;
+                    var oc = codOcen(pl, wplata(sid), sid, j.hu && j.hu.konto);
+                    say(oc.bledy.length ? ('Plik rozebrany, ale nie nadaje się do importu: ' + esc(oc.bledy[0]))
+                                        : 'Plik rozebrany — suma się zgadza. Sprawdź i utwórz import pobrań.',
+                        oc.bledy.length ? '#c00' : '#0a7a2f');
+                } catch (e){
+                    delete S.codPliki[sid];
+                    say('Nie odczytałem pliku: ' + esc((e && e.message) || e), '#c00');
+                }
+                odrysujGlowna();
+            };
+        });
+        box.querySelectorAll('.bk-cod-inny').forEach(function (b){
+            b.onclick = function (){ delete S.codPliki[b.getAttribute('data-sid')]; odrysujGlowna(); };
+        });
+        box.querySelectorAll('.bk-cod-pokaz').forEach(function (b){
+            b.onclick = function (){
+                var sid = b.getAttribute('data-sid'), e = codGet(sid); if (!e) return;
+                e.ukryty = false; codSet(sid, e); odrysujGlowna();
+            };
+        });
+        box.querySelectorAll('.bk-cod-zapomnij').forEach(function (b){
+            b.onclick = function (){
+                var sid = b.getAttribute('data-sid'), e = codGet(sid); if (!e) return;
+                if (!confirm(codZapomnijPytanie(e))) return;
+                codZapomnij(sid);
+            };
+        });
+        box.querySelectorAll('.bk-cod-ukryj').forEach(function (b){
+            b.onclick = function (){
+                var sid = b.getAttribute('data-sid'), w = wplata(sid); if (!w) return;
+                if (!confirm('Ukryć wpłatę ' + huTys(w.kwota) + ' HUF z ' + huDataPl(w.data) + '?\n\n'
+                    + 'Zniknie z listy niedokończonych. Pliku z maila do niej wtedy tu nie dodasz.')) return;
+                var e = codGet(sid) || baza(w, null); e.ukryty = true; codSet(sid, e); odrysujGlowna();
+            };
+        });
+        box.querySelectorAll('.bk-cod-nr-set').forEach(function (b){
+            b.onclick = async function (){
+                var sid = b.getAttribute('data-sid'), e = codGet(sid);
+                var inp = box.querySelector('.bk-cod-nr[data-sid="' + sid + '"]');
+                var nr = String((inp || {}).value || '').trim();
+                if (!e) return;
+                if (!/^\d{3,9}$/.test(nr)){ say('Numer paczki to same cyfry z adresu …/import_payments/NUMER/.', '#c47f00'); return; }
+                b.disabled = true; say('sprawdzam paczkę ' + esc(nr) + '…', '#666');
+                var sp;
+                try { sp = await bkSprawdzNumer(nr, e.nazwa); }
+                catch (err){ sp = { ok: false, powod: 'nie odczytałem paczki ' + nr + ': ' + ((err && err.message) || err) }; }
+                b.disabled = false;
+                if (!sp.ok){ say('Nie przypinam: ' + esc(sp.powod) + '.', '#c00'); return; }
+                if (sp.potwierdz && !confirm(sp.potwierdz + '\n\nPrzypiąć ją jako import pobrań z pliku ' + (e.nazwa || '') + '?')) return;
+                // Jeszcze raz po sprawdzeniu: w tym czasie wpis mogl sie zmienic (druga karta).
+                e = codGet(sid);
+                var st0 = codStan(e);
+                if (!e || (st0 !== 'wysylka' && st0 !== 'niepewne')){ odrysujGlowna(); return; }
+                e.impId = nr; e.stan = 'import'; delete e.blad;
+                codSet(sid, e); delete S.codPaczki[sid];
+                say('Zapisane: import pobrań to paczka ' + esc(nr) + '.', '#0a7a2f');
+                odrysujGlowna();
+            };
+        });
+        box.querySelectorAll('.bk-cod-zap').forEach(function (b){
+            b.onclick = function (){
+                var sid = b.getAttribute('data-sid'), e = codGet(sid), w = wplata(sid);
+                if (!e || !w) return;
+                if (!confirm('Zdjąć ślad wysyłki pliku ' + (e.plik || '') + '?\n\nZrób to TYLKO wtedy, gdy w Import payments NIE ma '
+                    + 'paczki z pliku ' + (e.nazwa || '') + '. Jeśli paczka jednak powstała, a wyślesz plik jeszcze raz, powstanie druga '
+                    + 'i pobrania zaksięgują się podwójnie.')) return;
+                codSet(sid, baza(w, e)); odrysujGlowna();
+            };
+        });
+        box.querySelectorAll('.bk-cod-wyslij').forEach(function (b){
+            b.onclick = async function (){
+                var sid = b.getAttribute('data-sid'), w = wplata(sid), pl = S.codPliki[sid];
+                if (!w || !pl || S.lot['cod:' + sid]) return;
+                var P = BK_PRZEW[w.przew], e0 = codGet(sid);
+                if (e0 && codStan(e0) !== 'czeka'){ say('Ta wpłata ma już import pobrań (albo jego wysyłka czeka na rozstrzygnięcie).', '#c47f00'); return; }
+                var oc = codOcen(pl, w, sid, j.hu && j.hu.konto);
+                if (oc.bledy.length){ say('Nie wysyłam: ' + esc(oc.bledy[0]), '#c00'); return; }
+                var cfg = ustaw(P.ust);
+                if (!cfg.bank || !cfg.booking){
+                    say('Najpierw wskaż ustawienia importu pobrań ' + esc(P.nazwa) + ' (krok 2) i kliknij „Zapisz”.', '#c47f00'); return;
+                }
+                var nazwa = codNazwa(w);
+                if (!confirm('Utworzyć import pobrań ' + P.nazwa + '?\n\n'
+                    + 'Wpłata: ' + huDataPl(w.data) + ' · ' + huTys(w.kwota) + ' HUF\n'
+                    + 'Plik z maila: ' + pl.nazwaPliku + '\n'
+                    + 'Plik do importu: ' + nazwa + '\n'
+                    + 'Pozycji: ' + pl.n + ' · suma ' + huTys(pl.suma) + ' — zgadza się z wpłatą\n'
+                    + 'Ustawienie importu: ' + (cfg.bankNm || '?') + ' (' + cfg.bank + ')\n'
+                    + 'Dopasowanie: ' + (cfg.bookingNm || '?') + ' (' + cfg.booking + ')\n'
+                    + 'Data księgowania: ' + w.data + ' (data wpływu z wyciągu — dla całej paczki)\n'
+                    + (oc.uwagi.length ? ('\nUWAGA:\n  • ' + oc.uwagi.join('\n  • ') + '\n') : '')
+                    + '\nImport utworzy paczkę. NIE zaksięguje jej — to osobny przycisk.')) return;
+                // Jeszcze raz po pytaniu: druga karta mogla w tym czasie wyslac ten plik.
+                e0 = codGet(sid);
+                if (e0 && codStan(e0) !== 'czeka'){ say('Ta wpłata dostała w międzyczasie import pobrań — nie wysyłam drugi raz.', '#c47f00'); return; }
+                // Slad PRZED wysylka (przeglad 29.09.2026): przy bledzie, F5 albo przerysowaniu
+                // w trakcie nic juz nie pozwoli wyslac tego pliku drugi raz bez decyzji czlowieka.
+                var wpis = baza(w, e0);
+                wpis.stan = 'wysylka'; wpis.impId = ''; wpis.nazwa = nazwa; wpis.plik = pl.nazwaPliku; wpis.karta = bkKarta();
+                wpis.hash = pl.hash; wpis.n = pl.n; wpis.suma = pl.suma; wpis.booked = false; wpis.czas = new Date().toISOString();
+                codSet(sid, wpis);
+                S.lot['cod:' + sid] = 1;
+                b.disabled = true; say('wysyłam import pobrań…', '#666');
+                var imp = '', blad = '';
+                try {
+                    imp = await bkWyslij(new Blob([pl.bajty], { type: 'text/csv' }), nazwa, cfg,
+                                         { data: w.data, bezZapasu: true });
+                } catch (e){ blad = (e && e.message) || String(e); }
+                delete S.lot['cod:' + sid];
+                wpis = codGet(sid) || wpis;
+                if (imp){ wpis.impId = imp; wpis.stan = 'import'; delete wpis.blad; delete S.codPliki[sid]; }
+                else { wpis.stan = 'niepewne'; wpis.blad = blad || 'nie odczytałem numeru paczki'; }
+                codSet(sid, wpis);
+                say(imp ? ('Import pobrań ' + esc(P.nazwa) + ': paczka <b>' + esc(imp) + '</b> — jeszcze NIEZAKSIĘGOWANA.')
+                        : ('Nie wiem, czy import pobrań powstał (' + esc(wpis.blad) + ') — sprawdź w Import payments i rozstrzygnij pod wpłatą.'),
+                    imp ? '#0a7a2f' : '#c00');
+                odrysujGlowna();
+            };
+        });
+        // Paczki pobran pod wplatami. Z pamieci, jesli juz czytane — wiec przerysowanie
+        // paczki wyciagu nie odpytuje prologistics o kazda z nich od nowa.
+        lista.forEach(function (it){
+            var sid = it.w.sid, e = codGet(sid);
+            if (!e || e.ukryty || codStan(e) !== 'import') return;
+            if (S.codPaczki[sid]) rysujPaczke(zCod(sid), S.codPaczki[sid]);
+            else codSprawdz(sid);
+        });
     }
 
     // Listy ustawien z poprzedniego uruchomienia — zeby po odswiezeniu strony nie
@@ -77727,7 +80469,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '20f3886 · 29.09.2026 13:17';
+    const HUB_BUDOWA = '87ec5c5 · 30.09.2026 09:42';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
