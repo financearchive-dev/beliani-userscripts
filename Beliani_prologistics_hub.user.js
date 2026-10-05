@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.4
+// @version      5.59.5
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -7568,8 +7568,9 @@
             Wklej całą tabelę ze strony — skrypt sam wyciągnie numery z "Refund_ XXXXXXX". Sprawdza tylko refundy ze statusem "Refund approved".<br>
             Przy wpłacie z Klarny zielone dostaje wyłącznie zwrot równy <b>całej</b> jej wpłacie.<br>
             Numer do 7 cyfr to <b>ticket</b> — tam kwoty z open amount nie porównuje; pilnuje, żeby zwroty z jednej wpłaty nie przekroczyły tego, co z niej zostało do zwrotu.<br>
-            Każdy zatwierdzony request przechodzi kontrolę autoryzacji: limit zatwierdzającego z arkusza 2025, kwota w EUR po kursie OANDA. Skasowany auftrag — bez autoryzacji.<br>
-            Pilnuje też <b>podwójnego zwrotu</b>: gdy na tę samą kwotę zwrot już wyszedł (nota w tickecie albo ujemny wiersz na auftragu), mówi to w Problemach razem z kontem, z którego poszedł.
+            Każdy zatwierdzony request przechodzi kontrolę autoryzacji: limit zatwierdzającego z arkusza 2025, kwota w EUR po kursie OANDA. Skasowany auftrag — bez autoryzacji. Zwrot VAT (faktura przestawiona na <b>0% VAT</b>) — też bez autoryzacji.<br>
+            Pilnuje też <b>podwójnego zwrotu</b>: gdy na tę samą kwotę zwrot już wyszedł (nota w tickecie albo ujemny wiersz na auftragu), mówi to w Problemach razem z kontem, z którego poszedł.<br>
+            Na stronie <b>listy importów</b> nie musisz nic wklejać — „⬇ Z tej strony" bierze wiersze wprost z tabeli, a po sprawdzeniu <b>zaznaczy prawidłowe</b>, żebyś mógł je zaksięgować guzikiem „Book Refunds/Orders".
         </div>
         <textarea id="tm-refund-input" placeholder="false&#9;1901240&#9;Refund_ 14548371&#9;Refund&#9;..." style="
             width: 100%; height: 120px; padding: 8px;
@@ -7578,6 +7579,14 @@
             box-sizing: border-box; font-family: monospace;
         "></textarea>
         <div id="tm-refund-preview" style="margin-top:4px; font-size:11px; color:#555; min-height:16px;"></div>
+        <div id="tm-refund-zestrony-box" style="margin-top:4px; display:none;">
+            <button id="tm-refund-zestrony" style="
+                padding:6px 10px; border:none; border-radius:6px;
+                background:#0f766e; color:#fff; cursor:pointer;
+                font-size:12px; font-weight:bold;
+            ">⬇ Z tej strony</button>
+            <span id="tm-refund-zestrony-info" style="font-size:11px; color:#666; margin-left:6px;"></span>
+        </div>
         <label style="display:block; margin-top:8px; font-size:12px; cursor:pointer;">
             <input type="checkbox" id="tm-refund-ksieg"> <b>Sprawdzenie księgowań</b>
         </label>
@@ -7587,6 +7596,7 @@
             przy requeście z <b>auftragu</b> <b>ujemnej płatności</b> na auftragu. Kwota z requestu, data zmiany
             statusu na Refund Done, konto Saferpay tego rynku. Po Open amount tego nie widać.
             Niewyksięgowane pokazuje na górze listy, z opcją zaksięgowania i sprawdzeniem po zapisie.
+            To osobna robota od sprawdzania zwrotów — w tym trybie HUB <b>nic nie zaznacza</b> na liście importów.
         </div>
         <button id="tm-refund-btn" style="
             margin-top:10px; width:100%; padding:10px;
@@ -7648,6 +7658,30 @@
                 font-family:monospace;
             "></div>
             <div id="tm-refund-summary" style="margin-top:8px; font-size:13px; font-weight:bold;"></div>
+            <div id="tm-refund-mark-section" style="display:none; margin-top:10px; border-top:1px solid #eee; padding-top:8px;">
+                <div id="tm-refund-mark-sum" style="font-size:12px; margin-bottom:6px;"></div>
+                <button id="tm-refund-mark" style="
+                    padding:7px 11px; border:none; border-radius:6px;
+                    background:#16a34a; color:#fff; cursor:pointer;
+                    font-size:12px; font-weight:bold;
+                ">✓ Zaznacz prawidłowe na stronie</button>
+                <button id="tm-refund-mark-show" style="
+                    padding:7px 11px; border:none; border-radius:6px;
+                    background:#334155; color:#fff; cursor:pointer;
+                    font-size:12px; margin-left:6px;
+                ">⟶ Pokaż „Book Refunds/Orders"</button>
+                <div style="font-size:11px; color:#666; margin-top:4px;">
+                    Zaznacza dokładnie te wiersze, o których kontrola nic nie zgłosiła <b>i</b> coś potwierdziła;
+                    pozostałe <b>odznacza</b>, żeby na stronie było wybrane tylko to, co sprawdzone.
+                    Księgowania HUB nie klika — guzik „Book Refunds/Orders" odblokowuje się sam i klikasz go Ty.
+                </div>
+                <div id="tm-refund-mark-status" style="font-size:11px; margin-top:4px;"></div>
+                <div id="tm-refund-mark-lista" style="
+                    display:none; font-size:11px; background:#f8fafc;
+                    border:1px solid #e2e8f0; border-radius:6px; padding:6px;
+                    margin-top:6px; max-height:140px; overflow-y:auto; font-family:monospace;
+                "></div>
+            </div>
         </div>
     `;
 
@@ -7705,6 +7739,165 @@
 
         return { unique, duplicates, counts, importy, waluty, wiersze };
     }
+
+    // ——— Lista importow wprost ze strony: odczyt tabeli i zaznaczanie prawidlowych ———
+    //
+    // Strona listy importow niesie dokladnie to, co do tej pory wklejalo sie recznie.
+    // Czytamy wiersz tak, jak wygladal we WKLEJCE — komorki sklejone tabulatorem — zeby
+    // parseAuftragNumbers dostal to samo co z Ctrl+C i zadnej regulki nie trzeba bylo ruszac.
+    //
+    // Kotwica to CHECKBOX wiersza, nie „pierwsza tabela na stronie": tabela listy
+    // (table.tablePrint) siedzi w prologistics wewnatrz tabel panelu filtrow, wiec
+    // document.querySelector('table') trafia w kalendarz. Odczytane z zywej strony
+    // 05.10.2026: tabela zewnetrzna ma 526 wierszy i naglowki „Mo Tu We…", wlasciwa 500.
+    const REFUND_CB_SEL = 'input[name="files"][value]';
+
+    function refundWierszeStrony() {
+        const out = [];
+        document.querySelectorAll(REFUND_CB_SEL).forEach(cb => {
+            // Checkbox naglowka ma value="all" — to nie wiersz.
+            if (!/^\d+$/.test(cb.value)) return;
+            const tr = cb.closest('tr');
+            if (!tr) return;
+            const kom = Array.from(tr.children).map(td => String(td.innerText || '').replace(/\s+/g, ' ').trim());
+            out.push({
+                imp: cb.value, cb: cb, kom: kom, tekst: kom.join('\t'),
+                // Rodzaj poznajemy po komorce Source, nie po numerze kolumny — tak samo
+                // jak parser wklejki.
+                refund: kom.some(c => /^Refund_\s*\d+$/.test(c))
+            });
+        });
+        return out;
+    }
+
+    function refundTekstZeStrony() {
+        return refundWierszeStrony().map(w => w.tekst).join('\n');
+    }
+
+    // Guzik ksiegowania na stronie listy. HUB go NIE klika — ksiegowanie zostaje
+    // u czlowieka. Zaznaczenie wierszy samo go odblokowuje: dopoki nic nie wybrane, stoi
+    // wyszarzony (odczytane 05.10.2026: `disabled` true przy pustym wyborze).
+    function refundGuzikKsieg() {
+        return Array.from(document.querySelectorAll('button'))
+            .find(b => /book\s*refunds?\s*\/\s*orders/i.test(String(b.textContent || ''))) || null;
+    }
+
+    function refundPokazGuzik() {
+        const g = refundGuzikKsieg();
+        if (!g) return false;
+        try { g.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) { g.scrollIntoView(); }
+        const stary = g.style.boxShadow;
+        let n = 0;
+        const mig = setInterval(() => {
+            g.style.boxShadow = (n % 2) ? '0 0 0 4px rgba(255,47,0,.65)' : '0 0 0 12px rgba(255,47,0,0)';
+            if (++n > 7) { clearInterval(mig); g.style.boxShadow = stary; }
+        }, 320);
+        return true;
+    }
+
+    // Zaznaczanie idzie KLIKIEM, nie `cb.checked = true`. Checkboxy listy sa sterowane
+    // Reactem (props `checked` + `onChange` → `setCheckbox`), a guzik ksiegowania bierze
+    // wybrane wiersze przez `getSelectedFileIds()` ze swojego stanu, NIE z DOM — samo
+    // ustawienie pola nie doszloby do ksiegowania i znikneloby przy przerysowaniu.
+    // Odczytane z zywej strony 05.10.2026.
+    let REFUND_KLIKAMY = false;
+
+    async function refundZaznaczNaStronie(czyste, postep) {
+        const chce = {};
+        (czyste || []).forEach(id => { chce[String(id)] = true; });
+        const wiersze = refundWierszeStrony();
+        const doRuchu = wiersze.filter(w => (!!chce[w.imp]) !== (!!w.cb.checked)).length;
+        let zazn = 0, odzn = 0, ruch = 0;
+        REFUND_KLIKAMY = true;
+        try {
+            for (const w of wiersze) {
+                const ma = !!chce[w.imp];
+                if (ma === !!w.cb.checked) continue;
+                w.cb.click();
+                if (ma) zazn++; else odzn++;
+                ruch++;
+                // React przerysowuje CALA liste po kazdym kliknieciu, a wierszy bywa 500 —
+                // oddajemy mu watek co kilka klikniec, inaczej karta stoi i wyglada na zwieszona.
+                if (ruch % 5 === 0) {
+                    if (postep) { try { postep(ruch, doRuchu); } catch (e) {} }
+                    await refundSleep(0);
+                }
+            }
+        } finally {
+            await refundSleep(80);
+            REFUND_KLIKAMY = false;
+        }
+        // Kontrola po fakcie: czy strona NAPRAWDE ma zaznaczone to, co mialo byc. Gdyby
+        // React cofnal nasze klikniecia, ma to byc widac w panelu, a nie zniknac.
+        const po = refundWierszeStrony();
+        return {
+            zazn: zazn, odzn: odzn,
+            potw: po.filter(w => chce[w.imp] && w.cb.checked).length,
+            obce: po.filter(w => !chce[w.imp] && w.cb.checked).length,
+            brak: Object.keys(chce).filter(id => !po.some(w => w.imp === id)).length,
+            chcianych: Object.keys(chce).length,
+            naStronie: po.length
+        };
+    }
+
+    // Werdykt per WIERSZ listy (numer importu), nie per numer auftragu — jeden auftrag
+    // moze miec dwa wiersze. „Prawidlowy" = nic go nie obciaza I cos zostalo o nim
+    // POTWIERDZONE: albo kontrola kwot dala zielone (request „Refund approved"), albo
+    // kontrola ksiegowan znalazla wyksiegowanie dla TEGO numeru importu. Sam brak zarzutow
+    // nie wystarcza — wiersz, o ktorym nie wiemy nic (np. „pominiety, bo nie Refund Done"),
+    // idzie do „niesprawdzone", bo po zaznaczeniu ksieguje sie prawdziwymi pieniedzmi.
+    function refundWerdyktyWierszy(unique, results, counts, importy, tylkoOStanie) {
+        const czyste = [], uwagi = [], niesprawdzone = [];
+        unique.forEach((nr, i) => {
+            const r = results[i];
+            const ids = (importy[nr] || []).map(String);
+            if (!ids.length) return;   // numeru wiersza nie znamy — nie ma czego zaznaczac
+            ids.forEach(imp => {
+                const dod = (lista, powod) => lista.push({ imp: imp, nr: nr, powod: powod });
+                if (!r) return dod(niesprawdzone, 'nie doszło do sprawdzenia');
+                if (counts[nr] > 1) return dod(uwagi, 'ten sam numer stoi w kilku wierszach listy');
+                if (r.executed) return dod(uwagi, 'zrobione i wyksięgowane — do zmiany statusu');
+                if (r.internalDuplicates && r.internalDuplicates.length) return dod(uwagi, 'zduplikowane requesty „Refund approved"');
+                if (!r.ok && !tylkoOStanie(r.error)) return dod(uwagi, String(r.error || 'problem'));
+                // `r.uwagi` to NOTATKI obok zielonego wyniku, nie zarzuty — i dlatego nie
+                // dyskwalifikuja. Wszystkie cztery miejsca, ktore tam pisza, opisuja kontrole,
+                // ktora PRZESZLA: autoryzacja wpisuje swoj opis przy kazdym zatwierdzonym
+                // requescie (`(a.ok ? uwagi : problemy).push(a.opis)` w autoryzacjaAuftragu
+                // i w checkTicketRefund), „auftrag skasowany — autoryzacja niewymagana" to
+                // regula, a sprawdzTransakcje i kontrola ticketow z jednej wplaty pcha do
+                // `uwagi` tylko to, co SIE MIESCI (przekroczenie idzie do `problemy` i gasi
+                // `ok`). Pierwsza wersja tej funkcji traktowala kazda uwage jak zarzut — na
+                // przebiegu z 05.10.2026 dalo to 0 prawidlowych przy 194 zielonych.
+                // Wpisy kontroli ksiegowan bez numeru importu dotycza calej pozycji
+                // (wczesne wyjscia: nie odczytalem auftragu, brak tabeli requestow).
+                const ksieg = (r.ksieg || []).filter(w => !w.importId || String(w.importId) === imp);
+                const zle = ksieg.filter(w => w.stan === 'brak' || w.stan === 'reka');
+                if (zle.length) return dod(uwagi, zle.map(w =>
+                    w.stan === 'brak' ? 'zwrot NIE jest wyksięgowany' : (w.powod || 'do rozstrzygnięcia')).join(' · '));
+                // Zaznaczamy tylko z POZYTYWNYM sladem kontroli autoryzacji. Samo `ok: true`
+                // nie wystarcza: autoryzacja ma wyjscia, na ktorych nie rusza wcale (patrz
+                // `r.autoryzacja`), a wtedy zielona pozycja znaczy tylko „kwoty sie zgadzaja".
+                const notatki = (r.uwagi && r.uwagi.length) ? ' · ' + r.uwagi.join(' · ') : '';
+                if (r.ok && r.autoryzacja === 'ok') return dod(czyste, 'kwoty i autoryzacja bez zastrzeżeń' + notatki);
+                // Skasowany auftrag i zwrot VAT — autoryzacji sie NIE wymaga (ustalenia
+                // uzytkownika), ale powod ma to mowic wprost, zamiast twierdzic, ze
+                // autoryzacja przeszla. Ktory to przypadek, mowi notatka.
+                if (r.ok && r.autoryzacja === 'niewymagana')
+                    return dod(czyste, 'kwoty bez zastrzeżeń · autoryzacji nie wymagano' + notatki);
+                if (r.ok) return dod(niesprawdzone, 'kwoty się zgadzają, ale autoryzacji nie sprawdziłem'
+                    + (r.autoryzacja ? ' (' + r.autoryzacja + ')' : ' — brak śladu kontroli'));
+                // Zwrot JEST wyksiegowany, ale czy ten wiersz importu ma byc jeszcze
+                // ksiegowany — tego kontrola nie wie. Do rozstrzygniecia przez czlowieka.
+                if (ksieg.some(w => w.stan === 'ok'))
+                    return dod(niesprawdzone, 'zwrot jest już wyksięgowany — nie wiem, czy ten wiersz importu ma być jeszcze księgowany');
+                dod(niesprawdzone, (ksieg[0] && ksieg[0].powod)
+                    || 'nie ma już requestu „Refund approved" — nic nie zostało potwierdzone');
+            });
+        });
+        return { czyste: czyste, uwagi: uwagi, niesprawdzone: niesprawdzone };
+    }
+
+    let REFUND_CZYSTE = [];
 
     function parseMoney(value) {
         if (value === null || value === undefined) return null;
@@ -8880,7 +9073,11 @@
     // 15519342 (wplata na koncie 1040 „Saferpay Beliani DE DKK"). Nieznany zapis waluty
     // to problem, a nie cicha zgoda.
     const REFUND_WALUTY = {
-        '€': 'EUR', 'eur': 'EUR', 'chf': 'CHF', 'nok': 'NOK', 'sek': 'SEK', 'dkk': 'DKK', 'kr.': 'DKK',
+        // „kr" bez kropki to SEK, „kr." z kropka to DKK — potwierdzone przez uzytkownika
+        // 05.10.2026 na liscie importow, gdzie NOK stoi jawnie jako „NOK". Do 5.59.5 „kr"
+        // nie bylo znane wcale i kazdy zwrot szwedzki konczyl sie „nie znam waluty «kr» —
+        // autoryzacji nie sprawdzilem".
+        '€': 'EUR', 'eur': 'EUR', 'chf': 'CHF', 'nok': 'NOK', 'sek': 'SEK', 'kr': 'SEK', 'dkk': 'DKK', 'kr.': 'DKK',
         'ft': 'HUF', 'huf': 'HUF', 'kč': 'CZK', 'czk': 'CZK', 'zł': 'PLN', 'pln': 'PLN',
         '£': 'GBP', 'gbp': 'GBP', 'ron': 'RON', 'lei': 'RON'
     };
@@ -9028,6 +9225,27 @@
         return null;
     }
 
+    // Faktura przestawiona na 0% VAT. Klient B2B podaje numer VAT po zakupie, sprzedaz klika
+    // „Make 0% VAT Invoice (prices automatically adjusted)", wartosc auftragu spada do netto,
+    // a nadplacony VAT wraca klientowi. Taki zwrot — slowami uzytkownika — NIE wymaga
+    // autoryzacji, bo nikt niczego nie uznaje: oddajemy podatek, ktorego nie powinnismy byli
+    // pobrac.
+    //
+    // Rozstrzyga guzik „Undo 0% VAT Invoice": CZYNNY jest tylko wtedy, gdy faktura juz jest
+    // na 0%. Zmierzone 05.10.2026 w przegladarce uzytkownika, na HTML-u Z FETCHA (atrybuty
+    // renderuje serwer, wiec HUB je widzi):
+    //   15695608 (zwrot VAT 245.85 EUR) — make 0% zablokowany, undo 0% CZYNNY
+    //   15881872, 15828978, 15097544    — make 0% czynny,      undo 0% zablokowany
+    //   15815436                        — oba zablokowane (VAT-u nie ma wcale)
+    // Dlatego zadamy OBU warunkow naraz, a nie samego „undo".
+    function auftragVat0(doc) {
+        if (!doc) return null;
+        const undo = doc.getElementById('customer_vat_undo_0');
+        const make = doc.getElementById('customer_vat_make_0');
+        if (!undo || !make) return null;   // inny uklad strony — nie zgadujemy
+        return !undo.hasAttribute('disabled') && make.hasAttribute('disabled');
+    }
+
     // Autoryzacja jednego zatwierdzonego requestu: zatwierdzajacy z logu -> lista pracownikow
     // -> stanowisko -> limit w EUR. Zwraca { ok, opis }. Czego nie da sie sprawdzic, to problem.
     async function autoryzacjaRequestu(w, walutaTok) {
@@ -9096,10 +9314,12 @@
             // Status i requesty auftragu tego ticketu — jedno wejscie na auction.php.
             let naAuftragu = [];
             let skasowany = null;
+            let vat0 = null;
             if (wynik.auftrag) {
                 try {
                     const sAuf = await refundStrona(wynik.auftrag);
                     skasowany = auftragSkasowany(sAuf.html);
+                    vat0 = auftragVat0(sAuf.doc);
                     naAuftragu = refundRequestWiersze(sAuf.doc) || [];
                 } catch (e) {
                     problemy.push(`nie odczytałem auftragu ${wynik.auftrag} (${e.message}) — requestów na nim nie sprawdziłem`);
@@ -9109,15 +9329,28 @@
             }
 
             const uwagi = [];
+            let ileAut = 0, ileOk = 0, ileNiewym = 0;
             for (const m of moje) {
                 if (!/^refund approved$/i.test(m.stan)) continue;
+                ileAut++;
                 if (skasowany === true) {
                     uwagi.push(`zatwierdził ${m.zatwierdzil || '?'} — auftrag skasowany, autoryzacja niewymagana`);
+                    ileNiewym++;
+                    continue;
+                }
+                if (vat0 === true) {
+                    uwagi.push(`zatwierdził ${m.zatwierdzil || '?'} — zwrot VAT (faktura 0% VAT), autoryzacja niewymagana`);
+                    ileNiewym++;
                     continue;
                 }
                 const a = await autoryzacjaRequestu(m, walutaTok);
+                if (a.ok) ileOk++;
                 (a.ok ? uwagi : problemy).push(a.opis);
             }
+            // Slad kontroli — ten sam, co na sciezce auftragu. Bez niego nie wiadomo,
+            // czy autoryzacja w ogole ruszyla (patrz komentarz w autoryzacjaAuftragu).
+            wynik.autoryzacja = !ileAut ? 'nieznana'
+                : (ileOk + ileNiewym === ileAut ? (ileOk ? 'ok' : 'niewymagana') : 'zla');
 
             const czynne = wiersze.concat(naAuftragu).filter(w => !REFUND_NIEAKTYWNE.test(w.stan));
             moje.forEach(m => sprawdzTransakcje(m, czynne.filter(w => w !== m), problemy, uwagi));
@@ -9176,19 +9409,37 @@
     // pomijamy — pieniadze poszly, zostal tylko status do zmiany.
     async function autoryzacjaAuftragu(r, nr, walutaTok) {
         const dane = AUFTRAG_NARZEDZIE[nr];
-        if (!r || r.executed || !dane) return;
+        if (!r || r.executed) return;
+        // SLAD KONTROLI, nie milczenie. Ta funkcja ma dwa wyjscia, na ktorych autoryzacja
+        // nie rusza wcale: brak odczytu narzedzia i brak wierszy „Refund approved" w TYM
+        // odczycie — a `checkRefund` szuka ich wlasnym czytnikiem i moze widziec inaczej.
+        // Do 5.59.5 oba konczyly sie cichym `return`, wiec pozycja zostawala zielona bez
+        // sprawdzonej autoryzacji i nic o tym nie mowilo. `r.autoryzacja` jest teraz
+        // warunkiem zaznaczenia wiersza do ksiegowania (refundWerdyktyWierszy).
+        if (!dane) { r.autoryzacja = 'nieznana'; return; }
         const zatw = dane.wiersze.filter(w => /^refund approved$/i.test(w.stan));
-        if (!zatw.length) return;
+        if (!zatw.length) { r.autoryzacja = 'nieznana'; return; }
         const uwagi = [];
         const problemy = [];
+        let ileOk = 0, ileNiewym = 0;
         for (const w of zatw) {
             if (dane.skasowany === true) {
                 uwagi.push(`zatwierdził ${w.zatwierdzil || '?'} — auftrag skasowany, autoryzacja niewymagana`);
+                ileNiewym++;
+                continue;
+            }
+            if (dane.vat0 === true) {
+                uwagi.push(`zatwierdził ${w.zatwierdzil || '?'} — zwrot VAT (faktura 0% VAT), autoryzacja niewymagana`);
+                ileNiewym++;
                 continue;
             }
             const a = await autoryzacjaRequestu(w, walutaTok);
+            if (a.ok) ileOk++;
             (a.ok ? uwagi : problemy).push(a.opis);
         }
+        r.autoryzacja = (ileOk + ileNiewym === zatw.length)
+            ? (ileOk ? 'ok' : 'niewymagana')
+            : 'zla';
         r.uwagi = (r.uwagi || []).concat(uwagi);
         if (problemy.length) {
             r.ok = false;
@@ -9206,7 +9457,11 @@
             const openAmount = openData.amount;
 
             // Dla kontroli autoryzacji (autoryzacjaAuftragu): requesty z narzedzia i status auftragu.
-            AUFTRAG_NARZEDZIE[auftragNumber] = { wiersze: refundRequestWiersze(doc) || [], skasowany: auftragSkasowany(html) };
+            AUFTRAG_NARZEDZIE[auftragNumber] = {
+                wiersze: refundRequestWiersze(doc) || [],
+                skasowany: auftragSkasowany(html),
+                vat0: auftragVat0(doc)
+            };
 
             const approvedAmounts = [];
             const approvedLogIds = [];
@@ -9572,6 +9827,61 @@
             }
         }
 
+        // Werdykt per wiersz listy importow — i zaznaczanie prawidlowych na stronie.
+        // Liczy sie tylko to, co jest NA TEJ stronie: zaznaczyc mozna wylacznie wiersz,
+        // ktory widzimy (inna strona listy albo inne filtry to inne wiersze).
+        const werdykty = refundWerdyktyWierszy(unique, results, counts, importy, tylkoOStanie);
+        const markSection = document.getElementById('tm-refund-mark-section');
+        const markSum = document.getElementById('tm-refund-mark-sum');
+        const markBtn = document.getElementById('tm-refund-mark');
+        const markStatus = document.getElementById('tm-refund-mark-status');
+        const markLista = document.getElementById('tm-refund-mark-lista');
+        const naStronie = refundWierszeStrony();
+        markStatus.innerHTML = '';
+        markLista.style.display = 'none';
+        markLista.innerHTML = '';
+        REFUND_CZYSTE = [];
+        // Kontrola ksiegowan to OSOBNA robota od sprawdzania zwrotow (ustalenie uzytkownika
+        // 05.10.2026: „wystarczy jak pokaze, w ktorych nie wyksiegowalo, nie musi nic
+        // zaznaczac"). W tym trybie wynikiem jest lista ksiegowan, a sekcja zaznaczania
+        // sie nie pokazuje — zeby nie mieszac dwoch mechanizmow na jednym ekranie.
+        if (!naStronie.length || ksiegOn) {
+            markSection.style.display = 'none';
+        } else {
+            const jest = {};
+            naStronie.forEach(w => { jest[w.imp] = true; });
+            // Wszystkie trzy liczniki o TEJ SAMEJ populacji — wierszach widocznych na stronie.
+            // Mieszanie „prawidlowe z tej strony" z „uwagi ze wszystkiego" dawalo sumy,
+            // ktore nie skladaly sie do liczby wierszy.
+            const czysteTu = werdykty.czyste.filter(w => jest[w.imp]);
+            const uwagiTu = werdykty.uwagi.filter(w => jest[w.imp]);
+            const niespTu = werdykty.niesprawdzone.filter(w => jest[w.imp]);
+            REFUND_CZYSTE = czysteTu.map(w => w.imp);
+            markSection.style.display = 'block';
+            markSum.innerHTML = `✓ prawidłowe (bez uwag i coś potwierdzone): <b>${czysteTu.length}</b>`
+                + ` &nbsp; ⚠ z uwagami: <b>${uwagiTu.length}</b>`
+                + ` &nbsp; ❔ niesprawdzone: <b>${niespTu.length}</b>`
+                + ` &nbsp; <span style="color:#888">wierszy na stronie: ${naStronie.length}</span>`
+                + (czysteTu.length < werdykty.czyste.length
+                    ? `<br><span style="color:#888">${werdykty.czyste.length - czysteTu.length} prawidłowych nie ma na tej stronie — ich nie zaznaczam.</span>`
+                    : '');
+            markBtn.disabled = !czysteTu.length;
+            markBtn.style.opacity = czysteTu.length ? '1' : '.55';
+            markBtn.textContent = `✓ Zaznacz prawidłowe na stronie (${czysteTu.length})`;
+            const pominiete = uwagiTu.map(w => ({ w: w, znak: '⚠' }))
+                .concat(niespTu.map(w => ({ w: w, znak: '❔' })));
+            if (pominiete.length) {
+                const LIMIT = 200;
+                markLista.style.display = 'block';
+                markLista.innerHTML = `<details><summary style="cursor:pointer; color:#555;">co pominąłem (${pominiete.length})</summary>`
+                    + pominiete.slice(0, LIMIT).map(x =>
+                        `<div>${x.znak} <a href="/react/settings_page/import_payments/${x.w.imp}/" target="_blank">${x.w.imp}</a>`
+                        + ` ${auLink(x.w.nr)} — ${escHtml(String(x.w.powod).slice(0, 160))}</div>`).join('')
+                    + (pominiete.length > LIMIT ? `<div style="color:#888">…i ${pominiete.length - LIMIT} dalszych</div>` : '')
+                    + '</details>';
+            }
+        }
+
         progressDiv.style.display = 'none';
         resultsDiv.style.display = 'block';
 
@@ -9833,11 +10143,84 @@
             + (bledy ? (', ' + bledy + ' do sprawdzenia ręcznie') : '') + '.';
     };
 
+    // ⬇ Z tej strony — wklejka bez wklejania. Bierze wiersze listy importow z DOM-u
+    // i wpisuje je do pola w tym samym ukladzie, w jakim przychodzily z Ctrl+C.
+    refundPanel.querySelector('#tm-refund-zestrony').onclick = () => {
+        const info = document.getElementById('tm-refund-zestrony-info');
+        const wiersze = refundWierszeStrony();
+        if (!wiersze.length) {
+            info.innerHTML = '<span style="color:#dc2626">Nie widzę tabeli listy importów na tej stronie.</span>';
+            return;
+        }
+        document.getElementById('tm-refund-input').value = wiersze.map(w => w.tekst).join('\n');
+        const ileRef = wiersze.filter(w => w.refund).length;
+        info.innerHTML = `wzięte z tej strony listy: <b>${wiersze.length}</b> wierszy`
+            + (ileRef < wiersze.length ? `, z tego ${ileRef} typu Refund` : '')
+            + '. Dalsze strony listy zaciągnij osobno.';
+        updateRefundPreview();
+    };
+
+    refundPanel.querySelector('#tm-refund-mark').onclick = async () => {
+        const guzik = document.getElementById('tm-refund-mark');
+        const st = document.getElementById('tm-refund-mark-status');
+        if (!REFUND_CZYSTE.length) {
+            st.innerHTML = '<span style="color:#dc2626">Nie ma czego zaznaczać.</span>';
+            return;
+        }
+        guzik.disabled = true;
+        st.innerHTML = '⏳ zaznaczam…';
+        let w;
+        try {
+            w = await refundZaznaczNaStronie(REFUND_CZYSTE,
+                (ile, zRazem) => { st.innerHTML = `⏳ zaznaczam… ${ile} z ${zRazem}`; });
+        } catch (e) {
+            guzik.disabled = false;
+            st.innerHTML = '<span style="color:#dc2626">Nie udało się: ' + escHtml(String((e && e.message) || e)) + '</span>';
+            return;
+        }
+        guzik.disabled = false;
+        let txt = `zaznaczone: <b>${w.potw}</b> z ${w.chcianych}`
+            + (w.odzn ? ` · odznaczyłem ${w.odzn} spoza prawidłowych` : '')
+            + (w.brak ? ` · ${w.brak} nie ma na stronie` : '');
+        if (w.potw < w.chcianych - w.brak)
+            txt += '<br><span style="color:#dc2626">Część kliknięć strona cofnęła — brakujące zaznacz ręcznie.</span>';
+        if (w.obce)
+            txt += `<br><span style="color:#dc2626">Uwaga: na stronie zostało ${w.obce} zaznaczonych wierszy spoza prawidłowych.</span>`;
+        const g = refundGuzikKsieg();
+        if (!g) {
+            txt += '<br><span style="color:#b45309">Nie widzę na stronie guzika „Book Refunds/Orders".</span>';
+        } else {
+            refundPokazGuzik();
+            txt += g.disabled
+                ? '<br><span style="color:#b45309">Guzik „Book Refunds/Orders" jest nadal wyszarzony — sprawdź, czy strona przyjęła zaznaczenie i czy wybrana jest data księgowania.</span>'
+                : '<br><span style="color:#16a34a">Guzik „Book Refunds/Orders" jest czynny — klikasz go Ty.</span>';
+        }
+        st.innerHTML = txt;
+    };
+
+    refundPanel.querySelector('#tm-refund-mark-show').onclick = () => {
+        if (!refundPokazGuzik())
+            document.getElementById('tm-refund-mark-status').innerHTML =
+                '<span style="color:#b45309">Nie widzę na stronie guzika „Book Refunds/Orders".</span>';
+    };
+
     refundBtn.onclick = () => {
         const isOpen = refundPanel.style.display !== 'none';
         refundPanel.style.display = isOpen ? 'none' : 'block';
 
         if (!isOpen) {
+            // Guzik „Z tej strony" tylko tam, gdzie jest co zaciagnac — na innych stronach
+            // prologistics nie ma tabeli listy importow.
+            const box = document.getElementById('tm-refund-zestrony-box');
+            if (box) {
+                // Sam licznik, bez czytania komorek: innerText 5500 komorek wymusza
+                // przeliczenie ukladu strony, a to dzieje sie przy KAZDYM otwarciu panelu.
+                const ile = Array.from(document.querySelectorAll(REFUND_CB_SEL))
+                    .filter(cb => /^\d+$/.test(cb.value)).length;
+                box.style.display = ile ? 'block' : 'none';
+                const info = document.getElementById('tm-refund-zestrony-info');
+                if (info && !info.innerHTML) info.textContent = `widzę ${ile} wierszy listy importów na tej stronie`;
+            }
             setTimeout(() => {
                 document.getElementById('tm-refund-input')?.addEventListener('input', updateRefundPreview);
             }, 50);
@@ -9846,7 +10229,9 @@
 
     // Samo-zamykanie przy kliknieciu w strone — patrz BL_AUTOCLOSE u gory pliku.
     document.addEventListener('click', (e) => {
-        if (BL_AUTOCLOSE && !refundBtn.contains(e.target) && !refundPanel.contains(e.target)) {
+        // REFUND_KLIKAMY: zaznaczanie wierszy listy idzie prawdziwym klikiem w checkboxy
+        // strony, a te klikniecia dochodza az tutaj i zamykalyby panel w trakcie pracy.
+        if (BL_AUTOCLOSE && !REFUND_KLIKAMY && !refundBtn.contains(e.target) && !refundPanel.contains(e.target)) {
             refundPanel.style.display = 'none';
         }
     });
@@ -29007,6 +29392,7 @@
         if (j.payer) return '';                       // z wyciagu — naglowek juz to mowi
         if (j.manual) return 'wpisana ręcznie';
         if (j.data && (j.data.ebay || j.data.galx || j.data.wayf)) return 'suma z raportu';
+        if (j.vtexPlik) return 'netto z pliku OBI';
         return '';
     }
     function mkDataEdyt(j){
@@ -41949,6 +42335,74 @@
         });
         return { ord: ord, ref: ref, unknown: unknown, kinds: kinds, cbs: cbs, net: net, gross: gross };
     }
+    // ===== OBI DE z samych plikow CSV z panelu VTEX (05.10.2026) =====
+    // Panel OBI eksportuje raport wyplaty jako CSV na przecinku: DOKLADNIE kolumny MK_OBI_HDR, w tej kolejnosci — ten sam
+    // uklad, ktory przychodzi z GraphQL. Plik zastepuje wiec pobranie z karty panelu: z tych samych wierszy powstaje ten
+    // sam plik importu (mkCsvObi) i ta sama agregacja (vtexAgg). Decyzje uzytkownika (05.10.2026):
+    //  - kwot NIE kontrolujemy (netSkip) — swiadome odejscie od zasady z MK_MAN i mirWczytaj; nie „naprawiac";
+    //  - na zamowienie idzie brutto (grossCredit, przy zwrocie grossDebit) — tak liczy vtexAgg;
+    //  - wiersz wyplaty („Internal Transfer" / adjustment) WYCINAMY z pliku importu: od wrzesnia niesie kwote i bez numeru
+    //    zamowienia zostalby w paczce jako NOT FOUND; do tego vtexAgg policzylby go jako nierozpoznana pozycje;
+    //  - zwroty jak przy pobraniu z panelu (w pliku importu i na liscie zwrotow);
+    //  - data z nazwy pliku (…_PODE_RRRRMMDD_NNNN.csv), a gdy nazwa jest inna — z wiersza wyplaty, ostatecznie dzisiejsza;
+    //    zawsze do zmiany w kolumnie Data. Wyplata 0,00 (np. 04.09.2026) niczego nie przekresla — wplaty z pliku ida.
+    function vtexCzyPlik(txt){
+        const r = mkCsvRowsPrzecinek(String(txt || '').slice(0, 4000))[0] || [];
+        if (r.length < MK_OBI_HDR.length) return false;
+        return MK_OBI_HDR.every(function (k, i){ return String(r[i] || '').trim() === k; });
+    }
+    function mkParseVtexCsv(txt, nazwa){
+        const t = mkCsvRowsPrzecinek(txt).filter(function (r){ return r.some(function (c){ return String(c).trim() !== ''; }); });
+        if (!t.length || !vtexCzyPlik(txt)) return { err: 'to nie jest raport z panelu OBI (inny nagłówek)' };
+        const rows = [], adj = [];
+        let seller = '';
+        t.slice(1).forEach(function (r){
+            const o = {};
+            MK_OBI_HDR.forEach(function (k, i){ o[k] = (r[i] == null) ? '' : String(r[i]); });
+            if (!seller) seller = String(o.sellerId || '').trim();
+            if (mkIntern(o) === 'adj') adj.push(o); else rows.push(o);
+        });
+        if (!rows.length && !adj.length) return { err: 'raport OBI bez ani jednego wiersza' };
+        // Kwota wyplaty: wiersz wyplaty niesie ja zawsze w kolumnie Credit, takze przy rozliczeniu ujemnym — tylko do opisu.
+        let wyplata = 0;
+        adj.forEach(function (x){ wyplata = r2(wyplata + (Number(x.netCredit) || 0) - (Number(x.netDebit) || 0)); });
+        let ref = '', dzien = '', skadData = '';
+        const m = String(nazwa || '').match(/PODE[_-]?(\d{4})(\d{2})(\d{2})[_-](\d+)/i);
+        if (m){ ref = 'PODE-' + m[1] + m[2] + m[3] + '-' + m[4]; dzien = m[1] + '-' + m[2] + '-' + m[3]; skadData = 'nazwa'; }
+        else {
+            const md = adj.length ? String(adj[0].creationDate || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/) : null;
+            if (md){ dzien = md[3] + '-' + md[2] + '-' + md[1]; skadData = 'wyplata'; }
+        }
+        return { err: '', ref: ref, dzien: dzien, skadData: skadData, rows: rows, adj: adj, wyplata: wyplata, seller: seller,
+                 cur: String((rows[0] || adj[0] || {}).grossCurrency || 'EUR').trim() || 'EUR' };
+    }
+    // Dane zlecenia w tym samym ksztalcie, co z vtexPass (pobranie z panelu) — plik importu, lista zwrotow i ksiegowanie
+    // paczki nie odrozniaja jednego od drugiego. Roznica: netOk zawsze prawda, netSkip + netWhy (kwot nie kontrolujemy).
+    function vtexZastosujPlik(j, p, nazwa){
+        const a = vtexAgg(p.rows);
+        let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + a.ref[k]); });
+        const both = Object.keys(a.ord).filter(function (k){ return a.ref[k] != null; });
+        j.data = { raw: p.rows, cycle: j.ref || '', shop: j.shop || 'OBI DE', gross: a.gross, refund: refund,
+                   net: a.net, netOk: true, netSkip: true,
+                   netWhy: 'raport z pliku — kwot nie kontroluję (netto ' + f2(a.net) + ', wypłata w pliku ' + f2(p.wyplata) + ')',
+                   ord: a.ord, ref: a.ref, unknown: a.unknown, skipped: a.kinds, full: true, both: both,
+                   pays: 1, split: false, rows: p.rows.length, total: p.rows.length, pages: 1,
+                   how: 'plik ' + nazwa + (p.adj.length ? (' (bez wiersza wypłaty: ' + p.adj.length + ')') : '') };
+        j.vtexPlik = { nazwa: nazwa, dzien: p.dzien, skadData: p.skadData, wyplata: p.wyplata };
+        const bad = [];
+        // Kontrola DANYCH, nie kwot: pozycja bez numeru zamowienia, ktora nie jest ani wyplata, ani abonamentem.
+        if (Object.keys(a.unknown).length) bad.push('nierozpoznane pozycje w raporcie');
+        if (!p.rows.length) bad.push('w pliku nie ma żadnej wpłaty ani zwrotu (sam wiersz wypłaty)');
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        const nota = ['raport ' + (j.ref || '(bez numeru PODE)') + ' z pliku'];
+        if (p.skadData === 'wyplata') nota.push('nazwa pliku bez PODE — data z wiersza wypłaty, sprawdź');
+        else if (!p.skadData) nota.push('w pliku nie ma daty wypłaty — wpisałem dzisiejszą, popraw ją');
+        if (j.amount != null && j.payer && !eq(a.net, j.amount)) nota.push('netto ' + f2(a.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu (kwot nie kontroluję)');
+        if (a.cbs.length) nota.push('obciążenia zwrotne: ' + a.cbs.join(', '));
+        j.note = nota.join(' · ');
+        return bad;
+    }
 
     // --- przelaczanie sklepow ---
     // Sesja jest przypieta do jednego sklepu, wiec cykle innych sklepow sa niewidoczne.
@@ -42839,7 +43293,7 @@
         + '<li><b>Zestawienia.</b> „⬇ Pobierz zestawienia” ściąga rozliczenia z paneli marketplace’ów — musisz być tam zalogowany. '
         +   'Amazon, Allegro, Limango i OBI CH nie mają pobierania: ich raport wgrywasz plikiem przez „📎 Dodaj pliki” '
         +   '(eBay też — krok 2 tylko rozpoznaje jego wypłatę). '
-        +   'OBI DE pobiera się z karty panelu OBI.</li>'
+        +   'OBI DE pobiera się z karty panelu OBI albo wgrywa plikami CSV z panelu (data z nazwy pliku, do zmiany w kolumnie Data; kwot nie kontroluję).</li>'
         + '<li><b>Import.</b> „⬆ Importuj zaznaczone” wgrywa do prologistics paczki importu dla zleceń „gotowe do importu”. '
         +   'To jeszcze <b>nie</b> jest księgowanie.</li>'
         + '<li><b>Księgowanie paczek.</b> „▶ Zaksięguj paczki” księguje pozycje OK ze wszystkich wgranych paczek naraz. '
@@ -43351,7 +43805,7 @@
         if (j.kind === 'joy') t = j.booked ? '' : '→ sekcja „Joybuy” pod listą';
         else if (st === 'new' || st === 'err'){
             const jak = mkCzekaJak(j);
-            t = jak === 'vtex' ? '→ pobierz z karty panelu OBI (baner nad listą)'
+            t = jak === 'vtex' ? '→ pobierz z karty panelu OBI (baner nad listą) albo wgraj CSV z panelu: „📎 Dodaj pliki”'
               : (jak === 'plik' ? '→ wgraj raport: „📎 Dodaj pliki”'
               : (st === 'err' ? '→ usuń przyczynę i ponów krok 2' : '→ krok 2: „⬇ Pobierz zestawienia” albo raport plikiem'));
         }
@@ -43597,7 +44051,7 @@
             if (teraz && teraz < 5 && n5) potem.push('⑤ ' + pod.join(', '));
             const uw = [];
             if (k.plik) uw.push(k.plik + ' czeka na raport plikiem („📎 Dodaj pliki”)');
-            if (k.vtex) uw.push(k.vtex + ' — do pobrania z karty panelu OBI (baner nad listą)');
+            if (k.vtex) uw.push(k.vtex + ' — do pobrania z karty panelu OBI (baner nad listą) albo plikiem CSV z panelu („📎 Dodaj pliki”)');
             if (teraz !== 2 && k.pob) uw.push(k.pob + ' czeka na zestawienie po wcześniejszej próbie — opis przy zleceniu');
             else if (k.err) uw.push(k.err + ' z błędem pobrania');
             if (k.rdyPoza) uw.push(k.rdyPoza + ' z gotowych do importu jest odznaczonych albo wstrzymanych — powód przy zleceniu');
@@ -48754,9 +49208,12 @@
             c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
             alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro',
             hd: 'rozliczenie Homedeco', brico: 'rozliczenie Brico Bravo',
-            f1: 'faktura/korekta Furniture 1' };
+            f1: 'faktura/korekta Furniture 1', vtex: 'raport OBI DE (panel)' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
+            // OBI DE (raport z panelu VTEX): komplet 17 kolumn MK_OBI_HDR co do nazwy i kolejnosci, na przecinku.
+            // Pytamy PIERWSZEGO — warunek jest najostrzejszy, a bez niego plik szedl do wyciagow i konczyl bledem.
+            try { if (vtexCzyPlik(txt)) return 'vtex'; } catch (e){}
             try { if (!mkParseBank(txt).err) return 'bank'; } catch (e){}
             // Eksport transakcji z Mirakla. Pytamy zaraz po wyciagu, bo warunek wejscia
             // jest jednoznaczny — kolumny „Billing Cycle ID" nie ma zadne inne zrodlo —
@@ -48796,7 +49253,7 @@
             if (!fs.length) return;
             if (MK_PULLING || mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — dodaj pliki po jego zakończeniu.', '#c47f00'); return; }
             const kubelki = { bank: [], mir: [], amz: [], mano: [], ebay: [], galx: [], wayf: [], lim: [], c24: [], c24pdf: [], cnov: [],
-                              alleops: [], allemap: [], allebil: [], hd: [], obich: [], brico: [], f1: [] }, nieznane = [];
+                              alleops: [], allemap: [], allebil: [], hd: [], obich: [], brico: [], f1: [], vtex: [] }, nieznane = [];
             for (let i = 0; i < fs.length; i++){
                 const f = fs[i];
                 let typ = '';
@@ -48859,6 +49316,7 @@
             kubelki.amz.forEach(function (f){ amzWczytaj(f); });
             kubelki.mir.forEach(function (f){ mirWczytaj(f); });
             kubelki.mano.forEach(function (f){ manoWczytaj(f); });
+            kubelki.vtex.forEach(function (f){ vtexWczytaj(f); });
             kubelki.cnov.forEach(function (f){ cnovWczytaj(f); });
             kubelki.hd.forEach(function (f){ hdWczytaj(f); });
             kubelki.brico.forEach(function (f){ bbWczytaj(f); });
@@ -49748,6 +50206,63 @@
                 manoZastosuj(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
                 say(manoKomunikat(p, j), (j.status !== 'ready' || p.niepewne.length) ? '#c47f00' : '#0a7a2f');
+            };
+            rd.readAsArrayBuffer(f);
+        }
+        // OBI DE z pliku CSV z panelu (05.10.2026). Tresc w onload jest synchroniczna — kilka plikow naraz nie gubi zapisu.
+        // Zlecenie: (1) to samo PODE (z wyciagu albo wczesniej wgrany ten sam plik), (2) czekajacy wpis bez referencji
+        // („Z arkusza", reczny) po kwocie i dacie, (3) nowe — z data z pliku. Kwot nie kontrolujemy (vtexZastosujPlik).
+        function vtexWczytaj(f){
+            if (!f) return;
+            const rd = new FileReader();
+            rd.onload = function(){
+                let p;
+                try { p = mkParseVtexCsv(mkDecode(rd.result), f.name); }
+                catch (e){ say('Nie mogę odczytać ' + f.name + ': ' + ((e && e.message) || e), '#c00'); return; }
+                if (p.err){ say(f.name + ': ' + p.err, '#c00'); return; }
+                if (p.seller && p.seller !== 'belianide860'){
+                    say(f.name + ': raport OBI sprzedawcy „' + p.seller + '" — znam tylko belianide860 (OBI DE). Nie zakładam zlecenia.', '#c47f00');
+                    return;
+                }
+                const a0 = vtexAgg(p.rows);
+                const jobs = jobsLoad();
+                // Klucz zlecenia: pelne PODE z nazwy (unikalne — powtarza sie tylko koncowka NNNN), a bez niego z TRESCI:
+                // dzien i netto. Ten sam plik wgrany drugi raz trafi wiec w to samo zlecenie, zamiast zakladac drugie.
+                const klucz = p.ref || ('OBI-PLIK-' + (p.dzien || 'bez-daty') + '-' + f2(a0.net));
+                let k = jobs[klucz] ? klucz : (p.ref ? mkKluczRef(jobs, p.ref) : '');
+                if (k && jobs[k].kind !== 'vtex') k = '';
+                // Ten sam raport wgrany wczesniej pod inna nazwa (z PODE albo bez): ten sam dzien i to samo netto.
+                if (!k) k = Object.keys(jobs).filter(function (x){
+                    const o = jobs[x];
+                    return o && o.kind === 'vtex' && o.vtexPlik && o.vtexPlik.dzien === p.dzien && o.data && eq(o.data.net, a0.net);
+                })[0] || '';
+                if (!k) k = mkCzekajaceBezRef(jobs, 'vtex', a0.net, p.dzien) || '';
+                let nowe = false;
+                if (!k){
+                    const d0 = new Date();
+                    const dzis = d0.getFullYear() + '-' + pad2(d0.getMonth() + 1) + '-' + pad2(d0.getDate());
+                    k = klucz;
+                    jobs[k] = { ref: p.ref || klucz, date: p.dzien || dzis, dateSrc: p.dzien || '',
+                                amount: a0.net, cur: p.cur,
+                                mp: 'OBI', brand: 'OBI', short: 'OBI', host: 'belianide860.myvtex.com', kind: 'vtex', shop: 'OBI DE',
+                                docs: null, payer: '', txId: '', status: 'new', msg: '' };
+                    nowe = true;
+                }
+                const j = jobs[k];
+                if (j.status === 'done'){
+                    say('OBI ' + (j.ref || f.name) + ' — to rozliczenie jest już zaimportowane' + (j.impId ? (' (paczka ' + j.impId + ')') : '') + '. Nic nie zmieniam.', '#c47f00');
+                    return;
+                }
+                if (!j.ref) j.ref = p.ref || klucz;
+                if (!j.date){ j.date = p.dzien; j.dateSrc = p.dzien; }
+                vtexZastosujPlik(j, p, f.name);
+                jobsSave(jobs); render();
+                const nOrd = Object.keys(j.data.ord).length, nRef = Object.keys(j.data.ref).length;
+                say('OBI DE ' + (j.ref || '') + ' — ' + (nowe ? 'nowe zlecenie z pliku' : 'plik dopięty do zlecenia') + ' · data ' + j.date
+                    + (p.skadData === 'nazwa' ? ' (z nazwy pliku)' : (p.skadData === 'wyplata' ? ' (z wiersza wypłaty — sprawdź)' : ' (dzisiejsza — popraw)'))
+                    + ' · zamówień ' + nOrd + ' na ' + f2(j.data.gross) + (nRef ? (' · zwrotów ' + nRef + ' na ' + f2(j.data.refund)) : '')
+                    + ' · kwot nie kontroluję' + (j.msg ? ('. ⚠ ' + j.msg) : '. Datę zmienisz w kolumnie Data; dalej krok 3.'),
+                    j.status === 'ready' ? '#0a7a2f' : '#c47f00');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -84820,7 +85335,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '793783c · 05.10.2026 13:11';
+    const HUB_BUDOWA = '38cc0cf · 05.10.2026 15:57';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
