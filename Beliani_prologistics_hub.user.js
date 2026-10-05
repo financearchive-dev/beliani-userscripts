@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.3
+// @version      5.59.4
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21771,6 +21771,25 @@
             }
             return null;
         }
+        // Z czego sklada sie wklejona kwota wedlug SAMEJ wklejki. Notatka niesie kwote
+        // kontenera przed roszczeniem („10925.90 USD penalty no. 1395"), kolumna kwoty —
+        // przelew po roszczeniu (10815.90). -> { g: kwota z notatki, adj: korekta z pcPenAdj,
+        // ktora dokladnie tlumaczy roznice, albo null } albo null, gdy notatka nie niesie
+        // kwoty albo niesie te sama. Przy dwoch kwotach w notatce nie zgadujemy, ktora
+        // jest kwota kontenera — wtedy tez null.
+        // Ta sama kwota z PRZECIWNYM znakiem to nie roznica 2×: pcMoneyTokens oddaje tylko
+        // kwoty dodatnie, a znak wklejki bywa pomylka czlowieka (order 16870, -22.53).
+        function pcWklejkaSklad(r, w, adjs){
+            if (w == null || !isFinite(w)) return null;
+            var tk = pcMoneyTokens((r && r.note) || '');
+            if (tk.length !== 1) return null;
+            var g = tk[0];
+            if (!isFinite(g) || pcAmtEq(g, w) || pcAmtEq(g, -w)) return null;
+            for (var i = 0; i < (adjs || []).length; i++){
+                if (pcAmtEq(w - g, adjs[i].sum)) return { g: g, adj: adjs[i] };
+            }
+            return { g: g, adj: null };
+        }
         // Dopasowuje kazdy wklejony wiersz balance do wlasnego komentarza (jeden komentarz = jedna platnosc).
         // rows -> [{ok|warn|bad, msg, title}] w tej samej kolejnosci.
         function pcMatchBalRows(rows, cands, pens){
@@ -21855,12 +21874,22 @@
                 var r5 = list[j], w5 = want(r5), rc5 = contOf(r5);
                 var tyt5 = left.length ? ('Niewykorzystane komentarze z kwotą:\n' + left.join('\n'))
                                        : 'W komentarzach ordera nie ma kwoty do dopasowania.';
-                // ROSZCZENIE (penalty / overpayment / underpayment / discount / other).
-                // Takiej pozycji nikt nie komentuje kwota z kontenerem — nie ma czego
-                // szukac i nie ma o czym mowic na czerwono.
+                // ROSZCZENIE (penalty / overpayment / underpayment / discount / other) —
+                // ale tylko wiersz BEZ kontenera: osobna linia na sama kwote roszczenia
+                // („-30 USD OVERPAYMENT 729", kontener i seq „-"). Takiej pozycji nikt nie
+                // komentuje kwota z kontenerem — nie ma czego szukac i nie ma o czym mowic
+                // na czerwono.
+                // Wiersz Z KONTENEREM to platnosc za kontener, ktora roszczenie tylko
+                // pomniejsza. Do 05.10.2026 tez szedl tedy i dostawal zielone „komentarz
+                // niepotrzebny" — FOSHAN SHI PERTH, order 19558: CAIU7165853,
+                // 10815.90 przy notatce „10925.90 USD penalty no. 1395", a komentarza
+                // z kwota kontenera na zamowieniu nie bylo wcale. Taki wiersz sprawdza sie
+                // jak kazdy inny: z komentarzem dostaje „kwota + kontener (po penalty …)"
+                // juz w kroku 1, a tu trafia tylko wtedy, gdy komentarza z kwota brak.
+                // W 13 logach od 27.07.2026 kazdy wiersz samego roszczenia mial kontener „-".
                 var pen5 = [];
                 try { pen5 = pcParsePenalties((r5 && r5.note) || '') || []; } catch (e){ pen5 = []; }
-                if (pen5.length){
+                if (pen5.length && !rc5){
                     res[j] = { ok: true, roszcz: true,
                                msg: 'roszczenie (' + pen5.join(', ') + ') — komentarz niepotrzebny',
                                title: 'Pozycja roszczenia z opisu wiersza. Kwoty roszczeń nie ma w komentarzach '
@@ -21874,18 +21903,29 @@
                 var maKon = !!rc5 && wolne.some(function(c){ return c.cont && c.cont === rc5; });
                 var konZajety = !!rc5 && !maKon && cs.some(function(c){ return c.cont && c.cont === rc5; });
                 var kwStr = (w5 != null) ? Number(w5).toFixed(2) : '?';
+                // Roznica OD RAZU w komunikacie, nie dopiero w dymku (zyczenie uzytkownika,
+                // 05.10.2026). Zaden komentarz z kwota tego wiersza nie pokrywa, wiec roznica
+                // to cala wklejona kwota; w nawiasie to, z czego sie sklada wedlug wklejki.
+                var sk5 = pcWklejkaSklad(r5, w5, pcPenAdj(pens, r5, rc5));
+                var skl5 = !sk5 ? '' : sk5.adj ? (' (we wklejce ' + sk5.g.toFixed(2) + ' po ' + pcPenLabel(sk5.adj) + ')')
+                                               : (' (w notatce ' + sk5.g.toFixed(2) + ')');
+                var roz5 = ((w5 != null && w5 !== 0) ? ' — różnica ' + kwStr : '') + skl5;
+                if (sk5) tyt5 = 'Wklejona kwota: ' + kwStr + ', w notatce: ' + sk5.g.toFixed(2)
+                              + (sk5.adj ? ' — różnicę tłumaczy ' + pcPenLabel(sk5.adj) + '\n' + pcPenDesc(sk5.adj)
+                                         : ' — różnicy nie tłumaczy żadne roszczenie z tego zamówienia')
+                              + '\n' + tyt5;
                 var msg5;
                 // Powod NAJBARDZIEJ szczegolowy idzie pierwszy. „Wszystkie komentarze
                 // poszly gdzie indziej" jest prawda takze wtedy, gdy komentarz z TYM
                 // kontenerem zjadl sasiedni wiersz — a wtedy to drugie zdanie mowi wiecej.
-                if (!cs.length)          msg5 = 'brak komentarza z kwotą';
-                else if (konZajety)      msg5 = 'komentarz z kontenerem ' + rc5 + ' jest już użyty przy innym wierszu';
-                else if (!wolne.length)  msg5 = 'wszystkie komentarze z kwotą poszły do innych wierszy';
-                else if (!rc5 && !maKw)  msg5 = 'brak kwoty ' + kwStr + ' w komentarzach (wiersz nie ma też numeru kontenera)';
+                if (!cs.length)          msg5 = 'brak komentarza z kwotą' + roz5;
+                else if (konZajety)      msg5 = 'komentarz z kontenerem ' + rc5 + ' jest już użyty przy innym wierszu' + roz5;
+                else if (!wolne.length)  msg5 = 'wszystkie komentarze z kwotą poszły do innych wierszy' + roz5;
+                else if (!rc5 && !maKw)  msg5 = 'brak kwoty ' + kwStr + skl5 + ' w komentarzach (wiersz nie ma też numeru kontenera)';
                 else if (!rc5)           msg5 = 'wiersz nie ma numeru kontenera — nie mam po czym dopasować';
-                else if (!maKon && !maKw) msg5 = 'brak w komentarzach i kontenera ' + rc5 + ', i kwoty ' + kwStr;
+                else if (!maKon && !maKw) msg5 = 'brak w komentarzach i kontenera ' + rc5 + ', i kwoty ' + kwStr + skl5;
                 else if (!maKon)         msg5 = 'brak kontenera ' + rc5 + ' w komentarzach (kwota ' + kwStr + ' jest)';
-                else                     msg5 = 'brak kwoty ' + kwStr + ' przy kontenerze ' + rc5;
+                else                     msg5 = 'brak kwoty ' + kwStr + skl5 + ' przy kontenerze ' + rc5;
                 res[j] = { bad: true, msg: msg5, title: tyt5 };
             }
             if (left.length) res.forEach(function(v){ if (v && !v.title) v.title = 'Niewykorzystane komentarze z kwotą:\n' + left.join('\n'); });
@@ -84780,7 +84820,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2ce93f1 · 05.10.2026 11:49';
+    const HUB_BUDOWA = '793783c · 05.10.2026 13:11';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
