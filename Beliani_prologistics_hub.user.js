@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.2
+// @version      5.59.3
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -43320,9 +43320,11 @@
                                   : (selOn(j) ? '→ krok 3: „⬆ Importuj zaznaczone”' : '→ odznaczone: nie pójdzie do importu');
         else if (st === 'done' && !j.impId) t = '→ wpisz numer paczki (niżej)';
         else if (st === 'done' && !j.booked){
-            t = (j.kind === 'f1' && !j.f1Plik) ? '→ paczka spoza HUB-a: sprawdź ją w prologistics'
-                                               : '→ krok 4: „▶ Zaksięguj paczki” albo „🔍 Otwórz paczkę”';
             ost = mkTypBlokada(j);
+            t = (j.kind === 'f1' && !j.f1Plik) ? '→ paczka spoza HUB-a: sprawdź ją w prologistics'
+              : (ost ? (mkTypBieg[j.ref] ? '→ krok 4: typy klientów w toku — postęp w widoku paczki'
+                        : ('→ krok 4: najpierw typy klientów — „' + mkTypGuzik(j).napis + '” w widoku paczki („🔍 Otwórz paczkę”)'))
+                     : '→ krok 4: „▶ Zaksięguj paczki” albo „🔍 Otwórz paczkę”');
         }
         else if (st === 'done' && j.booked && refOtw[mkKlucz(j)]) t = '→ krok 5: zwroty pod listą';
         return (t ? ('<div class="mk-wsk">' + esc(t) + '</div>') : '')
@@ -43405,7 +43407,22 @@
             const tf = shTrafienie(j, mkSheet[mkJobId(j)]);
             if (tf && tf.zaks) k.dup++;
         });
-        bookList().forEach(function (j){ k.book++; if (mkTypBlokada(j)) k.typ++; });
+        // Paczka na typach klientow: guzik zbiorczy ja POMIJA, wiec nie liczy sie do jego licznika. Krok 4 dostaje dla niej
+        // guzik typow — ten sam napis co w widoku paczki; prowadzi do pierwszej paczki, na ktorej da sie cos zrobic.
+        // Kolejnosc: paczka, na ktorej da sie cos zrobic; potem bez wierszy do sprawdzenia; na koncu ta, na ktorej typy
+        // wlasnie ida. W trakcie operacji napis BEZ liczby — sciezka nie przerysowuje sie co pozycje, liczba by zamarzla.
+        k.typG = null;
+        const wagaT = function (x){ return (x.bieg ? 2 : 0) + (x.pusto ? 1 : 0); };
+        bookList().forEach(function (j){
+            k.book++;
+            if (!mkTypBlokada(j)) return;
+            k.typ++;
+            const g = mkTypGuzik(j), pusto = !!mkTypPusto[j.ref];
+            const napis = g.bieg ? ('⏳ ' + (mkTypBieg[j.ref].co === 'fix' ? 'zmiana' : 'sprawdzanie') + ' typów klienta w toku')
+                        : (pusto ? ('⚠ typy: paczka ' + j.impId + ' bez wierszy do sprawdzenia') : g.napis);
+            const kand = { k: mkKlucz(j), ref: String(j.ref || ''), impId: String(j.impId || ''), napis: napis, bieg: g.bieg, pusto: pusto };
+            if (!k.typG || wagaT(kand) < wagaT(k.typG)) k.typG = kand;
+        });
         // To, czego guziki zbiorcze NIE wezma: gotowe, ale odznaczone albo wstrzymane; zaimportowane bez numeru
         // paczki albo spoza HUB-a. Bez tych liczb sciezka oglaszala „wszystko zaksięgowane" obok niepustej grupy.
         k.rdyPoza = Math.max(0, rdy - k.sel);
@@ -43433,7 +43450,11 @@
             const e = $('#mk-kn' + x[0]);
             if (e) e.className = 'mk-kn' + (teraz === x[0] ? ' mk-kn-teraz' : (x[1] ? ' mk-kn-jest' : ''));
         });
-        const mImp = k.sel > 0 && !mkWid.imp, mBook = k.book > 0 && !mkWid.book;
+        // Paczki, ktorych nie wstrzymuje bramka typow. O pozycjach OK i kontroli Furniture 1 rozstrzyga dopiero odczyt
+        // paczki — takie guzik zbiorczy pominie i powie dlaczego.
+        const nBook = k.book - k.typ;
+        const mImp = k.sel > 0 && !mkWid.imp, mBook = nBook > 0 && !mkWid.book;
+        const typG = k.typ ? k.typG : null, mTyp = !!typG && !typG.bieg && !mkWid.book;
         const duzy = function (on, kolor){
             return 'padding:5px 12px;border:none;border-radius:6px;background:' + (on ? kolor : '#c7c7c7')
                  + ';color:#fff;font-weight:700;cursor:' + (on ? 'pointer' : 'default') + ';font-size:12px';
@@ -43450,9 +43471,19 @@
             + ' style="' + duzy(mImp, '#5b21b6') + '">' + (mkWid.imp ? '⏳ Importuję…' : ('⬆ Importuj zaznaczone (' + k.sel + ')')) + '</button>'
             + (k.bezBank ? ('<span style="font-size:11px;color:#c47f00">' + k.bezBank + ' bez bank_setting — uzupełnij w ⚙ Konta</span>') : '')
             + '<span class="mk-strz">›</span>' + kn(4, k.book)
-            + '<button id="mk-book-all"' + (mBook ? '' : ' disabled')
-            + ' title="Księguje pozycje OK ze wszystkich wgranych, jeszcze niezaksięgowanych paczek. CHECK i NOT FOUND zostają nietknięte."'
-            + ' style="' + duzy(mBook, '#7c3aed') + '">' + (mkWid.book ? '⏳ Księguję paczki…' : ('▶ Zaksięguj paczki (' + k.book + ')')) + '</button>'
+            + ((nBook > 0 || !typG || mkWid.book)
+               ? ('<button id="mk-book-all"' + (mBook ? '' : ' disabled')
+                  + ' title="Księguje pozycje OK ze wszystkich wgranych, jeszcze niezaksięgowanych paczek. CHECK i NOT FOUND zostają nietknięte.'
+                  + (k.typ ? (' Paczki czekające na typy klientów (' + k.typ + ') pomija.') : '') + '"'
+                  + ' style="' + duzy(mBook, '#7c3aed') + '">' + (mkWid.book ? '⏳ Księguję paczki…' : ('▶ Zaksięguj paczki (' + nBook + ')')) + '</button>')
+               : '')
+            // Paczki na typach klientow: ten sam guzik co w widoku paczki (otwiera paczke i robi to samo).
+            + (typG ? ('<button id="mk-typ-all" data-k="' + esc(typG.k) + '"' + (mTyp ? '' : ' disabled')
+                  + ' title="Otwiera paczkę ' + esc(typG.impId) + ' i robi to samo, co guzik typów w jej widoku. Księgowanie paczki czeka na typy klientów — „▶ Zaksięguj paczki” ją pomija."'
+                  + ' style="' + (nBook > 0
+                      ? ('padding:4px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;font-weight:700;cursor:' + (mTyp ? 'pointer' : 'default') + ';font-size:11px')
+                      : duzy(mTyp, '#7c3aed')) + '">'
+                  + esc(typG.napis) + (k.typ > 1 && !typG.pusto ? (' · paczka ' + esc(typG.impId) + ' (1 z ' + k.typ + ')') : '') + '</button>') : '')
             + '<span class="mk-strz">›</span>' + kn(5, n5)
             + skok('mk-k-ref', 'Zwroty', mkLicz.ref, mkLicz.refJest)
             + (mkLicz.crJest ? skok('mk-k-cr', 'Potrącenia', mkLicz.cr, true) : '')
@@ -43470,6 +43501,28 @@
             if (mkWid.book) return;
             mkWid.book = true; krokiMaluj();
             try { await bookAllPackages(bk); } finally { mkWid.book = false; krokiRysuj(); }
+        };
+        // Typy klientow z kroku 4: otwieramy paczke (swiezy odczyt) i klikamy JEJ guzik typow — jedna droga, jeden napis.
+        const bt = slot.querySelector('#mk-typ-all');
+        if (bt) bt.onclick = async function(){
+            const kj = bt.getAttribute('data-k');
+            const jj = jobsLoad()[kj];
+            if (!jj){ krokiRysuj(); return; }
+            bt.disabled = true;
+            try { await impCheck(kj); } finally { bt.disabled = false; }
+            const box = $('#mk-imp-box');
+            const g = box ? box.querySelector('#mk-typ-run') : null;
+            // Klikamy guzik typow paczki TYLKO, gdy bramka dalej ja blokuje. Po „mimo to" w widoku stoi guzik z galezi
+            // odblokowanej („↻ Sprawdź typy jeszcze raz") — jego klik sprawdzalby od nowa i kasowal swiadoma decyzje.
+            // Paczka bez wierszy do sprawdzenia: tylko ja otwieramy (klik powtorzylby ten sam komunikat).
+            const jn = jobsLoad()[kj];
+            let cel = '';
+            if (g && !g.disabled && jn && mkTypBlokada(jn) && !mkTypPusto[jn.ref] && g.getAttribute('data-ref') === String(jj.ref || '')){
+                cel = g.getAttribute('data-cel') || '';
+                g.click();
+            }
+            // Przy „zmien" guzik paczki sam przewinal do tabelki typow — powrot do widoku paczki zabieralby ja z oczu.
+            if (cel !== 'zmien'){ try { if (box) box.scrollIntoView({ block: 'nearest' }); } catch (e){} }
         };
         [['#mk-k-ref', '#mk-ref'], ['#mk-k-cr', '#mk-cr'], ['#mk-k-joy', '#mk-joy']].forEach(function (x){
             const b = slot.querySelector(x[0]);
@@ -43491,13 +43544,16 @@
                          : ('krok 2 — ' + k.pob + ' czeka na zestawienie po wcześniejszej próbie; opis stoi przy zleceniu. Gdy przyczyna zniknie, kliknij „⬇ Pobierz zestawienia” jeszcze raz.'),
                 'krok 3 — kliknij „⬆ Importuj zaznaczone (' + k.sel + ')”. To wgrywa paczki importu do prologistics, jeszcze nie księguje.',
                 (k.book && k.book === k.typ)
-                    ? ('krok 4 — paczki czekają na typy klientów (' + k.typ + '): kliknij „🔍 Otwórz paczkę” przy zleceniu i sprawdź typy. „▶ Zaksięguj paczki” takie paczki pomija.')
-                    : ('krok 4 — kliknij „▶ Zaksięguj paczki (' + k.book + ')” albo „🔍 Otwórz paczkę” przy zleceniu, żeby obejrzeć ją przed księgowaniem.'),
+                    ? ((k.typG && k.typG.bieg)
+                       ? ('krok 4 — ' + k.typG.napis + ' (postęp w widoku paczki). Księgowanie odblokuje się po zakończeniu, gdy typy będą w porządku.')
+                       : ('krok 4 — przed księgowaniem typy klientów (' + k.typ + (k.typ > 1 ? ' paczek' : ' paczka') + '): kliknij „'
+                          + (k.typG ? k.typG.napis : '🔍 Sprawdź typy klientów') + '” w kroku 4 albo w widoku paczki. Księgowanie odblokuje się, gdy typy będą w porządku.'))
+                    : ('krok 4 — kliknij „▶ Zaksięguj paczki (' + (k.book - k.typ) + ')” albo „🔍 Otwórz paczkę” przy zleceniu, żeby obejrzeć ją przed księgowaniem.'),
                 'krok 5 — pod listą: ' + pod.join(', ') + '.'
             ][teraz];
             const potem = [];
             if (teraz && teraz < 3 && k.sel) potem.push('③ do importu: ' + k.sel);
-            if (teraz && teraz < 4 && k.book) potem.push('④ paczki do zaksięgowania: ' + k.book);
+            if (teraz && teraz < 4 && k.book) potem.push('④ paczki do zaksięgowania: ' + k.book + (k.typ ? (' (w tym na typy klientów: ' + k.typ + ')') : ''));
             if (teraz && teraz < 5 && n5) potem.push('⑤ ' + pod.join(', '));
             const uw = [];
             if (k.plik) uw.push(k.plik + ' czeka na raport plikiem („📎 Dodaj pliki”)');
@@ -43510,7 +43566,7 @@
             if (!teraz && mkWid.po) uw.push(mkWid.po + ' zaksięgowanych ma jeszcze uwagi — grupa ⑤ na liście');
             if (k.spr) uw.push('⚠ ' + k.spr + ' wymaga sprawdzenia (import wstrzymany)');
             if (k.dup) uw.push('⚠ ' + k.dup + ' z zaznaczonych jest już w arkuszu jako zaksięgowane — sprawdź przed importem');
-            if (k.typ) uw.push(k.typ + ' z paczek czeka na typy klientów — „🔍 Otwórz paczkę” przy zleceniu');
+            if (k.typ && k.book > k.typ) uw.push(k.typ + ' z paczek czeka na typy klientów — „▶ Zaksięguj paczki” ich nie weźmie; guzik typów stoi w kroku 4');
             if (k.pob && !k.sklepy) uw.push('nie znam jeszcze sklepów Mirakla — wejdź na Mirakla i rozwiń przełącznik sklepu');
             t.innerHTML = '<b style="color:#5b21b6">➜ Teraz:</b> ' + esc(glowne)
                 + (potem.length ? (' <span style="color:#6b7280">Potem: ' + esc(potem.join(' · ')) + '.</span>') : '')
@@ -52441,11 +52497,30 @@
     // ksiegowania (mkTypBlokada) i widok paczki czytaja to stad — dzieki temu guzik „w toku" przetrwa przerysowanie
     // widoku przez kogokolwiek, a dwie operacje na tej samej liscie pozycji nie ruszaja naraz.
     const mkTypBieg = {};                  // ref zlecenia -> { co: 'spr'|'fix', zostalo: N }
+    // Paczka bez wierszy z auftragiem i wyliczonym typem — sprawdzac nie ma czego (pamiec strony). Krok 4 nie prowadzi
+    // do niej w pierwszej kolejnosci, a jego guzik tylko ja otwiera.
+    const mkTypPusto = {};                 // ref zlecenia -> true
     function mkTypBiegOpis(ref){
         const b = mkTypBieg[ref];
         if (!b) return '';
         return b.co === 'fix' ? ('Zmiana typów klienta w toku. Pozostało ' + b.zostalo)
                               : ('Sprawdzanie typów klienta w toku. Pozostało ' + b.zostalo);
+    }
+    // Napis i cel guzika typow klienta — JEDNO miejsce dla widoku paczki, kroku 4 na sciezce i podpowiedzi przy zleceniu.
+    // Do 5.59.2 sciezka liczyla paczke zablokowana typami do „▶ Zaksięguj paczki (N)", a widok paczki mowil „Sprawdź typy
+    // klientów" — wygladalo, jakby guzik zbiorczy ksiegowal bez sprawdzenia (pomijal ja, ale tego nie bylo widac).
+    // cel: 'sprawdz' (czytamy typy z paczki) albo 'zmien' (tabelka typow z ptaszkami — lista pozycji jest w pamieci).
+    // Bez typStan przy typChecked (zlecenie sprawdzone przed 5.59) „st.doSpr" konczylo rysowanie widoku bledem.
+    function mkTypGuzik(j){
+        const st = j.typStan || null;
+        const trzebaSpr = !j.typChecked || !st || !!st.doSpr;
+        const maListe = !!(mkTyp[j.ref] || []).length;
+        const bieg = !!mkTypBieg[j.ref];
+        const napis = bieg ? mkTypBiegOpis(j.ref)
+            : trzebaSpr
+            ? ((!j.typChecked || !st) ? '🔍 Sprawdź typy klientów' : ('↻ Sprawdź typy jeszcze raz (' + st.doSpr + ' nieodczytanych)'))
+            : (maListe ? ('✎ Zmień typy klientów (' + st.zle + ')') : ('🔍 Sprawdź typy klientów (' + st.zle + ' do zmiany)'));
+        return { napis: napis, cel: (trzebaSpr || !maListe) ? 'sprawdz' : 'zmien', bieg: bieg, trzebaSpr: trzebaSpr, maListe: maListe };
     }
     // Stan bramki liczony z listy pozycji (mkTyp). Pozycja liczy sie stanem ZAMOWIENIA (najgorszy z jego auftragow).
     // `blad`, `nieznane`, `brak` i kazdy inny stan spoza listy ida do ponownego sprawdzenia, nie do ksiegowania.
@@ -52708,7 +52783,14 @@
                          chceKonto: (p.vatOrd || {})[ord] || '',
                          num: a.num, url: a.url, st: '', msg: '', aufs: [] });
         });
-        if (!lista.length){ say('W tej paczce nie ma wierszy z auftragiem i wyliczonym typem.', '#c47f00'); if (czytalem) mkTypPoZmianie(job); return; }
+        if (!lista.length){
+            if (!tylkoTe) mkTypPusto[refT] = true;
+            say('W tej paczce nie ma wierszy z auftragiem i wyliczonym typem — typów klienta nie ma czego sprawdzić. '
+              + 'Gdy paczka ma pozycje OK, księgujesz ją w jej widoku guzikiem „Zaksięguj mimo to”.', '#c47f00');
+            if (czytalem) mkTypPoZmianie(job); else { try { render(); } catch (e){} }
+            return;
+        }
+        delete mkTypPusto[refT];
         // Ponowienie podmienia TYLKO wskazane pozycje — reszta wyniku zostaje na ekranie i liczy sie do bramki.
         const filtr = (tylkoTe && tylkoTe.length && (mkTyp[refT] || []).length) ? tylkoTe : null;
         const doSpr = filtr ? lista.filter(function (x){ return filtr.indexOf(x.order) >= 0; }) : lista;
@@ -52725,6 +52807,7 @@
         try {
         if (btn) btn.disabled = true;
         mkTypGuzikWToku(refT);
+        try { render(); } catch (e){}                 // krok 4, „Teraz" i podpowiedz od razu mowia „w toku"
         say('Sprawdzam typ klienta: 0 z ' + doSpr.length + '…');
         amzTypRender(refT);
         let done = 0;
@@ -52993,6 +53076,7 @@
         try {
         btn.disabled = true;
         mkTypGuzikWToku(ref);
+        try { render(); } catch (e){}                 // krok 4, „Teraz" i podpowiedz od razu mowia „w toku"
         for (const p of wybrane){
             i++;
             const etyk = p.w.ff || p.x.order;
@@ -53323,14 +53407,20 @@
     const mkNfState = {};        // numer -> { kand: [...], stan, err, zaks }
     // Czy trwa operacja, ktorej komunikatow nie wolno zagluszac (zapis z widoku paczki, import, ksiegowanie, zwroty).
     function mkZajety(){ return !!(mkImpBieg || mkWid.imp || mkWid.book || refBusy); }
-    async function nfSprawdz(job, lista, btn){
+    const MK_NF_NARAZ = 5;        // tyle auftragow sprawdzamy naraz (wyszukiwarka + strona kazdego kandydata)
+    // Sprawdzanie po MK_NF_NARAZ naraz — do 5.59.3 szlo po jednym i przy kilkuset NOT FOUND trwalo bez konca. Kazda pozycja
+    // ma wlasny wpis mkNfState[numer]; wspolny jest tylko licznik gotowych. postep(gotowe, numer, poKoncu) — przed i po pozycji.
+    async function nfSprawdz(job, lista, btn, postep){
         if (!lista.length) return;
         if (btn) btn.disabled = true;               // od 5.59.1 zwykle bez guzika — sprawdzanie idzie samo
-        mkLog('notfound', '▶ szukam auftragow dla ' + lista.length + ' poz. NOT FOUND');
-        for (let i = 0; i < lista.length; i++){
-            const ff = lista[i];
-            if (btn || !mkZajety()) say('Szukam auftragu po ' + nfPoCzymOpis(job) + ' ' + (i + 1) + '/' + lista.length
-                + ' — ' + ff + '…');
+        mkLog('notfound', '▶ szukam auftragow dla ' + lista.length + ' poz. NOT FOUND (po ' + MK_NF_NARAZ + ' naraz)');
+        const kolejka = lista.slice();
+        let gotowe = 0;
+        const napis = function (){
+            if (btn || !mkZajety()) say('Sprawdzam auftragi po ' + nfPoCzymOpis(job) + ': ' + gotowe + ' z ' + lista.length
+                + ' (po ' + MK_NF_NARAZ + ' naraz)…');
+        };
+        async function jeden(ff){
             const st = mkNfState[ff] = { kand: [] };
             const t0 = Date.now();
             const f = await nfSzukaj(job, ff);
@@ -53338,14 +53428,14 @@
             if (f.err && f.pusto){
                 st.stan = 'brak';
                 mkLog('notfound', '· ' + ff + ': nie ma auftragu o tym ' + nfPoCzymOpis(job));
-                continue;
+                return;
             }
-            if (f.err){ st.err = f.err; st.szukBlad = true; mkLog('notfound', '✖ ' + ff + ': ' + f.err); continue; }
+            if (f.err){ st.err = f.err; st.szukBlad = true; mkLog('notfound', '✖ ' + ff + ': ' + f.err); return; }
             const nums = f.nums || [];
             if (!nums.length){
                 st.stan = 'brak';
                 mkLog('notfound', '· ' + ff + ': nie ma auftragu o tym ' + nfPoCzymOpis(job));
-                continue;
+                return;
             }
             // Czytamy KAZDEGO kandydata — przy kilku trzeba wiedziec, ktory jest skasowany,
             // a ktory nie. Bez tego „jest auftrag" nie mowi jeszcze nic uzytecznego.
@@ -53363,6 +53453,28 @@
                 return c.num + (c.deleted ? ' DELETED' : '') + (c.ok ? '' : ' [' + c.err + ']');
             }).join(', ') + ' — ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
         }
+        async function robot(){
+            while (kolejka.length){
+                const ff = kolejka.shift();
+                if (postep){ try { postep(gotowe, ff, false); } catch (e){} }
+                napis();
+                // Blad jednej pozycji nie przerywa pozostalych — zostaje przy niej jako nieudane sprawdzenie („↻ Odśwież" ponawia).
+                try { await jeden(ff); }
+                catch (e){
+                    const st = mkNfState[ff] = mkNfState[ff] || { kand: [] };
+                    st.err = (e && e.message) || String(e); st.szukBlad = true;
+                    mkLog('notfound', '✖ ' + ff + ': ' + st.err);
+                }
+                finally {
+                    gotowe++;
+                    if (postep){ try { postep(gotowe, ff, true); } catch (e){} }
+                    napis();
+                }
+            }
+        }
+        const roboty = [];
+        for (let r = 0; r < Math.min(MK_NF_NARAZ, lista.length); r++) roboty.push(robot());
+        await Promise.all(roboty);
         if (btn){ btn.disabled = false; say('Sprawdzone.', '#0a7a2f'); }
     }
     // Ksiegowanie wplaty na skasowanym auftragu. Konto bierzemy z ustawien sklepu,
@@ -53376,6 +53488,11 @@
             return;
         }
         const st = mkNfState[ff] || {};
+        // Guzik narysowany przy niepelnym wyniku (ponad nim przyszedl drugi kandydat) — nie ksiegujemy na pierwszym z brzegu.
+        if (st.stan !== 'sprawdzone' || (st.kand || []).length !== 1){
+            say('Auftrag ' + ff + ': wynik sprawdzania jest niepełny albo wskazuje kilka auftragów — kliknij „↻ Odśwież” i zdecyduj na pełnym wyniku.', '#c47f00');
+            return;
+        }
         const kand = (st.kand || [])[0] || {};
         const przed = (kand.nPay == null) ? null : kand.nPay;
         // Status bierzemy Z ODCZYTANEGO AUFTRAGU, a nie z napisu wpisanego na sztywno:
@@ -53484,14 +53601,25 @@
     // Co pokazac w kolumnie „Auftrag" przy wierszu NOT FOUND.
     function nfKom(job, ff, kwota, rv){
         const st = mkNfState[ff];
-        if (!st) return '<span style="color:#888">' + (mkNfAuto[String((job && job.impId) || '')] ? 'sprawdzam auftrag…' : '—') + '</span>';
+        // W trakcie samoczynnego sprawdzania: „sprawdzam" tylko przy pozycji, ktora wlasnie idzie, „w kolejce" przy reszcie
+        // tej rundy. Do 5.59.2 kazdy wiersz bez wyniku mowil „sprawdzam auftrag…", choc runda ma najwyzej MK_NF_AUTO pozycji.
+        const pNf = mkNfPostep[String((job && job.impId) || '')];
+        if (pNf && ff && pNf.teraz && pNf.teraz[ff] && !(st && (st.stan || st.err || st.zaks)))
+            return '<span style="color:#5b21b6;font-weight:700">⏳ sprawdzam teraz…</span>';
+        if (!st){
+            if (pNf && pNf.kolejka && pNf.kolejka[ff]) return '<span style="color:#888">w kolejce…</span>';
+            return '<span style="color:#888">' + ((pNf && ff) ? 'niesprawdzony — „sprawdź pozostałe” po zakończeniu' : '—') + '</span>';
+        }
         if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(mkCzasLok(st.zaks)) + '</span>';
         if (st.err)  return '<span style="color:#c00">' + esc(st.err) + '</span>';
         if (st.stan === 'brak') return '<span style="color:#c00">nie ma auftragu o tym numerze fulfilmentu</span>';
         // Furniture 1: zaden kandydat nie ma numeru fulfilmentu dokladnie rownego Reference — nie ksiegujemy.
         if (st.f1Blokuj) return '<span style="color:#c47f00">' + esc(st.f1Blokuj) + '</span>';
         const k = st.kand || [];
-        if (!k.length) return '<span style="color:#888">sprawdzam…</span>';
+        // Wynik w polowie czytania (pierwszy z kilku kandydatow) to jeszcze nie wynik — ten sam warunek co mkNfDeleted. Pozycje
+        // czyta tez przebieg bez postepu (po „▶ Zaksięguj paczki") albo przebieg innej paczki (mkNfState jest wspolne po numerze);
+        // bez tego warunku przy dwoch auftragach stal na chwile guzik ksiegowania na pierwszym z nich.
+        if (st.stan !== 'sprawdzone' || !k.length) return '<span style="color:#888">sprawdzam…</span>';
         const lnk = function (n){ return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank">' + esc(n) + '</a>'; };
         if (k.length > 1){
             return '<span style="color:#c47f00">kilka auftragów: ' + k.map(function (c){
@@ -53552,6 +53680,8 @@
     // wplata i zwrot sie znosza (tylko przy auftragu Deleted), wiec nie moze czekac na klikniecie.
     const mkNfAuto = {};          // numer paczki -> true, gdy sprawdzanie jest w toku
     const mkNfBezLimitu = {};     // numer paczki -> true po „sprawdź pozostałe / ponownie" (czlowiek poprosil)
+    // Postep samoczynnego sprawdzania: paczka -> { razem, gotowe, teraz (numer w trakcie), kolejka {numer: 1}, reszta }.
+    const mkNfPostep = {};
     const MK_NF_AUTO = 12;        // tyle wierszy NOT FOUND sprawdzamy SAMI na paczke; reszta na klikniecie
     let mkImpWidok = '';          // paczka pokazywana teraz w #mk-imp-box
     let mkImpBieg = 0;            // ile zapisow z widoku paczki jest w locie („Zaksięguj OK", subkonto, na auftragu)
@@ -53574,6 +53704,15 @@
         if ((st.kand || []).some(function (c){ return !c.ok && !c.deleted; })) return true;
         return !st.stan && !st.err && !(st.kand || []).length;
     }
+    // Naglowek postepu w widoku paczki. Auftragi sprawdzamy po MK_NF_NARAZ naraz (wyszukiwarka, potem strona kazdego kandydata).
+    function mkNfPostepTekst(job, paczka){
+        const p = mkNfPostep[paczka];
+        if (!p) return '⏳ sprawdzam auftragi po ' + nfPoCzymOpis(job) + '…';
+        const wToku = Object.keys(p.teraz || {}).length;
+        return '⏳ sprawdzam auftragi po ' + nfPoCzymOpis(job) + ': ' + p.gotowe + ' z ' + p.razem + ' (po ' + MK_NF_NARAZ + ' naraz)'
+             + (wToku ? (' · w toku ' + wToku) : '')
+             + (p.reszta > 0 ? (' · pozostałe ' + p.reszta + ' — „sprawdź pozostałe” po zakończeniu') : '');
+    }
     function nfNumer(x){ return String(x.payment_descr == null ? '' : x.payment_descr).trim(); }
     // Po sprawdzeniu wiadomo, ktore NOT FOUND znosza sie ze zwrotem. Jesli zaksiegowane zlecenie nioslo
     // notatke „zostały w paczce: NOT FOUND" i to byly wylacznie takie wplaty — notatka schodzi.
@@ -53589,11 +53728,28 @@
     }
     async function nfAutoStart(job, d, lista){
         const paczka = String(job.impId || '');
-        try { await nfSprawdz(job, lista, null); }
-        catch (e){ mkLog('notfound', '✖ sprawdzanie przerwane: ' + ((e && e.message) || e)); }
-        finally { delete mkNfAuto[paczka]; }
         const box = document.getElementById('mk-imp-box');
         const patrzy = function (){ return mkImpWidok === paczka && box && box.style.display !== 'none'; };
+        // Postep na zywo: naglowek „N z M · teraz …" i komorka wiersza. Poprawiamy wezly na miejscu — przerysowac widoku
+        // w trakcie nie wolno (stara migawka, czynne guziki). Pelny wynik przy wierszach rysuje sie po zakonczeniu.
+        const postep = function (gotowe, ff, poKoncu){
+            const p = mkNfPostep[paczka];
+            if (!p) return;
+            p.gotowe = gotowe;
+            p.teraz = p.teraz || {};
+            if (poKoncu) delete p.teraz[ff]; else p.teraz[ff] = 1;
+            if (!patrzy()) return;
+            const sp = box.querySelector('#mk-nf-stan');
+            if (sp) sp.textContent = mkNfPostepTekst(job, paczka);
+            box.querySelectorAll('.mk-nf-a').forEach(function (c){
+                if (c.getAttribute('data-ff') !== ff) return;
+                c.innerHTML = poKoncu ? '<span style="color:#0a7a2f">✔ sprawdzony — wynik pokażę po zakończeniu</span>'
+                                      : '<span style="color:#5b21b6;font-weight:700">⏳ sprawdzam teraz…</span>';
+            });
+        };
+        try { await nfSprawdz(job, lista, null, postep); }
+        catch (e){ mkLog('notfound', '✖ sprawdzanie przerwane: ' + ((e && e.message) || e)); }
+        finally { delete mkNfAuto[paczka]; delete mkNfPostep[paczka]; }
         // Widoku NIE rysujemy stara migawka: w czasie sprawdzania czlowiek mogl kliknac „Zaksięguj OK" albo
         // subkonto, a stary odczyt postawilby mu swiezy, czynny guzik do pozycji juz wyslanych. Czytamy paczke
         // jeszcze raz; gdy trwa zapis z tego widoku, zostawiamy rysowanie jemu (konczy sie wlasnym odczytem).
@@ -53654,7 +53810,12 @@
         const nfDoSpr = mkNfBezLimitu[mkImpWidok] ? nfBez
                       : nfBez.slice(0, Math.max(0, MK_NF_AUTO - nfZWynikiem));
         const nfStart = nfDoSpr.length > 0 && !mkNfAuto[mkImpWidok];
-        if (nfStart) mkNfAuto[mkImpWidok] = true;    // PRZED rysowaniem — wiersze pokaza „sprawdzam auftrag…"
+        if (nfStart){
+            mkNfAuto[mkImpWidok] = true;              // PRZED rysowaniem — wiersze z kolejki pokaza „w kolejce"
+            const kol = {};
+            nfDoSpr.forEach(function (id){ kol[id] = 1; });
+            mkNfPostep[mkImpWidok] = { razem: nfDoSpr.length, gotowe: 0, teraz: {}, kolejka: kol, reszta: nfBez.length - nfDoSpr.length };
+        }
         const nfCzeka = nfBez.length - (mkNfAuto[mkImpWidok] ? nfDoSpr.length : 0);   // bez wyniku i nie w toku
         // Trzecia zapora: prologistics samo oznacza pozycje, ktore juz kiedys wczytano.
         // To jedyna kontrola dzialajaca niezaleznie od tego, kto i czym je wprowadzil.
@@ -53769,11 +53930,15 @@
             h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
               // 5.59.1: bez guzika — auftragi sprawdzaja sie same, ta sama droga co modul „Księgowanie w auftragu".
               +  (mkNfAuto[mkImpWidok]
-                    ? ' <span id="mk-nf-stan" style="font-size:11px;color:#5b21b6;font-weight:700">⏳ sprawdzam auftragi po ' + esc(nfPoCzymOpis(job)) + '…</span>'
+                    ? ' <span id="mk-nf-stan" style="font-size:11px;color:#5b21b6;font-weight:700">' + esc(mkNfPostepTekst(job, mkImpWidok)) + '</span>'
                     : (' <span style="font-size:11px;color:#6b7280">'
-                       + (nfCzeka > 0 ? ('niesprawdzone: ' + nfCzeka + ' (sam sprawdzam do ' + MK_NF_AUTO + ' na paczkę)')
+                       + (nfCzeka > 0 ? ('niesprawdzone: ' + nfCzeka + ' — sam sprawdzam do ' + MK_NF_AUTO + ' na paczkę, resztę guzikiem obok')
                                       : ('auftragi sprawdzone po ' + esc(nfPoCzymOpis(job)) + ' — wynik w ostatniej kolumnie'))
-                       + '</span> <button id="mk-nf-znowu" class="mk-lnk" title="Sprawdza auftragi wierszy NOT FOUND jeszcze raz — także te, przy których wynik już jest (status auftragu mógł się zmienić). Nie rusza wierszy, na które poszedł zapis.">'
+                       // Gdy cos czeka, to wyrazny guzik — drobny odnosnik przy 748 niesprawdzonych latwo przeoczyc (zgloszenie 05.10.2026).
+                       + '</span> <button id="mk-nf-znowu"' + (nfCzeka > 0
+                            ? ' style="padding:3px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;font-weight:700;cursor:pointer;font-size:11px"'
+                            : ' class="mk-lnk"')
+                       + ' title="Sprawdza auftragi wierszy NOT FOUND (po ' + MK_NF_NARAZ + ' naraz) — także te, przy których wynik już jest (status auftragu mógł się zmienić). Nie rusza wierszy, na które poszedł zapis.">'
                        + (nfCzeka > 0 ? ('🔍 sprawdź pozostałe (' + nfCzeka + ')') : '↻ sprawdź ponownie') + '</button>'))
               +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
               +  'HUB sam sprawdza każdy z nich i mówi obok, co znalazł. Gdy auftrag jest DELETED, a zwrot całej kwoty stoi w tym samym rozliczeniu, wpłata i zwrot znoszą się i nie ma czego księgować. '
@@ -53821,7 +53986,9 @@
                 }
                 else if (full && (!stA || (!stA.stan && !stA.err))){
                     // „sprawdzam" tylko wtedy, gdy sprawdzanie naprawde biegnie; poza limitem samoczynnego sprawdzania mowimy, co kliknac.
-                    msg = mkNfAuto[mkImpWidok] ? 'zwrot całej kwoty jest w tym rozliczeniu — sprawdzam, czy auftrag jest Deleted…'
+                    const pK = mkNfPostep[mkImpWidok];
+                    msg = (mkNfAuto[mkImpWidok] && (stA || (pK && pK.kolejka && pK.kolejka[id])))
+                                               ? 'zwrot całej kwoty jest w tym rozliczeniu — sprawdzam, czy auftrag jest Deleted…'
                                                : 'zwrot całej kwoty jest w tym rozliczeniu — auftrag jeszcze niesprawdzony („🔍 sprawdź pozostałe” wyżej)';
                     colr = '#888';
                 }
@@ -53853,7 +54020,7 @@
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (rv == null ? '—' : f2(rv)) + '</td>'
                   +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td>'
-                  +  '<td style="padding:2px 6px">' + nfKom(job, id, a, rv) + nfF1Nota(id) + '</td></tr>';
+                  +  '<td class="mk-nf-a" data-ff="' + esc(id) + '" style="padding:2px 6px">' + nfKom(job, id, a, rv) + nfF1Nota(id) + '</td></tr>';
             });
             h += '</table></div>';
         }
@@ -53887,14 +54054,8 @@
             // jest pusta, wiec wtedy guzik znow kaze sprawdzic.
             const maListe = !!(mkTyp[jbNow.ref] || []).length;
             const biegT = mkTypBieg[jbNow.ref];
-            // Bez typStan przy typChecked (zlecenie sprawdzone przed 5.59) „typSt.doSpr" konczylo rysowanie widoku bledem.
-            const napis = biegT ? mkTypBiegOpis(jbNow.ref)
-                : trzebaSpr
-                ? ((!jbNow.typChecked || !typSt) ? '🔍 Sprawdź typy klientów'
-                                       : ('↻ Sprawdź typy jeszcze raz (' + typSt.doSpr + ' nieodczytanych)'))
-                : (maListe ? ('✎ Zmień typy klientów (' + typSt.zle + ')')
-                           : ('🔍 Sprawdź typy klientów (' + typSt.zle + ' do zmiany)'));
-            h += '<button id="mk-typ-run" data-ref="' + esc(String(jbNow.ref || '')) + '" data-cel="' + (trzebaSpr || !maListe ? 'sprawdz' : 'zmien') + '"'
+            const gT = mkTypGuzik(jbNow), napis = gT.napis;    // ten sam napis stoi w kroku 4 na sciezce
+            h += '<button id="mk-typ-run" data-ref="' + esc(String(jbNow.ref || '')) + '" data-cel="' + gT.cel + '"'
               +  (biegT ? ' disabled' : '')
               +  ' style="padding:5px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;'
               +  'font-weight:700;cursor:pointer;font-size:11px">' + napis + '</button>'
@@ -53999,6 +54160,7 @@
             jobsSave(jobs2);
             say('Kontrola typów klienta pominięta dla tej paczki — guzik księgowania jest odblokowany.', '#c47f00');
             impRender(job, d);
+            render();                                   // krok 4 na sciezce: paczka wchodzi do „▶ Zaksięguj paczki"
         };
         const tr = box.querySelector('#mk-typ-run');
         if (tr) tr.onclick = function(){
@@ -84618,7 +84780,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'd6a34f9 · 05.10.2026 09:12';
+    const HUB_BUDOWA = '2ce93f1 · 05.10.2026 11:49';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
