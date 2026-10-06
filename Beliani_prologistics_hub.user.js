@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.6
+// @version      5.59.7
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -49447,15 +49447,136 @@
             numery: 'w kolumnie Comments nie ma numerów faktur — wgraj wyciąg UBS, wtedy zlecenie powstanie samo z tytułu przelewu'
         };
         let shLista = [];
+        // Zakladki osob (prosba uzytkownika 06.10.2026: „aby osoby odpowiedzialne za dany rynek mogly ksiegowac tylko
+        // swoje"). Miesiac w arkuszu to kilka zakladek: glowna „10/2026" i zakladki osob („10/2026 Ula", „… Tomasz",
+        // „… Magda"). Lista pokazuje zakladke wybranej osoby; wybor pamieta TEN komputer (kazdy pracuje na swoim),
+        // nikogo nie blokujemy — „Wszystkie" jest zawsze pod reka. Miesiace: do 5. dnia miesiaca takze poprzedni,
+        // potem tylko biezacy; „wszystkie" pobiera caly arkusz (Apps Script przycina do 60 miesiecy).
+        // Osoby NIE sa wpisane w HUB-ie: bierzemy je z nazw zakladek, ktore oddal arkusz. Zakladka, ktorej Apps
+        // Script nie zna (PODZIAL w pliku Markety), nie przychodzi wcale — dlatego lista mowi, CO przeczytano.
+        // Wiersza ukrytego filtrem nie da sie zalozyc: shZaloz bierze tylko narysowane ptaszki.
+        const MK_SH_OSOBA_KEY = 'mkt_sh_osoba', MK_SH_WSZYSTKO = 60;
+        // shGen — pokolenie listy: kazde zamkniecie (takze po „Załóż zlecenia") je podbija, a pobranie zaczete
+        // wczesniej porzuca wtedy wynik bez rysowania i bez komunikatu. Inaczej zamknieta lista otwierala sie
+        // sama, a komunikat pobrania nadpisywal wynik zakladania razem z „POPRAWKI NIE WESZŁY".
+        let shTabs = [], shWszMies = false, shMiesiecy = 12, shPobieram = false, shWidac = 0, shGen = 0;
+        // „10/2026 Ula" -> { mies: '2026-10', osoba: 'Ula' }; glowna ma osobe ''. Nazwa w innym ksztalcie -> osoba null
+        // (takiego wiersza filtr nie chowa — lepiej go pokazac, niz zgubic).
+        function shZakladka(tab){
+            const m = String(tab == null ? '' : tab).match(/^(\d{2})\/(\d{4})(?: (.+))?$/);
+            return m ? { mies: m[2] + '-' + m[1], osoba: m[3] || '' } : { mies: '', osoba: null };
+        }
+        function shOsobaWybrana(){
+            let v = '*';
+            try { v = GM_getValue(MK_SH_OSOBA_KEY, '*'); } catch (e){}
+            return v == null ? '*' : String(v);
+        }
+        // Miesiace „biezace" wg dzisiejszej daty (czas lokalny): 1.–5. dzien — biezacy i poprzedni, od 6. — sam biezacy.
+        function shMiesiaceDomyslne(){
+            const d = new Date();
+            const t = d.getFullYear() + '-' + pad2(d.getMonth() + 1);
+            if (d.getDate() > 5) return [t];
+            const p = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+            return [t, p.getFullYear() + '-' + pad2(p.getMonth() + 1)];
+        }
+        function shMiesNazwa(k){ const p = String(k).split('-'); return p[1] + '/' + p[0]; }
+        function shOsobaNazwa(o){ return o === '' ? 'Główna' : String(o); }
+        function shWierszy(n){
+            const d = n % 10, s2 = n % 100;
+            return n + ' ' + (n === 1 ? 'wiersz' : ((d >= 2 && d <= 4 && !(s2 >= 12 && s2 <= 14)) ? 'wiersze' : 'wierszy'));
+        }
+        function shWidoczny(r, osoba, mies){
+            const z = shZakladka(r.tab);
+            if (z.osoba === null) return true;
+            if (!shWszMies && mies.indexOf(z.mies) < 0) return false;
+            return osoba === '*' || z.osoba === osoba;
+        }
+        // Pasek wyboru nad lista: osoby (z przeczytanych zakladek i z wierszy, glowna pierwsza), miesiace,
+        // przeczytane zakladki i ile wierszy schowal filtr — nic nie znika bez slowa.
+        function shFiltry(osoba, mies, ukr){
+            const os = [];
+            const dodaj = function (o){ if (o != null && os.indexOf(o) < 0) os.push(o); };
+            dodaj('');
+            shTabs.forEach(function (t){ dodaj(shZakladka(t).osoba); });
+            shLista.forEach(function (r){ dodaj(shZakladka(r.tab).osoba); });
+            if (osoba !== '*') dodaj(osoba);
+            const ile = function (o){
+                return shLista.filter(function (r){
+                    const z = shZakladka(r.tab);
+                    if (z.osoba === null) return true;
+                    return (shWszMies || mies.indexOf(z.mies) >= 0) && (o === '*' || z.osoba === o);
+                }).length;
+            };
+            const chip = function (val, et){
+                const on = val === osoba;
+                return '<button class="mk-td-os" data-o="' + esc(val) + '" style="padding:1px 8px;border:1px solid #5b21b6;border-radius:10px;font-size:10px;cursor:pointer;'
+                     + (on ? 'background:#5b21b6;color:#fff;font-weight:700' : 'background:#fff;color:#5b21b6') + '">'
+                     + esc(et) + ' (' + ile(val) + ')</button>';
+            };
+            const mBtn = function (id, on, et){
+                return '<button id="' + id + '" style="padding:1px 8px;border:1px solid #5b21b6;border-radius:10px;font-size:10px;cursor:pointer;'
+                     + (on ? 'background:#5b21b6;color:#fff;font-weight:700' : 'background:#fff;color:#5b21b6') + '"'
+                     + (shPobieram ? ' disabled' : '') + '>' + esc(et) + '</button>';
+            };
+            let h = '<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-bottom:3px">'
+                  + '<span style="font-size:10px;color:#555;font-weight:700">Zakładka:</span>'
+                  + os.map(function (o){ return chip(o, shOsobaNazwa(o)); }).join('') + chip('*', 'Wszystkie')
+                  + '<span style="font-size:10px;color:#888">— wybór zapamięta ten komputer</span></div>';
+            h += '<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-bottom:3px">'
+               + '<span style="font-size:10px;color:#555;font-weight:700">Miesiące:</span>'
+               + mBtn('mk-td-mb', !shWszMies, 'bieżące: ' + mies.map(shMiesNazwa).join(' i ')
+                      + (mies.length > 1 ? ' (poprzedni do 5. dnia miesiąca)' : ''))
+               + mBtn('mk-td-mw', shWszMies, shPobieram ? 'pobieram cały arkusz…'
+                      : ('wszystkie' + (shMiesiecy < MK_SH_WSZYSTKO ? ' — pobierze cały arkusz' : '')))
+               + '</div>';
+            const czyt = shTabs.filter(function (t){ const z = shZakladka(t); return shWszMies || mies.indexOf(z.mies) >= 0; });
+            h += '<div style="font-size:10px;color:#888;margin-bottom:2px">Arkusz przeczytał zakładki: '
+               + (czyt.length ? esc(czyt.slice(0, 8).join(' · ') + (czyt.length > 8 ? (' … (razem ' + czyt.length + ')') : ''))
+                              : '<i>żadnej z tych miesięcy</i>')
+               + ' <span style="color:#aaa">— zakładki spoza tej listy Apps Script nie czyta (osoby z PODZIAL w pliku Markety)</span></div>';
+            if (ukr.osoby || ukr.mies)
+                h += '<div style="font-size:10px;color:#c47f00;margin-bottom:2px">Ukryte: '
+                   + [ukr.osoby ? (shWierszy(ukr.osoby) + ' z innych zakładek (pokaże je „Wszystkie” przy „Zakładka:”)') : '',
+                      ukr.mies ? (shWierszy(ukr.mies) + ' z innych miesięcy (pokaże je „wszystkie” przy „Miesiące:”)') : ''].filter(Boolean).join(' · ')
+                   + '.</div>';
+            return h;
+        }
         function shZamknij(){
+            shGen++;
             if (shBox){ shBox.style.display = 'none'; shBox.innerHTML = ''; }
-            shLista = [];
+            shLista = []; shTabs = []; shWszMies = false; shMiesiecy = 12; shWidac = 0;
         }
         function shRysuj(){
             if (!shBox) return;
             const cele = mkCele(), jobs = jobsLoad();
             let gotowe = 0;
-            const h = shLista.map(function (r, i){
+            const osoba = shOsobaWybrana(), mies = shMiesiaceDomyslne();
+            // Wiersze grupami wg zakladki, w kolejnosci, w jakiej oddal je arkusz (miesiace od najnowszego,
+            // glowna przed osobami). Indeks w shLista (data-i) zostaje ten sam — od niego zalezy zakladanie.
+            const pozT = {};
+            shTabs.concat(shLista.map(function (r){ return r.tab; })).forEach(function (t){
+                if (!Object.prototype.hasOwnProperty.call(pozT, t)) pozT[t] = Object.keys(pozT).length;
+            });
+            const kolej = shLista.map(function (r, i){ return i; }).sort(function (a, b){
+                return (pozT[shLista[a].tab] - pozT[shLista[b].tab]) || (a - b);
+            });
+            const wTab = {}, ukr = { osoby: 0, mies: 0 };
+            shWidac = 0;
+            shLista.forEach(function (r){
+                if (shWidoczny(r, osoba, mies)){ wTab[r.tab] = (wTab[r.tab] || 0) + 1; shWidac++; }
+                else if (!shWszMies && mies.indexOf(shZakladka(r.tab).mies) < 0) ukr.mies++;
+                else ukr.osoby++;
+            });
+            let ostTab = null;
+            const h = kolej.map(function (i){
+                const r = shLista[i];
+                if (!shWidoczny(r, osoba, mies)) return '';
+                let nag = '';
+                if (r.tab !== ostTab){
+                    ostTab = r.tab;
+                    nag = '<div style="font-size:11px;font-weight:700;color:#5b21b6;margin-top:6px;padding:2px 6px;background:#f5f3ff;border-radius:4px">📄 zakładka „'
+                        + esc(r.tab) + '” — ' + shWierszy(wTab[r.tab] || 0) + '</div>';
+                }
                 let dop = mkDopasuj(cele, r.marketplace, r.konto);
                 // Nie rozpoznano — szukamy najblizszego kandydata. Podpowiedz NIE staje
                 // sie automatycznie celem: dopoki nikt jej nie kliknie, wiersz zostaje
@@ -49528,7 +49649,7 @@
                                  + '<button data-i="' + i + '" class="mk-td-u" style="padding:1px 7px;border:none;'
                                  + 'border-radius:4px;background:#7c3aed;color:#fff;font-size:10px;cursor:pointer">użyj</button>';
                          })());
-                return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0;border-top:1px solid #f1eafe">'
+                return nag + '<div style="display:flex;gap:6px;align-items:center;padding:2px 0;border-top:1px solid #f1eafe">'
                      // Wybor czlowieka (r._odzn) przezywa przerysowanie: poprawka daty w jednym wierszu
                      // zaznaczala dotad z powrotem wszystkie pozostale.
                      + '<input type="checkbox" data-i="' + i + '" class="mk-td-c"' + (mozna ? (r._odzn ? '' : ' checked') : ' disabled') + '>'
@@ -49546,13 +49667,17 @@
             }).join('');
             shBox.innerHTML =
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:2px">'
-              + '<span style="font-size:11px;color:#5b21b6;font-weight:700">Niezaksięgowane z arkusza — ' + shLista.length + '</span>'
+              + '<span style="font-size:11px;color:#5b21b6;font-weight:700">Niezaksięgowane z arkusza — '
+              + (shWidac === shLista.length ? shLista.length : (shWidac + ' z ' + shLista.length)) + '</span>'
               // Gdy z dluzszej listy ma pojsc jedno zlecenie: „Odznacz wszystkie" i jeden ptaszek.
               + (gotowe ? ('<button id="mk-td-all" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">☑ Zaznacz wszystkie</button>'
                          + '<button id="mk-td-none" style="padding:2px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">☐ Odznacz wszystkie</button>') : '')
               + '</div>'
               + '<div style="font-size:10px;color:#666;margin-bottom:6px">Wiersze, w których Booked stoi na „Nie". Datę i konto możesz poprawić przed założeniem — poprawka wraca do arkusza, do tego samego wiersza. Zlecenie tylko powstaje; pobranie rozliczenia i księgowanie zostają na Twoje kliknięcie.</div>'
-              + (h || '<div style="font-size:11px;color:#0a7a2f">Nie ma nic do zrobienia.</div>')
+              + shFiltry(osoba, mies, ukr)
+              + (h || ('<div style="font-size:11px;color:#0a7a2f">Nie ma nic do zrobienia'
+                       + (shLista.length ? (osoba === '*' ? ' w tych miesiącach' : (' na zakładce „' + esc(shOsobaNazwa(osoba)) + '” w tych miesiącach')) : '')
+                       + '.</div>'))
               + '<div style="margin-top:8px;display:flex;gap:8px;align-items:center">'
               + '<button id="mk-td-go" style="padding:4px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px"' + (gotowe ? '' : ' disabled') + '>Załóż zlecenia (' + gotowe + ')</button>'
               + '<button id="mk-td-x" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px">Zamknij</button>'
@@ -49570,6 +49695,20 @@
             if (x) x.onclick = shZamknij;
             const go = shBox.querySelector('#mk-td-go');
             if (go) go.onclick = function(){ shZaloz(go); };
+            // Wybor osoby pamieta ten komputer; przelaczenie nie rusza poprawek ani ptaszkow w wierszach.
+            shBox.querySelectorAll('.mk-td-os').forEach(function (b){
+                b.onclick = function(){
+                    try { GM_setValue(MK_SH_OSOBA_KEY, b.getAttribute('data-o')); } catch (e){}
+                    shRysuj();
+                };
+            });
+            const mB = shBox.querySelector('#mk-td-mb'), mW = shBox.querySelector('#mk-td-mw');
+            if (mB) mB.onclick = function(){ shWszMies = false; shRysuj(); };
+            // shPobierz sam przelacza na „wszystkie" i rysuje — po porzuconym pobraniu (lista zamknieta) nie ma czego rysowac.
+            if (mW) mW.onclick = function(){
+                if (shMiesiecy >= MK_SH_WSZYSTKO){ shWszMies = true; shRysuj(); return; }
+                return shPobierz(MK_SH_WSZYSTKO, false);
+            };
             // Napis na guziku ma mowic, ile jest ZAZNACZONYCH, a nie ile dalo sie
             // zaznaczyc przy rysowaniu. Bez tego przy jednym ptaszku guzik dalej
             // pokazywal „(3)" — zakladalo sie wtedy poprawnie, ale napis klamal.
@@ -49720,12 +49859,26 @@
                 + (dodane ? ' — teraz pobierz rozliczenia albo wgraj raporty.' : ''),
                 dodane ? '#0a7a2f' : '#c47f00');
         }
-        if (shBtn) shBtn.onclick = async function(){
-            if (MK_PULLING || mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
-            shBtn.disabled = true;
-            say('Pytam arkusz o niezaksięgowane…', '#666');
+        // Jedno pobranie listy — z guzika „⬇ Z arkusza" (12 miesiecy) i z „wszystkie" (MK_SH_WSZYSTKO). Przy ponownym
+        // pobraniu wiersz, ktory w arkuszu sie nie zmienil, zachowuje poprawki daty i konta oraz ptaszek — inaczej
+        // „wszystkie" kasowaloby to, co czlowiek juz poprawil. Blad przy „wszystkie" zostawia dotychczasowa liste.
+        async function shPobierz(miesiecy, nowa){
+            if (shPobieram) return false;
+            if (MK_PULLING || mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return false; }
+            // Kazde otwarcie zaczyna od miesiecy biezacych — ale dopiero gdy pobranie naprawde rusza; odmowa wyzej
+            // nie moze przestawic trybu listy, ktora dalej stoi otwarta.
+            if (nowa) shWszMies = false;
+            const gen = shGen;
+            shPobieram = true;
+            if (shBtn) shBtn.disabled = true;
+            if (!nowa && shBox && shBox.style.display !== 'none') shRysuj();
+            say(miesiecy >= MK_SH_WSZYSTKO ? 'Pytam arkusz o niezaksięgowane ze wszystkich miesięcy…' : 'Pytam arkusz o niezaksięgowane…', '#666');
+            let ok = false;
             try {
-                const r = await shTodo(12);
+                const r = await shTodo(miesiecy);
+                if (gen !== shGen){ shPobieram = false; if (shBtn) shBtn.disabled = false; return false; }
+                const stare = {};
+                shLista.forEach(function (x){ stare[x.tab + '|' + x.row] = x; });
                 // Zapamietujemy, co przyszlo z arkusza, zeby wiedziec, CO zostalo
                 // poprawione — i odeslac tylko to, a nie caly wiersz.
                 shLista = (r.result || []).map(function (x){
@@ -49737,25 +49890,48 @@
                              _data0: shData(x.data),
                              _konto0: String(x.konto == null ? '' : x.konto).trim() };
                 });
+                shLista.forEach(function (x){
+                    const o = stare[x.tab + '|' + x.row];
+                    if (!o || o._data0 !== x._data0 || o._konto0 !== x._konto0 || o.kwota !== x.kwota
+                        || o.marketplace !== x.marketplace) return;
+                    x.data = o.data; x.konto = o.konto; x._odzn = o._odzn; x._uzyj = o._uzyj;
+                });
+                shTabs = Array.isArray(r.tabs) ? r.tabs.map(String) : [];
+                shMiesiecy = miesiecy;
+                // „wszystkie" przed rysowaniem — inaczej komunikat nizej liczy „na liscie" starym filtrem.
+                if (miesiecy >= MK_SH_WSZYSTKO) shWszMies = true;
+                shPobieram = false;
                 shRysuj();
                 // Stare wdrożenie czyta tylko „MM/RRRR" — wiersze z zakładek Uli i Tomka
                 // byłyby niewidoczne, a lista wyglądałaby na kompletną.
                 const stareA = shStare(r);
-                say('Arkusz: ' + shLista.length + ' wierszy z Booked = Nie'
-                    + ((r.tabs && r.tabs.length) ? (' · zakładki ' + r.tabs.slice(0, 3).join(', ')
-                       + (r.tabs.length > 3 ? ' …' : '')) : '')
+                const os = shOsobaWybrana();
+                say('Arkusz: ' + shWierszy(shLista.length) + ' z Booked = Nie'
+                    + (miesiecy >= MK_SH_WSZYSTKO ? ' (wszystkie miesiące)' : '')
+                    + ' · na liście ' + shWidac + ' — zakładka: ' + (os === '*' ? 'wszystkie' : shOsobaNazwa(os))
                     + (stareA ? ' · UWAGA: wdrożone Apps Script jest starsze niż HUB i nie czyta zakładek „MM/RRRR Ula" ani „MM/RRRR Tomasz" — wdróż nową wersję' : ''),
                     stareA ? '#c47f00' : '#0a7a2f');
+                ok = true;
             } catch (e){
-                shZamknij();
                 // Nie zostawiamy czlowieka z samym „nie zna akcji" — od razu sprawdzamy,
                 // co ten adres w ogole serwuje, bo to jedyne, co rozstrzyga przyczyne.
+                // Blokade zdejmujemy dopiero PO sondzie: wczesniej drugie klikniecie ruszalo drugie pobranie,
+                // a konczaca sie sonda zdejmowala blokade temu drugiemu.
                 let s2 = '';
                 try { s2 = await shSonda(); } catch (e2){}
+                shPobieram = false;
+                if (shBtn) shBtn.disabled = false;
+                if (gen !== shGen) return false;
+                if (nowa) shZamknij();
+                else if (shBox && shBox.style.display !== 'none') shRysuj();
                 say('Arkusz: ' + ((e && e.message) || e) + (s2 ? (' — ' + s2) : ''), '#c00');
             }
-            shBtn.disabled = false;
-        };
+            shPobieram = false;
+            if (shBtn) shBtn.disabled = false;
+            return ok;
+        }
+        // Kazde otwarcie zaczyna od miesiecy biezacych (shPobierz z nowa = true); zapamietany jest tylko wybor osoby.
+        if (shBtn) shBtn.onclick = function(){ return shPobierz(12, true); };
 
         // ---- ⬆ Dociągnij braki ----
         // Po wgraniu wyciagu wplaty dopisuja sie same. Tu jest PODGLAD tego, co automat
@@ -85743,7 +85919,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '62bbca3 · 06.10.2026 07:04';
+    const HUB_BUDOWA = 'a4d902f · 06.10.2026 08:28';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
