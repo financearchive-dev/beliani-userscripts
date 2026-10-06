@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.5
+// @version      5.59.6
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -42360,7 +42360,8 @@
             const o = {};
             MK_OBI_HDR.forEach(function (k, i){ o[k] = (r[i] == null) ? '' : String(r[i]); });
             if (!seller) seller = String(o.sellerId || '').trim();
-            if (mkIntern(o) === 'adj') adj.push(o); else rows.push(o);
+            const oid = String(o.orderId || '').trim();
+            if (mkIntern(o) === 'adj' && (!oid || oid === '-')) adj.push(o); else rows.push(o);
         });
         if (!rows.length && !adj.length) return { err: 'raport OBI bez ani jednego wiersza' };
         // Kwota wyplaty: wiersz wyplaty niesie ja zawsze w kolumnie Credit, takze przy rozliczeniu ujemnym — tylko do opisu.
@@ -43821,8 +43822,16 @@
                      : '→ krok 4: „▶ Zaksięguj paczki” albo „🔍 Otwórz paczkę”');
         }
         else if (st === 'done' && j.booked && refOtw[mkKlucz(j)]) t = '→ krok 5: zwroty pod listą';
+        // Zaksiegowane, a cos zostalo (CHECK / NOT FOUND w paczce, przerwane koncowki, rozjazd Homedeco…): TRESC notatki
+        // przy wierszu. Do 5.59.6 zlecenie stalo w grupie ⑤ bez slowa, dlaczego — notatka szla tylko do arkusza.
+        const po = (st === 'done' && j.booked) ? mkProblemJob(j) : [];
         return (t ? ('<div class="mk-wsk">' + esc(t) + '</div>') : '')
-             + (ost ? ('<div class="mk-wsk" style="color:#b45309">⚠ przed księgowaniem: ' + esc(ost) + '</div>') : '');
+             + (ost ? ('<div class="mk-wsk" style="color:#b45309">⚠ przed księgowaniem: ' + esc(ost) + '</div>') : '')
+             + po.map(function (p){
+                   return '<div class="mk-wsk" style="color:#b45309;font-weight:700">⚠ ' + esc(p.tekst)
+                        + (p.rodzaj === 'ksiegowanie' ? '<span style="font-weight:400"> — wiersze pokaże „✔ Paczka … otwórz ponownie” pod zleceniem</span>' : '')
+                        + '</div>';
+               }).join('');
     }
     // Sklada tabele z grup. `o` niesie liczby do naglowka grupy „gotowe do importu".
     function mkListaZloz(grupy, o){
@@ -43905,6 +43914,7 @@
         // guzik typow — ten sam napis co w widoku paczki; prowadzi do pierwszej paczki, na ktorej da sie cos zrobic.
         // Kolejnosc: paczka, na ktorej da sie cos zrobic; potem bez wierszy do sprawdzenia; na koncu ta, na ktorej typy
         // wlasnie ida. W trakcie operacji napis BEZ liczby — sciezka nie przerysowuje sie co pozycje, liczba by zamarzla.
+        k.konc = mkKoncPaczki(jobs).length;          // zaksiegowane paczki, w ktorych zostaly wiersze CHECK
         k.typG = null;
         const wagaT = function (x){ return (x.bieg ? 2 : 0) + (x.pusto ? 1 : 0); };
         bookList().forEach(function (j){
@@ -43978,6 +43988,11 @@
                       ? ('padding:4px 10px;border:1px solid #7c3aed;border-radius:6px;background:#faf5ff;color:#5b21b6;font-weight:700;cursor:' + (mTyp ? 'pointer' : 'default') + ';font-size:11px')
                       : duzy(mTyp, '#7c3aed')) + '">'
                   + esc(typG.napis) + (k.typ > 1 && !typG.pusto ? (' · paczka ' + esc(typG.impId) + ' (1 z ' + k.typ + ')') : '') + '</button>') : '')
+            // Zaksiegowane paczki z wierszami CHECK: zestawienie koncowek w tolerancji ze wszystkich naraz.
+            + (k.konc ? ('<button id="mk-konc-all"' + (mkWid.book ? ' disabled' : '')
+                  + ' title="Zbiera z zaksięgowanych paczek wiersze CHECK z open amount w tolerancji i księguje je hurtem na subkoncie (jedno potwierdzenie)."'
+                  + ' style="padding:4px 10px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#5b21b6;font-weight:700;cursor:pointer;font-size:11px">'
+                  + '💰 Końcówki na subkonto (' + k.konc + (k.konc === 1 ? ' paczka' : ' paczek') + ')</button>') : '')
             + '<span class="mk-strz">›</span>' + kn(5, n5)
             + skok('mk-k-ref', 'Zwroty', mkLicz.ref, mkLicz.refJest)
             + (mkLicz.crJest ? skok('mk-k-cr', 'Potrącenia', mkLicz.cr, true) : '')
@@ -44017,6 +44032,18 @@
             }
             // Przy „zmien" guzik paczki sam przewinal do tabelki typow — powrot do widoku paczki zabieralby ja z oczu.
             if (cel !== 'zmien'){ try { if (box) box.scrollIntoView({ block: 'nearest' }); } catch (e){} }
+        };
+        const bko = slot.querySelector('#mk-konc-all');
+        if (bko) bko.onclick = async function(){
+            bko.disabled = true;
+            say('Czytam zaksięgowane paczki z wierszami CHECK…');
+            try {
+                const ile = await mkKoncSkanuj(null, false);
+                say('Końcówki w tolerancji: ' + ile.n + ' poz. w ' + ile.m + ' paczkach (razem ' + f2(ile.suma) + ').', ile.n ? '#0a7a2f' : '#666');
+                const kb = document.getElementById('mk-konc-box');
+                if (kb) kb.scrollIntoView({ block: 'nearest' });
+            } catch (e){ say('Końcówki na subkonto: ' + ((e && e.message) || e), '#c00'); }
+            finally { bko.disabled = false; }
         };
         [['#mk-k-ref', '#mk-ref'], ['#mk-k-cr', '#mk-cr'], ['#mk-k-joy', '#mk-joy']].forEach(function (x){
             const b = slot.querySelector(x[0]);
@@ -44060,6 +44087,7 @@
             if (!teraz && mkWid.po) uw.push(mkWid.po + ' zaksięgowanych ma jeszcze uwagi — grupa ⑤ na liście');
             if (k.spr) uw.push('⚠ ' + k.spr + ' wymaga sprawdzenia (import wstrzymany)');
             if (k.dup) uw.push('⚠ ' + k.dup + ' z zaznaczonych jest już w arkuszu jako zaksięgowane — sprawdź przed importem');
+            if (k.konc) uw.push(k.konc + (k.konc === 1 ? ' zaksięgowana paczka ma' : ' zaksięgowanych paczek ma') + ' wiersze CHECK — końcówki w tolerancji: „💰 Końcówki na subkonto” w kroku 4');
             if (k.typ && k.book > k.typ) uw.push(k.typ + ' z paczek czeka na typy klientów — „▶ Zaksięguj paczki” ich nie weźmie; guzik typów stoi w kroku 4');
             if (k.pob && !k.sklepy) uw.push('nie znam jeszcze sklepów Mirakla — wejdź na Mirakla i rozwiń przełącznik sklepu');
             t.innerHTML = '<b style="color:#5b21b6">➜ Teraz:</b> ' + esc(glowne)
@@ -50231,12 +50259,34 @@
                 const klucz = p.ref || ('OBI-PLIK-' + (p.dzien || 'bez-daty') + '-' + f2(a0.net));
                 let k = jobs[klucz] ? klucz : (p.ref ? mkKluczRef(jobs, p.ref) : '');
                 if (k && jobs[k].kind !== 'vtex') k = '';
-                // Ten sam raport wgrany wczesniej pod inna nazwa (z PODE albo bez): ten sam dzien i to samo netto.
-                if (!k) k = Object.keys(jobs).filter(function (x){
-                    const o = jobs[x];
-                    return o && o.kind === 'vtex' && o.vtexPlik && o.vtexPlik.dzien === p.dzien && o.data && eq(o.data.net, a0.net);
-                })[0] || '';
+                // Ten sam raport wgrany wczesniej pod inna nazwa (z PODE albo bez): ten sam dzien i to samo netto — ale dwa
+                // RÓZNE numery PODE to dwa rozne raporty, nawet przy tym samym dniu i netto (przeglad 06.10.2026).
+                const rozneP = function (o){ return !!p.ref && /^PODE-/i.test(String(o.ref || '')) && String(o.ref).toUpperCase() !== p.ref.toUpperCase(); };
+                const tenSam = function (o){
+                    return o && o.kind === 'vtex' && o.vtexPlik && o.vtexPlik.dzien === p.dzien && o.data && eq(o.data.net, a0.net) && !rozneP(o);
+                };
+                if (!k) k = Object.keys(jobs).filter(function (x){ return tenSam(jobs[x]); })[0] || '';
+                // Plik BEZ PODE w nazwie, a zlecenie z wyciagu niesie PODE-<dzien wyplaty>-NNNN: dzien z wiersza wyplaty jest
+                // (w plikach z wrzesnia zawsze) rowny dacie w PODE, kwota przelewu = netto albo wyplata z pliku. Dokladnie jedno.
+                if (!k && !p.ref && p.dzien){
+                    const pre = 'PODE-' + p.dzien.replace(/-/g, '') + '-';
+                    const zW = Object.keys(jobs).filter(function (x){
+                        const o = jobs[x];
+                        return o && o.kind === 'vtex' && String(o.ref || '').replace(/\s+/g, '').toUpperCase().indexOf(pre) === 0
+                            && o.amount != null && (eq(o.amount, a0.net) || eq(o.amount, p.wyplata));
+                    });
+                    if (zW.length === 1) k = zW[0];
+                }
                 if (!k) k = mkCzekajaceBezRef(jobs, 'vtex', a0.net, p.dzien) || '';
+                // Blizniak: ten sam raport stoi juz przy INNYM zleceniu (np. najpierw plik bez PODE, potem wyciag i plik z PODE).
+                // Dopiecie go drugi raz dalo by dwa zlecenia z tymi samymi zamowieniami — podwojny import. Nie zgadujemy, ktore usunac.
+                const blizniak = Object.keys(jobs).filter(function (x){ return x !== k && tenSam(jobs[x]); })[0];
+                if (blizniak){
+                    say('OBI ' + (p.ref || f.name) + ' — ten sam raport (' + p.dzien + ', netto ' + f2(a0.net) + ') stoi już przy zleceniu „'
+                        + (jobs[blizniak].ref || blizniak) + '"' + (jobs[blizniak].status === 'done' ? ' (zaimportowane)' : '')
+                        + '. Nie dopinam go drugi raz, żeby nie zaimportować tych samych zamówień dwa razy — zostaw jedno z tych zleceń.', '#c47f00');
+                    return;
+                }
                 let nowe = false;
                 if (!k){
                     const d0 = new Date();
@@ -50259,7 +50309,8 @@
                 jobsSave(jobs); render();
                 const nOrd = Object.keys(j.data.ord).length, nRef = Object.keys(j.data.ref).length;
                 say('OBI DE ' + (j.ref || '') + ' — ' + (nowe ? 'nowe zlecenie z pliku' : 'plik dopięty do zlecenia') + ' · data ' + j.date
-                    + (p.skadData === 'nazwa' ? ' (z nazwy pliku)' : (p.skadData === 'wyplata' ? ' (z wiersza wypłaty — sprawdź)' : ' (dzisiejsza — popraw)'))
+                    + (j.payer ? ' (z wyciągu)' : (j.date !== p.dzien ? ' (ustawiona wcześniej)'
+                       : (p.skadData === 'nazwa' ? ' (z nazwy pliku)' : (p.skadData === 'wyplata' ? ' (z wiersza wypłaty — sprawdź)' : ' (dzisiejsza — popraw)'))))
                     + ' · zamówień ' + nOrd + ' na ' + f2(j.data.gross) + (nRef ? (' · zwrotów ' + nRef + ' na ' + f2(j.data.refund)) : '')
                     + ' · kwot nie kontroluję' + (j.msg ? ('. ⚠ ' + j.msg) : '. Datę zmienisz w kolumnie Data; dalej krok 3.'),
                     j.status === 'ready' ? '#0a7a2f' : '#c47f00');
@@ -50879,7 +50930,7 @@
             if (!confirm('Usunąć wszystkie zlecenia (także pobrane rozliczenia)?')) return;
             jobsSave({});
             // Widok paczki, typow i podglad postepu zwrotow dotyczyly zlecen, ktorych juz nie ma — ekran wraca do czystego (podglad zostaje tylko w trakcie przebiegu).
-            ['#mk-imp-box', '#mk-typ-box', '#mk-prog'].forEach(function (q){ const e = $(q); if (e && !(q === '#mk-prog' && _mirIv)){ e.style.display = 'none'; if (q === '#mk-prog') e.innerHTML = ''; } });
+            ['#mk-imp-box', '#mk-typ-box', '#mk-prog', '#mk-konc-box'].forEach(function (q){ const e = $(q); if (e && !(q === '#mk-prog' && _mirIv)){ e.style.display = 'none'; if (q === '#mk-prog') e.innerHTML = ''; } });
             render(); say('Wyczyszczone.');
         };
         $('#mk-cfg').onclick = async function(){
@@ -54381,9 +54432,12 @@
 
         // Grosze roznicy to zaokraglenie, a nie blad — takie wiersze mozna wyrownac hurtem.
         const tol = tolGet();
+        // Open amount 0 to nie grosze, tylko druga wplata do oplaconego auftragu — na subkonto poszlaby cala wplata.
+        // Decyzja uzytkownika 06.10.2026 („niech 0 nie pokazuje"): zera nie ida tym guzikiem, tak samo jak w zbiorczych
+        // koncowkach (mkKoncWiersze). Zostaja w grupie „Open amount 0" ponizej, do wgladu.
         const near = chk.filter(function (x){
             const o = impNum(x.open_amount);
-            return o != null && Math.abs(o) <= tol && String(x.auction_number || '').trim();
+            return o != null && Math.abs(o) >= 0.005 && Math.abs(o) <= tol && String(x.auction_number || '').trim();
         });
         // Wiersze, w ktorych na auftragu NIE MA juz nic do zaplaty. Prologistics oznacza je
         // jako CHECK, bo wplata nie zgadza sie z zerem — ale to nie jest rozbieznosc do
@@ -54751,6 +54805,7 @@
         const fx = box.querySelector('#mk-fix');
         if (fx) fx.onclick = async function(){
             const m = box.querySelector('#mk-fix-msg');
+            if (mkWid.book || mkKsiegBieg){ say('Trwa księgowanie — kliknij „↻ Odśwież” po jego zakończeniu.', '#c47f00'); return; }
             if (!confirm('Ustawić status OK i zaksięgować ' + near.length + ' pozycji na subkoncie?\n\n'
                 + near.map(function (x){ return '  • ' + x.payment_descr + '  open ' + f2(impNum(x.open_amount)); }).join('\n')
                 + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „Book on sub-account".'
@@ -54758,12 +54813,18 @@
             fx.disabled = true; m.style.color = '#666'; m.textContent = 'ustawiam statusy…';
             mkImpBieg++; mkKsiegBieg++;
             try {
-                for (let i = 0; i < near.length; i++){
-                    m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + near.length;
-                    await impState(job.impId, near[i].id, 'OK');
+                // Swiezy odczyt: guzik narysowany wczesniej nie wie, ze te wiersze poszly juz na subkonto (np. przez
+                // „💰 Końcówki na subkonto") — drugi zapis by przeszedl (przeglad 06.10.2026).
+                const idsN = {};
+                near.forEach(function (x){ idsN[String(x.id)] = 1; });
+                const nearNow = (await impRows(job.impId)).rows.filter(function (x){ return String(x.state) === 'CHECK' && idsN[String(x.id)]; });
+                if (!nearNow.length){ m.textContent = 'tych wierszy nie ma już jako CHECK — odczytuję paczkę…'; await impCheck(kluczJob); return; }
+                for (let i = 0; i < nearNow.length; i++){
+                    m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + nearNow.length;
+                    await impState(job.impId, nearNow[i].id, 'OK');
                 }
                 m.textContent = 'księguję na subkoncie…';
-                await impBookSub(job.impId, near.map(function (x){ return x.id; }));
+                await impBookSub(job.impId, nearNow.map(function (x){ return x.id; }));
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
                 await impCheck(kluczJob);
             } catch (e){
@@ -55185,6 +55246,329 @@
         if (st.zle) return 'typy klientów do zmiany: ' + st.zle;
         return '';
     }
+    // ===== Koncowki w tolerancji na subkonto — zbiorczo (06.10.2026) =====
+    // Prosba uzytkownika: po zaksiegowaniu wielu paczek w kazdej zostaje wiersz CHECK z groszami. Zamiast otwierac kazda
+    // paczke i klikac „Ustaw OK i zaksięguj na subkoncie" — jedno zestawienie ze wszystkich ZAKSIEGOWANYCH paczek (takze
+    // z roznych dni), ta sama tolerancja co w widoku paczki (tolGet/tolSet), jedno potwierdzenie, jeden zapis na paczke.
+    // Tylko paczki z zaksiegowanymi pozycjami OK (j.booked): prologistics po zaksiegowaniu dalej oddaje wiersze jako OK,
+    // wiec koncowka przestawiona na OK PRZED „▶ Zaksięguj paczki" weszlaby drugi raz, na konto glowne.
+    // Z przegladu (06.10.2026): wiersze z open amount 0 NIE sa koncowkami (to druga wplata do oplaconego auftragu — na
+    // subkonto poszlaby cala wplata) i zostaja w widoku paczki; kazdy zapis zostawia slad przy zleceniu (koncWisi), zanim
+    // cokolwiek wyjdzie, bo przerwany zapis zostawial wiersze ze statusem OK bez ksiegowania — i bez sladu.
+    function mkKoncWiersze(rows, tol){
+        return (rows || []).filter(function (x){
+            if (String(x.state) !== 'CHECK') return false;
+            const o = impNum(x.open_amount);
+            return o != null && Math.abs(o) >= 0.005 && Math.abs(o) <= tol && !!String(x.auction_number || '').trim();
+        });
+    }
+    function mkKoncZera(rows){
+        return (rows || []).filter(function (x){
+            const o = impNum(x.open_amount);
+            return String(x.state) === 'CHECK' && o != null && Math.abs(o) < 0.005;
+        }).length;
+    }
+    // Slad zapisu: id wiersza -> { d: numer, f: 'stan' | 'sub' }. 'stan' — statusy szly, subkonto NIE zostalo wyslane
+    // (dokonczenie jest bezpieczne); 'sub' — zapytanie o subkonto wyszlo i nie wiadomo, czy weszlo (rozstrzyga czlowiek).
+    function mkKoncWisi(j){ return (j && j.koncWisi && typeof j.koncWisi === 'object') ? j.koncWisi : {}; }
+    function mkKoncJob(jobs, p){ const kk = mkKluczPamieci(jobs, p.j) || p.k; return { k: kk, j: jobs[kk] || null }; }
+    // Zaksiegowane zlecenia do zestawienia: z notatka „ksiegowanie" z CHECK albo ze sladem przerwanego zapisu. Paczka
+    // sprawdzona przy tej samej tolerancji i tej samej notatce, bez koncowek, nie wraca do licznika w kroku 4.
+    function mkKoncPaczki(jobs){
+        const tol = tolGet();
+        return (jobs || jobList()).filter(function (j){
+            if (!j || j.status !== 'done' || !j.impId || !j.booked) return false;
+            if (Object.keys(mkKoncWisi(j)).length) return true;
+            const p = mkProblemyZ(j).ksiegowanie;
+            if (!(p && /CHECK \d/.test(p.tekst))) return false;
+            return !(j.koncSpr && j.koncSpr.n === 0 && j.koncSpr.tol === tol && j.koncSpr.notka === p.tekst);
+        });
+    }
+    let mkKonc = null;                     // ostatnie zestawienie: { pakiety: [{ k, j, rows, err, stop }], tol }
+    // gotowe: numer paczki -> wiersze odczytane chwile wczesniej (guzik zbiorczy), zeby nie czytac drugi raz.
+    // tylkoGdyJest: sekcji nie pokazujemy, gdy nie ma czego ksiegowac ani dokonczyc (wolanie po ksiegowaniu zbiorczym).
+    async function mkKoncSkanuj(gotowe, tylkoGdyJest){
+        const lista = mkKoncPaczki();
+        const tol = tolGet();
+        const pakiety = [];
+        for (let i = 0; i < lista.length; i++){
+            const j = lista[i];
+            let rows = (gotowe && gotowe[String(j.impId)]) || null, err = '';
+            if (!rows){
+                say('Końcówki: czytam paczkę ' + (i + 1) + ' z ' + lista.length + ' — ' + j.impId + '…');
+                try { rows = (await impRows(j.impId)).rows; }
+                catch (e){ err = (e && e.message) || String(e); rows = []; }
+            }
+            const stop = err ? '' : (mkTypBlokada(j) || f1BlokadaKsiegowania(j, rows));
+            pakiety.push({ k: mkKlucz(j), j: j, rows: rows, err: err, stop: stop });
+        }
+        // Zapamietujemy wynik przy zleceniu — licznik w kroku 4 nie stoi wtedy na stale przy paczkach bez koncowek.
+        const jobs = jobsLoad();
+        let zm = false;
+        pakiety.forEach(function (p){
+            if (p.err) return;
+            const jj = mkKoncJob(jobs, p).j;
+            if (!jj) return;
+            const pr = mkProblemyZ(jj).ksiegowanie;
+            jj.koncSpr = { n: mkKoncWiersze(p.rows, tol).length, tol: tol, notka: pr ? pr.tekst : '' };
+            zm = true;
+        });
+        if (zm){ jobsSave(jobs); try { krokiRysuj(); } catch (e){} }     // licznik w kroku 4 od razu po zestawieniu
+        mkKonc = { pakiety: pakiety, tol: tol };
+        const ile = mkKoncIle();
+        if (!tylkoGdyJest || ile.n || ile.dok || ile.niep) mkKoncRysuj();
+        return ile;
+    }
+    // Wiersze do dokonczenia (status OK juz ustawiony, subkonto nie wyslane) i niepewne (subkonto wyslane bez potwierdzenia).
+    function mkKoncDokoncz(p, jobs){
+        const w = mkKoncWisi(mkKoncJob(jobs, p).j);
+        return (p.rows || []).filter(function (x){ const e = w[String(x.id)]; return String(x.state) === 'OK' && e && e.f === 'stan'; });
+    }
+    function mkKoncNiepewne(p, jobs){
+        const w = mkKoncWisi(mkKoncJob(jobs, p).j);
+        return Object.keys(w).filter(function (id){ return w[id].f === 'sub'; }).map(function (id){ return { id: id, d: w[id].d }; });
+    }
+    function mkKoncIle(){
+        const tol = (mkKonc && mkKonc.tol != null) ? mkKonc.tol : tolGet();
+        const jobs = jobsLoad();
+        let n = 0, m = 0, suma = 0, dok = 0, niep = 0, zera = 0;
+        ((mkKonc && mkKonc.pakiety) || []).forEach(function (p){
+            if (p.err) return;
+            niep += mkKoncNiepewne(p, jobs).length;
+            if (p.stop) return;
+            const w = mkKoncWiersze(p.rows, tol), d = mkKoncDokoncz(p, jobs);
+            zera += mkKoncZera(p.rows);
+            if (!w.length && !d.length) return;
+            m++; n += w.length; dok += d.length;
+            w.forEach(function (x){ suma = r2(suma + (impNum(x.open_amount) || 0)); });
+        });
+        return { n: n, m: m, suma: suma, dok: dok, niep: niep, zera: zera };
+    }
+    function mkKoncBox(){
+        let b = document.getElementById('mk-konc-box');
+        if (!b){
+            const imp = $('#mk-imp-box');
+            if (!imp) return null;
+            b = document.createElement('div');
+            b.id = 'mk-konc-box';
+            b.style.cssText = 'display:none;margin:10px 0;padding:10px 12px;border:1px solid #c4b5fd;border-radius:8px;background:#faf5ff';
+            imp.insertAdjacentElement('afterend', b);
+        }
+        return b;
+    }
+    function mkKoncRysuj(){
+        const b = mkKoncBox();
+        if (!b) return;
+        // Zestawienie zawsze przy BIEZACEJ tolerancji — mogla sie zmienic w widoku paczki.
+        if (mkKonc) mkKonc.tol = tolGet();
+        const tol = tolGet(), ile = mkKoncIle(), jobs = jobsLoad();
+        const pak = (mkKonc && mkKonc.pakiety) || [];
+        const wiersze = [], pomin = [], niep = [];
+        let poza = 0;
+        pak.forEach(function (p){
+            if (p.err){ pomin.push('paczka ' + p.j.impId + ': nie odczytałem (' + p.err + ')'); return; }
+            mkKoncNiepewne(p, jobs).forEach(function (x){ niep.push({ p: p, x: x }); });
+            if (p.stop){ pomin.push('paczka ' + p.j.impId + ': ' + p.stop); return; }
+            const w = mkKoncWiersze(p.rows, tol);
+            mkKoncDokoncz(p, jobs).forEach(function (x){ wiersze.push({ p: p, x: x, dok: true }); });
+            w.forEach(function (x){ wiersze.push({ p: p, x: x }); });
+            poza += (p.rows || []).filter(function (x){ return String(x.state) === 'CHECK'; }).length - w.length - mkKoncZera(p.rows);
+        });
+        const td = 'padding:1px 6px';
+        const znany = function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; };
+        let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
+              + '<b style="font-size:12px;color:#5b21b6">💰 Końcówki w tolerancji — na subkonto</b>'
+              + '<span style="font-size:11px;color:#374151;font-weight:700">' + ile.n + ' poz. w ' + ile.m + ' paczkach · razem ' + f2(ile.suma)
+              + (ile.dok ? (' · do dokończenia ' + ile.dok) : '') + '</span>'
+              + '<span style="font-size:11px;color:#666">tolerancja do <input id="mk-konc-tol" value="' + esc(String(tol)) + '" style="width:56px;font-size:11px">'
+              + ' <button id="mk-konc-tol-ok" class="mk-lnk">zastosuj</button> (ta sama, co w widoku paczki)</span>'
+              + '<button id="mk-konc-x" class="mk-lnk">✕ zamknij</button></div>'
+              + '<div style="font-size:10px;color:#6b7280;margin-bottom:4px">Wiersze CHECK z zaksięgowanych paczek, których open amount mieści się w tolerancji — '
+              + 'tak samo jak „Ustaw OK i zaksięguj na subkoncie" w widoku paczki, tylko ze wszystkich paczek naraz (Book on sub-account, bez przypisania).</div>';
+        if (!pak.length) h += '<div style="font-size:11px;color:#0a7a2f">Żadna zaksięgowana paczka nie ma zostawionych wierszy CHECK.</div>';
+        if (wiersze.length){
+            h += '<table style="border-collapse:collapse;font-size:11px;margin-bottom:6px"><tr style="color:#6b7280">'
+               + '<td style="' + td + '">paczka</td><td style="' + td + '">sklep</td><td style="' + td + '">data</td>'
+               + '<td style="' + td + '">numer</td><td style="' + td + '">auftrag</td><td style="' + td + ';text-align:right">wpłata</td>'
+               + '<td style="' + td + ';text-align:right">open amount</td><td style="' + td + '"></td></tr>'
+               + wiersze.map(function (w){
+                     return '<tr><td style="' + td + '"><a href="/react/settings_page/import_payments/' + esc(w.p.j.impId) + '/" target="_blank">' + esc(w.p.j.impId) + '</a></td>'
+                          + '<td style="' + td + '">' + esc(mkShort(w.p.j) || w.p.j.mp || '') + '</td>'
+                          + '<td style="' + td + '">' + esc(w.p.j.date || '') + '</td>'
+                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + esc(String(w.x.payment_descr == null ? '' : w.x.payment_descr)) + '</td>'
+                          + '<td style="' + td + '">' + esc(String(w.x.auction_number || '')) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + f2(impNum(w.x.amount)) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + (w.dok ? '—' : f2(impNum(w.x.open_amount))) + '</td>'
+                          + '<td style="' + td + ';color:#b45309">' + (w.dok ? 'dokończenie: status OK już ustawiony, subkonto nie poszło' : '')
+                          + (znany(w.x) ? (w.dok ? ' · ' : '') + '⚠ prologistics zna już tę płatność' : '') + '</td></tr>';
+                 }).join('') + '</table>'
+               + '<button id="mk-konc-go" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">'
+               + 'Zaksięguj na subkoncie (' + wiersze.length + ')</button> <span id="mk-konc-msg" style="font-size:11px;color:#666"></span>';
+        } else if (pak.length) h += '<div style="font-size:11px;color:#0a7a2f">W tolerancji do ' + f2(tol) + ' nie ma żadnego wiersza.</div>';
+        if (niep.length){
+            const wg = {};
+            niep.forEach(function (x){ (wg[x.p.k] = wg[x.p.k] || { p: x.p, l: [] }).l.push(x.x.d || x.x.id); });
+            h += '<div style="font-size:11px;color:#b91c1c;margin-top:6px;font-weight:700">⚠ Nie wiem, czy subkonto weszło — zapytanie wyszło, odpowiedź nie przyszła. Sprawdź paczkę w prologistics:</div>'
+               + Object.keys(wg).map(function (kk){
+                     const g = wg[kk];
+                     return '<div style="font-size:11px;margin:2px 0 2px 10px">paczka <a href="/react/settings_page/import_payments/' + esc(g.p.j.impId) + '/" target="_blank">'
+                          + esc(g.p.j.impId) + '</a>: ' + esc(g.l.join(', '))
+                          + ' <button class="mk-konc-weszlo mk-lnk" data-k="' + esc(kk) + '">✓ weszło — zdejmij ślad</button>'
+                          + ' <button class="mk-konc-jeszcze mk-lnk" data-k="' + esc(kk) + '">↻ nie weszło — dołącz do zapisu</button></div>';
+                 }).join('');
+        }
+        if (poza > 0) h += '<div style="font-size:10px;color:#6b7280;margin-top:4px">poza tolerancją zostaje CHECK: ' + poza + ' — te do wyjaśnienia w widoku paczki („🔍 Otwórz paczkę")</div>';
+        if (pomin.length) h += '<div style="font-size:10px;color:#b45309;margin-top:4px">pominięte: ' + esc(pomin.join(' · ')) + '</div>';
+        b.innerHTML = h;
+        b.style.display = 'block';
+        const x = b.querySelector('#mk-konc-x');
+        if (x) x.onclick = function(){ b.style.display = 'none'; };
+        const tok = b.querySelector('#mk-konc-tol-ok');
+        if (tok) tok.onclick = function(){
+            const v = Number(String(b.querySelector('#mk-konc-tol').value || '').replace(',', '.'));
+            if (!isFinite(v) || v < 0){ say('Podaj liczbę, np. 0.05.', '#c47f00'); return; }
+            tolSet(v); mkKoncRysuj();
+        };
+        const go = b.querySelector('#mk-konc-go');
+        if (go) go.onclick = function(){
+            Promise.resolve(mkKoncKsieguj(go)).catch(function (e){ say('Końcówki na subkonto: ' + ((e && e.message) || e), '#c00'); });
+        };
+        // Niepewne: czlowiek sprawdzil w prologistics. „weszło" zdejmuje slad; „nie weszło" przestawia go na dokonczenie.
+        b.querySelectorAll('.mk-konc-weszlo, .mk-konc-jeszcze').forEach(function (g){
+            g.onclick = function(){
+                const weszlo = g.classList.contains('mk-konc-weszlo');
+                const jobs2 = jobsLoad(), jj = jobs2[g.getAttribute('data-k')];
+                if (!jj) return;
+                const w = mkKoncWisi(jj);
+                Object.keys(w).forEach(function (id){ if (w[id].f === 'sub'){ if (weszlo) delete w[id]; else w[id].f = 'stan'; } });
+                if (Object.keys(w).length) jj.koncWisi = w; else { delete jj.koncWisi; mkProblemZdejmijZ(jj, 'koncowki'); }
+                jobsSave(jobs2);
+                render(); mkKoncRysuj();
+            };
+        });
+    }
+    async function mkKoncKsieguj(btn){
+        if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
+        if (mkWid.book || mkKsiegBieg){ say('Trwa księgowanie — końcówki zaksięgujesz po jego zakończeniu.', '#c47f00'); return; }
+        const tol = tolGet();
+        // Tolerancja zmieniona gdzie indziej (widok paczki) — tabela pokazuje inny zbior niz ten, ktory by poszedl.
+        if (!mkKonc || mkKonc.tol !== tol){
+            mkKoncRysuj();
+            say('Tolerancja zmieniła się (teraz do ' + f2(tol) + ') — przeliczyłem zestawienie, sprawdź je i kliknij jeszcze raz.', '#c47f00');
+            return;
+        }
+        const jobs0 = jobsLoad();
+        const plan = ((mkKonc && mkKonc.pakiety) || []).filter(function (p){ return !p.err && !p.stop; })
+            .map(function (p){ return { p: p, w: mkKoncWiersze(p.rows, tol), d: mkKoncDokoncz(p, jobs0) }; })
+            .filter(function (x){ return x.w.length || x.d.length; });
+        if (!plan.length){ mkKoncRysuj(); say('W tolerancji do ' + f2(tol) + ' nie ma nic do zaksięgowania — zestawienie odświeżone.', '#c47f00'); return; }
+        let n = 0, suma = 0;
+        plan.forEach(function (x){ n += x.w.length + x.d.length; x.w.forEach(function (y){ suma = r2(suma + (impNum(y.open_amount) || 0)); }); });
+        if (!confirm('Zaksięgować ' + n + ' końcówek z ' + plan.length + ' paczek na subkoncie (open amount razem ' + f2(suma) + ')?\n\n'
+            + plan.map(function (x){
+                  return '  • paczka ' + x.p.j.impId + '  ' + (mkShort(x.p.j) || x.p.j.mp || '') + ' ' + (x.p.j.date || '') + ': '
+                       + x.w.map(function (y){ return String(y.payment_descr == null ? '' : y.payment_descr) + ' wpłata ' + f2(impNum(y.amount)) + ', open ' + f2(impNum(y.open_amount)); })
+                           .concat(x.d.map(function (y){ return String(y.payment_descr == null ? '' : y.payment_descr) + ' (dokończenie)'; })).join('; ');
+              }).join('\n')
+            + '\n\nOdpowiada to ręcznej zmianie statusu na OK i przyciskowi „Book on sub-account" w każdej paczce. '
+            + 'Każdą paczkę czytam jeszcze raz tuż przed zapisem — idą tylko wiersze, które dalej są CHECK w tolerancji.'
+            + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+        btn.disabled = true;
+        const msg = document.getElementById('mk-konc-msg');
+        let paczek = 0, wierszy = 0;
+        const bad = [], zapisane = {};
+        mkImpBieg++; mkKsiegBieg++;
+        try {
+            for (let i = 0; i < plan.length; i++){
+                const x = plan[i], imp = x.p.j.impId;
+                let faza = '', ids = [];
+                if (msg) msg.textContent = 'paczka ' + (i + 1) + ' z ' + plan.length + ' — ' + imp + '…';
+                try {
+                    // Swiezy odczyt tuz przed zapisem: idzie tylko to, co DALEJ jest CHECK w tolerancji i bylo w potwierdzeniu,
+                    // plus dokonczenie poprzedniego przerwanego zapisu. Bramki tez na swiezo.
+                    const swieze = (await impRows(imp)).rows;
+                    const js1 = jobsLoad(), z1 = mkKoncJob(js1, x.p);
+                    const stopT = mkTypBlokada(z1.j || x.p.j) || f1BlokadaKsiegowania(z1.j || x.p.j, swieze);
+                    if (stopT){ bad.push(imp + ': ' + stopT); continue; }
+                    const potw = {};
+                    x.w.forEach(function (y){ potw[String(y.id)] = 1; });
+                    const teraz = mkKoncWiersze(swieze, tol).filter(function (y){ return potw[String(y.id)]; });
+                    const wisi = mkKoncWisi(z1.j);
+                    const dok = swieze.filter(function (y){ const e = wisi[String(y.id)]; return String(y.state) === 'OK' && e && e.f === 'stan'; });
+                    if (!teraz.length && !dok.length){ bad.push(imp + ': tych wierszy nie ma już w paczce jako CHECK'); continue; }
+                    // Slad PRZED pierwszym zapytaniem — przezyje blad w polowie.
+                    if (z1.j){
+                        teraz.forEach(function (y){ wisi[String(y.id)] = { d: String(y.payment_descr == null ? '' : y.payment_descr), f: 'stan' }; });
+                        z1.j.koncWisi = wisi; jobsSave(js1);
+                    }
+                    faza = 'stan';
+                    for (let k = 0; k < teraz.length; k++) await impState(imp, teraz[k].id, 'OK');
+                    ids = teraz.concat(dok).map(function (y){ return String(y.id); });
+                    const js2 = jobsLoad(), z2 = mkKoncJob(js2, x.p);
+                    if (z2.j){
+                        const w2 = mkKoncWisi(z2.j);
+                        ids.forEach(function (id){ w2[id] = { d: (w2[id] && w2[id].d) || '', f: 'sub' }; });
+                        z2.j.koncWisi = w2; jobsSave(js2);
+                    }
+                    faza = 'sub';
+                    await impBookSub(imp, ids);
+                    faza = 'po';
+                    paczek++; wierszy += ids.length; zapisane[String(imp)] = x.p.j;
+                    // Otwarty widok tej paczki ma jeszcze czynne „Ustaw OK i zaksięguj na subkoncie" z migawki — gasimy od razu.
+                    if (mkImpWidok === String(imp)){
+                        const bx = document.getElementById('mk-imp-box'), g = bx ? bx.querySelector('#mk-fix') : null;
+                        if (g){ g.disabled = true; g.textContent = '✔ Końcówki zaksięgowane na subkoncie'; }
+                    }
+                    let po = null;
+                    try { po = (await impRows(imp)).rows; } catch (e){}
+                    const js3 = jobsLoad(), z3 = mkKoncJob(js3, x.p);
+                    if (z3.j){
+                        const w3 = mkKoncWisi(z3.j);
+                        ids.forEach(function (id){ delete w3[id]; });
+                        if (Object.keys(w3).length) z3.j.koncWisi = w3; else { delete z3.j.koncWisi; mkProblemZdejmijZ(z3.j, 'koncowki'); }
+                        if (po){
+                            const nChk = po.filter(function (r){ return String(r.state) === 'CHECK'; }).length;
+                            const nNf = impNfZostaje(z3.j, po);
+                            if (!nChk && !nNf) mkProblemZdejmijZ(z3.j, 'ksiegowanie');
+                            else mkProblemUstawW(z3.j, 'ksiegowanie', 'księgowanie paczki ' + imp,
+                                'końcówki na subkoncie zaksięgowane (' + ids.length + ' poz.), ale zostały w paczce: '
+                                + [nChk ? ('CHECK ' + nChk) : '', nNf ? ('NOT FOUND ' + nNf) : ''].filter(Boolean).join(', ')
+                                + ' — te pozycje nie weszły');
+                        }
+                        jobsSave(js3);
+                    }
+                    // Zestawienie z wierszy PO zapisie; gdy odczyt padl — przynajmniej te wiersze juz nie sa „do zrobienia".
+                    if (po) x.p.rows = po;
+                    else x.p.rows = (x.p.rows || []).map(function (r){ return ids.indexOf(String(r.id)) >= 0 ? Object.assign({}, r, { state: 'OK' }) : r; });
+                } catch (e){
+                    const opis = (e && e.message) || String(e);
+                    bad.push(imp + ': ' + opis + (faza === 'sub' ? ' — NIE WIEM, czy subkonto weszło: sprawdź paczkę w prologistics' : ''));
+                    // Zestawienie po bledzie ma pokazac stan z paczki (np. wiersz ze statusem OK jako „dokończenie"), nie stary odczyt.
+                    try { x.p.rows = (await impRows(imp)).rows; } catch (e2){}
+                    const js4 = jobsLoad(), z4 = mkKoncJob(js4, x.p);
+                    if (z4.j && Object.keys(mkKoncWisi(z4.j)).length){
+                        mkProblemUstawW(z4.j, 'koncowki', 'końcówki na subkonto, paczka ' + imp,
+                            faza === 'sub' ? ('subkonto wysłane bez potwierdzenia (' + opis + ') — sprawdź paczkę w prologistics i odhacz w „💰 Końcówki na subkonto”')
+                                           : ('status OK ustawiony, subkonto nie poszło (' + opis + ') — dokończ w „💰 Końcówki na subkonto”'));
+                        jobsSave(js4);
+                    }
+                }
+            }
+        } finally {
+            mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1);
+            btn.disabled = false;
+        }
+        // Otwarty widok paczki, na ktora poszedl zapis — od nowa, ze swiezego odczytu (nie ze starej migawki).
+        const bxW = document.getElementById('mk-imp-box');
+        if (mkImpWidok && zapisane[mkImpWidok] && bxW && bxW.style.display !== 'none'){
+            const jw = zapisane[mkImpWidok];
+            try { await impCheck(mkKluczPamieci(jobsLoad(), jw) || mkKlucz(jw)); } catch (e){}
+        }
+        render();
+        mkKoncRysuj();
+        say('Końcówki na subkoncie: zaksięgowane ' + wierszy + ' poz. w ' + paczek + ' z ' + plan.length + ' paczek'
+            + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.'), bad.length ? '#c47f00' : '#0a7a2f');
+    }
     async function bookAllPackages(b){
         const list = bookList();
         if (!list.length) return;
@@ -55294,7 +55678,31 @@
             render();
         }
         b.disabled = false;
-        say('Zaksięgowanych paczek ' + done + ' z ' + good.length + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.'), bad.length ? '#c00' : '#0a7a2f');
+        // Koncowki w tolerancji z zaksiegowanych paczek — jedno zestawienie zamiast otwierania kazdej paczki (06.10.2026).
+        // Wiersze zaksiegowanych przed chwila paczek mamy z planu (ksiegowanie OK nie rusza wierszy CHECK).
+        let konc = null;
+        // Pelne zestawienie (z odczytem wczesniejszych paczek) tylko wtedy, gdy wlasnie zaksiegowane paczki maja koncowki —
+        // ich wiersze sa juz w planie, wiec samo sprawdzenie nic nie kosztuje (przeglad 06.10.2026).
+        const tolK = tolGet();
+        const jestKonc = good.some(function (p){ const jj = jobsLoad()[mkKlucz(p.j)]; return jj && jj.booked && mkKoncWiersze(p.rows, tolK).length; });
+        if (done && jestKonc){
+            const got = {};
+            good.forEach(function (p){ got[String(p.j.impId)] = p.rows; });
+            try { konc = await mkKoncSkanuj(got, true); } catch (e){ konc = null; }
+        }
+        const zostaly = [];
+        good.forEach(function (p){
+            const jz = jobsLoad()[mkKlucz(p.j)];
+            const pr = jz && jz.booked ? mkProblemyZ(jz).ksiegowanie : null;
+            const m = pr && String(pr.tekst).match(/zostały w paczce: ([^—]+?)\s*—/);
+            if (m) zostaly.push('paczka ' + p.j.impId + ' (' + ((jz.data && jz.data.shop) || jz.mp || '') + '): ' + m[1]);
+        });
+        say('Zaksięgowanych paczek ' + done + ' z ' + good.length + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.')
+            + (zostaly.length ? (' ⚠ W paczkach zostało (nie weszło): ' + zostaly.join(' · ') + ' — opis przy zleceniach w grupie ⑤.') : '')
+            + ((konc && konc.n) ? (' Końcówki w tolerancji: ' + konc.n + ' poz. w ' + konc.m + ' paczkach (razem ' + f2(konc.suma)
+                                   + ') — zestawienie „💰 Końcówki na subkonto" pod widokiem paczki.') : ''),
+            bad.length ? '#c00' : '#0a7a2f');
+        if (konc && konc.n){ try { const kb = document.getElementById('mk-konc-box'); if (kb) kb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
     }
 
     async function impCheck(ref){
@@ -85335,7 +85743,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '38cc0cf · 05.10.2026 15:57';
+    const HUB_BUDOWA = '62bbca3 · 06.10.2026 07:04';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
