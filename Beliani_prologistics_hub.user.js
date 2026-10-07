@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.7
+// @version      5.59.8
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -32291,6 +32291,8 @@
         }
         else if (!manor && full && a.pay != null && !eq(net, j.amount)) bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
         if (manor){
+            const docSumImp = (o.docSumImp == null) ? docSum : o.docSumImp;   // bez dokumentow od Manora
+            const odM = docs.filter(function (d){ return d && d.od; });
             // Kontrola Manora stoi na DOKUMENTACH, nie na wierszu wyplaty.
             // Dwa progi, oba musza przejsc: suma dokumentow ma sie rownac
             // wplacie, a pozycje sciagniete z cykli — sumie dokumentow.
@@ -32308,12 +32310,39 @@
                         why = ' — różnica to dokładnie podwójna kwota ' + d.nr
                             + ' (typ „' + (d.typ || '?') + '"), czyli ten dokument ma odwrotny znak, a nie brakuje pozycji';
                 });
+                // Skonto w awizie: Manor zaplacil mniej niz suma dokumentow — to nie brak dokumentu.
+                const avz = j.avis;
+                if (!why && avz && avz.sumaBetrag != null && avz.suma != null && !eq(avz.sumaBetrag, avz.suma))
+                    why = ' — w awizie jest skonto: dokumenty na ' + f2(avz.sumaBetrag) + ', zapłacone ' + f2(avz.suma);
                 bad.push('suma dokumentów ' + f2(docSum) + ' ≠ ' + f2(j.amount) + ' z wyciągu' + why);
             }
-            else if (full && !eq(net, docSum)) bad.push('pozycje z cykli ' + f2(net) + ' ≠ suma dokumentów ' + f2(docSum)
+            // Dokumenty OD Manora (faktury i noty reczne z zakladki „For shop") licza sie do sumy wplaty,
+            // ale ich pozycje nie ida do importu — pozycje z cykli porownujemy wiec z samymi IN…/CN….
+            else if (full && !eq(net, docSumImp)) bad.push('pozycje z cykli ' + f2(net) + ' ≠ suma dokumentów'
+                + (odM.length ? ' do importu' : '') + ' ' + f2(docSumImp)
                 + ' — cykl noty kredytowej niesie coś ponad samą notę, nie zaimportuję tego na ślepo');
-            j.note = 'dokumenty: ' + docs.map(function (d){ return d.nr + ' ' + f2(d.val); }).join(' · ')
-                   + ' · cykli: ' + cycIds.length;
+            // Awizo z poczty (gdy wgrane) to druga, niezalezna od panelu lista kwot — kazdy dokument
+            // ma sie zgadzac co do grosza. Rozjazd to blad w panelu albo w awizie, nie do importu.
+            if (j.avis && (j.avis.poz || []).length){
+                const bez0 = function (v){ return String(v == null ? '' : v).toUpperCase().replace(/^0+/, ''); };
+                const wAv = {};
+                j.avis.poz.forEach(function (p){ wAv[bez0(p.nr)] = p.kw; });
+                docs.forEach(function (d){
+                    const a = wAv[bez0(d.nr)];
+                    if (a != null && d.val != null && !eq(a, d.val))
+                        bad.push('dokument ' + d.nr + ': panel mówi ' + f2(d.val) + ', awizo ' + f2(a));
+                });
+            }
+            // Kontrola netto Manora stoi na dokumentach: suma wszystkich = wplata, pozycje = dokumenty
+            // do importu. Bez tego „kontrola netto ✗" porownywalaby same pozycje IN…/CN… z wplata.
+            j.data.netOk = full && eq(docSum, j.amount) && eq(net, docSumImp);
+            j.note = 'dokumenty: ' + docs.filter(function (d){ return !d.od; })
+                                         .map(function (d){ return d.nr + ' ' + f2(d.val); }).join(' · ')
+                   + (odM.length ? (' · od Manora (poza importem): '
+                        + odM.map(function (d){ return d.nr + ' ' + f2(d.val); }).join(' · ')) : '')
+                   + ' · cykli: ' + cycIds.length
+                   + (j.avis ? (' · awizo' + (j.avis.nr ? (' ' + j.avis.nr) : '')
+                        + (j.avis.valuta ? (' z ' + j.avis.valuta) : '') + ': ' + f2(j.avis.suma)) : '');
         }
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join('; ');
@@ -33440,7 +33469,12 @@
     // z bank_settingu, i na tym polega roznica wobec pozostalych marketplace'ow.
     const MK_AMZ_ACC = {
         de: { acc: '1323', vat: { 'B2C': '3252', 'B2B': '3283', 'B2B 0%': '3264' } },
-        uk: { acc: '1282', vat: { 'B2C': '3289', 'B2B': '3205' } },
+        // UK „B2B 0%" (06.10.2026, decyzja uzytkownika: „idzie bez zmian 1282 i konto 3205").
+        // Zamowienie bez Tax i bez MarketplaceFacilitatorVAT to wysylka poza obszar VAT UK —
+        // pierwsze takie: 205-1925872-7401166 na Guernsey (auftrag 15634701, rozliczenie
+        // 27846105592). Do tej pory brak wpisu blokowal plik calego rozliczenia (amzBrakKont).
+        // Typ klienta na auftragu zostaje B2C — patrz MK_AMZ_TYP_BEZ_VAT.
+        uk: { acc: '1282', vat: { 'B2C': '3289', 'B2B': '3205', 'B2B 0%': '3205' } },
         // FR nie ma konta dla „B2B" i to jest stan swiadomy, a nie przeoczenie: w 7
         // rozliczeniach FR (26.05–09.08.2026, 1898 zamowien) nie bylo ANI JEDNEGO B2B —
         // same B2C (1706) i B2B 0% (192). Nie zgadujemy numeru konta. Gdyby FR B2B kiedys
@@ -41730,7 +41764,9 @@
         const hit = list.filter(function (x){
             return same(manorVal(x, ['number', 'documentnumber']), nr);
         })[0];
-        if (!hit) return { nr: nr, err: 'panel nie zna takiego dokumentu' };
+        // „brak" = nie ma go na TEJ liscie (dokumenty nasze dla Manora). manorDocs szuka go wtedy
+        // jeszcze wsrod dokumentow OD Manora (manorDocOd) i dopiero potem uznaje za nieznany.
+        if (!hit) return { nr: nr, brak: true, err: 'panel nie zna takiego dokumentu — nie ma go ani wśród naszych dokumentów dla Manora (IN…/CN…), ani wśród dokumentów od Manora' };
         const out = { nr: nr, keys: Object.keys(hit) };
         out.cyc = String(manorVal(hit, ['shopbillingcycleid', 'billingcycleid', 'billingcycle', 'cycle']) || '');
         out.cur = String(manorVal(hit, ['currencycode', 'currency']) || '');
@@ -41765,8 +41801,197 @@
     }
     async function manorDocs(nrs){
         const out = [];
-        for (let i = 0; i < nrs.length; i++) out.push(await manorDoc(nrs[i]));
+        let od = null;                 // lista dokumentow OD Manora — pobierana raz i dopiero, gdy potrzebna
+        for (let i = 0; i < nrs.length; i++){
+            let d = await manorDoc(nrs[i]);
+            if (d.brak){
+                if (!od) od = await manorDocsOd();
+                d = manorDocOd(nrs[i], od) || d;
+            }
+            out.push(d);
+        }
         return out;
+    }
+    // ===== Manor: dokumenty OD operatora (zakladka „For shop") =====
+    // Zmierzone na zywym panelu 07.10.2026: przelew z 01.10 (10 886,08 CHF) regulowal piec dokumentow,
+    // a dwa z nich — 248017 (faktura reczna 1 124,24) i 248018 (nota reczna 910,00) — NIE stoja na
+    // liscie „For the operator" (MANOR_DOC: tylko nasze IN…/CN…), lecz na drugiej, „For shop": to
+    // dokumenty wystawione przez Manora dla nas. Inne API, typ w polu „type" (MANUAL_INVOICE,
+    // MANUAL_CREDIT, AUTOMATIC_INVOICE), numer dopelniony zerami do 12 cyfr (000000248017). Stad
+    // dawne „panel nie zna takiego dokumentu" przy KAZDYM numerze bez prefiksu — takze przy 247638,
+    // na ktorym opisano MANUAL_CREDIT. Adresy wziete z ruchu samego panelu (wszystkie 200): lista
+    // stronami (limit + nextPageToken → pageToken), PDF pod /<id>/download
+    // (Content-Disposition: attachment; filename="invoice-000000248017.pdf").
+    // Te dokumenty NIE ida do pliku importu — ich pozycje nie sa zamowieniami. Licza sie w sumie
+    // dokumentow, ktora ma sie zgodzic z wplata; na liscie stoja jako informacja z PDF-em.
+    const MANOR_DOC_OD = '/sellerpayment/private/accounting-document/finalized';
+    async function manorDocsOd(){
+        const out = [], byl = {};
+        let tok = '', str = 0;
+        do {
+            const j = await mkApi(MANOR_DOC_OD + '?state=ISSUED&sort=dateCreated%2CDESC&limit=100'
+                                + (tok ? ('&pageToken=' + encodeURIComponent(tok)) : ''));
+            let nowe = 0;
+            mkArr(j).forEach(function (x){
+                const k = String((x && x.id) || JSON.stringify(x));
+                if (byl[k]) return;
+                byl[k] = 1; out.push(x); nowe++;
+            });
+            tok = (j && j.nextPageToken) || '';
+            str++;
+            if (!nowe) break;              // strona bez nowych pozycji — dalej nie przewiniemy
+        } while (tok && str < 20);
+        return out;
+    }
+    // Faktura OD operatora to jego naleznosc od nas — przelew maleje; nota (credit) — rosnie.
+    // Odwrotnie niz przy naszych IN…/CN… i tak samo, jak w awizie: 248017 „S 1,124.24-", 248018
+    // „H 910.00". payableAmount ma ten sam znak przy MANUAL_* (−1124.24 / +910), ale przy
+    // AUTOMATIC_INVOICE niesie kwote CALEGO cyklu (8486.43 przy fakturze abonamentowej na 42.16),
+    // dlatego znak bierzemy z typu, a payableAmount tylko sprawdza MANUAL_*.
+    function manorDocOd(nr, lista){
+        const bez0 = function (v){ return String(v == null ? '' : v).toUpperCase().replace(/^0+/, ''); };
+        const hit = (lista || []).filter(function (x){ return bez0(manorVal(x, ['number', 'documentnumber'])) === bez0(nr); });
+        if (!hit.length) return null;
+        if (hit.length > 1) return { nr: nr, od: true, err: 'numer stoi ' + hit.length + ' razy na liście dokumentów od Manora — nie wiem, który to' };
+        const x = hit[0];
+        const out = { nr: nr, od: true, id: String(x.id || ''), num: String(manorVal(x, ['number', 'documentnumber']) || ''),
+                      keys: Object.keys(x) };
+        out.cyc = String(manorVal(x, ['shopbillingcycleid', 'billingcycleid', 'billingcycle', 'cycle']) || '');
+        out.cur = String(manorVal(x, ['currencycode', 'currency']) || '');
+        out.typ = String(manorVal(x, ['type', 'documentrequesttype', 'documenttype']) || '').toUpperCase();
+        const amt = mkNum(manorVal(x, ['totalamountincludingtaxes', 'amountincludingtaxes',
+                                       'totalincludingtaxes', 'incltaxes', 'totalamount']));
+        const sgn = /CREDIT/.test(out.typ) ? 1 : (/INVOICE|DEBIT/.test(out.typ) ? -1 : 0);
+        out.val = (amt == null || !sgn) ? null : r2(sgn * Math.abs(amt));
+        if (!out.id) out.err = 'w odpowiedzi nie widzę identyfikatora dokumentu';
+        else if (amt == null) out.err = 'w odpowiedzi nie widzę kwoty brutto';
+        else if (!sgn) out.err = 'nie rozpoznaję typu dokumentu od Manora („' + out.typ + '") — nie wiem, czy dodaje, czy odejmuje';
+        else if (/^MANUAL_/.test(out.typ) && x.payableAmount != null){
+            const pa = mkNum(x.payableAmount);
+            if (pa != null && !eq(pa, out.val))
+                out.err = 'kwota ze znakiem z typu (' + f2(out.val) + ') nie zgadza się z „payableAmount" panelu (' + f2(pa) + ')';
+        }
+        return out;
+    }
+    function manorTypOd(typ){
+        const t = String(typ || '').toUpperCase();
+        if (t === 'MANUAL_INVOICE') return 'faktura ręczna';
+        if (t === 'MANUAL_CREDIT') return 'nota ręczna';
+        if (t === 'AUTOMATIC_INVOICE') return 'faktura automatyczna';
+        return t ? t.toLowerCase() : 'dokument';
+    }
+    // PDF dokumentu od Manora — ten sam adres, pod ktory kieruje guzik „Download" w panelu.
+    // Z prologistics przez GM (ciasteczko sesji Manora dobiera menedzer skryptow, jak w mkApi),
+    // na samym panelu zwyklym fetch-em. Nazwa z Content-Disposition, a gdy jej brak — taka,
+    // jak z panelu (invoice-/credit-<numer>.pdf).
+    function manorPdfNazwa(d, naglowki){
+        const m = String(naglowki || '').match(/filename\*?\s*=\s*(?:UTF-8'')?"?([^";\r\n]+)"?/i);
+        if (m){ try { return decodeURIComponent(m[1]).trim(); } catch (e){ return m[1].trim(); } }
+        return (/CREDIT/.test(String(d.typ || '')) ? 'credit-' : 'invoice-') + (d.num || d.nr) + '.pdf';
+    }
+    async function manorPdf(j, d){
+        const host = onMirakl ? location.hostname : String((j && j.host) || 'manor-prod.mirakl.net');
+        const sciezka = MANOR_DOC_OD + '/' + encodeURIComponent(d.id) + '/download';
+        let u8, nagl = '';
+        if (onMirakl){
+            const r = await fetch(sciezka, { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' na ' + MANOR_DOC_OD + '/…/download');
+            u8 = new Uint8Array(await r.arrayBuffer());
+            nagl = 'content-disposition: ' + (r.headers.get('content-disposition') || '');
+        } else {
+            const r = await new Promise(function (ok, nie){
+                if (typeof GM_xmlhttpRequest === 'undefined'){ nie(new Error('brak GM_xmlhttpRequest')); return; }
+                GM_xmlhttpRequest({
+                    method: 'GET', url: 'https://' + host + sciezka, timeout: 90000,
+                    headers: { 'accept': 'application/pdf, */*' }, responseType: 'arraybuffer',
+                    // Gdyby menedzer zignorowal responseType: tekst bajt po bajcie (x-user-defined), nie UTF-8.
+                    overrideMimeType: 'text/plain; charset=x-user-defined',
+                    onload: ok,
+                    onerror: function (){ nie(new Error('nie mogę połączyć się z ' + host)); },
+                    ontimeout: function (){ nie(new Error(host + ' nie odpowiedział na czas')); }
+                });
+            });
+            if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + MANOR_DOC_OD + '/…/download');
+            // Menedzer, ktory zignoruje responseType, oddaje tekst — bajty odzyskujemy jak w c24Plik.
+            if (r.response && r.response.byteLength != null) u8 = new Uint8Array(r.response);
+            else {
+                const t = String(r.responseText || '');
+                u8 = new Uint8Array(t.length);
+                for (let i = 0; i < t.length; i++) u8[i] = t.charCodeAt(i) & 0xFF;
+            }
+            nagl = String(r.responseHeaders || '');
+        }
+        let glowa = '';
+        for (let i = 0; i < Math.min(5, u8.length); i++) glowa += String.fromCharCode(u8[i]);
+        if (glowa.indexOf('%PDF') !== 0)
+            throw new Error('zamiast PDF-u przyszło coś innego (' + u8.length + ' B) — najpewniej strona logowania, zaloguj się na ' + host);
+        const nazwa = manorPdfNazwa(d, nagl);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([u8], { type: 'application/pdf' }));
+        a.download = nazwa;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+        return nazwa;
+    }
+    // ===== Manor: awizo „Regulierte Zahlung" (PDF z maila) =====
+    // Gdy tytul przelewu mowi „SIEHE AVIS", numery dokumentow sa tylko w awizie. Uklad z prawdziwego
+    // pliku (Manor_Zahlung_0020012344_20261001.pdf): naglowek z numerem platnosci w nawiasie
+    // i „Valutadatum", potem wiersze
+    //   Belegnr     Ref.BelegNr GsBe Bezeichnung [Belegkopftext]       Bel.Datum  S/H Betrag     Skonto    Regul.Betrag
+    //   1100080640  IN2858A-89  0120 eManor 5262440649_5653184088      01.09.2026 H   82.50 CHF  0.00      82.50
+    //   2600015827  248017      0120 eManor                            25.09.2026 S   1,124.24- CHF 0.00   1,124.24-
+    // i „Gesamtsumme 10,886.08 CHF 0.00 10,886.08 *". Numerem dokumentu w panelu jest Ref.BelegNr —
+    // Belegnr to numer wewnetrzny Manora, w Miraklu go nie ma. Minus stoi ZA liczba.
+    function manorAvisKw(s){
+        let t = String(s == null ? '' : s).trim();
+        const minus = /-$/.test(t) || /^-/.test(t);
+        t = t.replace(/^-+|-+$/g, '').replace(/['’\s]/g, '');
+        const m = t.match(/^(\d[\d.,]*)[.,](\d{2})$/);
+        if (!m) return null;
+        const calk = m[1].replace(/[.,]/g, '');
+        if (!/^\d+$/.test(calk)) return null;
+        const v = Number(calk + '.' + m[2]);
+        return minus ? -v : v;
+    }
+    const MANOR_AVIS_WIERSZ = /^(\d{8,12})\s+(\S+)\s+(\d{3,4})\s+(.*?)\s*(\d{2}\.\d{2}\.\d{4})\s+([SH])\s+(-?\d[\d.,'’]*-?)\s+([A-Z]{3})\s+(-?\d[\d.,'’]*-?)\s+(-?\d[\d.,'’]*-?)\s*\*?$/;
+    function manorAvisParse(tekst){
+        const t = String(tekst || '');
+        if (!/MANOR\s*AG/i.test(t) || !/Regulierte\s+Zahlung/i.test(t))
+            return { err: 'to nie wygląda na awizo Manora („Regulierte Zahlung" od MANOR AG)' };
+        const linie = t.split(/\r?\n/).map(function (x){ return x.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+        const poz = [], nieczytane = [];
+        let suma = null, sumaReg = null, cur = '';
+        linie.forEach(function (l){
+            const m = l.match(MANOR_AVIS_WIERSZ);
+            if (m){
+                poz.push({ beleg: m[1], nr: m[2].toUpperCase(), data: m[5], sh: m[6], kw: manorAvisKw(m[7]),
+                           cur: m[8], reg: manorAvisKw(m[10]), txt: l });
+                return;
+            }
+            const g = l.match(/^Gesamtsumme\s+(\S+)\s+([A-Z]{3})\s+(\S+)\s+(\S+)/i);
+            if (g){ suma = manorAvisKw(g[1]); cur = g[2]; sumaReg = manorAvisKw(g[4]); return; }
+            if (/^\d{8,12}\s/.test(l)) nieczytane.push(l);
+        });
+        const nr = (t.match(/\(\s*0*(\d{5,})\s*\)/) || [])[1] || '';
+        const valuta = (t.match(/Valutadatum\s*:?\s*(\d{2}\.\d{2}\.\d{4})/i) || [])[1] || '';
+        if (nieczytane.length)
+            return { err: 'nie umiem przeczytać ' + nieczytane.length + ' wiersza(y) awiza: ' + nieczytane.slice(0, 3).join(' | ') };
+        if (!poz.length) return { err: 'w awizie nie znalazłem żadnego wiersza z dokumentem' };
+        const zle = poz.filter(function (p){
+            return p.kw == null || p.reg == null || (p.sh === 'S' && p.reg > 0) || (p.sh === 'H' && p.reg < 0);
+        });
+        if (zle.length)
+            return { err: 'kwota albo strona S/H nie do odczytania w: ' + zle.slice(0, 3).map(function (p){ return p.txt; }).join(' | ') };
+        if (sumaReg == null) return { err: 'w awizie nie widzę „Gesamtsumme"' };
+        let razem = 0;
+        poz.forEach(function (p){ razem = r2(razem + p.reg); });
+        if (!eq(razem, sumaReg))
+            return { err: 'wiersze awiza dają ' + f2(razem) + ', a „Gesamtsumme" mówi ' + f2(sumaReg) + ' — nie przeczytałem wszystkiego' };
+        const ile = {};
+        poz.forEach(function (p){ ile[p.nr] = (ile[p.nr] || 0) + 1; });
+        const dwa = Object.keys(ile).filter(function (x){ return ile[x] > 1; });
+        if (dwa.length) return { err: 'ten sam numer dokumentu stoi w awizie więcej niż raz: ' + dwa.join(', ') };
+        return { nr: nr, valuta: valuta, cur: cur || poz[0].cur || '', suma: sumaReg, sumaBetrag: suma, poz: poz };
     }
     // Cykl rozliczeniowy zamyka sie w dniu wyplaty: okres 11/07-21/07 zostal utworzony
     // 21 lipca o 00:02 i tego samego dnia przyszedl przelew. Dlatego zamiast przegladac
@@ -42857,7 +43082,7 @@
             dopasowane[id] = 1;
             // --- konto sprzedazy ---
             const dozw = okKonta[typ];
-            // v3.96: typ, dla ktorego tabela kont NIE MA wpisu (dzis: FR/NL B2B, UK B2B 0%).
+            // v3.96: typ, dla ktorego tabela kont NIE MA wpisu (dzis: FR/NL B2B; UK B2B 0% ma 3205 od 06.10.2026).
             // Dotad taki wiersz przechodzil po cichu, bo nie bylo z czym porownac —
             // a to jest dokladnie sytuacja, ktora trzeba zobaczyc (decyzja z 13.08.2026).
             if (typ && !dozw && w.length){
@@ -43701,18 +43926,160 @@
              + '</div>';
     }
 
+    // Manor po wpisaniu numerow: dopasowanie rusza od razu. Funkcje ustawia blok „Mirakl: pobranie
+    // rozliczen" (tam zyje mkPass); do tego czasu null i wtedy prosimy o „⬇ Pobierz zestawienia".
+    let mkManorTeraz = null;
     function manorBox(j){
         if (!onProlo || String(j.mp || '') !== 'Manor') return '';
         const st = j.status || 'new';
         if (st !== 'partial' && st !== 'err' && st !== 'new') return '';
+        const k = esc(mkKlucz(j));
+        const bezNumerow = !(j.docs || []).length;
         return '<div style="margin-top:4px;padding:4px 6px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px">'
-             + '<span style="font-size:10px;color:#7c2d12">numery dokumentów z przelewu (po przecinku):</span> '
-             + '<input class="mk-mdoc" data-k="' + esc(mkKlucz(j)) + '" value="' + esc((j.docs || []).join(', ')) + '" '
-             + 'placeholder="IN2858A-80, CN2858A-68, 247638" '
+             + (bezNumerow
+                 ? ('<div style="font-size:11px;color:#9a3412;font-weight:700;margin-bottom:3px">'
+                    + 'W tytule przelewu nie ma numerów dokumentów — dodaj PDF awiza z maila od Manora, '
+                    + 'numery uzupełnię i sprawdzę sam.</div>')
+                 : '')
+             + '<span style="font-size:10px;color:#7c2d12">numery dokumentów (kolumna „Ref.BelegNr" w awizie, po przecinku):</span> '
+             + '<input class="mk-mdoc" data-k="' + k + '" value="' + esc((j.docs || []).join(', ')) + '" '
+             + 'placeholder="IN2858A-89, CN2858A-77, 248017" '
              + 'style="width:280px;font-size:11px;padding:2px 4px;border:1px solid #fdba74;border-radius:4px">'
-             + ' <button class="mk-mdocb" data-k="' + esc(mkKlucz(j)) + '" '
+             + ' <button class="mk-mdocb" data-k="' + k + '" title="Zapisuje numery i od razu sprawdza je w panelu Manora" '
              + 'style="padding:2px 8px;border:none;border-radius:4px;background:#ea580c;color:#fff;'
-             + 'font-size:11px;cursor:pointer">zapisz numery</button></div>';
+             + 'font-size:11px;cursor:pointer">zapisz i sprawdź</button>'
+             + ' <button class="mk-mavis" data-k="' + k + '" '
+             + 'title="PDF „Regulierte Zahlung” z maila od Manora — numery dokumentów i kwoty wezmę z awiza" '
+             + 'style="padding:2px 8px;border:1px solid #ea580c;border-radius:4px;background:#fff;color:#9a3412;'
+             + 'font-size:11px;cursor:pointer' + (bezNumerow ? ';font-weight:700' : '') + '">📎 Awizo z maila (PDF)</button>'
+             + (j.avis
+                 ? ('<div style="font-size:10px;color:#7c2d12;margin-top:2px">numery z awiza „' + esc(j.avis.plik || '') + '”'
+                    + (j.avis.valuta ? (' · valuta ' + esc(j.avis.valuta)) : '')
+                    + ' · suma ' + f2(j.avis.suma) + ' ' + esc(j.avis.cur || '') + '</div>')
+                 : '')
+             + '</div>';
+    }
+    // Dokumenty OD Manora przy zleceniu (manorDocOd): tylko informacja — nie ida do importu, licza sie
+    // w sumie wplaty. Numer jest odnosnikiem do PDF-u z panelu (manorPdf).
+    // Decyzja uzytkownika 07.10.2026: zaksiegowane zlecenie zostaje w „zaksięgowane z uwagami" (mkUwagaPo),
+    // dopoki ktos nie odhaczy, ze te dokumenty sa zalatwione (j.manorOdZal = { kiedy: UTC }). To rozwiazanie
+    // PRZEJSCIOWE — regula ksiegowania dokumentow od Manora ma byc ustalona pozniej.
+    function manorOdBox(j){
+        if (!onProlo || String(j.mp || '') !== 'Manor') return '';
+        const od = (j.manorOd || []).filter(function (d){ return d && d.id; });
+        if (!od.length) return '';
+        const k = esc(mkKlucz(j)), zal = j.manorOdZal;
+        let razem = 0;
+        od.forEach(function (d){ razem = r2(razem + (Number(d.val) || 0)); });
+        const g = 'padding:1px 7px;border:1px solid #1d4ed8;border-radius:5px;background:#fff;color:#1d4ed8;'
+                + 'font-size:10px;cursor:pointer;margin-left:6px';
+        const stopka = '<div style="margin-top:3px">'
+             + (zal
+                 ? ('<span style="color:#166534;font-weight:700">✓ załatwione</span> <span style="color:#64748b">(odhaczone '
+                    + esc(mkCzasLok(zal.kiedy || '')) + ')</span>'
+                    + '<button class="mk-mzal" data-k="' + k + '" data-co="cofnij" style="' + g + '">↶ cofnij</button>')
+                 : ((j.booked ? ('<b>Paczka jest zaksięgowana bez nich (razem ' + (razem > 0 ? '+' : '') + f2(razem) + ').</b> ') : '')
+                    + 'Zlecenie zostaje w „zaksięgowane z uwagami", dopóki ich nie odhaczysz.'
+                    + '<button class="mk-mzal" data-k="' + k + '" data-co="zal" style="' + g + '">✓ dokumenty od Manora załatwione</button>'))
+             + '</div>';
+        return '<div style="margin-top:4px;padding:4px 7px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:5px;'
+             + 'font-size:11px;color:#1e3a8a">📄 W tym przelewie są też dokumenty <b>od Manora</b> — HUB ich nie importuje '
+             + 'ani nie księguje, liczą się tylko w sumie wpłaty. Kliknij numer, żeby pobrać PDF: '
+             + od.map(function (d){
+                   return '<button class="mk-mpdf" data-k="' + esc(mkKlucz(j)) + '" data-id="' + esc(d.id) + '" '
+                        + 'title="Pobierz PDF tego dokumentu z panelu Manora" '
+                        + 'style="font:inherit;font-family:ui-monospace,monospace;font-weight:700;color:#1d4ed8;'
+                        + 'text-decoration:underline;background:none;border:none;padding:0;cursor:pointer">'
+                        + esc(d.nr) + '</button> ' + esc(manorTypOd(d.typ)) + ' <b>'
+                        + (d.val > 0 ? '+' : '') + f2(d.val) + '</b>';
+               }).join(' · ')
+             + stopka
+             + '</div>';
+    }
+    // Wspolne dla „zapisz i sprawdź" i awiza: nowe numery to zlecenie do pobrania od nowa.
+    function manorNoweNumery(j){
+        // Manor ma jeden panel. Zlecenie bez hosta przelot wyslalby na panel domyslny (Vente).
+        if (!j.host) j.host = 'manor-prod.mirakl.net';
+        j.status = 'new';
+        j.msg = '';
+        j.note = '';
+        delete j.data;
+        delete j.manorOd;
+        delete j.manorOdZal;
+    }
+    // Awizo „Regulierte Zahlung" (PDF z maila) → numery dokumentow przy zleceniu. Suma awiza ma sie
+    // zgadzac z wplata: awizo innego przelewu to najlatwiejsza pomylka przy kilku wplatach Manora.
+    // Zwraca napis do komunikatu (sukces) albo '' (odmowa — powod jest juz na pasku).
+    async function manorAvisWczytaj(k, plik){
+        const nazwa = String((plik && plik.name) || 'awizo.pdf');
+        let tekst = '';
+        try { tekst = await c24PdfTekst(new Uint8Array(await plik.arrayBuffer())); }
+        catch (e){ say('Nie przeczytałem PDF-u „' + nazwa + '”: ' + ((e && e.message) || e), '#c00'); return ''; }
+        const av = manorAvisParse(tekst);
+        if (av.err){ say('Awizo „' + nazwa + '”: ' + av.err + '. Numerów nie wpisuję — możesz wpisać je ręcznie.', '#c00'); return ''; }
+        if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — wgraj awizo po jego zakończeniu (przelot nadpisałby numery swoim stanem zleceń).', '#c47f00'); return ''; }
+        const jobs = jobsLoad(), j = jobs[k];
+        if (!j){ say('Tego zlecenia nie ma już na liście.', '#c47f00'); return ''; }
+        if (j.status === 'done'){ say('To zlecenie jest już zaimportowane — numerów z awiza nie zmieniam.', '#c47f00'); return ''; }
+        if (j.amount != null && !eq(av.suma, j.amount)){
+            say('Awizo „' + nazwa + '” jest na ' + f2(av.suma) + ' ' + (av.cur || '')
+              + (av.valuta ? (' (valuta ' + av.valuta + ')') : '')
+              + ', a ta wpłata na ' + f2(j.amount) + ' ' + (j.cur || '') + ' — to awizo innej wpłaty. Numerów nie wpisuję.', '#c00');
+            return '';
+        }
+        if (j.cur && av.cur && String(j.cur).toUpperCase() !== String(av.cur).toUpperCase()){
+            say('Awizo „' + nazwa + '” jest w ' + av.cur + ', a wpłata w ' + j.cur + ' — numerów nie wpisuję.', '#c00');
+            return '';
+        }
+        j.docs = av.poz.map(function (p){ return p.nr; });
+        j.avis = { plik: nazwa, nr: av.nr, valuta: av.valuta, suma: av.suma, sumaBetrag: av.sumaBetrag, cur: av.cur,
+                   poz: av.poz.map(function (p){ return { nr: p.nr, kw: p.kw, reg: p.reg }; }) };
+        manorNoweNumery(j);
+        jobsSave(jobs); render();
+        return 'Z awiza „' + nazwa + '”' + (av.nr ? (' (płatność ' + av.nr + (av.valuta ? (', valuta ' + av.valuta) : '') + ')') : '')
+             + ' wpisałem numery dokumentów (' + j.docs.length + '): ' + j.docs.join(', ')
+             + ' — suma ' + f2(av.suma) + ' ' + (av.cur || '') + ' = wpłata.';
+    }
+    // Po zapisaniu numerow (recznie albo z awiza) dokumenty spinaja sie z wplata od razu — przez
+    // mkManorTeraz, czyli te sama droge i te same kontrole, co „⬇ Pobierz zestawienia".
+    async function manorPoNumerach(k, napis){
+        if (typeof mkManorTeraz !== 'function'){
+            say(napis + ' Kliknij „⬇ Pobierz zestawienia".', '#0a7a2f');
+            return;
+        }
+        const j0 = jobsLoad()[k] || { brand: 'Manor', mp: 'Manor', host: 'manor-prod.mirakl.net' };
+        // Import i ksiegowanie w toku zapisuja zlecenia po drodze, a przelot (mkPass) zapisuje na koniec swoja
+        // migawke w CALOSCI — cofnalby ich wynik („done", „booked"). One same odmawiaja przy przelocie
+        // (mkPrzelotTrwa); tu pilnujemy strony odwrotnej. Numery sa juz zapisane — sprawdzenie na potem.
+        if (mkWid.imp || mkWid.book || mkImpBieg || mkKsiegBieg){
+            say(napis + ' Trwa import albo księgowanie — numery są zapisane, sprawdzę je po jego zakończeniu: '
+              + 'kliknij wtedy „⬇ Pobierz zestawienia".', '#c47f00');
+            return;
+        }
+        say(napis + ' Sprawdzam dokumenty w panelu Manora…', '#0a7a2f');
+        let w;
+        try { w = await mkManorTeraz(j0.host); }
+        catch (e){
+            say('Manor: ' + withLogin(j0, (e && e.message) || String(e))
+              + ' · numery są zapisane — po zalogowaniu kliknij „⬇ Pobierz zestawienia".', '#c00');
+            render();
+            return;
+        }
+        if (!w) return;                    // trwa inny przelot albo dopis brakow — mkJakoPrzelot juz to powiedzial
+        const j = jobsLoad()[k];
+        if (!j) return;
+        if (j.status === 'ready'){
+            const od = j.manorOd || [];
+            say('✓ Manor: dokumenty spięte z wpłatą ' + f2(j.amount) + ' ' + (j.cur || '') + ' — gotowe do importu.'
+              + (od.length ? (' Dokumenty od Manora (' + od.map(function (d){ return d.nr; }).join(', ')
+                              + ') stoją przy zleceniu tylko jako informacja — numer pobiera PDF.') : ''), '#0a7a2f');
+        }
+        else if (j.status === 'new')
+            // mkPass przy bledzie listy cykli mowi swoje i zwraca 0 — to zdanie (w.tekst) idzie dalej, nie ogolnik.
+            say(withLogin(j, 'Manor: zlecenie nie zostało sprawdzone' + (w.tekst ? (' — ' + w.tekst) : '')
+                           + ' · numery są zapisane; po poprawieniu kliknij „⬇ Pobierz zestawienia"'), '#c47f00');
+        else say('Manor: ' + (j.status === 'partial' ? 'wymaga sprawdzenia — ' : '') + (j.msg || 'nie udało się'),
+                 j.status === 'err' ? '#c00' : '#c47f00');
     }
 
     // ---------- sciezka krokow i etapy listy (5.59.1) ----------
@@ -43785,6 +44152,8 @@
         if (j.data && j.data.netOk === false && !j.data.netSkip) return true;
         // Amazon: cofnieta wyplata i Goodwill policzony dwa razy dotycza INNEGO rozliczenia — zaksiegowanie ich nie zamyka.
         if (j.data && j.data.amz && (j.data.amz.cofN || j.data.amz.gwKolizja)) return true;
+        // Dokumenty od Manora (manorOdBox) HUB pomija — zlecenie czeka, az ktos je odhaczy (decyzja 07.10.2026, przejsciowo).
+        if (String(j.mp || '') === 'Manor' && (j.manorOd || []).length && !j.manorOdZal) return true;
         const tf = shTrafienie(j, mkSheet[mkJobId(j)]);            // cudzy zaksiegowany wiersz w arkuszu = mozliwy dubel
         if (tf && tf.zaks && !tf.wlasny) return true;
         return false;
@@ -44181,7 +44550,7 @@
                    + '</div>')
                 : '';
             let det = linkify(j.booked ? impMsgPoKsieg(j.msg) : (j.msg || ''));
-            if (!j.data) det += manorBox(j);
+            if (!j.data) det += manorBox(j) + manorOdBox(j);
             if (!j.data && j.kind === 'f1') det += f1BrakiHtml(j);
             if (j.data){
                 const n = Object.keys(j.data.ord || {}).length, nr = refIle(j);
@@ -44298,7 +44667,7 @@
                 }
                 else if (sh && sh.similar && sh.similar.length) det += '<div style="color:#c47f00">w arkuszu jest podobny wpis: ' + esc(sh.similar.map(function (x){ return x.data + ' ' + x.marketplace + ' ' + f2(x.kwota); }).join('; ')) + '</div>';
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
-                det += manorBox(j);
+                det += manorBox(j) + manorOdBox(j);
                 det += obiChKontrolaHtml(j);
                 det += obiChRefBox(j);
                 // Po zaksiegowaniu to juz nie ostrzezenie — szare, i bez „jeszcze NIEZAKSIĘGOWANA".
@@ -44666,7 +45035,7 @@
             };
         });
         out.querySelectorAll('.mk-mdocb').forEach(function (b){
-            b.onclick = function(){
+            b.onclick = async function(){
                 const ref = b.getAttribute('data-k');
                 const inp = out.querySelector('.mk-mdoc[data-k="' + ref + '"]');
                 if (!inp) return;
@@ -44674,15 +45043,65 @@
                     .map(function (x){ return x.trim().toUpperCase(); })
                     .filter(function (x, i, a){ return x && a.indexOf(x) === i; });
                 if (!nrs.length){ say('Nie wpisałeś żadnego numeru.', '#c47f00'); return; }
+                // Przelot trzyma migawke zlecen i zapisuje ja CALA — numery zapisane w jego trakcie by przepadly (5.53).
+                if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zapisz numery po jego zakończeniu (przelot nadpisałby je swoim stanem zleceń).', '#c47f00'); return; }
                 const jobs = jobsLoad();
                 if (!jobs[ref]) return;
+                // Numery inne niz we wgranym awizie — awizo przestaje byc ich zrodlem.
+                const av = jobs[ref].avis;
+                if (av && (av.poz || []).map(function (p){ return p.nr; }).join(',') !== nrs.join(',')) delete jobs[ref].avis;
                 jobs[ref].docs = nrs;
-                jobs[ref].status = 'new';
-                jobs[ref].msg = '';
-                jobs[ref].note = '';
-                delete jobs[ref].data;
+                manorNoweNumery(jobs[ref]);
                 jobsSave(jobs); render();
-                say('Zapisane: ' + nrs.join(', ') + '. Kliknij „⬇ Pobierz zestawienia".', '#0a7a2f');
+                await manorPoNumerach(ref, 'Zapisane: ' + nrs.join(', ') + '.');
+            };
+        });
+        // Awizo z maila (PDF). Pole pliku jedno, ukryte, w dokumencie — wgrywa przez nie takze stanowisko testowe.
+        out.querySelectorAll('.mk-mavis').forEach(function (b){
+            b.onclick = function(){
+                const ref = b.getAttribute('data-k');
+                const stare = document.getElementById('mk-mavis-inp');
+                if (stare) stare.remove();
+                const inp = document.createElement('input');
+                inp.type = 'file'; inp.accept = 'application/pdf,.pdf'; inp.id = 'mk-mavis-inp';
+                inp.style.display = 'none';
+                inp.onchange = async function(){
+                    const f = inp.files && inp.files[0];
+                    if (!f) return;
+                    const napis = await manorAvisWczytaj(ref, f);
+                    if (napis) await manorPoNumerach(ref, napis);
+                };
+                document.body.appendChild(inp);
+                inp.click();
+            };
+        });
+        // Dokumenty od Manora odhaczone recznie (manorOdBox) — dopiero wtedy zaksiegowane zlecenie moze zejsc do „Zakończone".
+        out.querySelectorAll('.mk-mzal').forEach(function (b){
+            b.onclick = function(){
+                if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+                const k = b.getAttribute('data-k'), co = b.getAttribute('data-co');
+                const jobs = jobsLoad(), j = jobs[k];
+                if (!j || !(j.manorOd || []).length) return;
+                const nr = j.manorOd.map(function (d){ return d.nr; }).join(', ');
+                if (co === 'cofnij') delete j.manorOdZal;
+                else j.manorOdZal = { kiedy: new Date().toISOString().slice(0, 16).replace('T', ' ') };
+                jobsSave(jobs); render();
+                say(co === 'cofnij'
+                    ? ('Dokumenty od Manora (' + nr + ') znowu czekają na odhaczenie.')
+                    : ('✓ Dokumenty od Manora (' + nr + ') odhaczone jako załatwione.'), co === 'cofnij' ? '#c47f00' : '#0a7a2f');
+            };
+        });
+        // Numer dokumentu od Manora → PDF z panelu.
+        out.querySelectorAll('.mk-mpdf').forEach(function (b){
+            b.onclick = async function(){
+                const k = b.getAttribute('data-k'), id = b.getAttribute('data-id');
+                const j = jobsLoad()[k];
+                const d = j && (j.manorOd || []).filter(function (x){ return x && x.id === id; })[0];
+                if (!d){ say('Nie znam już tego dokumentu — odśwież listę.', '#c47f00'); return; }
+                b.disabled = true;
+                try { say('Pobrano ' + (await manorPdf(j, d)) + '.', '#0a7a2f'); }
+                catch (e){ say('Nie pobrałem PDF-u dokumentu ' + d.nr + ': ' + withLogin(j, (e && e.message) || String(e)), '#c00'); }
+                finally { b.disabled = false; }
             };
         });
         // #mk-imp-all i #mk-book-all podpina krokiMaluj() — od 5.59.1 stoja w sciezce krokow, poza #mk-out.
@@ -45172,13 +45591,17 @@
             return (x.id || '?') + '  ' + (x.auf || '') + '  ' + x.deb + '/' + x.cre + '  ' + f2(x.kwota); });
         sek('W PROLOGISTICS, A NIE MA W ROZLICZENIU', k.wolne, function (x){
             return (x.ff || '—') + '  ' + (x.auf || '') + '  ' + f2(x.kwota); });
-        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+        // „opis.dodatkowe" — usterki liczone poza czterema wspolnymi listami (Allegro:
+        // roznica przy znoszeniu sie i zwrot przy przeksiegowaniu). ManoMano ich nie podaje.
+        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                 + ((opis && opis.dodatkowe) || 0);
         L.push('');
         L.push(bl ? ('DO SPRAWDZENIA: ' + bl + ' pozycji') : 'Wszystko się zgadza.');
         return L.join('\n');
     }
     function mmKnRender(p, k, zle, opis, pomin){
-        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+        const bl = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                 + ((opis && opis.dodatkowe) || 0);
         const H = [];
         H.push('<div style="border:1px solid ' + (bl ? '#f5c2c7' : '#badbcc') + ';background:'
              + (bl ? '#fff5f5' : '#f3fbf6') + ';border-radius:8px;padding:8px;margin-bottom:8px">'
@@ -45691,16 +46114,29 @@
         // opisywalyby inne pozycje, wiec ida do kosza razem z podrecznym zapisem stron.
         alleZapomnijKonta();
         const poFf = Object.create(null);
-        (ex || []).forEach(function (r){ if (r.ff){ const kl = mkFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
+        (ex || []).forEach(function (r){ if (r.ff){ const kl = alleFfBaza(r.ff); (poFf[kl] || (poFf[kl] = [])).push(r); } });
 
         const brakuje = [], zleKonto = [], zlaKwota = [], brakZwrot = [], obce = [], bezTypu = [];
+        // Przeksiegowania (alleStorna): po zdjeciu par „storno + ta sama kwota od nowa"
+        // konto, kwote i slad zwrotu sprawdzamy juz tylko na wierszach, ktore zostaly.
+        const przeks = [], poStornie = Object.create(null);
         Object.keys(p.ord).forEach(function (id){
             const typ = p.typOrd[id] || '';
             const brutto = r2(p.ord[id]);
-            const w = poFf[id] || [];
-            if (!w.length){
+            const wsz = poFf[id] || [];
+            // Wiersze z drugiego auftragu („uuid/N") nie zastepuja wplaty: zamowienie, ktore ma
+            // w zestawieniu WYLACZNIE korekty z „/N", zostaje „brakiem platnosci" — tak jak przed
+            // laczeniem dopiskow. Inaczej sama nota na drugim auftragu gasila brak wplaty.
+            const zDopisku = wsz.length > 0 && wsz.every(function (r){ return !r.sprzedaz && mkFfBaza(r.ff) !== id; });
+            if (!wsz.length || zDopisku){
                 brakuje.push({ id: id, kwota: brutto, typ: typ, maZwrot: p.ref[id] != null });
                 return;
+            }
+            const st = alleStorna(wsz, brutto, p.ref[id]);
+            const w = st ? st.aktywne : wsz;
+            if (st){
+                poStornie[id] = w;
+                przeks.push(allePrzeksOpis(id, typ, brutto, st, p.ref[id]));
             }
             // Zamowienie bez rozstrzygnietego typu klienta nie ma z czym byc porownane —
             // idzie na osobna liste, a nie do „zlych kont".
@@ -45749,20 +46185,17 @@
         // Zwroty: slad w OBU kierunkach. Zwrot bywa zaksiegowany po stronie wplaty
         // i warunek „musi byc korekta" zglaszalby jako brak cos, co jest zaksiegowane.
         Object.keys(p.ref || {}).forEach(function (id){
-            const w = poFf[id] || [];
-            if (w.some(function (r){ return r.zwrot; })) return;
+            // Po przeksiegowaniu storno nie jest sladem zwrotu — odwraca wplate, ktora
+            // zaksiegowano od nowa. Zwrotu (np. VAT) szukamy w tym, co po nim zostalo.
+            const w = poStornie[id] || poFf[id] || [];
             const a = Math.abs(r2(p.ref[id]));
-            // Sladem NIE MOZE byc wiersz sprzedazy tego samego zamowienia: przy pelnym
-            // zwrocie ma te sama kwote co zwrot, wiec usprawiedliwialby sam siebie
-            // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
-            // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
-            if (w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; })) return;
+            if (!alleBezSladuZwrotu(w, a)) return;
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length });
         });
         const znane = Object.create(null);
         Object.keys(p.ord).forEach(function (k){ znane[k] = 1; });
         Object.keys(p.ref || {}).forEach(function (k){ znane[k] = 1; });
-        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[mkFfBaza(r.ff)]; });
+        const wolne = (ex || []).filter(function (r){ return !r.ff || !znane[alleFfBaza(r.ff)]; });
 
         // Zamowienie, ktorego nie ma w prologistics, a w TYM SAMYM zestawieniu ma i wplate,
         // i zwrot: pieniadze sie znosza i nie ma czego ksiegowac. Dotad wychodzilo jako DWIE
@@ -45796,8 +46229,128 @@
                  znoszaSie: znoszaSie,
                  // Do licznika usterek ida tylko te pary, ktorych roznicy nie umiemy nazwac.
                  znoszaZle: znoszaSie.filter(function (x){ return !x.wyjasnione; }).length,
+                 // Przeksiegowania z kwota zgodna z wplata. Do licznika usterek idzie tylko
+                 // zwrot, ktory w prologistics jest inny niz w Allegro (allePrzeksOpis).
+                 przeks: przeks,
+                 przeksZle: przeks.filter(function (x){ return x.zle; }).length,
                  nOrd: Object.keys(p.ord).length, nZwr: Object.keys(p.ref || {}).length,
                  nEx: (ex || []).length, brakTabeli: false };
+    }
+    // Numer zamowienia Allegro to UUID. Drugi auftrag do tego samego zamowienia dostaje
+    // w prologistics ten sam numer z dopiskiem „/1", „/2"… Wrzesien 2026: zwrot 179,00
+    // do 5a55a530-… zaksiegowany nota w tickecie 678251 na auftragu 15514916
+    // („5a55a530-…/1"), a wplata stoi na 15410144 bez dopisku. Bez zdjecia dopisku jedna
+    // nota dawala dwa bledy naraz: „zwrot bez sladu" i „w prologistics, a nie ma
+    // w rozliczeniu". Tniemy TYLKO przy ksztalcie UUID i tylko w kontroli Allegro —
+    // numerow innych rynkow nie znamy na tyle, zeby ciac cokolwiek (patrz mkFfBaza).
+    const ALLE_FF_DOPISEK = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/\d+$/i;
+    function alleFfBaza(ff){
+        const t = mkFfBaza(ff);
+        const m = t.match(ALLE_FF_DOPISEK);
+        return m ? m[1] : t;
+    }
+    // Przeksiegowanie („puste ksiegowanie"): wplate wycofano stornem i ta sama kwote
+    // zaksiegowano od nowa. Tak wyglada faktura przestawiona na 0% VAT („Make 0% VAT
+    // Invoice") — wrzesien 2026, auftragi 15532301, 15585229, 15588090, 15623331:
+    //     wplata X na 3209 (23%) · storno −X na 3209 · X od nowa na 3204 (0%)
+    //     · „VAT refund" −X·23/123 na 3204,
+    // a Allegro oddaje kupujacemu ten VAT osobna operacja „zwrot". W zestawieniu stoja
+    // wtedy DWA wiersze sprzedazy po X i suma wychodzila podwojona wobec wplaty.
+    // Pare zdejmujemy tylko wtedy, gdy WYJASNIA nadwyzke: po zdjeciu reszta sprzedazy ma
+    // byc rowna wplacie z Allegro. Pelny zwrot (sprzedaz X + korekta X) tu nie wpada —
+    // tam suma sprzedazy zgadza sie od razu i niczego nie szukamy. Podwojna wplata BEZ
+    // storna tez nie: nie ma czym jej wyjasnic, zostaje „kwota sie nie zgadza".
+    // Regula ogolna, nie tylko VAT (decyzja uzytkownika 06.10.2026) — poprawka konta
+    // stornem i wplata od nowa wyglada tak samo i tak samo nie jest bledem.
+    // Zuzyte wiersze trzymamy OBOK (zbior), nie w nich — te same wiersze sluza
+    // kolejnemu porownaniu, tak samo jak w kontroli Wayfaira.
+    // Czy zwrot z Allegro (kwota a) NIE ma w tych wierszach sladu. Jedna definicja dla kontroli
+    // zwrotow i dla sekcji przeksiegowan — dwie rozne (obecnosc wiersza wobec kwoty) pozwalaly
+    // pozycji wypasc z obu naraz: zostajaca korekta 0,00 albo wiersz obcy tej kwoty nie byly
+    // ani „zwrotem bez sladu", ani roznica zwrotu (przeglad 06.10.2026).
+    function alleBezSladuZwrotu(w, a){
+        // Slad w OBU kierunkach: korekta albo wiersz nie-sprzedazy tej samej kwoty.
+        if (w.some(function (r){ return r.zwrot; })) return false;
+        // Sladem NIE MOZE byc wiersz sprzedazy tego samego zamowienia: przy pelnym
+        // zwrocie ma te sama kwote co zwrot, wiec usprawiedliwialby sam siebie
+        // i zamowienie sprzedane i zwrocone w jednym rozliczeniu przechodzilo
+        // bez slowa (sprawdzone na 27661335692: 4 takie zwroty na 710.88).
+        return !w.some(function (r){ return !r.sprzedaz && Math.abs(Math.abs(r.kwota) - a) < 0.02; });
+    }
+    function alleStorna(w, brutto, refAl){
+        const sprz = w.filter(function (r){ return r.sprzedaz; });
+        let reszta = r2(sprz.reduce(function (a, r){ return a + r.kwota; }, 0));
+        if (sprz.length < 2 || reszta - brutto <= 0.02) return null;
+        // Korekty po kolei w czasie — z kilku tej samej kwoty pierwsza jest stornem.
+        const kor = w.filter(function (r){ return r.zwrot; }).slice().sort(function (a, b){
+            return String(a.data || '').localeCompare(String(b.data || '')); });
+        const uzyte = new Set(), pary = [];
+        for (let i = 0; i < kor.length && reszta - brutto > 0.02; i++){
+            const z = kor[i], a = Math.abs(r2(z.kwota));
+            if (a < 0.005 || reszta - a < brutto - 0.02) continue;
+            // Storno odwraca wplate z TEGO SAMEGO konta sprzedazy — ta jest oryginalem,
+            // a zostaje wplata zaksiegowana od nowa. Innego konta NIE bierzemy: korekta 30 na
+            // 3209 obok wplaty 30 na 3292 to nie storno tej wplaty, a sparowanie ich chowalo
+            // wplate na zlym koncie (przeglad 06.10.2026). Bez pary zostaje stary wynik.
+            const s = sprz.filter(function (x){
+                return !uzyte.has(x) && x.konto === z.konto && Math.abs(Math.abs(r2(x.kwota)) - a) < 0.02; })[0];
+            if (!s) continue;
+            uzyte.add(s); uzyte.add(z);
+            pary.push({ storno: z, sprz: s });
+            reszta = r2(reszta - Math.abs(r2(s.kwota)));
+        }
+        if (!pary.length || Math.abs(reszta - brutto) > 0.02) return null;
+        const aktywne = w.filter(function (r){ return !uzyte.has(r); });
+        if (!aktywne.some(function (r){ return r.sprzedaz; })) return null;
+        // Korekta rowna CALEMU zwrotowi z Allegro, po ktorej zdjeciu ten zwrot zostaje bez
+        // sladu, to najpewniej sam zwrot, a nie storno: podwojna wplata + prawdziwy zwrot
+        // wygladaja z daleka jak przeksiegowanie. Zostaje wtedy stary wynik („kwota sie nie
+        // zgadza") zamiast mylacego „zwrot bez sladu" przy zwrocie, ktory jest zaksiegowany.
+        // Przy fakturze 0% Allegro oddaje sam VAT, wiec storno X nigdy nie rowna sie zwrotowi.
+        const ra = (refAl != null) ? Math.abs(r2(refAl)) : null;
+        if (ra != null && pary.some(function (q){ return Math.abs(Math.abs(r2(q.storno.kwota)) - ra) < 0.02; })
+            && alleBezSladuZwrotu(aktywne, ra)) return null;
+        return { pary: pary, aktywne: aktywne };
+    }
+    // Wpis do sekcji przeksiegowan. Zwrot porownujemy KWOTA (decyzja uzytkownika
+    // 06.10.2026): przy fakturze 0% Allegro oddaje VAT operacja „zwrot", a prologistics
+    // niesie go jako „VAT refund" — rozne kwoty to usterka i ida do licznika. Gdy
+    // w prologistics zwrotu nie ma wcale, zglasza to juz „Zwrot bez sladu" — tu nie
+    // liczymy go drugi raz.
+    function allePrzeksOpis(id, typ, brutto, st, refAl){
+        const zwrPl = r2(st.aktywne.filter(function (r){ return r.zwrot; })
+                                   .reduce(function (a, r){ return a + Math.abs(r.kwota); }, 0));
+        const zwrAl = (refAl != null) ? Math.abs(r2(refAl)) : null;
+        const roznica = r2(zwrPl - (zwrAl || 0));
+        const bezSladu = zwrAl != null && zwrAl > 0.005 && alleBezSladuZwrotu(st.aktywne, zwrAl);
+        const jedne = function (t){ return t.filter(function (x, i){ return x && t.indexOf(x) === i; }); };
+        return {
+            id: id, typ: typ, kwota: brutto,
+            pary: st.pary.map(function (q){
+                return { kwota: Math.abs(r2(q.sprz.kwota)), z: q.sprz.konto || q.storno.konto, data: q.storno.data }; }),
+            na: jedne(st.aktywne.filter(function (r){ return r.sprzedaz; }).map(function (r){ return r.konto; })).join(', '),
+            zwrPl: zwrPl, zwrAl: zwrAl, roznica: roznica, bezSladu: bezSladu,
+            zle: !bezSladu && Math.abs(roznica) > 0.02,
+            // Zwrot rowny 23/123 przeksiegowanej kwoty to zwrot VAT-u — tylko do opisu.
+            vat: zwrPl > 0.005 && st.pary.some(function (q){
+                return Math.abs(zwrPl - r2(Math.abs(q.sprz.kwota) * 23 / 123)) <= 0.02; }),
+            auf: jedne(st.pary.map(function (q){ return q.sprz.auf; })
+                       .concat(st.aktywne.map(function (r){ return r.auf; }))).join(', ')
+        };
+    }
+    function allePrzeksTekst(x){
+        return x.pary.map(function (q){
+            return 'storno ' + f2(q.kwota) + ' na ' + (q.z || '?') + ', od nowa na ' + (x.na || '?');
+        }).join('; ') + (x.vat ? ' (faktura 0% VAT, zwrot VAT 23%)' : '');
+    }
+    // Numer auftragu linkujemy tylko w postaci „15623331 / 3". Nota z ticketu niesie
+    // „CREDIT … TICKET …" i pierwsza liczba nie jest tam numerem auftragu.
+    function allePrzeksAuf(x){
+        return (x.auf ? x.auf.split(', ') : []).map(function (a){
+            const m = String(a).match(/^(\d+)\s*\/\s*(\d+)$/);
+            return m ? ('<a href="/auction.php?number=' + m[1] + '&txnid=' + m[2] + '" target="_blank">' + mmEsc(a) + '</a>')
+                     : mmEsc(a);
+        }).join(', ') || '—';
     }
     // Auftrag po numerze fulfilmentu — ta sama droga, ktorej uzywa lista NOT FOUND przy
     // imporcie (search.php?what=ff_number). „Prologistics nie znalazl" nie znaczy jeszcze,
@@ -45970,8 +46523,12 @@
         const konta = [];
         lista.forEach(function (r){ if (r.selling && konta.indexOf(r.selling) < 0) konta.push(r.selling); });
         const a = Math.abs(r2(kwota || 0));
+        // Dopasowujemy WIERSZ SPRZEDAZY (tylko takie trafiaja do tej kontroli), wiec tylko
+        // platnosci dodatnie. Bez znaku storno −X (konto starej wplaty) wygrywalo z wplata
+        // zaksiegowana od nowa i przeksiegowanie na ZLE konto wychodzilo jako „na auftragu
+        // jest wlasciwe" (przeglad 06.10.2026).
         let kand = lista.filter(function (r){
-            return r.kwota != null && Math.abs(Math.abs(r.kwota) - a) < 0.02; });
+            return r.kwota != null && r.kwota > 0 && Math.abs(r.kwota - a) < 0.02; });
         if (kand.length > 1 && kontoRozl){
             const z = kand.filter(function (r){ return r.konto === kontoRozl; });
             if (z.length) kand = z;
@@ -45979,6 +46536,14 @@
         if (kand.length > 1 && data){
             const z = kand.filter(function (r){ return r.data === String(data).slice(0, 10); });
             if (z.length) kand = z;
+        }
+        if (kand.length > 1){
+            // Kilka wplat tej kwoty na ROZNYCH kontach (wplata i ta sama kwota od nowa tego
+            // samego dnia) — ktora jest ta z zestawienia, nie wiadomo. „Nie wiem" nie gasi
+            // usterki: pozycja zostaje na czerwonej liscie, a opis mowi dlaczego.
+            const kk = [];
+            kand.forEach(function (r){ if (kk.indexOf(r.selling) < 0) kk.push(r.selling); });
+            if (kk.length > 1) return { wiersz: null, ilu: kand.length, skad: 'niejedn', konta: kk };
         }
         if (kand.length) return { wiersz: kand[0], ilu: kand.length, skad: 'kwota', konta: konta };
         // Kwota nie trafila — bo platnosc zaksiegowano na inna sume (rabat, dwie wplaty
@@ -46077,6 +46642,9 @@
         if (st.konto){
             cz.push('w auftragu ' + st.konto
                   + (st.skad === 'wszystkie' ? ' (nie po kwocie — wszystkie płatności tego auftragu stoją na tym koncie)' : ''));
+        } else if (st.skad === 'niejedn'){
+            cz.push(st.ilu + ' wpłaty tej kwoty na różnych kontach (' + (st.konta || []).join(', ')
+                  + ') — nie rozstrzygam, sprawdź auftrag');
         } else if (st.nPlat){
             cz.push('żadna z ' + st.nPlat + ' płatności auftragu nie ma tej kwoty'
                   + (st.konta && st.konta.length ? (' — konta sprzedaży na auftragu: ' + st.konta.join(', ')) : ''));
@@ -46084,7 +46652,7 @@
             cz.push('na auftragu nie ma ani jednej płatności');
         }
         if (st.konto && wEksporcie && st.konto !== String(wEksporcie)) cz.push('ROZJAZD z eksportem');
-        if (st.ilu > 1) cz.push(st.ilu + ' wiersze o tej kwocie — wybrałem pierwszy');
+        if (st.konto && st.ilu > 1) cz.push(st.ilu + ' wiersze o tej kwocie — wybrałem pierwszy');
         if (st.formSelling && st.formSelling !== st.konto) cz.push('pod formularzem ' + st.formSelling);
         if (st.typAuf) cz.push('customer_type ' + st.typAuf);
         if (st.deleted) cz.push('AUFTRAG SKASOWANY');
@@ -46108,6 +46676,9 @@
                 cz.push('<span style="color:#888" title="Żadna płatność nie ma kwoty z zestawienia, ale wszystkie stoją na tym koncie">nie po kwocie</span>');
             if (wEksporcie && st.konto !== String(wEksporcie))
                 cz.push('<span style="color:#c47f00">≠ eksport</span>');
+        } else if (st.skad === 'niejedn'){
+            cz.push('<span style="color:#c00">' + st.ilu + ' wpłaty tej kwoty na różnych kontach: '
+                  + mmEsc((st.konta || []).join(', ')) + ' — nie rozstrzygam</span>');
         } else if (st.nPlat){
             cz.push('<span style="color:#c47f00">żadna z ' + st.nPlat + ' płatności nie ma tej kwoty</span>');
             if (st.konta && st.konta.length)
@@ -46115,7 +46686,7 @@
         } else {
             cz.push('<span style="color:#c47f00">auftrag bez płatności</span>');
         }
-        if (st.ilu > 1) cz.push('<span style="color:#c47f00">' + st.ilu + ' wiersze o tej kwocie</span>');
+        if (st.konto && st.ilu > 1) cz.push('<span style="color:#c47f00">' + st.ilu + ' wiersze o tej kwocie</span>');
         if (st.formSelling && st.formSelling !== st.konto)
             cz.push('<span style="color:#888">formularz ' + mmEsc(st.formSelling) + '</span>');
         if (st.typAuf) cz.push('<span style="color:#888">' + mmEsc(st.typAuf) + '</span>');
@@ -46132,10 +46703,14 @@
                  + '" target="_blank" title="Szukaj w panelu sprzedawcy Allegro">' + mmEsc(nr) + '</a>';
         }).join('<br>');
     }
-    function alleKnOpis(p){
+    function alleKnOpis(p, k){
         return { tytul: 'Allegro ' + (p.konto || '?') + ' ↔ Export payments',
                  zrodlo: 'operacje ' + (p.od || '?') + (p.doo && p.doo !== p.od ? ('…' + p.doo) : '')
-                       + (p.sprzedawca ? (' · sprzedawca ' + p.sprzedawca) : '') };
+                       + (p.sprzedawca ? (' · sprzedawca ' + p.sprzedawca) : ''),
+                 // Usterki spoza czterech wspolnych list. Wiersz stanu w Saldach liczyl je
+                 // od dawna (salAlleStat), a naglowek wyniku nie — i mowil „Wszystko sie
+                 // zgadza" obok wiersza stanu z usterkami.
+                 dodatkowe: ((k && k.znoszaZle) || 0) + ((k && k.przeksZle) || 0) };
     }
     // Allegro wypisuje dwie sekcje SAMO — bogaciej niz wspolny render: z numerem operacji
     // w Allegro i z wynikiem szukania auftragu. Reszte rysuje wspolny kod, a liczniki
@@ -46143,7 +46718,7 @@
     const ALLE_POMIN = { brakuje: 1, brakZwrot: 1, zleKonto: 1, zleKontoOk: 1, bezTypu: 1 };
     function alleKnTekst(p, k, zle){
         const L = [];
-        const podst = mmKnTekst(p, k, zle, alleKnOpis(p), ALLE_POMIN).split('\n');
+        const podst = mmKnTekst(p, k, zle, alleKnOpis(p, k), ALLE_POMIN).split('\n');
         // Sekcje wlasne wstawiamy zaraz za naglowkiem, przed reszta.
         const wl = [];
         if ((k.znoszaSie || []).length){
@@ -46155,6 +46730,19 @@
                                  : (x.dostawa ? ('  — różnica ' + f2(x.roznica) + ' to opłata za dostawę')
                                               : ('  — RÓŻNICA ' + f2(x.roznica) + ' bez wyjaśnienia')))
                       + '   nr operacji: ' + (((p.zrodlo || {})[x.id] || []).join(', ') || '—'));
+            });
+        }
+        if ((k.przeks || []).length){
+            wl.push('');
+            wl.push('PRZEKSIĘGOWANIE: STORNO I TA SAMA KWOTA OD NOWA — kwota się zgadza (' + k.przeks.length + ')'
+                  + (k.przeksZle ? ('; ZWROT INNY NIŻ W ALLEGRO: ' + k.przeksZle) : ''));
+            k.przeks.forEach(function (x){
+                wl.push('   ' + x.id + '  wpłata ' + f2(x.kwota) + '  ' + allePrzeksTekst(x)
+                      + '  zwrot: prologistics ' + (x.zwrPl ? f2(x.zwrPl) : '—')
+                      + ', Allegro ' + (x.zwrAl == null ? '—' : f2(x.zwrAl))
+                      + (x.zle ? ('  — ZWROT SIĘ NIE ZGADZA, różnica ' + f2(x.roznica))
+                               : (x.bezSladu ? '  — zwrotu nie ma w prologistics (ZWROT BEZ ŚLADU niżej)' : ''))
+                      + (x.auf ? ('   auftrag ' + x.auf) : ''));
             });
         }
         if ((k.brakuje || []).length){
@@ -46240,6 +46828,24 @@
                          + kwo(f2(x.wplata)) + kwo(f2(x.zwrot)) + kom(opis) + kom(alleAufKom(x.id)) + '</tr>';
                 }));
         }
+        if ((k.przeks || []).length){
+            const zleP = k.przeksZle || 0;
+            tab('Przeksięgowanie: storno i ta sama kwota od nowa — kwota się zgadza (' + k.przeks.length + ')'
+                + (zleP ? (' · zwrot inny niż w Allegro: ' + zleP) : ''), zleP ? '#c00' : '#0a7a2f',
+                ['Zamówienie', 'Wpłata', 'Storno i od nowa', 'Zwrot w prologistics', 'Zwrot w Allegro', 'Zwrot', 'Auftrag'],
+                k.przeks.map(function (x){
+                    const stan = x.zle ? ('<b style="color:#c00">różnica ' + f2(x.roznica) + '</b>')
+                               : (x.bezSladu ? '<span style="color:#c00">brak w prologistics — patrz „Zwrot bez śladu”</span>'
+                                             : '<span style="color:#0a7a2f">✓</span>');
+                    return '<tr style="border-top:1px solid #f1f5f9">'
+                         + kom('<code>' + mmEsc(x.id) + '</code>')
+                         + kwo(f2(x.kwota))
+                         + kom(mmEsc(allePrzeksTekst(x)))
+                         + kwo(x.zwrPl ? f2(x.zwrPl) : '—')
+                         + kwo(x.zwrAl == null ? '—' : f2(x.zwrAl))
+                         + kom(stan) + kom(allePrzeksAuf(x)) + '</tr>';
+                }));
+        }
         if ((k.brakuje || []).length){
             tab('Brak płatności w prologistics (' + k.brakuje.length + ')', '#c00',
                 ['Zamówienie', 'Nr operacji w Allegro', 'Wpłata', 'Typ', 'Auftrag'],
@@ -46302,7 +46908,7 @@
                          + kom(alleKontoHtml(x.id, wEks)) + '</tr>';
                 }));
         }
-        return mmKnRender(p, k, zle, alleKnOpis(p), ALLE_POMIN) + H.join('');
+        return mmKnRender(p, k, zle, alleKnOpis(p, k), ALLE_POMIN) + H.join('');
     }
     // Numery, dla ktorych warto poszukac auftragu: wszystko, czego prologistics nie ma.
     function alleDoSprawdzenia(k){
@@ -51684,7 +52290,8 @@
                 const manor = String(j.mp || '') === 'Manor';
                 const bezKwoty = mkBezKwoty(j);
                 const nrs = (j.docs || []).filter(Boolean);
-                let cycIds = [], byRef = true, byKwote = false, docs = null, docSum = null;
+                let cycIds = [], byRef = true, byKwote = false, docs = null, docSum = null, docSumImp = null;
+                let nrsImp = nrs;                 // Manor: numery, z ktorych idzie import (bez dokumentow od Manora)
                 let reczny = false;               // cykl wskazany z listy, nie dobrany
                 // Manor bez numerow w tytule („SIEHE AVIS VOM …"). Nie zgadujemy cyklu po
                 // dacie — przy tym operatorze data przelewu i data cyklu rozjezdzaja sie
@@ -51692,8 +52299,10 @@
                 if (manor && !nrs.length){
                     j.status = 'partial';
                     j.msg = 'Manor nie podał w przelewie numerów dokumentów — w tytule stoi „SIEHE AVIS". '
-                          + 'Weź je z awiza z poczty i wpisz niżej, po przecinku.';
+                          + 'Dodaj niżej PDF awiza z maila („📎 Awizo z maila") — numery uzupełnię i sprawdzę sam. '
+                          + 'Możesz też wpisać je ręcznie, po przecinku.';
                     j.note = '';
+                    delete j.manorOd;
                     jobsSave(jobs); render();
                     continue;
                 }
@@ -51706,13 +52315,40 @@
                         // Do komunikatu dokladamy klucze, ktore przyszly w odpowiedzi —
                         // bez nich poprawa nazw pol byla by zgadywanka na slepo.
                         j.status = 'err';
+                        delete j.manorOd;
                         j.msg = nogo.map(function (d){ return d.nr + ': ' + d.err; }).join('; ')
+                              + (nogo.some(function (d){ return d.brak; })
+                                  ? ' · numer dokumentu stoi w awizie w kolumnie „Ref.BelegNr" (np. IN2858A-89, CN2858A-77, 248017), nie w „Belegnr"'
+                                  : '')
                               + (nogo[0].keys ? (' · pola w odpowiedzi: ' + nogo[0].keys.join(', ')) : '');
                         jobsSave(jobs); render(); continue;
                     }
                     docSum = 0;
                     docs.forEach(function (d){ docSum = r2(docSum + d.val); });
-                    cycIds = docs.map(function (d){ return d.cyc; })
+                    // Dokumenty OD Manora (manorDocOd: faktury i noty reczne, zakladka „For shop") licza sie
+                    // do sumy wplaty, ale NIE do importu — ich pozycje nie sa zamowieniami. Cykle pobieramy wiec
+                    // tylko dla naszych IN…/CN…; tamte zostaja przy zleceniu jako informacja z PDF-em (manorOdBox).
+                    const docsImp = docs.filter(function (d){ return !d.od; });
+                    const docsOd = docs.filter(function (d){ return d.od; });
+                    if (docsOd.length) j.manorOd = docsOd.map(function (d){
+                        return { nr: d.nr, num: d.num, id: d.id, typ: d.typ, val: d.val };
+                    });
+                    else delete j.manorOd;
+                    delete j.manorOdZal;              // nowy wynik dopasowania — wczesniejsze odhaczenie go nie dotyczy
+                    if (!docsImp.length){
+                        j.status = 'partial';
+                        delete j.data;
+                        j.msg = 'Ten przelew reguluje wyłącznie dokumenty od Manora ('
+                              + docsOd.map(function (d){ return d.nr + ' ' + f2(d.val); }).join(', ')
+                              + (eq(docSum, j.amount) ? '' : (' — razem ' + f2(docSum) + ', a wpłata ' + f2(j.amount)))
+                              + ') — nie ma w nim zamówień do pliku importu. Zaksięguj go ręcznie.';
+                        j.note = '';
+                        jobsSave(jobs); render(); continue;
+                    }
+                    docSumImp = 0;
+                    docsImp.forEach(function (d){ docSumImp = r2(docSumImp + d.val); });
+                    nrsImp = docsImp.map(function (d){ return d.nr; });
+                    cycIds = docsImp.map(function (d){ return d.cyc; })
                                  .filter(function (c, k, arr){ return c && arr.indexOf(c) === k; });
                 } else {
                     // Empik nie podaje w przelewie zadnego numeru cyklu (w tytule stoi
@@ -51785,7 +52421,7 @@
                     // do kwoty brutto tego dokumentu.
                     if (manor){
                         const want = {};
-                        nrs.forEach(function (d){ want[String(d).toUpperCase().replace(/^0+/, '')] = 1; });
+                        nrsImp.forEach(function (d){ want[String(d).toUpperCase().replace(/^0+/, '')] = 1; });
                         let seen = 0;
                         const only = list.filter(function (x){
                             const v = manorVal(x, ['invoicenumber', 'accountingdocumentnumber',
@@ -51801,7 +52437,7 @@
                     const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     const wynik = mkZlozZlecenie(j, tx, {
                         manor: manor, bezKwoty: bezKwoty, byRef: byRef, byKwote: byKwote,
-                        cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum,
+                        cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum, docSumImp: docSumImp,
                         reczny: reczny });
                     // Cykl dobrany po dacie, ktorego kwota nie pasuje — nie jest nasz.
                     // Dopisujemy go do sprawdzonych i szukamy dalej, inaczej przelot po
@@ -52539,6 +53175,22 @@
         function mkHosts(jobs){ return mkHostsOf(jobs, 'mirakl'); }
         async function mkShopName(){ const s = await mkShop(); return String(s.name || s.shopName || ''); }
 
+        // Manor po wpisaniu numerow (recznie albo z awiza): od razu ta sama droga, co „⬇ Pobierz
+        // zestawienia" — mkPass, czyli te same kontrole — ale tylko na panelu Manora i bez przelaczania
+        // sklepow: Beliani ma tam jeden sklep (1C Beliani, 2858), a wlasnie przelaczanie jest powodem,
+        // dla ktorego pelny przelot pyta o zgode. Blokade (inny przelot, dopis brakow) daje mkJakoPrzelot:
+        // wtedy wraca undefined, a on sam mowi dlaczego.
+        mkManorTeraz = mkJakoPrzelot(async function (host){
+            const h = onMirakl ? location.hostname : String(host || 'manor-prod.mirakl.net');
+            MK_PRZELOT++;
+            mkSetHost(h);
+            const boot = await mkBoot();
+            const home = boot.home || '';
+            const nm = mkShopLabel(home, await mkShopName(), h);
+            const ok = await mkPass(jobsLoad(), nm, h, home);
+            const el = $('#mk-status');                  // ostatnie zdanie przelotu — gdy zlecenie zostalo nietkniete
+            return { ok: ok, tekst: el ? String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300) : '' };
+        });
         const bRun = $('#mk-run'), bAll = $('#mk-all');
         // mkJakoPrzelot: flaga „przelot trwa" (w karcie i w GM) na caly czas pobierania — wyciag,
         // „Dociągnij braki", import i ksiegowanie czekaja, bo przelot zapisuje zlecenia hurtem (5.53).
@@ -53252,7 +53904,18 @@
         if (n) aufSave();
         return n;
     }
-    function amzTypCel(t){ return /^B2C$/i.test(String(t || '')) ? 'B2C' : (/^B2B/i.test(String(t || '')) ? 'B2B' : ''); }
+    // Typ klienta, ktorego bramka wymaga przy zamowieniu Amazona BEZ VAT („B2B 0%"), gdy nie
+    // jest to B2B. UK (decyzja uzytkownika 06.10.2026): bez VAT to wysylka poza obszar VAT UK
+    // (Guernsey), klient zostaje B2C — na UK typow praktycznie sie nie zmienia, a UK B2B to
+    // w prologistics 20% VAT na fakturze. Bez wyjatku bramka kazala przestawic klienta na B2B.
+    // Tylko Amazon: ManoMano i Allegro tez ida przez te bramke i maja wlasne „B2B 0%".
+    const MK_AMZ_TYP_BEZ_VAT = { uk: 'B2C' };
+    function amzTypCel(t, krajAmz){
+        const s = String(t || '');
+        const wyj = krajAmz ? MK_AMZ_TYP_BEZ_VAT[String(krajAmz).toLowerCase()] : '';
+        if (wyj && /^B2B 0%$/i.test(s)) return wyj;
+        return /^B2C$/i.test(s) ? 'B2C' : (/^B2B/i.test(s) ? 'B2B' : '');
+    }
     // v3.80: pula NIE POLYKA juz wyjatkow. Wczesniej stalo tu „catch (e){}" i kazdy blad
     // — nawet literowka w nazwie funkcji — konczyl sie tym, ze przelot przebiegal w ciszy
     // i nic sie nie pokazywalo. Blad ma wyladowac PRZY POZYCJI, zeby bylo widac, co siadlo.
@@ -53559,7 +54222,7 @@
             });
             if (!ord) return;
             const raport = (p.typOrd || {})[ord] || '';
-            const chce = amzTypCel(raport);
+            const chce = amzTypCel(raport, (job.data && job.data.amz) ? p.kraj : '');
             if (!chce) return;                              // raport nie umial wyliczyc typu
             lista.push({ order: ord, raport: raport, chce: chce,
                          chceKonto: (p.vatOrd || {})[ord] || '',
@@ -53672,7 +54335,7 @@
         const filtr = (tylkoTe && tylkoTe.length) ? tylkoTe : null;
         const doSpr = Object.keys(p.ord).map(function (id){
             const raport = (p.typOrd || {})[id] || '';
-            return { order: id, raport: raport, chce: amzTypCel(raport),
+            return { order: id, raport: raport, chce: amzTypCel(raport, (j.data && j.data.amz) ? p.kraj : ''),
                      chceKonto: (p.vatOrd || {})[id] || '', st: '', jest: '', selling: '', msg: '' };
         }).filter(function (x){ return x.chce && (!filtr || filtr.indexOf(x.order) >= 0); });
         if (!doSpr.length){ say('Żadne zamówienie z tego rozliczenia nie ma wyliczonego typu.', '#c47f00'); return; }
@@ -68176,7 +68839,12 @@
     // po samym wyborze z listy jest konieczne.
     function salZlozAlle(){
         const most = salAlleMost();
-        if (!most || !SAL_ALLE || !SAL_ALLE.ops){ SAL_ALLE_P = null; salAlleInfo(); return; }
+        if (!most || !SAL_ALLE || !SAL_ALLE.ops){
+            SAL_ALLE_P = null; salAlleInfo();
+            if (most && SAL_ALLE)
+                salSay('Wśród wskazanych plików nie ma pliku operacji Allegro — bez niego nie złożę rozliczenia.', '#c47f00');
+            return;
+        }
         const sel = salPanel().querySelector('#sal-akonto');
         const konto = String((sel && sel.value) || '').trim();
         SAL_ALLE_P = most.raport(SAL_ALLE, konto);
@@ -68193,6 +68861,11 @@
         salPraca('plik', 'czytam ' + files.length + ' plik' + (files.length === 1 ? '' : 'ów') + '…');
         try {
             SAL_ALLE = await most.zbierz(files);
+            // Kanal „plik" zamykamy PRZED zlozeniem. Komunikat o wsadzie idzie przez salSay,
+            // ktory trwajacego kanalu nie rusza — dotad obok „Wsad kompletny" zostawal napis
+            // „plik: czytam 15 plików…" z tykajacym zegarem, choc wszystko bylo przeczytane.
+            // Zamkniety kanal salSay sprzata sam, wiec zostaje jeden wiersz: o wsadzie.
+            salKoniec('plik', 'przeczytane: ' + files.length + ' plik' + (files.length === 1 ? '' : 'ów') + '.');
             salZlozAlle();
         } catch (e){
             SAL_ALLE = null; SAL_ALLE_P = null; salAlleInfo();
@@ -68224,10 +68897,12 @@
     // i odczyt kont z auftragow, ktory po nim nastepuje.
     function salAlleStat(k, dodatek){
         const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
-                    + (k.znoszaZle || 0);
+                    + (k.znoszaZle || 0) + (k.przeksZle || 0);
         const znosi = (k.znoszaSie || []).length;
+        const przeks = (k.przeks || []).length;
         salSay((blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.')
              + (znosi ? (' Wpłata i zwrot znoszą się w ' + znosi + ' zamówieni' + (znosi === 1 ? 'u' : 'ach') + '.') : '')
+             + (przeks ? (' Przeksięgowane (storno i ta sama kwota od nowa): ' + przeks + '.') : '')
              + (dodatek ? (' ' + dodatek) : ''),
                blady ? '#c47f00' : '#0a7a2f');
     }
@@ -83596,6 +84271,95 @@
         });
         return W;
     }
+    // Bilans i RZiS jednej spolki przylozone do saldolisty KONTO PO KONCIE. Osobno od HTML-a,
+    // zeby dalo sie sprawdzic na stanowisku.
+    //
+    // Co z czym porownujemy: „total" z bilansu/RZiS wobec „saldo" z saldolisty, w tych samych
+    // znakach, w ktorych oba pliki je podaja — ten sam warunek, ktory w rcnReconcile decyduje,
+    // czy wolno wziac kwote w walucie transakcji (rcnGr(total) === rcnGr(saldo)). Dzieki temu
+    // widok pokazuje DOKLADNIE to, na czym stoi tamta kontrola, a nie wlasna miare.
+    //
+    // Konta bez kwoty w wyciagu (tylko plan kont) ida osobno — one nic nie mowia o kwotach,
+    // tylko o stronie i znaku. Osobno tez konta, ktore sa po jednej stronie, a po drugiej nie.
+    function rcnBilansRzisSp(sp, wycSp, plikiWyc){
+        if (!sp || !wycSp) return { jest: false };
+        var sal = {};
+        (sp.konta || []).forEach(function (k){ sal[rcnKonto(k.konto)] = k; });
+        function grupa(id, nazwa){
+            return { id: id, nazwa: nazwa, wiersze: [], rozne: [], ile: 0, ileWspolnych: 0,
+                     sumaTotGr: 0, sumaSalGr: 0, sumaRozGr: 0 };
+        }
+        var G = { B: grupa('B', 'Bilans'), E: grupa('E', 'Rachunek wyników'), X: grupa('X', 'Strona nieznana') };
+        var bezKwoty = [], tylkoWyciag = [], tylkoSaldolista = [], ileFw = 0, ileFwUzyte = 0;
+        Object.keys(wycSp.konta).forEach(function (kt){
+            var e = wycSp.konta[kt];
+            var k = sal[kt] || null;
+            if (e.total == null){
+                bezKwoty.push({ konto: kt, nazwa: e.nazwa || (k ? rcnBiale(k.nazwa) : ''), strona: e.strona,
+                                znak: e.znak, waluta: e.waluta || '', maSaldolista: !!k,
+                                saldo: k ? rcnNum(k.saldo) : null });
+                return;
+            }
+            var saldo = k ? rcnNum(k.saldo) : null;
+            var zgodne = !!k && rcnGr(e.total) === rcnGr(saldo);
+            if (e.fw != null){ ileFw++; if (zgodne) ileFwUzyte++; }
+            var w = { konto: kt, nazwa: e.nazwa || (k ? rcnBiale(k.nazwa) : ''), waluta: e.waluta || '',
+                      fw: e.fw, total: e.total, saldo: saldo, maSaldolista: !!k, zgodne: zgodne,
+                      roznicaGr: k ? (rcnGr(e.total) - rcnGr(saldo)) : null,
+                      zrodla: (e.zrodla || []).slice() };
+            var g = G[e.strona] || G.X;
+            g.wiersze.push(w);
+            g.ile++;
+            g.sumaTotGr += rcnGr(e.total);
+            if (k){
+                g.ileWspolnych++;
+                g.sumaSalGr += rcnGr(saldo);
+                g.sumaRozGr += w.roznicaGr;
+                if (!zgodne) g.rozne.push(w);
+            } else tylkoWyciag.push(w);
+        });
+        // Saldo w saldoliscie, ktorego wyciag nie wycenia. Zero pomijamy: konto bez salda nie
+        // musi stac w bilansie i nie ma o czym mowic.
+        Object.keys(sal).forEach(function (kt){
+            var e = wycSp.konta[kt];
+            if (e && e.total != null) return;
+            var saldo = rcnNum(sal[kt].saldo);
+            if (rcnGr(saldo) === 0) return;
+            tylkoSaldolista.push({ konto: kt, nazwa: rcnBiale(sal[kt].nazwa), saldo: saldo, wPlanie: !!e });
+        });
+        function poKoncie(a, b){
+            var na = /^\d+$/.test(a.konto) ? +a.konto : 1e12, nb = /^\d+$/.test(b.konto) ? +b.konto : 1e12;
+            return (na - nb) || (a.konto < b.konto ? -1 : a.konto > b.konto ? 1 : 0);
+        }
+        ['B', 'E', 'X'].forEach(function (id){ G[id].wiersze.sort(poKoncie); G[id].rozne.sort(poKoncie); });
+        bezKwoty.sort(poKoncie); tylkoWyciag.sort(poKoncie); tylkoSaldolista.sort(poKoncie);
+        // Okres wyciagu wobec okresu saldolisty. UWAGA: w naglowku bilansu Infoniqi stoi
+        // ROK OBROTOWY („per 31.12.2026”), a nie dzien wydruku — zmierzone na plikach z 30.09.2026.
+        // Rozjazd samych naglowkow NIE jest wiec dowodem, ze wyciag jest z innego dnia; dowodem
+        // sa konta, ktore sie roznia. Oba podajemy osobno i nie mieszamy ich ze soba.
+        var okresy = [], naglowekInny = false;
+        Object.keys(wycSp.okresy || {}).forEach(function (typ){
+            var d = wycSp.okresy[typ];
+            if (!d) return;
+            var tekst = '';
+            (plikiWyc || []).forEach(function (pw){ if (pw && pw.typ === typ && pw.okres && !tekst) tekst = pw.okres; });
+            okresy.push({ typ: typ, 'do': d, tekst: tekst });
+            if (sp['do'] && d !== sp['do']) naglowekInny = true;
+        });
+        // Pliki bez okresu w ogole (lexware'owy bilans i GuV) — zeby widok mogl to powiedziec,
+        // a nie milczec o tym, ze okresu nie zna.
+        var bezOkresu = (plikiWyc || []).filter(function (pw){ return pw && !pw['do']; })
+            .map(function (pw){ return pw.rodzaj; });
+        var rozne = G.B.rozne.length + G.E.rozne.length + G.X.rozne.length;
+        return { jest: true, kod: sp.kod || '', nazwa: sp.nazwa || '', waluta: sp.waluta || '',
+                 okresSal: sp['do'] || '', okresOdSal: sp.od || '', okresy: okresy,
+                 naglowekInny: naglowekInny, bezOkresu: bezOkresu,
+                 rodzaje: wycSp.rodzaje || {}, pliki: (wycSp.pliki || []).slice(),
+                 grupy: [G.B, G.E, G.X], bezKwoty: bezKwoty, tylkoWyciag: tylkoWyciag,
+                 tylkoSaldolista: tylkoSaldolista, ileFw: ileFw, ileFwUzyte: ileFwUzyte,
+                 ileRoznych: rozne,
+                 ok: rozne === 0 && !tylkoWyciag.length && !tylkoSaldolista.length };
+    }
     function rcnParseWorkbook(wb, fileName){
         var X = rcnX();
         if (!X) throw new Error('brak biblioteki XLSX — odśwież stronę');
@@ -83764,27 +84528,34 @@
     }
 
     // Odpowiedz akcji „mapping": kontrola kompletnosci i odczyt kazdego pliku.
-    function rcnMapowaniaZDrive(j){
-        var X = rcnX();
-        if (!X) throw new Error('brak biblioteki XLSX — odśwież stronę');
-        if (!j || !Array.isArray(j.files)) throw new Error('odpowiedź Apps Scriptu bez listy plików (files)');
-        if (!j.files.length) throw new Error('folder mapowań na Drive jest pusty');
+    // Kontrola tresci pliku z Drive: dlugosc odkodowanego base64 wobec dlugosci, ktora podal
+    // Apps Script. Jedna kopia dla mapowan i dla wyciagow — obie drogi maja odrzucac ten sam
+    // uszkodzony plik, a nie jedna z nich.
+    function rcnKontrolaB64(files){
         var uciete = [], rozmiary = [];
-        j.files.forEach(function (f){
+        (files || []).forEach(function (f){
             var dl = -1;
             try { dl = atob(String(f.b64 || '')).length; } catch (e){ dl = -1; }
-            // Porownujemy z „bytes" — dlugoscia tablicy, z ktorej skrypt zrobil base64. „size" to
+            // Porownujemy z „bytes” — dlugoscia tablicy, z ktorej skrypt zrobil base64. „size” to
             // metadane Drive z listingu: plik zapisany w trakcie pobierania ma tam stara wartosc,
-            // a przez jeden taki plik odrzucalismy wszystkie 26. Starszy skrypt bez „bytes" → size.
+            // a przez jeden taki plik odrzucalismy wszystkie 26. Starszy skrypt bez „bytes” → size.
             var oczek = (f.bytes != null && f.bytes !== '') ? Number(f.bytes) : Number(f.size);
             if (dl < 0 || dl !== oczek) uciete.push((f.name || '?') + ' (' + (dl < 0 ? 'nieczytelne base64' : dl + ' z ' + oczek + ' B') + ')');
             else if (f.bytes != null && f.size != null && Number(f.size) !== Number(f.bytes))
                 rozmiary.push((f.name || '?') + ' (Drive: ' + f.size + ' B, odczytane: ' + f.bytes + ' B)');
         });
-        if (uciete.length) throw new Error('treść plików z Drive nie zgadza się z długością podaną przez Apps Script: ' + uciete.join(', ') + ' — odśwież mapowania jeszcze raz');
+        return { uciete: uciete, rozmiary: rozmiary };
+    }
+    function rcnMapowaniaZDrive(j){
+        var X = rcnX();
+        if (!X) throw new Error('brak biblioteki XLSX — odśwież stronę');
+        if (!j || !Array.isArray(j.files)) throw new Error('odpowiedź Apps Scriptu bez listy plików (files)');
+        if (!j.files.length) throw new Error('folder mapowań na Drive jest pusty');
+        var kb = rcnKontrolaB64(j.files);
+        if (kb.uciete.length) throw new Error('treść plików z Drive nie zgadza się z długością podaną przez Apps Script: ' + kb.uciete.join(', ') + ' — odśwież mapowania jeszcze raz');
         var mapowania = [], pliki = [], uwagi = [];
-        if (rozmiary.length) uwagi.push('rozmiar z listy Drive różni się od odczytanej treści (plik zapisany w trakcie pobierania?): '
-            + rozmiary.join(', ') + ' — liczę odczytaną treść; jeśli ktoś właśnie edytuje mapowanie, odśwież za chwilę');
+        if (kb.rozmiary.length) uwagi.push('rozmiar z listy Drive różni się od odczytanej treści (plik zapisany w trakcie pobierania?): '
+            + kb.rozmiary.join(', ') + ' — liczę odczytaną treść; jeśli ktoś właśnie edytuje mapowanie, odśwież za chwilę');
         if (j.count != null && Number(j.count) !== j.files.length) uwagi.push('Apps Script zgłasza ' + j.count + ' plików, a przysłał ' + j.files.length);
         j.files.forEach(function (f){
             var opis = { name: f.name, id: f.id, lastUpdated: f.lastUpdated || null, size: f.size, kod: '', liczbaKont: 0, liczbaWierszy: 0, blad: '' };
@@ -83817,6 +84588,72 @@
         return { folder: j.folder || '', count: j.count, teraz: j.teraz || null, wersja: j.wersja || '',
                  pominiete: Array.isArray(j.pominiete) ? j.pominiete : [], duplikaty: Array.isArray(j.duplikaty) ? j.duplikaty : [],
                  mapowania: mapowania, pliki: pliki, najnowszy: najnowszy, uwagi: uwagi };
+    }
+
+    // Pliki z folderu „rzis i bilanz”. Plan kont, bilans i RZiS wchodza do sesji od razu —
+    // one tylko opisuja konta i nie zmieniaja uzgodnienia same z siebie. Saldolisty i mapowania,
+    // ktore w tym folderze tez leza, ida WYLACZNIE na liste: saldolista to dane wejsciowe
+    // uzgodnienia i o tym, czy wchodzi, decyduje czlowiek (w folderze lezy np. sierpien, a ktos
+    // moze wlasnie uzgadniac wrzesien).
+    function rcnWyciagiZDrive(j){
+        var X = rcnX();
+        if (!X) throw new Error('brak biblioteki XLSX — odśwież stronę');
+        if (!j || !Array.isArray(j.files)) throw new Error('odpowiedź Apps Scriptu bez listy plików (files)');
+        // Pusty folder to BLAD, nie sukces — tak samo jak przy mapowaniach. Bez tego puste
+        // pobranie zdejmowalo wyciagi z sesji, podmieniało dobre dane na puste i zostawialo
+        // zielone „pobrane: <teraz>”. Sciezka bledu zachowuje to, co bylo.
+        if (!j.files.length) throw new Error('folder „rzis i bilanz” nie oddał ani jednego pliku .xlsx — '
+            + 'nic nie pobieram i zostawiam to, co było');
+        var kb = rcnKontrolaB64(j.files);
+        if (kb.uciete.length) throw new Error('treść plików z Drive nie zgadza się z długością podaną przez Apps Script: '
+            + kb.uciete.join(', ') + ' — pobierz jeszcze raz');
+        var wyciagi = [], inne = [], pliki = [], uwagi = [];
+        if (kb.rozmiary.length) uwagi.push('rozmiar z listy Drive różni się od odczytanej treści (plik zapisany w trakcie pobierania?): '
+            + kb.rozmiary.join(', ') + ' — liczę odczytaną treść');
+        j.files.forEach(function (f){
+            var opis = { name: f.name, id: f.id, lastUpdated: f.lastUpdated || null, size: f.size, co: '', kont: 0, blad: '' };
+            function dopisz(t){ opis.co = opis.co ? opis.co + ', ' + t : t; }
+            try {
+                var wb = X.read(String(f.b64 || ''), { type: 'base64' });
+                var w = rcnParseWorkbook(wb, f.name);
+                (w.wyciagi || []).forEach(function (wy){
+                    wy.zrodlo = 'drive'; wy.lastUpdated = f.lastUpdated || null; wy.driveId = f.id || '';
+                    wyciagi.push(wy);
+                    dopisz(wy.rodzaj);
+                    opis.kont += wy.konta.length;
+                });
+                var sald = (w.saldolisty || []).concat(w.lexware || []);
+                if (sald.length){
+                    dopisz('saldolista');
+                    inne.push({ name: f.name, id: f.id, b64: String(f.b64 || ''), rodzaj: 'saldolista',
+                                opis: sald.map(function (sl){
+                                    return (sl.typ === 'lexware' ? 'Lexware → saldolista' : 'saldolista') + ' „' + sl.nazwa + '” ('
+                                        + sl.konta.length + ' kont' + (sl['do'] ? ', do ' + rcnDataPl(sl['do']) : '') + ')';
+                                }).join('; ') });
+                }
+                if ((w.mapowania || []).length){
+                    dopisz('mapowanie');
+                    inne.push({ name: f.name, id: f.id, b64: String(f.b64 || ''), rodzaj: 'mapowanie',
+                                opis: w.mapowania.map(function (mp){ return 'mapowanie ' + (mp.kod || '(bez kodu)') + ' (' + mp.liczbaKont + ' kont)'; }).join('; ') });
+                }
+                if (!opis.co)
+                    opis.blad = 'nie rozpoznaję zawartości — ani plan kont, ani bilans, ani RZiS'
+                        + ((w.bledy || []).length ? ': ' + w.bledy.join(' ') : '')
+                        + ((w.pominieteArkusze || []).length ? ' (arkusze: ' + w.pominieteArkusze.map(function (a){ return a.arkusz; }).join(', ') + ')' : '');
+                else if ((w.bledy || []).length) opis.blad = w.bledy.join(' ');
+            } catch (e){
+                opis.blad = 'nie da się odczytać pliku: ' + rcnBlad(e);
+            }
+            pliki.push(opis);
+        });
+        var bledne = pliki.filter(function (p){ return p.blad; });
+        if (bledne.length) uwagi.push('plików, z których nic nie wziąłem: ' + bledne.length + ' — '
+            + bledne.slice(0, 4).map(function (p){ return p.name; }).join(', ') + (bledne.length > 4 ? ' i dalsze' : ''));
+        return { folder: j.folder || '', razem: (j.razem != null ? Number(j.razem) : j.files.length),
+                 teraz: j.teraz || null, wersja: j.wersja || '',
+                 pominiete: Array.isArray(j.pominiete) ? j.pominiete : [],
+                 duplikaty: Array.isArray(j.duplikaty) ? j.duplikaty : [],
+                 wyciagi: wyciagi, inne: inne, pliki: pliki, uwagi: uwagi };
     }
 
     // ---------- przypisanie saldolisty do spolki ----------
@@ -84633,6 +85470,11 @@
         var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
         return baza + '_import_' + (m ? m[2] + '_' + m[1] : 'bez_daty') + '.xlsx';
     }
+    // Obrotowka zlozona mimo blokad ma to mowic NAZWA, nie tylko dziennikiem w srodku:
+    // plik lezy potem w Pobranych obok zdrowych i nikt go nie otwiera, zeby sprawdzic.
+    function rcnLucaNazwaMimo(nazwa){
+        return String(nazwa || 'obrotowka.xlsx').replace(/\.xlsx$/i, '') + '_NIE-ZGADZA-SIE.xlsx';
+    }
 
     // Obrotówka jednej spółki. sp = saldolista z rcnParseWorkbook (z przypisanym sp.kod),
     // idx = indeks mapowań (rcnIndexMappings). Zwraca komplet arkuszy, dziennik i listę
@@ -84792,14 +85634,17 @@
                  sumaVortrag: sumVGr / 100, sumaSaldo: sumBGr / 100, sumaSoll: sumSGr / 100, sumaHaben: sumHGr / 100,
                  log: log, blokady: blokady, ostrzezenia: ostrzezenia, ok: blokady.length === 0 };
     }
-    // Plik .xlsx z gotowego wyniku rcnLucanetRows. Odmowa jest twarda: przy choćby jednej
-    // blokadzie pliku NIE składamy — obrotówka, która się nie bilansuje, wchodzi do LucaNetu
-    // i psuje konsolidację, a błąd wychodzi dopiero tam.
-    function rcnLucanetBlob(R){
+    // Plik .xlsx z gotowego wyniku rcnLucanetRows. Przy choćby jednej blokadzie pliku NIE
+    // składamy — obrotówka, która się nie bilansuje, wchodzi do LucaNetu i psuje konsolidację,
+    // a błąd wychodzi dopiero tam.
+    // mimo = świadome wymuszenie z panelu (człowiek potwierdził w okienku). Wtedy plik powstaje,
+    // ale nie udaje zdrowego: dochodzi arkusz „NIE ZGADZA SIE” z listą kontroli, dziennik dostaje
+    // wiersz o wymuszeniu, a nazwę znaczy rcnLucaNazwaMimo. Wołający odpowiada za nazwę.
+    function rcnLucanetBlob(R, mimo){
         var X = rcnX();
         if (!X) throw new Error('brak biblioteki XLSX — odśwież stronę');
         if (!R) throw new Error('brak wyniku obrotówki');
-        if (R.blokady.length)
+        if (R.blokady.length && !mimo)
             throw new Error('Nie składam obrotówki ' + (R.etykieta || R.kod) + ': ' + R.blokady.join(' | '));
         var wb = X.utils.book_new();
         function dodaj(nazwa, aoa, kolumny, kwotyKol){
@@ -84814,9 +85659,25 @@
             });
             X.utils.book_append_sheet(wb, ws, nazwa);
         }
+        var wymuszone = !!(mimo && R.blokady.length);
+        // Ukladu „Import sheet” nie ruszamy nawet przy wymuszeniu — to on idzie do LucaNetu
+        // i dodatkowy wiersz zepsulby import. Ostrzezenie siedzi w osobnym arkuszu i w nazwie.
         dodaj('Import sheet', R.importSheet, [10, 22, 60, 18, 16, 16], [5]);
         dodaj('Mapping Details', R.mappingDetails, [60, 14, 52, 16, 12], [3, 4]);
-        dodaj('Processing Log', R.processingLog, [10, 150], []);
+        var dziennik = R.processingLog;
+        if (wymuszone) dziennik = dziennik.concat([['ERROR', 'WYMUSZONE z panelu HUB-a: plik złożony MIMO '
+            + R.blokady.length + ' ' + rcnPlural(R.blokady.length, 'kontroli, która nie przechodzi',
+                'kontroli, które nie przechodzą', 'kontroli, które nie przechodzą')
+            + ' — patrz arkusz „NIE ZGADZA SIE”']]);
+        dodaj('Processing Log', dziennik, [10, 150], []);
+        if (wymuszone){
+            var ost = [['OBROTÓWKA ZŁOŻONA MIMO BŁĘDÓW — NIE WRZUCAJ JEJ DO LUCANETU, DOPÓKI DANE SIĘ NIE ZGADZAJĄ'],
+                       ['Spółka', R.etykieta || R.kod], ['Data księgowania', R.postingDate || '—'],
+                       ['Kontroli, które nie przechodzą', R.blokady.length],
+                       ['Suma kolumny Value', R.balans], [], ['#', 'Co się nie zgadza']];
+            R.blokady.forEach(function (b, i){ ost.push([i + 1, b]); });
+            dodaj('NIE ZGADZA SIE', ost, [34, 150], []);
+        }
         return new Blob([X.write(wb, { bookType: 'xlsx', type: 'array' })],
             { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     }
@@ -84831,15 +85692,17 @@
     // ---------- siec ----------
     // Ksztalt zapytania jak shReq w init_mkt (sprawdzony w ScriptCacie): text/plain bez
     // zapytania wstepnego CORS, sekret w tresci, nie w adresie.
-    function rcnDriveReq(action){
+    function rcnDriveReq(action, extra){
         var c = rcnPolaczenie();
         if (!c.url) return Promise.reject(new Error('brak adresu wdrożenia Apps Scriptu — wpisz go w „⚙ Połączenie z Drive”'));
+        var cialo = { secret: c.secret, action: action };
+        if (extra) Object.keys(extra).forEach(function (k){ if (extra[k] != null) cialo[k] = extra[k]; });
         return new Promise(function (ok, zle){
             if (typeof GM_xmlhttpRequest === 'undefined'){ zle(new Error('brak GM_xmlhttpRequest')); return; }
             GM_xmlhttpRequest({
                 method: 'POST', url: c.url,
                 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                data: JSON.stringify({ secret: c.secret, action: action }),
+                data: JSON.stringify(cialo),
                 timeout: 120000,
                 onload: function (r){
                     var j = null;
@@ -84911,8 +85774,9 @@
     var S = {
         spolki: [], mapPliki: [], wyciagi: [], wycIdx: null, idx: null, wynik: null, bladWyniku: '',
         drive: { stan: 'nic', blad: '', dane: null, pobrano: null },
+        wyc: { stan: 'nic', blad: '', dane: null, pobrano: null, postep: '' },
         kursy: {}, otwarte: {}, msg: null, polMsg: null, kursMsg: null,
-        licznik: 0, pierwszeOtwarcie: false, zajete: { pliki: false, kursy: false, ping: false }
+        licznik: 0, pierwszeOtwarcie: false, zajete: { pliki: false, kursy: false, ping: false, wyciagi: false }
     };
 
     (function (){
@@ -85112,14 +85976,137 @@
         }
         rysuj();
     }
+    // Wstawia do sesji to, co rcnParseWorkbook znalazl w skoroszycie, i oddaje opis dla paska
+    // komunikatow. Jedna kopia dla plikow z dysku uzytkownika i dla saldolist wgrywanych
+    // z folderu „rzis i bilanz” — inaczej jedna droga zapomina o czesci rodzajow.
+    function dodajZeSkoroszytu(w, zrodloWyc){
+        var opis = [];
+        w.saldolisty.concat(w.lexware).forEach(function (sl){
+            S.licznik++;
+            sl.id = 'r' + S.licznik;
+            sl.kod = ''; sl.kodZrodlo = ''; sl.kodOpis = '';
+            S.spolki.push(sl);
+            opis.push((sl.typ === 'lexware' ? 'Lexware → saldolista' : 'saldolista') + ' „' + sl.nazwa + '” (' + sl.konta.length + ' kont)');
+        });
+        w.mapowania.forEach(function (mp){
+            mp.zrodlo = 'plik';
+            S.mapPliki.push(mp);
+            opis.push('mapowanie ' + (mp.kod || '(bez kodu)') + ' (' + mp.liczbaKont + ' kont) — zastępuje Drive na czas sesji');
+        });
+        (w.wyciagi || []).forEach(function (wy){
+            S.licznik++;
+            wy.id = 'w' + S.licznik;
+            wy.zrodlo = zrodloWyc || 'plik';
+            S.wyciagi.push(wy);
+            opis.push(wy.rodzaj + (wy.nazwa ? ' „' + wy.nazwa + '”' : '') + ' (' + wy.konta.length + ' kont)');
+        });
+        return opis;
+    }
+    // Wyciagi z drugiego folderu Drive. Idziemy PORCJAMI, bo tyle oddaje Apps Script —
+    // 76 plikow w jednym zapytaniu zblizaloby sie do jego limitu czasu, a przerwane
+    // zapytanie nie daje nic.
+    async function pobierzWyciagi(){
+        // Klikniecie w trakcie pobierania nie moze przepadac bez slowa — guzik bywa czynny
+        // (np. zaraz po „Wyczysc”), a cisza wyglada jak zepsuty guzik.
+        if (S.zajete.wyciagi){ say('Już pobieram bilanse i RZiS z Drive — czekam na odpowiedź Apps Scriptu.', 'info'); rysuj(); return; }
+        if (!rcnPolaczenie().url){ S.wyc.stan = 'brak'; rysuj(); return; }
+        S.zajete.wyciagi = true;
+        S.wyc.stan = 'pobieram'; S.wyc.blad = ''; S.wyc.postep = '';
+        rysuj();
+        try {
+            var PORCJA = 20, od = 0, razem = null, pliki = [], ostatnia = null, krok = 0;
+            // Sufit na liczbe zapytan: przy odpowiedzi, ktora nie posuwa sie do przodu (stary
+            // kod, blad po stronie skryptu), petla musi sie skonczyc, a nie kreci do konca swiata.
+            while (krok < 40){
+                krok++;
+                var j = await rcnDriveReq('wyciagi', { od: od, ile: PORCJA });
+                if (!j || !Array.isArray(j.files)) throw new Error('odpowiedź Apps Scriptu bez listy plików (files)');
+                var r = (j.razem == null) ? j.files.length : Number(j.razem);
+                if (razem == null) razem = r;
+                else if (r !== razem) throw new Error('folder zmienił się w trakcie pobierania (było ' + razem
+                    + ' plików, jest ' + r + ') — pobierz jeszcze raz');
+                ostatnia = j;
+                pliki = pliki.concat(j.files);
+                S.wyc.postep = 'pobrane ' + pliki.length + ' z ' + razem;
+                rysuj();
+                if (!j.files.length) break;
+                od = pliki.length;
+                if (od >= razem) break;
+            }
+            if (razem != null && pliki.length !== razem)
+                throw new Error('folder ma ' + razem + ' plików, a pobrałem ' + pliki.length
+                    + ' — nie liczę na niepełnym zestawie, pobierz jeszcze raz');
+            ostatnia = ostatnia || { files: [] };
+            ostatnia.files = pliki;
+            var dane = rcnWyciagiZDrive(ostatnia);
+            S.wyc.dane = dane;
+            S.wyc.pobrano = new Date().toISOString();
+            S.wyc.stan = 'ok';
+            S.wyc.postep = '';
+            // Wyciagi z Drive podmieniamy w calosci; wgrane recznie zostaja.
+            S.wyciagi = S.wyciagi.filter(function (wy){ return wy.zrodlo !== 'drive'; });
+            dane.wyciagi.forEach(function (wy){ S.licznik++; wy.id = 'w' + S.licznik; S.wyciagi.push(wy); });
+            przelicz();
+        } catch (e){
+            S.wyc.stan = 'blad';
+            S.wyc.postep = '';
+            var t = rcnBlad(e);
+            if (/nieznana akcja/i.test(t)) t += ' — wdróż nową wersję skryptu mapowań: Deploy → Manage deployments '
+                + '→ ołówek przy istniejącym wdrożeniu → Version: NEW VERSION → Deploy';
+            S.wyc.blad = t;
+            try { console.error('[HUB recon] wyciagi z Drive', e); } catch (e2){}
+        } finally { S.zajete.wyciagi = false; }
+        rysuj();
+    }
+    // Czy plik z folderu jest JUZ w sesji. Liczymy ze stanu sesji, nie ze znacznika przy
+    // pozycji: po ponownym pobraniu lista „innych" powstaje od nowa i znacznik przepada,
+    // a drugie klikniecie wstawialo te sama spolke DRUGI RAZ (zlapane na stanowisku —
+    // szesc kart zamiast pieciu, a uzgodnienie liczylo ja podwojnie).
+    function wyciagWSesji(nazwa){
+        var n = String(nazwa || '');
+        if (!n) return false;
+        return S.spolki.some(function (sp){ return sp.plik === n; })
+            || S.mapPliki.some(function (mp){ return mp.plik === n; });
+    }
+    // Saldolista albo mapowanie, ktore lezy w folderze „rzis i bilanz” — wgrywane na klik,
+    // z tresci pobranej razem z wyciagami (bez drugiego zapytania do Drive).
+    function wgrajZDrive(i){
+        var D = S.wyc.dane;
+        var poz = (D && D.inne && D.inne[i]) ? D.inne[i] : null;
+        if (!poz){ say('Nie ma takiego pliku na liście — pobierz folder jeszcze raz.', 'warn'); rysuj(); return; }
+        var X = rcnX();
+        if (!X){ say('brak biblioteki XLSX — odśwież stronę', 'err'); rysuj(); return; }
+        if (wyciagWSesji(poz.name)){
+            say('„' + poz.name + '” jest już w sesji — nie wgrywam drugi raz. '
+                + 'Usuń starą pozycję, jeśli chcesz wczytać plik od nowa.', 'warn');
+            rysuj(); return;
+        }
+        try {
+            var w = rcnParseWorkbook(X.read(poz.b64, { type: 'base64' }), poz.name);
+            var opis = dodajZeSkoroszytu(w, 'drive');
+            if (!opis.length){ say(poz.name + ': nie rozpoznałem ani saldolisty, ani mapowania.', 'warn'); rysuj(); return; }
+            odswiezIndeks(); przypiszKody(); przelicz();
+            say(poz.name + ' — z Drive: ' + opis.join('; '), 'ok');
+        } catch (e){
+            say(poz.name + ': błąd odczytu — ' + rcnBlad(e), 'err');
+            try { console.error('[HUB recon] wgraj z Drive', e); } catch (e2){}
+        }
+        rysuj();
+    }
     async function sprawdzPolaczenie(){
         if (S.zajete.ping) return;
         S.zajete.ping = true; S.polMsg = { t: 'sprawdzam połączenie…', c: 'info' };
         rysuj();
         try {
             var j = await rcnDriveReq('ping');
+            // Drugi folder osobno: wdrozony starszy kod nie zna go wcale (brak pol), a nowszy
+            // moze go nie widziec (bladWyc) — obie rzeczy maja byc widoczne tutaj.
+            var oWyc = j.bladWyc ? ' · folder wyciągów NIE działa: ' + j.bladWyc
+                     : (j.folderWyc ? ' · folder „' + j.folderWyc + '”, plików: ' + (j.countWyc != null ? j.countWyc : '?')
+                                    : ' · wdrożony skrypt nie zna jeszcze folderu wyciągów (wdróż nową wersję)');
             S.polMsg = { t: 'Połączenie działa: folder „' + (j.folder || '?') + '”, plików: ' + (j.count != null ? j.count : '?')
-                          + (j.wersja ? ', wersja skryptu: ' + j.wersja : ''), c: 'ok' };
+                          + oWyc + (j.wersja ? ' · wersja skryptu: ' + j.wersja : ''),
+                         c: (j.bladWyc || !j.folderWyc) ? 'warn' : 'ok' };
         } catch (e){
             S.polMsg = { t: 'Nie działa: ' + rcnBlad(e), c: 'err' };
         } finally { S.zajete.ping = false; }
@@ -85150,25 +86137,7 @@
                     var buf = await czytajPlik(f);
                     var wb = rcnCzytajSkoroszyt(buf);
                     var w = rcnParseWorkbook(wb, f.name);
-                    var opis = [];
-                    w.saldolisty.concat(w.lexware).forEach(function (sl){
-                        S.licznik++;
-                        sl.id = 'r' + S.licznik;
-                        sl.kod = ''; sl.kodZrodlo = ''; sl.kodOpis = '';
-                        S.spolki.push(sl);
-                        opis.push((sl.typ === 'lexware' ? 'Lexware → saldolista' : 'saldolista') + ' „' + sl.nazwa + '” (' + sl.konta.length + ' kont)');
-                    });
-                    w.mapowania.forEach(function (mp){
-                        mp.zrodlo = 'plik';
-                        S.mapPliki.push(mp);
-                        opis.push('mapowanie ' + (mp.kod || '(bez kodu)') + ' (' + mp.liczbaKont + ' kont) — zastępuje Drive na czas sesji');
-                    });
-                    (w.wyciagi || []).forEach(function (wy){
-                        S.licznik++;
-                        wy.id = 'w' + S.licznik;
-                        S.wyciagi.push(wy);
-                        opis.push(wy.rodzaj + (wy.nazwa ? ' „' + wy.nazwa + '”' : '') + ' (' + wy.konta.length + ' kont)');
-                    });
+                    var opis = dodajZeSkoroszytu(w, 'plik');
                     if (w.bledy && w.bledy.length){
                         bledy++;
                         raport.push(f.name + ': ' + w.bledy.join(' '));
@@ -85244,6 +86213,8 @@
             if (a === 'zamknij'){ panel.style.display = 'none'; return; }
             if (a === 'wybierz'){ rcnPlik.click(); return; }
             if (a === 'odswiez'){ pobierzMapowania(); return; }
+            if (a === 'wyc-drive'){ pobierzWyciagi(); return; }
+            if (a === 'wyc-wgraj'){ wgrajZDrive(Number(el.getAttribute('data-i'))); return; }
             if (a === 'ping'){ sprawdzPolaczenie(); return; }
             if (a === 'kursy'){ pobierzKursy(); return; }
             if (a === 'usun-spolke'){
@@ -85262,13 +86233,29 @@
                 przelicz(); rysuj(); return;
             }
             if (a === 'wyczysc-wyciagi'){
-                if (!confirm('Usunąć z panelu wszystkie wczytane wyciągi (plan kont, bilans, RZiS)?\n\nSaldolisty i mapowania zostają.')) return;
+                // Bez tej strazy pobieranie, ktore wlasnie leci, po kilkunastu sekundach wstawia
+                // wyciagi Z POWROTEM — i to po tym, jak czlowiek swiadomie je usunal.
+                if (S.zajete.wyciagi){
+                    say('Trwa pobieranie bilansów i RZiS z Drive — poczekaj na koniec, '
+                        + 'bo inaczej wrócą same po zakończeniu pobierania.', 'warn');
+                    rysuj(); return;
+                }
+                if (!confirm('Usunąć z panelu wszystkie wczytane wyciągi (plan kont, bilans, RZiS)?\n\n'
+                    + 'Dotyczy też tych pobranych z Drive — po usunięciu możesz je pobrać jeszcze raz.\n'
+                    + 'Saldolisty i mapowania zostają.')) return;
                 S.wyciagi = []; S.wycIdx = null;
+                S.wyc = { stan: 'nic', blad: '', dane: null, pobrano: null, postep: '' };
                 przelicz(); rysuj(); return;
             }
             if (a === 'wyczysc'){
+                if (S.zajete.wyciagi){
+                    say('Trwa pobieranie bilansów i RZiS z Drive — poczekaj na koniec, '
+                        + 'bo inaczej wyciągi wrócą same po zakończeniu pobierania.', 'warn');
+                    rysuj(); return;
+                }
                 if (!confirm('Usunąć z panelu wszystkie wgrane saldolisty, wyciągi i pliki mapowania?\n\nMapowania z Drive zostają.')) return;
                 S.spolki = []; S.mapPliki = []; S.wyciagi = []; S.wycIdx = null; S.kursy = {}; S.kursMsg = null; say('', '');
+                S.wyc = { stan: 'nic', blad: '', dane: null, pobrano: null, postep: '' };
                 odswiezIndeks(); przelicz(); rysuj(); return;
             }
             if (a === 'gotowa'){
@@ -85277,14 +86264,34 @@
                 if (sp && sp.lexware) rcnZapiszBlob(rcnGotowaBlob(sp), 'Gotowa_saldolista_' + sp.nazwa + '.xlsx');
                 return;
             }
-            if (a === 'luca'){
+            if (a === 'luca' || a === 'luca-mimo'){
                 var lid = el.getAttribute('data-id');
                 var lsp = S.spolki.filter(function (s){ return s.id === lid; })[0];
                 if (!lsp) return;
                 var LR = rcnLucanetRows(lsp, S.idx || rcnIndexMappings([]), { kursy: kursyMapa(), wyciagi: S.wycIdx });
-                rcnZapiszBlob(rcnLucanetBlob(LR), LR.nazwaPliku);
-                say('Obrotówka „' + LR.nazwaPliku + '”: ' + LR.wiersze.length + ' '
-                    + rcnPlural(LR.wiersze.length, 'wiersz', 'wiersze', 'wierszy') + ', bilans ' + rcnKw(LR.balans) + '.', 'ok');
+                // Blokady liczymy TERAZ, nie z chwili rysowania panelu: miedzy jednym a drugim
+                // mozna bylo zmienic kurs, kod spolki albo wgrac wyciag.
+                var mimo = (a === 'luca-mimo') && LR.blokady.length > 0;
+                // Osobne say() tutaj nadpisalby komunikat koncowy (jedno gniazdo S.msg) —
+                // czlowiek nie zobaczylby ani slowa o tym, czemu plik nie ma dopisku.
+                var zbedne = (a === 'luca-mimo') && !LR.blokady.length;
+                if (mimo && !confirm('Składam obrotówkę „' + (LR.etykieta || LR.kod) + '” MIMO '
+                        + LR.blokady.length + ' ' + rcnPlural(LR.blokady.length, 'kontroli, która nie przechodzi',
+                            'kontroli, które nie przechodzą', 'kontroli, które nie przechodzą') + ':\n\n'
+                        + LR.blokady.map(function (b, i){ return (i + 1) + '. ' + b; }).join('\n')
+                        + '\n\nPlik dostanie w nazwie „NIE-ZGADZA-SIE” i arkusz z tą listą.\n'
+                        + 'Taka obrotówka NIE nadaje się do wrzucenia do LucaNetu, dopóki dane się nie zgadzają — '
+                        + 'wchodzi do konsolidacji i psuje ją, a błąd wychodzi dopiero tam.\n\nSkładam?')) return;
+                var lnazwa = mimo ? rcnLucaNazwaMimo(LR.nazwaPliku) : LR.nazwaPliku;
+                rcnZapiszBlob(rcnLucanetBlob(LR, mimo), lnazwa);
+                say('Obrotówka „' + lnazwa + '”: ' + LR.wiersze.length + ' '
+                    + rcnPlural(LR.wiersze.length, 'wiersz', 'wiersze', 'wierszy') + ', bilans ' + rcnKw(LR.balans) + '.'
+                    + (mimo ? ' ZŁOŻONA MIMO ' + LR.blokady.length + ' ' + rcnPlural(LR.blokady.length,
+                        'kontroli, która nie przechodzi', 'kontroli, które nie przechodzą',
+                        'kontroli, które nie przechodzą') + ' — patrz arkusz „NIE ZGADZA SIE”.' : '')
+                    + (zbedne ? ' Wymuszenie było zbędne — ta obrotówka przechodzi już wszystkie kontrole, '
+                        + 'więc plik jest zwyczajny, bez dopisku „NIE-ZGADZA-SIE”.' : ''),
+                    mimo ? 'warn' : zbedne ? 'info' : 'ok');
                 rysuj(); return;
             }
             if (a === 'luca-wszystkie'){
@@ -85456,7 +86463,8 @@
         }
         var st = panel.scrollTop, h;
         try {
-            h = htmlNaglowek() + htmlMapowania() + htmlPliki() + htmlSpolki() + htmlKursy() + htmlWyniki();
+            h = htmlNaglowek() + htmlMapowania() + htmlWycDrive() + htmlPliki() + htmlSpolki()
+              + htmlBilansRzis() + htmlKursy() + htmlWyniki();
         } catch (e){
             h = htmlNaglowek() + '<div class="rcn-msg rcn-err">Błąd rysowania panelu: ' + esc(rcnBlad(e)) + '</div>';
             try { console.error('[HUB recon] rysowanie', e); } catch (e2){}
@@ -85468,8 +86476,15 @@
                 var k = d.getAttribute('data-k');
                 // <details open> z samego renderingu tez wywoluje toggle. Bez tego filtra
                 // domyslne „otwarte" zapisywalo sie na stale i nie liczylo od nowa.
-                if (S.otwarte[k] === undefined && d.open === (d.getAttribute('data-dom') === '1')) return;
+                var bylo = S.otwarte[k];
+                if (bylo === undefined && d.open === (d.getAttribute('data-dom') === '1')) return;
                 S.otwarte[k] = d.open;
+                // Tabele rysowane leniwie musza sie po rozwinieciu POJAWIC — same otwarcie
+                // <details> zapisuje tylko stan, tresc powstaje przy nastepnym przerysowaniu.
+                // Tylko na PRZEJSCIU w otwarte: <details open> odtworzony przez innerHTML sam
+                // odpala toggle, wiec bezwarunkowe rysuj() tutaj zawiesza karte w nieskonczonej
+                // petli (zlapane na stanowisku — przegladarka przestawala odpowiadac).
+                if (d.getAttribute('data-leniwy') === '1' && d.open && bylo !== true) rysuj();
             });
         });
         if (fokus && fokus.pole){
@@ -85580,6 +86595,67 @@
         }
         return h;
     }
+    // Sekcja drugiego folderu Drive. Pokazuje tez to, czego HUB z niego NIE wzial: PDF-y
+    // (Lexware'y mamy w .xlsx), saldolisty i mapowania, ktore trzeba wgrac swiadomie, oraz
+    // pliki, z ktorych nic nie wyszlo. Plik, o ktorym panel milczy, wyglada jak wzięty.
+    function htmlWycDrive(){
+        var D = S.wyc, dane = D.dane, pol = rcnPolaczenie();
+        var h = '<div class="rcn-sek" style="margin-top:8px">Bilanse i RZiS z Drive <span class="rcn-aux">'
+              + '<button type="button" class="rcn-btn" data-akcja="wyc-drive"' + (D.stan === 'pobieram' || !pol.url ? ' disabled' : '') + '>'
+              + (dane ? '↻ Pobierz jeszcze raz' : '↓ Pobierz bilanse i RZiS z Drive') + '</button></span></div>';
+        if (!pol.url)
+            h += '<div class="rcn-mut">Najpierw adres wdrożenia Apps Scriptu (wyżej, „⚙ Połączenie z Drive”).</div>';
+        else if (D.stan === 'pobieram')
+            h += '<div class="rcn-msg rcn-info">pobieram z folderu „rzis i bilanz”… '
+               + esc(D.postep || 'pierwsza porcja') + ' (porcjami po 20 plików)</div>';
+        else if (D.stan === 'blad')
+            h += '<div class="rcn-msg rcn-err">Nie pobrałem: ' + esc(D.blad)
+               + (dane ? '<br>Liczę na plikach pobranych ' + esc(rcnChwila(D.pobrano)) + '.' : '') + '</div>';
+        else if (!dane)
+            h += '<div class="rcn-mut">Plan kont, bilans i RZiS leżą w osobnym folderze na Drive. '
+               + 'HUB bierze je stąd — ale dopiero po kliknięciu, bo to kilkadziesiąt plików. '
+               + 'Bez nich cała saldolista idzie jednym kursem i znak części kont zostaje niepewny.</div>';
+        if (!dane) return h;
+        var zDrive = S.wyciagi.filter(function (wy){ return wy.zrodlo === 'drive'; }).length;
+        h += '<div style="font-size:12px;margin:4px 0">Folder <b>„' + esc(dane.folder || '?') + '”</b>'
+           + ' · plików .xlsx: <b>' + dane.pliki.length + '</b>'
+           + ' · wyciągów w sesji: <b>' + zDrive + '</b>'
+           + ' · pobrane: <b>' + esc(rcnChwila(D.pobrano)) + '</b>'
+           + (dane.wersja ? ' <span class="rcn-mut">· skrypt ' + esc(dane.wersja) + '</span>' : '') + '</div>';
+        dane.uwagi.forEach(function (u){ h += '<div class="rcn-msg rcn-warn">' + esc(u) + '</div>'; });
+        if (dane.pominiete.length) h += '<div class="rcn-mut">Nie są plikami .xlsx, więc ich nie czytam: '
+            + esc(dane.pominiete.map(function (p){ return (p.name || '?') + ' [' + (p.mime || '?') + ']'; }).join(', ')) + '</div>';
+        if (dane.duplikaty.length) h += '<div class="rcn-msg rcn-warn">Powtórzone nazwy plików w folderze: ' + esc(dane.duplikaty.join(', ')) + '</div>';
+        if (dane.inne.length){
+            h += '<div class="rcn-karta" style="margin:4px 0"><b style="font-size:12px">W tym folderze leżą też saldolisty i mapowania</b>'
+               + '<div class="rcn-mut">Same z siebie nie wchodzą — saldolista to dane uzgodnienia i okres w folderze nie musi być tym, '
+               + 'który właśnie uzgadniasz. Wgraj kliknięciem.</div>'
+               + '<table class="rcn-t"><tbody>';
+            dane.inne.forEach(function (x, i){
+                h += '<tr><td>' + esc(x.name) + '</td><td class="rcn-mut">' + esc(x.opis) + '</td><td class="rcn-num">'
+                   + (wyciagWSesji(x.name) ? pill('wgrany', 'rcn-ok', 'plik o tej nazwie jest już w sesji')
+                               : '<button type="button" class="rcn-btn rcn-btn2" data-akcja="wyc-wgraj" data-i="' + i + '">↓ Wgraj do sesji</button>')
+                   + '</td></tr>';
+            });
+            h += '</tbody></table></div>';
+        }
+        var bledne = dane.pliki.filter(function (p){ return p.blad; });
+        if (bledne.length){
+            h += '<details data-k="wyc-bledne"' + otw('wyc-bledne', true) + '><summary>Pliki, z których nic nie wziąłem: ' + bledne.length + '</summary>'
+               + '<table class="rcn-t"><tbody>'
+               + bledne.map(function (p){ return '<tr><td>' + esc(p.name) + '</td><td class="rcn-mut">' + esc(p.blad) + '</td></tr>'; }).join('')
+               + '</tbody></table></details>';
+        }
+        h += '<details data-k="wyc-pliki"' + otw('wyc-pliki', false) + '><summary>Wszystkie pliki z folderu (' + dane.pliki.length + ')</summary>'
+           + '<table class="rcn-t"><thead><tr><th>Plik</th><th>Co to jest</th><th class="rcn-num">Kont</th><th>Zmiana</th></tr></thead><tbody>'
+           + dane.pliki.map(function (p){
+                 return '<tr><td>' + esc(p.name) + '</td><td>' + (p.co ? esc(p.co) : pill('nie wziąłem', 'rcn-err', p.blad || ''))
+                      + '</td><td class="rcn-num">' + (p.kont || '') + '</td><td class="rcn-mut">'
+                      + esc(p.lastUpdated ? rcnChwila(p.lastUpdated) : '—') + '</td></tr>';
+             }).join('')
+           + '</tbody></table></details>';
+        return h;
+    }
     function htmlListaUwag(lista){
         if (!lista.length) return '<div class="rcn-mut">brak</div>';
         var h = '<table class="rcn-t"><tbody>';
@@ -85607,7 +86683,7 @@
         if (!S.wyciagi.length) return '';
         var ix = S.wycIdx, h = '<div class="rcn-sek" style="margin-top:8px">Wyciągi (plan kont, bilans, RZiS) <span class="rcn-aux">'
             + '<button type="button" class="rcn-btn rcn-btn2" data-akcja="wyczysc-wyciagi">Usuń wszystkie</button></span></div>'
-            + '<table class="rcn-t"><thead><tr><th>Plik</th><th>Rodzaj</th><th>Spółka</th><th class="rcn-num">Kont</th><th>Okres</th><th></th></tr></thead><tbody>';
+            + '<table class="rcn-t"><thead><tr><th>Plik</th><th>Rodzaj</th><th>Spółka</th><th class="rcn-num">Kont</th><th>Okres</th><th>Skąd</th><th></th></tr></thead><tbody>';
         S.wyciagi.forEach(function (wy, i){
             var kod = wy.kodWykryty || '';
             h += '<tr><td class="rcn-mut">' + esc(wy.plik) + (wy.arkusz ? ' / ' + esc(wy.arkusz) : '') + '</td><td>' + esc(wy.rodzaj) + '</td>'
@@ -85617,10 +86693,11 @@
                                      'w pliku nie ma nazwy spółki, a nazwa pliku nie zaczyna się od numeru — dopisz numer na początku nazwy'))
                + '</td><td class="rcn-num">' + wy.konta.length + '</td>'
                + '<td class="rcn-mut">' + esc(wy.okres || '—') + '</td>'
+               + '<td>' + (wy.zrodlo === 'drive' ? pill('Drive', 'rcn-info') : pill('z pliku', 'rcn-warn')) + '</td>'
                + '<td class="rcn-num"><button type="button" class="rcn-btn rcn-btn2" data-akcja="usun-wyciag" data-i="' + i + '">Usuń</button></td></tr>';
         });
         if (ix && ix.uwagi.length)
-            h += '<tr><td colspan="6" class="rcn-mut">' + ix.uwagi.slice(0, 6).map(esc).join('<br>') + '</td></tr>';
+            h += '<tr><td colspan="7" class="rcn-mut">' + ix.uwagi.slice(0, 6).map(esc).join('<br>') + '</td></tr>';
         return h + '</tbody></table>';
     }
     function bledySpolki(id){
@@ -85704,7 +86781,10 @@
                 h += '<div class="rcn-msg rcn-err"><b>Obrotówki do LucaNetu nie policzyłem</b>: ' + esc(lucaBlad) + '</div>';
             } else if (lucaR.blokady.length){
                 h += '<div class="rcn-msg rcn-err"><b>Nie składam obrotówki do LucaNetu</b><ul class="rcn-ul">'
-                   + lucaR.blokady.map(function (b){ return '<li>' + esc(b) + '</li>'; }).join('') + '</ul></div>';
+                   + lucaR.blokady.map(function (b){ return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>'
+                   + '<div style="margin-top:4px"><button type="button" class="rcn-btn rcn-btn2" data-akcja="luca-mimo" data-id="' + esc(sp.id) + '">⬇ Złóż mimo to</button>'
+                   + ' <span class="rcn-mut">plik dostanie w nazwie „NIE-ZGADZA-SIE” i arkusz z tą listą; '
+                   + 'do LucaNetu taki nie idzie, dopóki dane się nie zgadzają</span></div></div>';
             } else {
                 h += '<div style="margin-top:4px"><button type="button" class="rcn-btn rcn-btn2" data-akcja="luca" data-id="' + esc(sp.id) + '">⬇ Obrotówka do LucaNetu</button>'
                    + ' <span class="rcn-mut">' + lucaR.wiersze.length + ' ' + rcnPlural(lucaR.wiersze.length, 'wiersz', 'wiersze', 'wierszy')
@@ -85713,6 +86793,134 @@
             h += '</div>';
         });
         return h + '</div>';
+    }
+    // Widok bilansu i RZiS. Pelne tabele rysujemy LENIWIE — tylko gdy czlowiek rozwinie
+    // <details>. 22 spolki po kilkaset kont to kilka tysiecy wierszy w DOM przy KAZDYM
+    // przerysowaniu panelu, a panel przerysowuje sie po kazdej zmianie pola.
+    function htmlBilansRzis(){
+        if (!S.wycIdx || !S.spolki.length) return '';
+        var maja = S.spolki.filter(function (sp){ return sp.kod && S.wycIdx.spolki[sp.kod]; });
+        var bez = S.spolki.filter(function (sp){ return !sp.kod || !S.wycIdx.spolki[sp.kod]; });
+        if (!maja.length){
+            return '<div class="rcn-sek" style="margin-top:8px">Bilans i RZiS</div>'
+                 + '<div class="rcn-mut">Żadna wgrana spółka nie ma wyciągu — pobierz folder „rzis i bilanz” '
+                 + 'albo wgraj pliki ręcznie. Bez nich nie wiem, które konto jest bilansowe, a które wynikowe.</div>';
+        }
+        var wyniki = maja.map(function (sp){
+            var pw = (S.wycIdx.pliki || []).filter(function (p){ return p.kod === sp.kod; });
+            return { sp: sp, R: rcnBilansRzisSp(sp, S.wycIdx.spolki[sp.kod], pw) };
+        });
+        var zle = wyniki.filter(function (x){ return !x.R.ok; }).length;
+        var h = '<div class="rcn-sek" style="margin-top:8px">Bilans i RZiS wobec saldolisty — spółek: ' + wyniki.length
+              + (zle ? ' · ' + pill('do obejrzenia: ' + zle, 'rcn-warn') : ' · ' + pill('wszystkie zgodne', 'rcn-ok')) + '</div>';
+        if (bez.length) h += '<div class="rcn-mut">Bez wyciągu: ' + esc(bez.map(function (sp){ return sp.nazwa; }).join(', ')) + '</div>';
+        wyniki.forEach(function (x){
+            var sp = x.sp, R = x.R, kk = 'brz|' + sp.id;
+            var tytul = esc(rcnKodEt(R.kod, (S.idx && S.idx.etykiety[R.kod]) || R.nazwa || R.kod));
+            var znacz = R.ok ? pill('zgodne', 'rcn-ok')
+                      : pill((R.ileRoznych ? R.ileRoznych + ' ' + rcnPlural(R.ileRoznych, 'konto się różni', 'konta się różnią', 'kont się różni') : 'różnice w składzie kont'), 'rcn-warn');
+            h += '<details data-k="' + esc(kk) + '"' + otw(kk, !R.ok && wyniki.length <= 3) + '><summary>' + tytul + ' ' + znacz
+               + ' <span class="rcn-mut">' + esc(Object.keys(R.rodzaje).join(', ') || '—') + '</span></summary>';
+            h += '<div class="rcn-karta" style="margin:4px 0">';
+            h += '<div style="font-size:12px">saldolista <b>' + esc(R.okresOdSal ? rcnDataPl(R.okresOdSal) + ' – ' : '')
+               + esc(R.okresSal ? rcnDataPl(R.okresSal) : '—') + '</b>'
+               + ' · nagłówek wyciągu: ' + (R.okresy.length
+                     ? R.okresy.map(function (o){ return esc(o.typ) + ' „<b>' + esc(o.tekst || rcnDataPl(o['do'])) + '</b>”'; }).join(', ')
+                     : '<span class="rcn-mut">brak</span>')
+               + (R.bezOkresu.length ? ' · <span class="rcn-mut">bez okresu w pliku: ' + esc(R.bezOkresu.join(', ')) + '</span>' : '')
+               + ' · waluta ksiąg <b>' + esc(R.waluta || '?') + '</b></div>';
+            // Naglowek bilansu Infoniqi niesie ROK OBROTOWY, nie dzien wydruku - sam rozjazd
+            // napisow niczego nie dowodzi i nie strasze nim na czerwono.
+            if (R.naglowekInny)
+                h += '<div class="rcn-mut">Nagłówek wyciągu mówi o innym dniu niż koniec saldolisty. U Infoniqi w nagłówku '
+                   + 'bilansu stoi <b>rok obrotowy</b>, a nie dzień wydruku, więc sam ten napis nic nie rozstrzyga — '
+                   + 'rozstrzygają konta, które się różnią.</div>';
+            if (R.ileRoznych)
+                h += '<div class="rcn-msg rcn-err"><b>Różni się ' + R.ileRoznych + ' '
+                   + rcnPlural(R.ileRoznych, 'konto', 'konta', 'kont') + '.</b> Najczęstsza przyczyna to wyciąg '
+                   + 'wydrukowany na inny dzień niż saldolista — wtedy różni się każde konto, które w międzyczasie ruszało, '
+                   + 'i żadna z tych liczb nie jest błędna, tylko nie z tego dnia. Jedno albo dwa konta przy zgodnej reszcie '
+                   + 'to nie okres, tylko to konkretne konto. Kwoty w walucie transakcji biorę tylko z kont zgodnych co do grosza.</div>';
+            h += '<div class="rcn-mut">pliki: ' + esc(R.pliki.join(' · ')) + '</div>';
+            if (R.ileFw)
+                h += '<div style="font-size:12px;margin-top:2px">kwota w walucie transakcji: na <b>' + R.ileFw + '</b> '
+                   + rcnPlural(R.ileFw, 'koncie', 'kontach', 'kontach') + ', z czego używam <b>' + R.ileFwUzyte + '</b>'
+                   + (R.ileFwUzyte < R.ileFw ? ' <span class="rcn-mut">(resztę pomijam, bo Total z wyciągu nie równa się Saldu z saldolisty)</span>' : '') + '</div>';
+            R.grupy.forEach(function (g){
+                if (!g.ile) return;
+                var kp = 'brz-pelna|' + sp.id + '|' + g.id, pelnaOtw = S.otwarte[kp] === true;
+                h += '<div style="margin-top:6px"><b style="font-size:12px">' + esc(g.nazwa) + '</b> <span class="rcn-mut">· kont: ' + g.ile
+                   + ' · Σ Total (wyciąg) ' + rcnKw(g.sumaTotGr / 100)
+                   + ' · Σ Saldo (saldolista, ' + g.ileWspolnych + ' wspólnych kont) ' + rcnKw(g.sumaSalGr / 100)
+                   + ' · różnica ' + rcnKw(g.sumaRozGr / 100) + '</span></div>';
+                if (g.rozne.length) h += htmlBrzTabela(g.rozne, 'Konta, które się różnią (' + g.rozne.length + ')', RCN_BRZ_SUFIT);
+                h += '<details data-k="' + esc(kp) + '" data-leniwy="1"' + otw(kp, false) + '><summary>wszystkie konta ('
+                   + g.ile + ')</summary>'
+                   + (pelnaOtw ? htmlBrzTabela(g.wiersze, '') : '<div class="rcn-mut">rozwijam na żądanie — kliknij jeszcze raz, jeśli tabeli nie widać</div>')
+                   + '</details>';
+            });
+            if (R.tylkoWyciag.length)
+                h += '<div style="margin-top:6px">' + htmlBrzTabela(R.tylkoWyciag, 'W wyciągu z kwotą, a w saldoliście tego konta nie ma ('
+                   + R.tylkoWyciag.length + ')', RCN_BRZ_SUFIT) + '</div>';
+            if (R.tylkoSaldolista.length){
+                h += '<div style="margin-top:6px"><b style="font-size:12px">W saldoliście z saldem, a wyciąg ich nie wycenia ('
+                   + R.tylkoSaldolista.length + ')</b><table class="rcn-t"><thead><tr><th>Konto</th><th>Nazwa</th>'
+                   + '<th class="rcn-num">Saldo</th><th>W planie kont</th></tr></thead><tbody>'
+                   + R.tylkoSaldolista.slice(0, RCN_BRZ_SUFIT).map(function (w){
+                         return '<tr><td class="rcn-mono">' + esc(w.konto) + '</td><td>' + esc(w.nazwa) + '</td>'
+                              + '<td class="rcn-num">' + rcnKw(w.saldo) + '</td><td>'
+                              + (w.wPlanie ? pill('jest', 'rcn-info') : pill('nie ma', 'rcn-warn')) + '</td></tr>';
+                     }).join('')
+                   + (R.tylkoSaldolista.length > RCN_BRZ_SUFIT
+                        ? '<tr><td colspan="4" class="rcn-mut">pokażuję ' + RCN_BRZ_SUFIT + ' z '
+                          + R.tylkoSaldolista.length + '</td></tr>' : '')
+                   + '</tbody></table></div>';
+            }
+            if (R.bezKwoty.length){
+                var kb = 'brz-bez|' + sp.id;
+                h += '<details data-k="' + esc(kb) + '"' + otw(kb, false) + '><summary>Konta z planu kont bez kwoty w bilansie i RZiS ('
+                   + R.bezKwoty.length + ')</summary><div class="rcn-mut">Plan kont mówi o nich stronę i znak, kwoty nie. '
+                   + 'Konto, które w bilansie nie stoi, zwykle ma zero.</div>'
+                   + '<table class="rcn-t"><thead><tr><th>Konto</th><th>Nazwa</th><th>Strona</th><th>Znak</th><th class="rcn-num">Saldo z saldolisty</th></tr></thead><tbody>'
+                   + R.bezKwoty.slice(0, RCN_BRZ_SUFIT).map(function (w){
+                         return '<tr><td class="rcn-mono">' + esc(w.konto) + '</td><td>' + esc(w.nazwa) + '</td>'
+                              + '<td>' + (w.strona === 'B' ? 'bilans' : w.strona === 'E' ? 'wynik' : '—') + '</td>'
+                              + '<td>' + esc(w.znak || '—') + '</td>'
+                              + '<td class="rcn-num">' + (w.saldo == null ? '<span class="rcn-mut">brak w saldoliście</span>' : rcnKw(w.saldo)) + '</td></tr>';
+                     }).join('')
+                   + (R.bezKwoty.length > RCN_BRZ_SUFIT ? '<tr><td colspan="5" class="rcn-mut">pokażuję ' + RCN_BRZ_SUFIT
+                        + ' z ' + R.bezKwoty.length + '</td></tr>' : '')
+                   + '</tbody></table></details>';
+            }
+            h += '</div></details>';
+        });
+        return h;
+    }
+    // sufit = ile wierszy narysowac. Tabele poza leniwymi <details> rysuja sie zawsze, wiec
+    // bez sufitu spolka z samym planem kont dokladala kilkaset wierszy do DOM przy KAZDYM
+    // przerysowaniu panelu (u 1002: 265) — a tych spolek jest 22.
+    var RCN_BRZ_SUFIT = 50;
+    function htmlBrzTabela(wiersze, tytul, sufit){
+        var ile = wiersze.length, pokaz = (sufit && ile > sufit) ? wiersze.slice(0, sufit) : wiersze;
+        var maFw = pokaz.some(function (w){ return w.fw != null; });
+        var h = (tytul ? '<b style="font-size:12px">' + esc(tytul) + '</b>' : '')
+              + '<table class="rcn-t"><thead><tr><th>Konto</th><th>Nazwa</th>'
+              + (maFw ? '<th>Waluta</th><th class="rcn-num">Kwota w walucie</th>' : '')
+              + '<th class="rcn-num">Total (wyciąg)</th><th class="rcn-num">Saldo (saldolista)</th>'
+              + '<th class="rcn-num">Różnica</th></tr></thead><tbody>';
+        pokaz.forEach(function (w){
+            h += '<tr><td class="rcn-mono">' + esc(w.konto) + '</td><td>' + esc(w.nazwa) + '</td>'
+               + (maFw ? '<td class="rcn-mono">' + esc(w.waluta || '—') + '</td><td class="rcn-num">'
+                       + (w.fw == null ? '<span class="rcn-mut">—</span>' : rcnKw(w.fw)) + '</td>' : '')
+               + '<td class="rcn-num">' + rcnKw(w.total) + '</td>'
+               + '<td class="rcn-num">' + (w.maSaldolista ? rcnKw(w.saldo) : '<span class="rcn-mut">brak konta</span>') + '</td>'
+               + '<td class="rcn-num">' + (w.roznicaGr == null ? '—'
+                     : (w.roznicaGr === 0 ? pill('0,00', 'rcn-ok') : pill(rcnKw(w.roznicaGr / 100), 'rcn-err'))) + '</td></tr>';
+        });
+        if (pokaz.length < ile)
+            h += '<tr><td colspan="' + (maFw ? 7 : 5) + '" class="rcn-mut">pokażuję ' + pokaz.length
+               + ' z ' + ile + ' — wszystkie są niżej, w „wszystkie konta”</td></tr>';
+        return h + '</tbody></table>';
     }
     function htmlKursy(){
         if (!S.spolki.length) return '';
@@ -85919,7 +87127,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'a4d902f · 06.10.2026 08:28';
+    const HUB_BUDOWA = 'dab032c · 07.10.2026 09:16';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
