@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.59.8
+// @version      5.59.9
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -36,6 +36,7 @@
 // @connect      empik.com
 // @connect      leenbakker.nl
 // @connect      castorama.fr
+// @connect      castorama.pl
 // @connect      xxxlgroup.com
 // @connect      bricodepot.es
 // @connect      homedeco.nl
@@ -4362,7 +4363,7 @@
                 ? { matchType: 'single', amount: normalizeAmount(amount), date: bookingDate, entries: [], multiOccurrence: true }
                 : null;
         } else {
-            existingRefund = findBookedRefundEntry(getFrameDoc(ctx), amount, bookingDate, false);
+            existingRefund = findBookedRefundEntry(getFrameDoc(ctx), amount, bookingDate, false, !!(dupInfo && dupInfo.jednaNota));
         }
 
         if (existingRefund) {
@@ -4480,11 +4481,19 @@
         //   DK: Refundering
         // Łatwo dorzucić kolejne języki gdy się pojawią (NL Terugbetaling,
         // HU Visszatérítés, RO Rambursare, SE Återbetalning, NO Refusion, etc).
-        const re = /(?:Refund|R(?:ü|u)ckerstattung|Remboursement|Rimborso|Reembolso|Refundering|Terugbetaling|Visszatérítés|Rambursare|Återbetalning|Refusion|Hyvitys|Zwrot)\b[^0-9]{0,80}([0-9]+[.,][0-9]{1,2})[^0-9]+([0-9]{4}-[0-9]{2}-[0-9]{2})/i;
+        //
+        // ZNAK (5.59.8). Nota ujemna — claim Amazona, wplata do ticketu — ma minus TUZ przed kwota:
+        // „Reembolso de -33.66 EUR em 2026-07-28" (zaobserwowane na Worten PT, 15.09.2026). Parser go
+        // gubil, wiec claim −39.97 i zwrot 39.97 tego samego zamowienia wygladaly na tickecie tak samo:
+        // kontrola duplikatu brala note claimu za zwrot (i odwrotnie), a nota claimu nie pasowala
+        // do jego wlasnej kwoty nigdy. Leniwe [^0-9]{0,80}? zostawia minus grupie (-?); minus oddzielony
+        // spacja albo stojacy gdzie indziej nie jest znakiem kwoty i zostaje pominiety, jak dotad.
+        // Prawdziwy minus (U+2212) liczy sie tak samo jak „-".
+        const re = /(?:Refund|R(?:ü|u)ckerstattung|Remboursement|Rimborso|Reembolso|Refundering|Terugbetaling|Visszatérítés|Rambursare|Återbetalning|Refusion|Hyvitys|Zwrot)\b[^0-9]{0,80}?([-−]?)([0-9]+[.,][0-9]{1,2})[^0-9]+([0-9]{4}-[0-9]{2}-[0-9]{2})/i;
         const m = String(text || '').match(re);
         if (!m) return null;
-        const amt = normalizeAmount(m[1]);
-        const date = normalizeDateForCompare(m[2]);
+        const amt = normalizeAmount((m[1] ? '-' : '') + m[2]);
+        const date = normalizeDateForCompare(m[3]);
         if (amt === null || amt === 0) return null;
         if (!date || date === '0000-00-00') return null;
         return { amount: amt, date: date };
@@ -4521,9 +4530,9 @@
             // bo tekst pochodzi z pojedynczego <a> już potwierdzonej credit note (nie z body).
             let parsed = parseRefundLinkText(linkText);
             if (!parsed) {
-                const am = linkText.match(/([0-9]+[.,][0-9]{1,2})/);
+                const am = linkText.match(/([-−]?)([0-9]+[.,][0-9]{1,2})/);   // znak jak w parseRefundLinkText (5.59.8)
                 const dm = linkText.match(/([0-9]{4}-[0-9]{2}-[0-9]{2})/);
-                const amt = am ? normalizeAmount(am[1]) : null;
+                const amt = am ? normalizeAmount((am[1] ? '-' : '') + am[2]) : null;
                 const dt = dm ? normalizeDateForCompare(dm[1]) : null;
                 if (amt !== null && amt !== 0 && dt && dt !== '0000-00-00') {
                     parsed = { amount: amt, date: dt };
@@ -4626,7 +4635,8 @@
         return inne.map(e => e.amount + ' z ' + e.date).join(', ');
     }
 
-    function findBookedRefundEntry(doc, amount, bookingDate, requireSameDate) {
+    // jednaNota — pozycja ksiegowana na JEDNA note (claim: row.kind, pierwszaPozycja): bez krokow 2–3 (sum).
+    function findBookedRefundEntry(doc, amount, bookingDate, requireSameDate, jednaNota) {
         const expectedAmount = normalizeAmount(amount);
         if (!expectedAmount) return null;
 
@@ -4651,44 +4661,36 @@
         if (requireSameDate) return null;
 
         const expectedNum = parseFloat(expectedAmount);
+        // KROKI 2–3 (sumy not), 5.59.8:
+        //  * pozycja na JEDNA note (claim) sie nie rozbija, wiec sumy jej nie dotycza. Do 5.59.8 krok 3 uznawal
+        //    claim za zaksiegowany, gdy na tickecie staly dwie noty z ta sama data — Goodwill 20 po zwrocie 100
+        //    rozbitym na 50 + 50 szedl jako „już zaksięgowane" i nikt go nie ksiegowal;
+        //  * sumujemy tylko noty TEGO SAMEGO znaku co kwota i porownujemy wartosci bezwzgledne: nota claimu nie
+        //    jest kawalkiem zwrotu, a ujemna pozycja bez rodzaju (Homedeco: wplata do ticketu na minus) rozbita
+        //    przez prologistics na artykuly ma sie rozpoznac przy ponownym puszczeniu tak samo jak dodatnia.
+        if (jednaNota || !expectedNum) return null;
+        const znak = expectedNum < 0 ? -1 : 1, cel = Math.abs(expectedNum);
+        const mod = entries.filter(entry => Math.sign(parseFloat(entry.amount)) === znak)
+                           .map(entry => ({ amount: Math.abs(parseFloat(entry.amount)).toFixed(2), date: entry.date, e: entry }));
+        if (!mod.length) return null;
+        const zSumy = (lista, typ) => ({
+            matchType: typ,
+            exactDate: false,
+            amount: (znak * lista.reduce((acc, x) => acc + parseFloat(x.amount), 0)).toFixed(2),
+            date: lista[lista.length - 1].date || '',
+            text: lista.map(x => `${x.e.amount} (${x.date})`).join(' + '),
+            entries: lista.map(x => x.e)
+        });
 
         // 2. Subset sumujący się dokładnie do oczekiwanej kwoty (np. 50 + 50 = 100)
-        const subset = findSubsetMatchingSum(entries, expectedNum);
-        if (subset) {
-            const totalAmount = subset.reduce((s, e) => s + parseFloat(e.amount), 0).toFixed(2);
-            return {
-                matchType: 'subset',
-                exactDate: false,
-                amount: totalAmount,
-                date: subset[subset.length - 1].date || '',
-                text: subset.map(e => `${e.amount} (${e.date})`).join(' + '),
-                entries: subset
-            };
-        }
+        const subset = findSubsetMatchingSum(mod, cel);
+        if (subset) return zSumy(subset, 'subset');
 
         // 3. Suma wszystkich pozycji równa lub przekracza oczekiwaną kwotę
-        if (entries.length > 1) {
-            const total = entries.reduce((s, e) => s + parseFloat(e.amount), 0);
-            if (Math.abs(total - expectedNum) < 0.005) {
-                return {
-                    matchType: 'sum-equal',
-                    exactDate: false,
-                    amount: total.toFixed(2),
-                    date: entries[entries.length - 1].date || '',
-                    text: entries.map(e => `${e.amount} (${e.date})`).join(' + '),
-                    entries
-                };
-            }
-            if (total > expectedNum + 0.005) {
-                return {
-                    matchType: 'sum-exceeds',
-                    exactDate: false,
-                    amount: total.toFixed(2),
-                    date: entries[entries.length - 1].date || '',
-                    text: entries.map(e => `${e.amount} (${e.date})`).join(' + '),
-                    entries
-                };
-            }
+        if (mod.length > 1) {
+            const total = mod.reduce((acc, x) => acc + parseFloat(x.amount), 0);
+            if (Math.abs(total - cel) < 0.005) return zSumy(mod, 'sum-equal');
+            if (total > cel + 0.005) return zSumy(mod, 'sum-exceeds');
         }
 
         return null;
@@ -4720,8 +4722,11 @@
             };
         }
 
-        // 2. Rozbity match: ≥2 wpisy z naszą datą, sumujące się do oczekiwanej kwoty
-        const sameDateEntries = entries.filter(e => e.date === expectedDate);
+        // 2. Rozbity match: ≥2 wpisy z naszą datą, sumujące się do oczekiwanej kwoty.
+        // Tylko noty tego samego znaku co kwota — patrz findBookedRefundEntry (5.59.8).
+        const znakH = Math.sign(parseFloat(expectedAmount));
+        const sameDateEntries = znakH
+            ? entries.filter(e => e.date === expectedDate && Math.sign(parseFloat(e.amount)) === znakH) : [];
         if (sameDateEntries.length >= 2) {
             // e.amount pochodzi z normalizeAmount i jest TEKSTEM ("113.00").
             // Bez parseFloat "+" sklejal napisy i suma nigdy sie nie zgadzala,
@@ -4908,6 +4913,91 @@
         }
 
         return { ok: true, method: 'editable-fields' };
+    }
+
+    // NUMERY NOT ZAKSIEGOWANYCH NA TICKECIE — bez czytania ich tekstu.
+    // Te same znaczniki co w extractBookedRefundEntries (<a id="unbook">, input.solution-checkbox
+    // [data-refund-id]), ale numer bierzemy z adresu credit_note.php?id=…, wiec nie zalezy od jezyka,
+    // formatu kwoty ani od tego, czy tekst noty w ogole da sie odczytac. bezNumeru — zaksiegowane
+    // noty, przy ktorych numeru nie widac: wtedy porownanie numerow niczego nie rozstrzyga.
+    function ksNumeryNot(doc) {
+        const ids = new Set();
+        let bezNumeru = 0;
+        if (!doc || !doc.querySelectorAll) return { ids, bezNumeru };
+        const byly = new Set();
+        const dodaj = lc => {
+            if (!lc || byly.has(lc)) return;
+            byly.add(lc);
+            const a = lc.querySelector('a[href*="credit_note.php"]');
+            const m = a ? String(a.getAttribute('href') || a.href || '').match(/[?&]id=(\d+)/) : null;
+            if (m) ids.add(m[1]); else bezNumeru++;
+        };
+        doc.querySelectorAll('a[id="unbook"]').forEach(ub => {
+            const tr = ub.closest ? ub.closest('tr') : null;
+            dodaj(tr ? tr.querySelector('.credit-note-link-container') : null);
+        });
+        doc.querySelectorAll('input.solution-checkbox[data-refund-id]').forEach(cb => {
+            dodaj(cb.closest ? cb.closest('.credit-note-link-container') : null);
+        });
+        return { ids, bezNumeru };
+    }
+
+    // POTWIERDZENIE ZAPISU MUSI POKAZAC NOWA NOTE (5.59.8).
+    // verifyTicketBooking szuka zaksiegowanej noty z nasza kwota i data, a gdy jej nie ma — DOWOLNEJ
+    // zaksiegowanej noty z nasza data. Przy zwrocie i claimie tego samego zamowienia ta druga to nota
+    // zwrotu sprzed chwili: 07.10.2026 SAFE-T −39.97 (406-7971398-8018765, ticket 692991) wyszedl jako
+    // „zaksięgowano", a noty nie bylo — potwierdzila go nota zwrotu 59.99 z ta sama data. Tak samo przy
+    // dwoch pozycjach tej samej kwoty (dupTotal > 1): druga „potwierdzala sie" nota pierwszej.
+    // Dlatego sukces liczy sie dopiero, gdy na tickecie jest zaksiegowana nota, ktorej numeru przed
+    // zapisem nie bylo — ta sama zasada, po ktorej bookOne rozpoznaje swoj zapis na poczatku proby.
+    // Zostaje dotychczasowa kontrola, gdy ticket pokazuje zaksiegowane noty bez numeru albo gdy
+    // fillTicket sam uznal pozycje za juz zaksiegowana (Update nie poszedl).
+    function ksPotwierdzNowaNota(v, numeryPrzed, doc, fillResult) {
+        if (!v || !v.ok || !numeryPrzed || (fillResult && fillResult.alreadyBooked)) return v;
+        const po = ksNumeryNot(doc);
+        if (po.bezNumeru || numeryPrzed.bezNumeru) return v;
+        const nowe = [...po.ids].filter(id => !numeryPrzed.ids.has(id));
+        if (!nowe.length) {
+            return {
+                ok: false,
+                error: 'Po Update na tickecie nie przybyła żadna nowa nota (kontrola „' + (v.method || '?')
+                     + '" trafiła w notę, która była tam przed zapisem) — zapis nie wszedł'
+            };
+        }
+        // Kontrola mogla oprzec sie na STAREJ nocie (luzna kontrola po dacie, rozbicie), a nowa nota wyjsc z inna
+        // data albo kwota. Zapis wszedl (jest nowy numer) — ale w logu ma stac, CO naprawde przybylo.
+        const si = v.splitInfo;
+        if (si && (si.entries || []).some(e => e && e.refundId && nowe.indexOf(e.refundId) >= 0)) return v;
+        const wpisy = extractBookedRefundEntries(doc).filter(e => e.refundId && nowe.indexOf(e.refundId) >= 0);
+        if (!wpisy.length) return v;
+        return Object.assign({}, v, { splitInfo: {
+            matchType: 'new-refund-id',
+            amount: wpisy.map(e => e.amount).join(' + '),
+            date: wpisy[0].date || '',
+            text: wpisy.map(e => e.amount + ' (' + e.date + ')').join(' + '),
+            entries: wpisy
+        } });
+    }
+
+    // Rodzaj pozycji przy numerze w logu: „‹SAFE-T Reimbursement›" (5.59.8). Zwrot i claim tego samego
+    // zamowienia to DWIE pozycje z jednym numerem, a modul marketplace'ow czyta z tego logu, ktora
+    // przeszla (ksDone). Po samym numerze wpis o zaksiegowanym zwrocie zaliczal i claim — tak przepadl
+    // SAFE-T 406-7971398-8018765. Zwykly zwrot (rodzaj pusty) zostaje bez dopisku, jak dotad.
+    function ksRodzajZn(row) {
+        const k = String((row && row.kind) || '').replace(/[‹›]/g, '').trim();
+        if (!k) return '';
+        return ' ‹' + k.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]) + '›';
+    }
+
+    // Rodzaj pozycji w postaci KANONICZNEJ: „SAFE-T Reimbursement" i samo „SAFE-T" to ten sam rodzaj ('safet'),
+    // tak samo Goodwill i REVERSAL; inny rodzaj (np. „CN 12" przy Furniture 1) — caly napis. Pusty = zwykly zwrot.
+    // KOPIA w init_ksieg i init_mkt (dwa domkniecia) — obie musza byc identyczne: z niej sklada sie klucz
+    // trwalego zapisu modulu ticketa (ledgerAdd) i jego odczyt (ksZapis / ksZapisKlucz).
+    function ksRodzajKlucz(kind) {
+        const s = String(kind == null ? '' : kind).trim().toLowerCase();
+        if (!s) return '';
+        const m = s.match(/goodwill|safe-?t|reversal/);
+        return m ? m[0].replace('-', '') : s.replace(/\s+/g, ' ');
     }
 
     // v3.9: responsible_uname używa Select2 z AJAX. Lista opcji w nativowym <select>
@@ -5567,7 +5657,12 @@
 
                 // Ten sam wpis juz na tickecie stoi — drugiego nie robimy. Gdy powstal
                 // w POPRZEDNIEJ probie tego przebiegu, jest NASZ (nie „already booked").
-                const juz = findBookedRefundEntry(getFrameDoc(ctx), kwota, data, false);
+                // Unpaid COD (bez rozbij) ksieguje JEDNA linie, solution nie ma znaczenia (uzytkownik,
+                // 07.10.2026) — wiec tylko jedna nota z ta kwota i data, bez sum not (jednaNota), tak jak
+                // kontrola w fillTicket. Z sumami dwie cudze noty z tym dniem (zwrot 100 rozbity na
+                // 50 + 50) dawaly Unpaid COD 60 „już zaksięgowane" i nic sie nie zapisywalo. Zwroty
+                // (rozbij) zostaja z sumami: zwrot rozbity na pozycje ma sie rozpoznac przy ponowieniu.
+                const juz = findBookedRefundEntry(getFrameDoc(ctx), kwota, data, false, !rozbij);
                 if (juz) {
                     w.ksieg = { ok: true, alreadyBooked: !kliknietoUpdate,
                                 opis: juz.text || juz.amount || '' };
@@ -5588,6 +5683,13 @@
                     continue;
                 }
 
+                // Numery zaksiegowanych not TUZ przed zapisem — kontrola po Update (ksPotwierdzNowaNota)
+                // uzna zapis dopiero po nocie, ktorej tu nie bylo. Sama verifyTicketBooking bierze za dowod
+                // takze DOWOLNA zaksiegowana note z nasza data, wiec Update, ktory niczego nie zapisal,
+                // „potwierdzala" nota zwrotu z tego samego dnia — ta sama luka, przez ktora claim Amazona
+                // wyszedl jako zaksiegowany (5.59.8, bookOne). Gdy fillTicket sam uzna pozycje za zaksiegowana
+                // (fill.alreadyBooked), Update nie idzie, petla konczy sie nizej i nowej noty nikt nie wymaga.
+                const numeryPrzed = ksNumeryNot(getFrameDoc(ctx));
                 let fill;
                 try {
                     fill = await fillTicket(kwota, data, konto, ctx, null,
@@ -5652,13 +5754,15 @@
                 // i odbicie — sleep dotyczy zwloki SERWERA, nie renderowania strony.
                 await loadForRead(href, 20000, ctx);
                 await sleep(900);
-                let ver = verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId);
+                let ver = ksPotwierdzNowaNota(verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId),
+                                              numeryPrzed, getFrameDoc(ctx), fill);
                 let odb = osobaId ? ucodOdbijSprawdz(getFrameDoc(ctx), getFrameHtml(ctx), tekst, osobaId, osoba, wyslane) : null;
                 const backoff = [3000, 6000, 10000];
                 for (let i = 0; i < backoff.length && !(ver.ok && (!odb || odb.ok)); i++) {
                     await sleep(backoff[i]);
                     try { await loadForRead(href, 25000, ctx); await sleep(1500); } catch (e) { /* nizej i tak cos powiemy */ }
-                    ver = verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId);
+                    ver = ksPotwierdzNowaNota(verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId),
+                                              numeryPrzed, getFrameDoc(ctx), fill);
                     if (osobaId) odb = ucodOdbijSprawdz(getFrameDoc(ctx), getFrameHtml(ctx), tekst, osobaId, osoba, wyslane);
                 }
                 if (ver.ok) {
@@ -5905,7 +6009,7 @@
                 ? { matchType: 'single', amount: normalizeAmount(amount), date: bookingDate, entries: [], multiOccurrence: true }
                 : null;
         } else {
-            existingRefund = findBookedRefundEntry(doc, amount, bookingDate, false);
+            existingRefund = findBookedRefundEntry(doc, amount, bookingDate, false, !!(opcje && opcje.pierwszaPozycja));
         }
         if (existingRefund) {
             return {
@@ -6263,7 +6367,7 @@
                     ? { matchType: 'single', amount: normalizeAmount(row.amount), date: row.bookingDate, entries: [], multiOccurrence: true }
                     : null;
             } else {
-                existingRefundBefore = findBookedRefundEntry(getFrameDoc(ctx), row.amount, row.bookingDate, false);
+                existingRefundBefore = findBookedRefundEntry(getFrameDoc(ctx), row.amount, row.bookingDate, false, !!String(row.kind || '').trim());
             }
 
             if (existingRefundBefore) {
@@ -6372,6 +6476,9 @@
                 // i z tego samego powodu — patrz komentarz przy fillTicket.
                 // Zwykły zwrot zostaje BEZ zmian: tam rozbicie na artykuły jest właściwe.
                 const jestClaim = !!String(row.kind || '').trim();
+                // Numery zaksiegowanych not TUZ przed zapisem — kontrola nizej (ksPotwierdzNowaNota)
+                // uzna zapis dopiero po nocie, ktorej tu nie bylo.
+                const numeryPrzed = ksNumeryNot(getFrameDoc(ctx));
                 const fillResult = await fillTicket(row.amount, row.bookingDate, row.accountNum, ctx,
                                                     { total: row.dupTotal || 1, index: row.dupIndex || 1 },
                                                     jestClaim ? { pierwszaPozycja: true } : null);
@@ -6428,13 +6535,13 @@
                 await loadForRead(ticketHref, 20000, ctx);
                 await sleep(900);
 
-                let verify = verifyTicketBooking(
+                let verify = ksPotwierdzNowaNota(verifyTicketBooking(
                     getFrameDoc(ctx),
                     row.amount,
                     row.bookingDate,
                     row.accountNum,
                     fillResult.articleId
-                );
+                ), numeryPrzed, getFrameDoc(ctx), fillResult);
 
                 // v3.21: race condition po Update — serwer mógł zapisać refund ale render
                 // strony jeszcze nie pokazuje markera <a id="unbook">. Robimy do 3 retries
@@ -6452,13 +6559,13 @@
                         await loadForRead(ticketHref, 25000, ctx);
                         await sleep(1500);
                     } catch (e) { /* reload fail — verify i tak zwróci coś */ }
-                    verify = verifyTicketBooking(
+                    verify = ksPotwierdzNowaNota(verifyTicketBooking(
                         getFrameDoc(ctx),
                         row.amount,
                         row.bookingDate,
                         row.accountNum,
                         fillResult.articleId
-                    );
+                    ), numeryPrzed, getFrameDoc(ctx), fillResult);
                 }
 
                 if (verify.ok) {
@@ -6911,7 +7018,10 @@
                 // Klucz DOKLADNIE taki sam jak po stronie czytajacej (ksZapis w module
                 // marketplace'ow) — inaczej obie polowy mowilyby o czym innym.
                 const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
-                const k = id + '|' + kw.toFixed(2);
+                // 5.59.8: rodzaj w kluczu (zwykly zwrot — bez dopisku, jak dotad). Zwrot 39.97 i SAFE-T −39.97
+                // tego samego zamowienia mialy jeden klucz i wpis zwrotu zamykal niezaksiegowany claim.
+                const kl = ksRodzajKlucz(r.kind);
+                const k = id + '|' + kw.toFixed(2) + (kl ? '|' + kl : '');
                 if (maja[k]) return;
                 maja[k] = 1;
                 lista.push({ k: k, at: new Date().toISOString().slice(0, 10) });
@@ -6932,6 +7042,7 @@
                 orderNumber: r.orderNumber, amount: r.amount, accountNum: r.accountNum,
                 bookingDate: r.bookingDate, source: r.source || '', isGoodwill: !!r.isGoodwill,
                 dupTotal: r.dupTotal, dupIndex: r.dupIndex,
+                kind: r.kind || '',          // rodzaj pozycji: klucz zapisu (ledgerAdd, ksZapis po drugiej stronie)
                 booked: !!r.booked, alreadyBooked: !!r.alreadyBooked, skipped: !!r.skipped,
                 // v3.67: adres ticketu idzie do zapisu razem z numerem. Bez niego wiersz
                 // przywrocony po wznowieniu mial numer, ale nie mial dokad prowadzic —
@@ -7096,7 +7207,7 @@
         for (let i = 0; i < previewRows.length; i++) {
             const row = previewRows[i];
             try {
-                const result = await checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, defaultFrameCtx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                const result = await checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, defaultFrameCtx, { total: row.dupTotal || 1, index: row.dupIndex || 1, jednaNota: !!String(row.kind || '').trim() });
                 if (result.ok) {
                     Object.assign(previewRows[i], result);
                     previewRows[i].noSolutionTickets = result.noSolutionTickets || [];
@@ -7220,6 +7331,7 @@
 
         async function processOne(workerLabel, i, ctx) {
             const row = previewRows[i];
+            const zn = ksRodzajZn(row);          // rodzaj przy numerze — modul marketplace'ow rozroznia po nim pozycje
             if (row.booked || row.alreadyBooked) {
                 // WZNAWIANIE. Ta pozycja przeszla w jednym z wczesniejszych przebiegow —
                 // flaga zapisuje sie dopiero po POTWIERDZONYM zapisie w ERP albo po tym,
@@ -7233,24 +7345,24 @@
                 //
                 // Tresc mowi WPROST, skad to wiemy — „wczesniejszy przebieg" to nie to
                 // samo co odczyt ticketu przed chwila i nie wolno tego zacierac.
-                logLine(`ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — `
+                logLine(`ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — `
                         + `już zaksięgowane (wcześniejszy przebieg`
                         + (row.ticketId ? `, ticket #${row.ticketId}` : '')
                         + `). Pomijam.`, '#2563eb');
                 already++;
                 return 'pominiete';
             }
-            const logRow = logLine(`🔍 [W${workerLabel}] <strong>${row.orderNumber}</strong> — szukam ticketu…`, '#6b7280');
+            const logRow = logLine(`🔍 [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — szukam ticketu…`, '#6b7280');
 
             let checkResult;
             try {
                 checkResult = await ksMierz('etap: szukanie ticketu', function (){
-                    return checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1 });
+                    return checkOne(row.orderNumber, row.amount, row.accountNum, row.bookingDate, ctx, { total: row.dupTotal || 1, index: row.dupIndex || 1, jednaNota: !!String(row.kind || '').trim() });
                 });
             } catch (e) {
                 previewRows[i].loading = false;
                 previewRows[i].error = e.message;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong> — błąd przy sprawdzaniu: ${e.message}`;
+                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — błąd przy sprawdzaniu: ${e.message}`;
                 logRow.style.color = '#dc2626';
                 updateRow(i);
                 fail++;
@@ -7266,7 +7378,7 @@
                 previewRows[i].checkedTickets = checkResult.checkedTickets || 0;
                 previewRows[i].auctionUrls = checkResult.auctionUrls || [];
                 previewRows[i].stanUsun = checkResult.stanUsun || null;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong> — ${checkResult.error}`;
+                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — ${checkResult.error}`;
                 logRow.style.color = '#dc2626';
                 updateRow(i);
                 fail++;
@@ -7279,14 +7391,14 @@
 
             if (previewRows[i].alreadyBooked && previewRows[i].existingRefund) {
                 const desc = describeExistingRefund(previewRows[i].existingRefund);
-                logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} — już zaksięgowane: ${desc}. Pomijam.`;
+                logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} — już zaksięgowane: ${desc}. Pomijam.`;
                 logRow.style.color = '#2563eb';
                 updateRow(i);
                 already++;
                 return;
             }
 
-            logRow.innerHTML = `⏳ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} | ${row.amount} | księguję…`;
+            logRow.innerHTML = `⏳ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} | ${row.amount} | księguję…`;
 
             try {
                 const bookResult = await ksMierz('etap: księgowanie', function (){ return bookOne(previewRows[i], ctx); });
@@ -7301,16 +7413,16 @@
                     if (bookResult.alreadyBooked) {
                         previewRows[i].alreadyBooked = true;
                         previewRows[i].existingRefund = bookResult.existingRefund || null;
-                        logRow.innerHTML = `[W${workerLabel}] ` + `ℹ️ <strong>${row.orderNumber}</strong> — Zwrot nadpłaty z tytułu VAT już zaksięgowany. Pomijam.`;
+                        logRow.innerHTML = `[W${workerLabel}] ` + `ℹ️ <strong>${row.orderNumber}</strong>${zn} — Zwrot nadpłaty z tytułu VAT już zaksięgowany. Pomijam.`;
                         logRow.style.color = '#2563eb';
                         already++;
                     } else if (previewRows[i].booked) {
                         const _ex = vatExtraText(previewRows[i]);
-                        logRow.innerHTML = `[W${workerLabel}] ` + `✅ <strong>${row.orderNumber}</strong> — Zwrot nadpłaty z tytułu VAT: ${(-Math.abs(parseFloat(row.amount))).toFixed(2)} → konto ${row.accountNum}, ${row.bookingDate}${_ex}`;
+                        logRow.innerHTML = `[W${workerLabel}] ` + `✅ <strong>${row.orderNumber}</strong>${zn} — Zwrot nadpłaty z tytułu VAT: ${(-Math.abs(parseFloat(row.amount))).toFixed(2)} → konto ${row.accountNum}, ${row.bookingDate}${_ex}`;
                         logRow.style.color = (previewRows[i].vatOverTolerance || previewRows[i].vat8100Failed) ? '#d97706' : '#16a34a';
                         ok++;
                     } else {
-                        logRow.innerHTML = `[W${workerLabel}] ` + `❌ <strong>${row.orderNumber}</strong> — VAT refund BŁĄD: ${bookResult.error || 'nieznany'}`;
+                        logRow.innerHTML = `[W${workerLabel}] ` + `❌ <strong>${row.orderNumber}</strong>${zn} — VAT refund BŁĄD: ${bookResult.error || 'nieznany'}`;
                         logRow.style.color = '#dc2626';
                         fail++;
                     }
@@ -7332,11 +7444,11 @@
                         const detail = bookResult.noSolutionReasonText ? ` — <em>${bookResult.noSolutionReasonText}</em>` : '';
                         const who = esc.reassigned ? esc.reassignedTo : (esc.openedBy || '?');
                         if (bookResult.escalationKind === 'category_check') {
-                            logRow.innerHTML = `✅+⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} zaksięgowano${describeSplitInfo(bookResult.verifySplitInfo)} — uzupełniono kategorię (A), sprawdź: ${describeEscalation(esc)} → <strong>${who}</strong>`;
+                            logRow.innerHTML = `✅+⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} zaksięgowano${describeSplitInfo(bookResult.verifySplitInfo)} — uzupełniono kategorię (A), sprawdź: ${describeEscalation(esc)} → <strong>${who}</strong>`;
                         } else if (bookResult.fallbackUsed && bookResult.verified) {
-                            logRow.innerHTML = `✅+⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} zaksięg. na pierwszej pozycji (${reasonShort})${describeSplitInfo(bookResult.verifySplitInfo)} + ESKALACJA: ${describeEscalation(esc)} → <strong>${who}</strong>`;
+                            logRow.innerHTML = `✅+⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} zaksięg. na pierwszej pozycji (${reasonShort})${describeSplitInfo(bookResult.verifySplitInfo)} + ESKALACJA: ${describeEscalation(esc)} → <strong>${who}</strong>`;
                         } else {
-                            logRow.innerHTML = `⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — Ticket #${previewRows[i].ticketId} ESKALACJA bez zaksięg. (${reasonShort}${detail}): ${describeEscalation(esc)} → <strong>${who}</strong>`;
+                            logRow.innerHTML = `⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} ESKALACJA bez zaksięg. (${reasonShort}${detail}): ${describeEscalation(esc)} → <strong>${who}</strong>`;
                         }
                         logRow.style.color = '#d97706';
                         escalated++;
@@ -7344,23 +7456,23 @@
                         const desc = describeExistingRefund(bookResult.existingRefund);
                         previewRows[i].alreadyBooked = true;
                         previewRows[i].existingRefund = bookResult.existingRefund;
-                        logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong> — w międzyczasie zaksięgowane: ${desc}.`;
+                        logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — w międzyczasie zaksięgowane: ${desc}.`;
                         logRow.style.color = '#2563eb';
                         already++;
                     } else {
-                        logRow.innerHTML = `✅ [W${workerLabel}] <strong>${row.orderNumber}</strong> — zaksięgowano (Ticket #${previewRows[i].ticketId}, ${row.amount}, ${row.bookingDate})${describeSplitInfo(bookResult.verifySplitInfo)}${bookResult.wasClosed ? ' | ticket zamknięty ponownie' : ''}`;
+                        logRow.innerHTML = `✅ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — zaksięgowano (Ticket #${previewRows[i].ticketId}, ${row.amount}, ${row.bookingDate})${describeSplitInfo(bookResult.verifySplitInfo)}${bookResult.wasClosed ? ' | ticket zamknięty ponownie' : ''}`;
                         logRow.style.color = '#16a34a';
                         ok++;
                     }
                 } else {
                     previewRows[i].bookError = bookResult.error; previewRows[i].booked = false;
-                    logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong> — BŁĄD: ${bookResult.error}`;
+                    logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${bookResult.error}`;
                     logRow.style.color = '#dc2626';
                     fail++;
                 }
             } catch (e) {
                 previewRows[i].bookError = e.message; previewRows[i].booked = false;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong> — BŁĄD: ${e.message}`;
+                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${e.message}`;
                 logRow.style.color = '#dc2626';
                 fail++;
             }
@@ -28415,6 +28527,11 @@
         // Hornbach DE: panel hornbach-mp.mirakl.net, jeden sklep 2370. Konto 1522 (w planie
         // kont z literowka: „Hormbach DE Beliani DE"), import 206 „Hornbach", booking 9.
         'Mirakl (Hornbach) · Hornbach DE': { bank: '206', booking: '9', acct: '1522' },
+        // Castorama PL: panel marketplace.castorama.pl, jeden sklep 2316 (w MK_SHOPID z jawna nazwa
+        // „Castorama PL" — panel nazywa go „Beliani"). Import 210 „Castorama PL": PLN, konto 1523,
+        // domyslny booking Fulfillment No, numer w kolumnie 5, kwota w 15 — czyli domyslny uklad MK_HDR.
+        // Odczytane 07.10.2026 z ustawienia #210 i z 34 recznych paczek tego ustawienia.
+        'Mirakl (Castorama PL) · Castorama PL': { bank: '210', booking: '9', acct: '1523' },
         // Homedeco NL: import 32 „Homedeco NL", konto 1349, booking 9 (Fulfillment No —
         // ordernumber z pliku to numer fulfilmentu). Potwierdzone przez uzytkownika 16.09.2026.
         'Homedeco · Homedeco NL': { bank: '32', booking: '9', acct: '1349' },
@@ -29538,9 +29655,10 @@
         //
         // Warunek jest OSTRY: adres logowania musi prowadzic na TEN SAM host, co panel
         // z reguly wyciagu. Inaczej ta sama nazwa wskazywalaby cudzy panel. To jedno
-        // porownanie odsiewa Castorame PL (wlasny marketplace), Galaxusa DE
-        // (partner.galaxus.eu) i OBI CH (streckenportal), a Conforame rozdziela na dwie
-        // wlasciwe instalacje: FR na conforama-prod, ES i PT na conforamaiberia-prod.
+        // porownanie odsiewa Galaxusa DE (partner.galaxus.eu) i OBI CH (streckenportal),
+        // Conforame rozdziela na dwie wlasciwe instalacje (FR na conforama-prod, ES i PT
+        // na conforamaiberia-prod), a Castorame na dwa panele: FR na marketplace.castorama.fr,
+        // PL na marketplace.castorama.pl. Do 5.59.9 Castorama PL nie miala reguly i odpadala.
         //
         // Nazwy sklepu NIE wpisujemy — poda ja panel, tak samo jak przy „NN".
         Object.keys(MK_LOGIN).forEach(function (k){
@@ -29569,8 +29687,10 @@
                 const e = mkNorm(etykieta);
                 return mkNorm(x.label) === e || (x.shop && mkNorm(x.shop) === e);
             })) return;
+            // Waluta z reguly, jak w pozostalych zrodlach celow — inaczej zlecenie z arkusza na tym
+            // celu dostawalo domyslne EUR (dotyczy regul z „cur": Castorama PL).
             out.push({ mp: r.mp, shop: '', brand: r.brand, short: r.short || r.brand,
-                       host: r.host, kind: r.kind || 'mirakl', cur: '',
+                       host: r.host, kind: r.kind || 'mirakl', cur: r.cur || '',
                        label: etykieta, acct: '', zrodlo: 'lista paneli' });
         });
         // SKLEPY NAZWANE INACZEJ NIZ MARKA PANELU. Zrodlo wyzej wymaga, zeby marka
@@ -31163,7 +31283,7 @@
         // „OBI CH" kolumna pokazywala „OBI CH CH".
         // Waluta celu — OBI CH placi w CHF. Bez niej zlecenie zalozone z arkusza albo
         // recznie dostawalo domyslne EUR („cur: w.cur || 'EUR'” przy zakladaniu).
-        // To jedyna regula wyciagu, ktora niesie walute — mkCele przepisuje ja stad.
+        // Walute niosa tylko reguly OBI CH i Castoramy PL (PLN) — mkCele przepisuje ja stad.
           brand: 'OBI', short: 'OBI', kind: 'obich', shop: 'OBI CH', cur: 'CHF' },
         // Galaxus: referencja to UUID wypisany w „Reason for payment", ktory wyciag lamie
         // spacja w srodku — dlatego wzorzec musi trafiac takze po sklejeniu bialych znakow.
@@ -31446,7 +31566,21 @@
         { mp: 'Mirakl (Castorama FR)', ok: true, payer: /CASTORAMA\s*FRAN/i,
           ref: /(?:KUNDENREFERENZ|CUSTOMER\s*REF(?:ERENCE)?|KUNDENREF)\s*[:.]?\s*(\d{6,})(?!\s*\d)/i,
           brand: 'Castorama', short: 'Castorama', host: 'marketplace.castorama.fr' },
-        // Castorama spoza Francji albo bez numeru: wiersz ma zostac chociaz NAZWANY.
+        // Castorama PL — panel marketplace.castorama.pl (wlasna domena, stad osobny @connect),
+        // jeden sklep 2316 (MK_SHOPID). Wyplaty ida bez posrednika (pspName NOT_SPECIFIED,
+        // payOut bez numeru), dwa razy w miesiacu, na konto BNP PL Beliani Kundendienst —
+        // a wyciagu tego konta do HUB-a nikt nie wgrywa (07.10.2026). Zlecenia zaklada wiec
+        // „⬇ Z arkusza", a regula daje im przede wszystkim HOST: mkLeft i mkPass nie biora
+        // zlecenia bez numeru i bez hosta, a mkCele bez reguly ok:true na tym hoscie nie ma
+        // celu „Castorama PL". Platnik to sama nazwa, bez wzorca referencji — jak przy Brico
+        // Depot i Hornbachu; cykl dobiera sie po kwocie. Ta sama spolka placi tez co innego
+        // (np. 1410.06 na koncie BNP PL SP 06.10.2026): gdyby taki wyciag trafil do HUB-a,
+        // zlecenie nie znajdzie cyklu o tej kwocie, a kontrola netto nie przepusci cudzego.
+        // Waluta celu: PLN. Bez niej zlecenie z arkusza dostawalo domyslne EUR — plik importu
+        // nazywal sie „… 253762.30 EUR do prolo.csv", a lista pokazywala zla walute (stanowisko S8).
+        { mp: 'Mirakl (Castorama PL)', ok: true, payer: /CASTORAMA\s*POLSKA/i,
+          brand: 'Castorama', short: 'Castorama', host: 'marketplace.castorama.pl', cur: 'PLN' },
+        // Castorama ani z Francji, ani z Polski (albo FR bez numeru): wiersz ma zostac chociaz NAZWANY.
         { mp: 'Castorama',      ok: false, payer: /CASTORAMA/i },
         // Brico Depot ES i PT — panel marketplace.bricodepot.es (wlasna domena, stad osobny
         // @connect), sklepy w MK_SHOPID. Rozliczenia ida bez posrednika (pspName
@@ -32016,6 +32150,11 @@
         // Castorama FR: 2241 z naglowka mirakl-shop-uuid panelu marketplace.castorama.fr.
         '2241': { mp: 'Mirakl (Castorama FR)', brand: 'Castorama', short: 'Castorama',
                   host: 'marketplace.castorama.fr' },
+        // Castorama PL: 2316 odczytany 07.10.2026 wprost z panelu (currentShopUUID na stronie glownej,
+        // shops/current: „Beliani", PLN; jedyny sklep loginu, /switch-shop/2316 oddaje 200). Nazwe
+        // wpisujemy jawnie, bo „Beliani" z panelu nie jest etykieta z _Markety — tak jak przy Hornbachu.
+        '2316': { mp: 'Mirakl (Castorama PL)', brand: 'Castorama', short: 'Castorama',
+                  host: 'marketplace.castorama.pl', shop: 'Castorama PL' },
         // Brico Depot: jeden login, cztery sklepy, odczytane 15.09.2026 wprost z panelu
         // (/sellerpayment/private/shops/current po przelaczeniu, uuid = numer sklepu):
         // 2555 „Beliani ES (Vendedor Internacional - UE)" i 2606 „Beliani PT (…)" sa
@@ -32073,9 +32212,15 @@
     function mkShopLabel(id, nazwaZPanelu, host){
         const i = String(id == null ? '' : id).trim();
         const w = MK_SHOPID[i];
-        if (w && w.shop) return w.shop;
+        // Numery sklepow sa per OPERATOR: kazda instancja Mirakla liczy od okolo 2000, wiec ten sam
+        // numer bywa na kilku panelach (2316 to Castorama PL, ale nie musi byc tylko ona). Jawna nazwa
+        // z mapy — i sklep Leroya zapamietany z eksportu — obowiazuja wiec wylacznie na panelu, do
+        // ktorego naleza. Inaczej obcy sklep dostalby cudza etykiete, a z nia cudzy klucz ustawien,
+        // bank_setting i konto. Bez hosta (wolajacy go nie zna) zostaje dawne zachowanie.
+        const h = String(host || '');
+        if (w && w.shop && (!h || !w.host || h === w.host)) return w.shop;
         const zap = lshopLoad()[i];
-        if (zap) return zap;
+        if (zap && (!h || h === MK_LEROY_HOST)) return zap;
         if (i && String(host || '') === MK_LEROY_HOST) return 'Leroy Merlin · sklep ' + i;
         return String(nazwaZPanelu || '');
     }
@@ -43058,11 +43203,99 @@
         const brakuje = [], zleKonto = [], zlaKwota = [], stawki = [], obce = [], brakZwrot = [];
         const bezKonta = [];                                  // v3.96
         const dopasowane = {};
+        // --- claimy: pozycje osobne z raportu i ich slad w ksiegach ---
+        // SAFE-T, REVERSAL_REIMBURSEMENT i Goodwill nie sa zwrotami — Amazon oddaje nam
+        // pieniadze albo doklada rekompensate. Nie maja zwyklego VAT-u sprzedazy, wiec
+        // osoba saldujaca poprawia go potem RECZNIE i musi wiedziec, gdzie ich szukac.
+        //
+        // 5.59.8: sladem jest WIERSZ O KWOCIE CLAIMU, a nie dowolny wiersz tego zamowienia. Lista
+        // pokazywala wszystko, co w Export Payments stalo pod numerem, i nic nie zglaszala — 07.10.2026
+        // SAFE-T 39.97 (406-7971398-8018765), ktorego nikt nie zaksiegowal, stal „do wglądu" przy nocie
+        // zwrotu 59.99 i sprzedazy 59.99 tego zamowienia. Teraz:
+        //   * najpierw swoje wiersze biora sprzedaz z tego rozliczenia (platnosc na auftragu o kwocie
+        //     sprzedazy) i zwykly zwrot (korekta o kwocie zwrotu) — claim na te sama kwote nie moze
+        //     usprawiedliwic sie cudzym wierszem;
+        //   * claim bierze wiersz o swojej kwocie (±0.02), a gdy nota rozbila sie na artykuly (przed 5.47
+        //     SAFE-T 101.72 szedl jako 50.86 + 50.86) — wiersze JEDNEJ noty, ktore razem daja jego kwote;
+        //   * kazdy wiersz wyjasnia jedna pozycje.
+        // Claim bez takiego wiersza idzie do claimyBez i liczy sie do bledow; „do wglądu" zostaje
+        // to, co swoj slad ma — z tym wierszem, a nie z calym numerem.
+        // Liczone PRZED petla zamowien: nota claimu stoi w prologistics po stronie wplaty (Debit = konto
+        // rozliczeniowe) i kontrola kwoty sprzedazy nizej dodawala ja do wplaty za zamowienie — 406-7971398-8018765
+        // z dopisana nota SAFE-T 39.97 wychodzil z „Kwota się nie zgadza: export 99.96, raport 59.99".
+        // notyClaimow — noty (CREDIT …), ktore okazaly sie sladem claimu; do sumy sprzedazy nie wchodza.
+        // Po przegladzie 5.59.8 trzy rzeczy wiecej:
+        //   * sladem jest tylko NOTA (CREDIT …) po STRONIE claimu: claim ze znakiem minus (SAFE-T, REVERSAL na minus)
+        //     stoi po stronie wplaty (Debit = konto rozliczeniowe), Goodwill i REVERSAL na plus — po stronie zwrotu.
+        //     Bez tego nota zwrotu z wczesniejszego rozliczenia (p.ref jej nie zna) albo rozbita na artykuly stawala
+        //     za niezaksiegowany SAFE-T tej samej kwoty — czyli wracalo zgloszenie;
+        //   * zwrot z tego rozliczenia zabiera swoja note takze rozbita (wiersze jednej noty, ktore daja jego kwote);
+        //   * kilka pozycji jednego zamowienia i rodzaju (dwa Goodwill) modul ticketa sumuje w jedna pozycje i jedna
+        //     note (parseExcel: klucz numer|rodzaj) — tu tez liczymy je razem.
+        const claimy = [], claimyBez = [], notyClaimow = new Set();
+        const claimWiersz = function (r){
+            return { auf: r.auf, kwota: r.kwota, vat: r.vat, konto: r.konto,
+                     deb: r.deb, cre: r.cre, data: r.data, paid: r.paid, zwrot: r.zwrot };
+        };
+        const poClaimId = {};
+        (p.refExtra || []).forEach(function (x){
+            if (!x || !x.id) return;
+            const lista = poClaimId[x.id] || (poClaimId[x.id] = []);
+            const znak = (x.sign === -1) ? -1 : 1, kl = ksRodzajKlucz(x.rodzaj);
+            const g = lista.filter(function (y){ return y.kl === kl && y.znak === znak; })[0];
+            if (g){
+                g.kwota = r2(g.kwota + Math.abs(x.amt)); g.ile++;
+                if (x.data && g.daty.indexOf(x.data) < 0) g.daty.push(x.data);
+            } else lista.push({ id: x.id, rodzaj: x.rodzaj || 'pozycja osobna', kl: kl, znak: znak,
+                                kwota: r2(Math.abs(x.amt)), ile: 1, daty: x.data ? [x.data] : [] });
+        });
+        Object.keys(poClaimId).forEach(function (id){
+            const w = poFf[mkFfBaza(id)] || [];
+            const zostaje = w.slice();
+            const rowna = function (r, a){ return Math.abs(Math.abs(r.kwota) - a) < 0.02; };
+            const nota = function (r){ return /^CREDIT\b/i.test(String(r.auf || '')); };
+            const zdejmij = function (test){
+                for (let i = 0; i < zostaje.length; i++) if (test(zostaje[i])) return zostaje.splice(i, 1)[0];
+                return null;
+            };
+            // Wiersze JEDNEJ noty po danej stronie, ktore razem daja kwote (nota rozbita na artykuly) — zdjete.
+            const notaZSumy = function (a, strona){
+                const noty = {};
+                zostaje.forEach(function (r){ if (nota(r) && r[strona]) (noty[r.auf] || (noty[r.auf] = [])).push(r); });
+                let out = [];
+                Object.keys(noty).some(function (auf){
+                    const suma = r2(noty[auf].reduce(function (acc, r){ return acc + Math.abs(r.kwota); }, 0));
+                    if (noty[auf].length > 1 && Math.abs(suma - a) < 0.02){ out = noty[auf]; return true; }
+                    return false;
+                });
+                out.forEach(function (r){ zostaje.splice(zostaje.indexOf(r), 1); });
+                return out;
+            };
+            if (p.ord && p.ord[id] != null){
+                const a = Math.abs(r2(p.ord[id]));
+                zdejmij(function (r){ return r.sprzedaz && !nota(r) && rowna(r, a); });
+            }
+            if (p.ref && p.ref[id] != null){
+                const a = Math.abs(r2(p.ref[id]));
+                if (!zdejmij(function (r){ return r.zwrot && rowna(r, a); })) notaZSumy(a, 'zwrot');
+            }
+            poClaimId[id].forEach(function (x){
+                const strona = x.znak === -1 ? 'sprzedaz' : 'zwrot';
+                const jeden = zdejmij(function (r){ return nota(r) && r[strona] && rowna(r, x.kwota); });
+                const slad = jeden ? [jeden] : notaZSumy(x.kwota, strona);
+                slad.forEach(function (r){ notyClaimow.add(r); });
+                const opis = { id: x.id, rodzaj: x.rodzaj + (x.ile > 1 ? (' ×' + x.ile) : ''), kwota: x.kwota,
+                               data: x.daty.join(', ') };
+                if (slad.length) claimy.push(Object.assign(opis, { wiersze: slad.map(claimWiersz) }));
+                else claimyBez.push(Object.assign(opis, { wiersze: w.map(claimWiersz) }));
+            });
+        });
         Object.keys(p.ord).forEach(function (id){
             const typ = p.typOrd[id] || '';
             const brutto = r2(p.ord[id]);
             const w = poFf[id] || [];
-            const sprz = w.filter(function (r){ return r.sprzedaz; });
+            // Nota claimu (notyClaimow, wyzej) to nie sprzedaz, choc stoi po stronie wplaty (5.59.8).
+            const sprz = w.filter(function (r){ return r.sprzedaz && !notyClaimow.has(r); });
             // --- stawka VAT: liczymy z raportu, nie z prologistics ---
             const pr = p.prinOrd[id] || 0, tx = p.taxOrd[id] || 0;
             if (pr > 0 && tx > 0 && stKraj != null){
@@ -43136,22 +43369,6 @@
             brakZwrot.push({ id: id, kwota: a, wierszy: w.length,
                              sprzedazy: w.filter(function (r){ return r.sprzedaz; }).length });
         });
-        // --- claimy: pozycje osobne z raportu i ich slad w ksiegach ---
-        // SAFE-T, REVERSAL_REIMBURSEMENT i Goodwill nie sa zwrotami — Amazon oddaje nam
-        // pieniadze albo doklada rekompensate. Nie maja zwyklego VAT-u sprzedazy, wiec
-        // osoba saldujaca poprawia go potem RECZNIE i musi wiedziec, gdzie ich szukac.
-        // Lista jest informacyjna: nie liczy sie do bledow i nie zmienia werdyktu.
-        const claimy = (p.refExtra || []).filter(function (x){ return x && x.id; })
-            .map(function (x){
-                const w = poFf[mkFfBaza(x.id)] || [];
-                return { id: x.id, rodzaj: x.rodzaj || 'pozycja osobna',
-                         kwota: r2(Math.abs(x.amt)), data: x.data || '',
-                         wiersze: w.map(function (r){
-                             return { auf: r.auf, kwota: r.kwota, vat: r.vat, konto: r.konto,
-                                      deb: r.deb, cre: r.cre, data: r.data, paid: r.paid,
-                                      zwrot: r.zwrot };
-                         }) };
-            });
         // --- zwroty i claimy zaksiegowane WIECEJ NIZ RAZ ---
         // Kwote porownywalismy dotad wylacznie po stronie sprzedazy (zlaKwota nizej).
         // Po stronie zwrotow i claimow pytalismy tylko, czy jest JAKIS slad — wiec nota
@@ -43284,7 +43501,7 @@
             sklejone: sklejone.sort(function (a, b){ return b.kwota - a.kwota; }),
             niepewne: niepewne.sort(function (a, b){ return b.kwota - a.kwota; }),
             zleKonto: zleKonto, zlaKwota: zlaKwota, obce: obce, brakZwrot: brakZwrot,
-            claimy: claimy,
+            claimy: claimy, claimyBez: claimyBez,
             podwojne: podwojne,
             podwojneSuma: r2(podwojne.reduce(function (a, x){ return a + x.nadwyzka; }, 0)),
             stawki: stawki.sort(function (a, b){ return a.st - b.st; }),
@@ -43875,6 +44092,9 @@
         if (!onProlo) return '';
         if ((j.kind || 'mirakl') !== 'mirakl') return '';     // f1, hd, cnov… maja swoje
         if (j.status !== 'partial') return '';
+        // Wyplata juz stoi w paczce importu (kontrola po tresci): rozliczenie bylo WLASCIWE, wiec „szukaj
+        // innego" prowadziloby donikad — a cykl trafilby do pominietych. Rozstrzyga czlowiek w Import payments.
+        if (j.juzWPaczce) return '';
         const byl = String((j.data && j.data.cycle) || '').trim();
         return '<div style="margin-top:4px">'
              + '<button class="mk-cykl-inny" data-k="' + esc(mkKlucz(j)) + '" '
@@ -45172,7 +45392,7 @@
         // recznie i musi miec je pod reka, zanim zajmie sie usterkami.
         if ((k.claimy || []).length){
             h += sek('\u2139\ufe0f Claimy zaksięgowane — do wglądu: ' + k.claimy.length, '#5b21b6',
-                '<div style="font-size:10px;color:#666;margin-bottom:3px">SAFE-T, REVERSAL i Goodwill to nie są zwroty — Amazon oddaje nam pieniądze albo dokłada rekompensatę, więc nie mają zwykłego VAT-u sprzedaży i saldując trzeba go poprawić ręcznie. Poniżej: co mówi raport i gdzie ta pozycja siedzi w księgach. Ta lista niczego nie zgłasza.</div>'
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">SAFE-T, REVERSAL i Goodwill to nie są zwroty — Amazon oddaje nam pieniądze albo dokłada rekompensatę, więc nie mają zwykłego VAT-u sprzedaży i saldując trzeba go poprawić ręcznie. Poniżej: co mówi raport i wiersz w księgach na kwotę claimu. Ta lista niczego nie zgłasza — claim bez takiego wiersza stoi niżej, w „❌ Claim bez noty w Export Payments”.</div>'
                 + '<div style="' + mono + '">'
                 + k.claimy.map(function (x){
                       const glowa = esc(x.rodzaj) + '  <b>' + esc(x.id) + '</b>  ' + f2(x.kwota)
@@ -45290,6 +45510,24 @@
                       return esc(x.id) + '  ' + f2(x.kwota) + '  <span style="color:#666">(' + co + ')</span>';
                   }).join('<br>') + '</div>');
         }
+        // 5.59.8: claim z raportu bez wiersza na swoja kwote (mkKontrolaAmz). Do tej pory stal „do wglądu"
+        // obok wierszy zwrotu i sprzedazy tego samego zamowienia i nikt go nie zauwazyl.
+        if ((k.claimyBez || []).length){
+            h += sek('❌ Claim bez noty w Export Payments — ' + k.claimyBez.length, '#c00',
+                '<div style="font-size:10px;color:#666;margin-bottom:3px">SAFE-T, REVERSAL i Goodwill z tego rozliczenia, dla których w Export Payments nie ma noty na kwotę claimu (ani noty, której pozycje dają ją razem) po jego stronie: claim na minus — po stronie wpłaty, na plus — po stronie zwrotu. Wiersze sprzedaży i zwrotu tego zamówienia się nie liczą — przy każdym stoi, co dla tego numeru w ogóle jest.</div>'
+                + '<div style="' + mono + '">'
+                + k.claimyBez.map(function (x){
+                      return esc(x.rodzaj) + '  <b>' + esc(x.id) + '</b>  ' + f2(x.kwota) + (x.data ? ('  ' + esc(x.data)) : '')
+                           + (x.wiersze.length
+                              ? x.wiersze.map(function (r){
+                                    return '<br>&nbsp;&nbsp;&nbsp;&nbsp;jest tylko: ' + knLink(r.auf) + '  ' + f2(r.kwota)
+                                         + (r.konto ? ('  konto ' + esc(r.konto)) : '')
+                                         + (r.data ? ('  ' + esc(r.data)) : '')
+                                         + (r.zwrot ? '  (korekta)' : '');
+                                }).join('')
+                              : '  <span style="color:#666">(tego numeru nie ma w Export Payments)</span>');
+                  }).join('<br>') + '</div>');
+        }
         // v3.95: pokazujemy WYLACZNIE pozycje z listy dla marketingu, ktorych naprawde
         // nie ma w ksiegach. Te, ktore maja odpowiednik kwotowy, sa zalatwione — a ich
         // wypisywanie dublowalo sekcje „w exporcie, a nie ma w rozliczeniu".
@@ -45342,7 +45580,7 @@
         }
 
         if (!k.brakuje.length && !k.zleKonto.length && !k.zlaKwota.length && !k.brakZwrot.length
-            && !k.wyjBez.length && !k.bezKonta.length && !(k.podwojne || []).length)
+            && !k.wyjBez.length && !k.bezKonta.length && !(k.podwojne || []).length && !(k.claimyBez || []).length)
             h += sek('✔ Wszystko zaksięgowane i na właściwych kontach', '#0a7a2f',
                      '<div style="font-size:10px;color:#666">' + k.nDopasowanych + ' z ' + k.nOrd
                      + ' zamówień ma płatność, konta zgodne z typem klienta, kwoty się zgadzają'
@@ -45434,6 +45672,15 @@
                      + (!ile ? 'nie ma tego numeru w Export Payments'
                              : (sprz === ile ? 'tylko sprzedaż tego zamówienia, korekty brak'
                                              : (ile + ' wierszy, żaden nie jest korektą tego zwrotu'))));
+            });
+        }
+        if ((k.claimyBez || []).length){
+            L.push(''); L.push('CLAIM BEZ NOTY W EXPORT PAYMENTS (' + k.claimyBez.length + ')');
+            k.claimyBez.forEach(function (x){
+                L.push('\t' + x.id + '\t' + x.rodzaj + '\t' + f2(x.kwota) + '\t' + (x.data || '') + '\t'
+                     + (x.wiersze.length
+                        ? ('jest tylko: ' + x.wiersze.map(function (r){ return (r.auf || '?') + ' ' + f2(r.kwota); }).join(' | '))
+                        : 'tego numeru nie ma w Export Payments'));
             });
         }
         if (k.wyjBez.length){
@@ -47610,7 +47857,8 @@
             const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
             if (!id) return;
             const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
-            o[id + '|' + kw.toFixed(2)] = 1;
+            const kl = ksRodzajKlucz(r.kind);           // ten sam klucz co ledgerAdd (5.59.8: z rodzajem)
+            o[id + '|' + kw.toFixed(2) + (kl ? '|' + kl : '')] = 1;
         };
         let p = null;
         try { p = JSON.parse(localStorage.getItem(MK_TPROG) || 'null'); } catch (e){ p = null; }
@@ -47621,12 +47869,22 @@
         if (b && Array.isArray(b.rows)) b.rows.forEach(function (r){ if (r && r.k) o[r.k] = 1; });
         return o;
     }
+    // Klucz pozycji listy zwrotow w zapisie modulu ticketa: numer | kwota bez znaku | rodzaj (zwykly zwrot bez
+    // rodzaju — klucz jak przed 5.59.8, wiec stare wpisy zwrotow dalej sie licza).
+    function ksZapisKlucz(r){
+        const kl = ksRodzajKlucz(r && r.rodzaj);
+        return String(r && r.id) + '|' + Math.abs(Number(r && r.amt) || 0).toFixed(2) + (kl ? '|' + kl : '');
+    }
     function rdState(key, x){
         const d = rdLoad()[key];
         const zap = ksZapis();
         const zLogu = [];
+        // Numer liczy sie z zapisu modulu ticketa dopiero, gdy jest tam KAZDA jego pozycja (numer + kwota + rodzaj,
+        // ksZapisKlucz): zwrot i claim tego samego zamowienia to dwie pozycje, a wpis zwrotu zamykal dotad i claim (5.59.8).
         (x.rows || []).forEach(function (r){
-            if (zap[r.id + '|' + Math.abs(r.amt).toFixed(2)] && zLogu.indexOf(r.id) < 0) zLogu.push(r.id);
+            if (zLogu.indexOf(r.id) >= 0) return;
+            const rr = x.rows.filter(function (y){ return y.id === r.id; });
+            if (rr.every(function (y){ return zap[ksZapisKlucz(y)]; })) zLogu.push(r.id);
         });
         const ids = ((d && d.ids) || []).slice();
         zLogu.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
@@ -47814,23 +48072,86 @@
         }
         return false;
     }
+    // Rodzaj pozycji, ktory modul ticketa dopisal w linii logu tuz za numerem — „‹SAFE-T Reimbursement›"
+    // (ksRodzajZn po tamtej stronie, 5.59.8). Pusty = zwykly zwrot. Lista, bo numer bywa w linii kilka razy.
+    function ksRodzajeLinii(t, id){
+        const s = String(id == null ? '' : id).trim(), txt = String(t == null ? '' : t);
+        const out = [];
+        if (!s) return out;
+        const znak = /[A-Za-z0-9#_\/-]/;
+        for (let i = txt.indexOf(s); i >= 0; i = txt.indexOf(s, i + 1)){
+            const a = i > 0 ? txt.charAt(i - 1) : '', b = txt.charAt(i + s.length);
+            if ((a && znak.test(a)) || (b && znak.test(b))) continue;
+            const m = /^\s*‹([^›]*)›/.exec(txt.slice(i + s.length));
+            out.push(m ? m[1].trim() : '');
+        }
+        return out;
+    }
+    // Rodzaj pozycji w postaci KANONICZNEJ: „SAFE-T Reimbursement" i samo „SAFE-T" to ten sam rodzaj ('safet'),
+    // tak samo Goodwill i REVERSAL; inny rodzaj (np. „CN 12" przy Furniture 1) — caly napis. Pusty = zwykly zwrot.
+    // KOPIA w init_ksieg i init_mkt (dwa domkniecia) — obie musza byc identyczne: z niej sklada sie klucz
+    // trwalego zapisu modulu ticketa (ledgerAdd) i jego odczyt (ksZapis / ksZapisKlucz).
+    function ksRodzajKlucz(kind) {
+        const s = String(kind == null ? '' : kind).trim().toLowerCase();
+        if (!s) return '';
+        const m = s.match(/goodwill|safe-?t|reversal/);
+        return m ? m[0].replace('-', '') : s.replace(/\s+/g, ' ');
+    }
+    // Ten sam rodzaj = ten sam klucz kanoniczny. Modul ticketa, gdy wybierze odczyt wklejki po wzorcu numeru,
+    // zna tylko slowo („SAFE-T" zamiast „SAFE-T Reimbursement"); poczatek napisu tu nie wystarcza, bo „CN 12"
+    // i „CN 123" (dwie korekty Furniture 1) to rozne pozycje.
+    function ksRodzajZgodny(a, b){
+        return ksRodzajKlucz(a) === ksRodzajKlucz(b);
+    }
+    // Linia logu dotyczy TEJ pozycji: jej numer jako caly token (ksMaNumer) i jej rodzaj.
+    function ksLiniaPozycji(t, r){
+        return ksRodzajeLinii(t, r && r.id).some(function (k){ return ksRodzajZgodny(k, r && r.rodzaj); });
+    }
+    // Teksty elementow logu ticketa (null — logu nie ma). Limit dlugosci zostaje dla potwierdzen: dluga
+    // linia to blad z zrzutem DIAG, a w nim stoi „zaksiegowane_refundy=…" — wygladalby na potwierdzenie.
+    function ksLogLinie(limit){
+        const list = document.getElementById('tm-t-progress-list');
+        if (!list) return null;
+        const max = limit || 400;
+        return Array.prototype.slice.call(list.querySelectorAll('*'))
+            .map(function (e){ return String(e.textContent || ''); })
+            .filter(function (t){ return t && t.length < max; });
+    }
+    const KS_POTW = /zaksięgowan|zaksiegowan|zaksięg\. na pierwszej|zaksieg\. na pierwszej|już był|juz byl/i;
+    function ksPotwierdzona(txt, r){
+        return txt.some(function (t){ return ksLiniaPozycji(t, r) && KS_POTW.test(t); });
+    }
+    function ksMaLinie(txt, r){
+        return txt.some(function (t){ return ksLiniaPozycji(t, r); });
+    }
     // Ktore pozycje modul ticketa naprawde potwierdzil. Czytamy jego wlasny log —
     // dzieki temu przy czesciowym niepowodzeniu nie oznaczymy calej grupy jako zrobionej.
+    // 5.59.8: numer jest zrobiony dopiero, gdy potwierdzona jest KAZDA jego pozycja, rozpoznana po
+    // numerze i rodzaju. Do tej pory wystarczal sam numer: 07.10.2026 linia „zaksięgowano" zwrotu
+    // 406-7971398-8018765 zaliczyla tez SAFE-T tego zamowienia, ktorego noty nie bylo.
     function ksDone(x){
-        const list = document.getElementById('tm-t-progress-list');
-        if (!list) return [];
-        const txt = Array.prototype.slice.call(list.querySelectorAll('*'))
-            .map(function (e){ return String(e.textContent || ''); })
-            .filter(function (t){ return t && t.length < 400; });
+        const txt = ksLogLinie();
+        if (!txt) return [];
         const ok = [];
         x.rows.forEach(function (r){
-            const hit = txt.some(function (t){
-                return ksMaNumer(t, r.id)
-                    && /zaksięgowan|zaksiegowan|zaksięg\. na pierwszej|zaksieg\. na pierwszej|już był|juz byl/i.test(t);
-            });
-            if (hit && ok.indexOf(r.id) < 0) ok.push(r.id);
+            if (ok.indexOf(r.id) >= 0) return;
+            const rr = x.rows.filter(function (y){ return y.id === r.id; });
+            if (rr.every(function (y){ return ksPotwierdzona(txt, y); })) ok.push(r.id);
         });
         return ok;
+    }
+    // Numery potwierdzone tylko W CZESCI: jedna pozycja weszla, inna tego samego zamowienia nie.
+    function ksCzesciowe(x){
+        const txt = ksLogLinie();
+        if (!txt) return [];
+        const out = [];
+        x.rows.forEach(function (r){
+            if (out.indexOf(r.id) >= 0) return;
+            const rr = x.rows.filter(function (y){ return y.id === r.id; });
+            const n = rr.filter(function (y){ return ksPotwierdzona(txt, y); }).length;
+            if (n && n < rr.length) out.push(r.id);
+        });
+        return out;
     }
     // Pozycje pominiete z powodu statusu Deleted. Czytamy ten sam log co ksDone —
     // rozdzielenie ich od „nie wiadomo, co sie stalo" jest cala roznica miedzy
@@ -47916,7 +48237,7 @@
             if (!poz.length) return;
             const notatki = [], otwarte = [];
             poz.forEach(function (r){
-                if (done.indexOf(r.id) >= 0 || zapis[r.id + '|' + Math.abs(r.amt).toFixed(2)]) return;
+                if (done.indexOf(r.id) >= 0 || zapis[ksZapisKlucz(r)]) return;
                 if (usuniete.indexOf(r.id) >= 0) return;
                 if (powody[r.id] === 'brak ticketu'){
                     const au = linki[r.id] || [];
@@ -49056,7 +49377,18 @@
         // przy niezaksiegowanym zwrocie mowilby nieprawde.
         const powodyPre = bezLogu ? {} : ksBledy(x);
         (usuniete || []).forEach(function (id){ if (!powodyPre[id]) powodyPre[id] = 'auftrag Deleted — nic nie zaksięgowano'; });
+        // 5.59.8: pozycja, o ktorej log ticketa ma linie, a zadna jej nie potwierdza, NIE weszla — nawet gdy
+        // ksBledy nie znalazl powodu (blad ze zrzutem DIAG jest za dlugi na jego odczyt). Bez tego przy pustym
+        // „done" komentarz „SAFE-T …" stanal 07.10.2026 w tickecie 692991 przy claimie, ktorego noty nie bylo.
+        const txtK = bezLogu ? null : ksLogLinie(), txtL = bezLogu ? null : ksLogLinie(100000);
+        if (txtK && txtL) zOpisem.forEach(function (r){
+            if (!powodyPre[r.id] && ksMaLinie(txtL, r) && !ksPotwierdzona(txtK, r))
+                powodyPre[r.id] = 'log ticketa nie potwierdził zapisu';
+        });
         const want = zOpisem.filter(function (r){
+            // Per POZYCJA, gdy log jest (5.59.8): claim, ktory wszedl, dostaje komentarz takze wtedy, gdy zwrot tego
+            // zamowienia padl; claim, ktory padl — nie, choc numer bywa „zrobiony" przez inna pozycje.
+            if (txtK) return ksPotwierdzona(txtK, r);
             if (done.length) return done.indexOf(r.id) >= 0;
             return !powodyPre[r.id];
         });
@@ -49238,7 +49570,7 @@
         let przerwane = '';
         if (r !== 'ok'){
             przerwane = r;
-            const conf = ksDone(x);
+            const conf = ksDone(xs);             // tylko pozycje WYSLANE do ticketa (bez znoszacych sie)
             mkLog('ticket', '  czekanie skonczylo sie jako „' + r + '" — log ticketa potwierdza '
                   + 'na TEN MOMENT ' + conf.length + ' z ' + x.rows.length + ' poz.');
             if (!conf.length){
@@ -49254,7 +49586,7 @@
         // Zapisujemy, co POTWIERDZIL log ticketa. Gdy nic nie da sie z niego odczytac,
         // a przebieg sie zakonczyl, oznaczamy calosc, ale z adnotacja — lepiej pokazac
         // niepewnosc niz udawac, ze wiemy.
-        const done = bezTicketa ? [] : ksDone(x);
+        const done = bezTicketa ? [] : ksDone(xs);
         // Same liczby nie wystarczaja. Przy „potwierdzil 5 z 7" trzeba wiedziec, KTORE
         // dwie zostaly — inaczej jedyna droga to przeklikanie wszystkich siedmiu.
         // Pozycje pominiete przez Deleted wyjmujemy z „bez potwierdzenia" — inaczej
@@ -49265,10 +49597,13 @@
         const brakP = x.rows.map(function (rr){ return rr.id; })
                             .filter(function (id){ return done.indexOf(id) < 0 && usuniete.indexOf(id) < 0; });
         if (!bezTicketa) mkLog('ticket', 'log ticketa potwierdzil ' + done.length + ' z ' + xs.rows.length + ' wyslanych poz.'
-              + ((done.length || !brakP.length) ? '' : ' — oznaczam reszte BEZ potwierdzenia'));
+              + ((done.length || !brakP.length) ? '' : ' — reszte, o ktorej log milczy, oznaczam BEZ potwierdzenia'));
         if (done.length)     mkLog('ticket', '    potwierdzone:      ' + done.join(', '));
         if (usuniete.length) mkLog('ticket', '    auftrag Deleted (pominiete, nic nie poszlo): ' + usuniete.join(', '));
         if (brakP.length)    mkLog('ticket', '    BEZ potwierdzenia: ' + brakP.join(', '));
+        const czesc = bezTicketa ? [] : ksCzesciowe(xs);
+        if (czesc.length)    mkLog('ticket', '    w tym potwierdzone W CZESCI (jedna pozycja numeru weszla, inna nie — numer zostaje do zrobienia): '
+                                   + czesc.join(', '));
         if (usuniete.length) rdMarkDel(x.key, usuniete);
         // Z pominietych: kandydaci do „znosi się" = kazdy wiersz numeru ma rowna wplate w tym samym rozliczeniu.
         // Potwierdza to dopiero paczka importu (wplata NOT FOUND) — czytamy ja teraz, raz na zlecenie.
@@ -49336,8 +49671,26 @@
             // Log nic nie potwierdzil: reszte oznaczamy z adnotacja „bez potwierdzenia" — ale NIE pozycje
             // pominiete przez Deleted. One maja wlasny slad (del); wpisane tu jako „zaksięgowane" kasowaly go
             // i grupa zlozona z samej zniesionej pozycji wychodzila jako „zaksięgowane (bez potwierdzenia)".
+            // 5.59.8: „bez potwierdzenia" to NIEWIEDZA — log o numerze milczy (albo mowi „brak ticketu",
+            // ktory arkusz zalatwia notatka). Gdy log ma o pozycji linie, a zadna jej nie potwierdza
+            // (blad, przekroczony czas, eskalacja bez zapisu, inna data), to nie niewiedza, tylko wiadomosc,
+            // ze nie weszla — numer zostaje do zrobienia. Tak claim, ktory nie wszedl, stawal na liscie jako
+            // „zaksięgowane (bez potwierdzenia z logu)".
+            const txtL = bezTicketa ? null : ksLogLinie(100000);
+            const blK = bezTicketa ? {} : ksBledy(x);
+            const nieWeszly = [];
             rdMark(x.key, x.rows.map(function (rr){ return rr.id; })
-                               .filter(function (id){ return usuniete.indexOf(id) < 0; }), false);
+                               .filter(function (id, n, a){
+                                   if (a.indexOf(id) !== n || usuniete.indexOf(id) >= 0) return false;
+                                   if (!txtL || blK[id] === 'brak ticketu') return true;
+                                   const rr = xs.rows.filter(function (y){ return y.id === id; });
+                                   if (!rr.some(function (y){ return ksMaLinie(txtL, y); })) return true;
+                                   nieWeszly.push(id);
+                                   return false;
+                               }), false);
+            if (nieWeszly.length)
+                mkLog('ticket', '    NIE oznaczam — log ticketa ma linie, ale nie potwierdza zapisu (zostaja do zrobienia): '
+                      + nieWeszly.join(', '));
         }
         // Zwroty zalatwione — odhaczamy je w arkuszu, per wiersz (patrz refDoArkusza).
         // Niepowodzenie tego kroku nie cofa ksiegowania, trafia tylko na pasek stanu.
@@ -54725,6 +55078,112 @@
         const j = await r.json();
         return { rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
     }
+    // ---------- wyplata zaimportowana recznie (kontrola po tresci) ----------
+    // Pozostale zapory nie widza paczki zalozonej RECZNIE: impSameFile szuka nazwy „data + sklep", a reczna
+    // paczka nazywa sie inaczej („CastoramaPL2.10.2026 do prolo.csv"); arkusz tez nie, bo wiersz takiej wyplaty
+    // zostaje z Booked „Nie" (przy Castoramie PL z wyboru — decyzja uzytkownika 07.10.2026). Przy marketplace'ach
+    // z MK_IMP_PO_TRESCI szukamy wiec przed importem TYCH SAMYCH NUMEROW ZAMOWIEN w paczkach banku zlecenia
+    // zaimportowanych od daty wplywu minus MK_TRESC_OKNO dni (najwyzej MK_TRESC_MAX najnowszych):
+    //   - polowa zamowien albo wiecej w jednej paczce = ta sama wyplata: nie importujemy, zlecenie idzie do
+    //     „wymaga sprawdzenia" z numerem paczki;
+    //   - pojedyncze trafienia = ostrzezenie w oknie potwierdzenia (zamowienie bywa rozliczone w dwoch cyklach);
+    //   - nie dalo sie sprawdzic = nie importujemy (zapora, nie podpowiedz), zlecenie zostaje „gotowe" do ponowienia.
+    // Klucz to marketplace: o tym, ze wyplaty importuje sie tez recznie, wiemy per rynek, nie per bank.
+    const MK_IMP_PO_TRESCI = { 'Mirakl (Castorama PL)': 1 };
+    const MK_TRESC_OKNO = 10;
+    const MK_TRESC_MAX = 8;
+    function mkPoTresci(j){
+        return !!(j && MK_IMP_PO_TRESCI[String(j.mp || '')] && j.data && j.data.ord && typeof j.data.ord === 'object');
+    }
+    // Numery z kolumny fulfilmentu (payment_descr) per paczka banku, od dnia `od`. Paczka bez wierszy to BLAD,
+    // jak w zaporze Furniture 1: 0 wierszy nie dowodzi, ze numeru tam nie ma (prologistics mogl jej nie wczytac).
+    async function mkTrescPaczki(bank, od, cache){
+        const kc = String(bank) + '|' + String(od || '');
+        if (cache && cache[kc]) return cache[kc];
+        const L = await impListaBanku(bank);
+        const wOknie = L.lista.filter(function (x){
+            const d = impDataYmd(x && x.import_datetime_from);
+            return !d || !od || d >= od;
+        });
+        const brane = wOknie.slice(0, MK_TRESC_MAX);
+        const w = { paczki: [], obcietych: wOknie.length - brane.length, niepelna: !!L.niepelna };
+        for (let i = 0; i < brane.length; i++){
+            const x = brane[i];
+            const d = await impRows(x.file_id);
+            if (!d.rows.length)
+                throw new Error('paczka ' + x.file_id + (x.filename ? (' „' + x.filename + '”') : '')
+                                + ' nie ma wierszy — prologistics mogło jej jeszcze nie wczytać');
+            const nr = {};
+            d.rows.forEach(function (r){ const n = String((r && r.payment_descr) || '').trim(); if (n) nr[n] = 1; });
+            w.paczki.push({ id: String(x.file_id), nazwa: String(x.filename || ''),
+                            kiedy: String(x.import_datetime_from || '').slice(0, 16), kto: String(x.user || ''), nr: nr });
+        }
+        if (cache) cache[kc] = w;
+        return w;
+    }
+    // Zlecenie „gotowe", ktorego wyplata juz stoi w paczce: do „wymaga sprawdzenia" z opisem. Zapis bez await
+    // miedzy odczytem a zapisem, na swiezym magazynie — jak f1ZapiszZapore.
+    function mkTrescZastosuj(j, tekst, slad){
+        const jobs = jobsLoad(), k = mkKluczPamieci(jobs, j), x = k ? jobs[k] : null;
+        if (!x || x.status !== 'ready') return false;
+        x.status = 'partial';
+        x.msg = tekst;
+        x.juzWPaczce = Object.assign({ kiedy: new Date().toISOString() }, slad || {});
+        jobsSave(jobs);
+        return true;
+    }
+    // Tuz przed importem (doImportAll), tak jak f1PrzedImportem.
+    // Zwraca { dalej: zlecenia do wysylki (kolejnosc jak w sel), stop: [{ j, powod }], uwaga: { klucz: tekst } }.
+    async function mkTrescPrzedImportem(sel){
+        const stop = [], uwaga = {}, zatrz = {}, cache = {};
+        const sets = setLoad();
+        const doS = (sel || []).filter(mkPoTresci);
+        for (let i = 0; i < doS.length; i++){
+            const j = doS[i], k = mkKlucz(j);
+            const nr = Object.keys(j.data.ord).map(function (n){ return String(n).trim(); }).filter(Boolean);
+            if (!nr.length) continue;
+            const bank = String((sets[setKey(j.mp, j.data.shop)] || {}).bank || '').trim();
+            if (!/^\d+$/.test(bank)){
+                zatrz[k] = 1;
+                stop.push({ j: j, powod: 'nie znam ustawienia importu, więc nie sprawdzę, czy tej wypłaty nie zaimportowano już ręcznie' });
+                continue;
+            }
+            const od = mkShift(j.date, -MK_TRESC_OKNO);
+            say(((j.data && j.data.shop) || j.mp) + ' ' + (j.date || '') + ' ' + f2(j.amount)
+                + ' — sprawdzam, czy tej wypłaty nie zaimportowano już ręcznie (paczki importu ' + bank + ')…');
+            let w;
+            try { w = await mkTrescPaczki(bank, od, cache); }
+            catch (e){
+                zatrz[k] = 1;
+                stop.push({ j: j, powod: 'nie sprawdziłem, czy tej wypłaty nie zaimportowano już ręcznie (paczki importu ' + bank + ': '
+                                       + ((e && e.message) || e) + ') — spróbuj jeszcze raz' });
+                continue;
+            }
+            let naj = null;
+            w.paczki.forEach(function (p){
+                let wsp = 0;
+                nr.forEach(function (n){ if (p.nr[n]) wsp++; });
+                if (wsp && (!naj || wsp > naj.wsp)) naj = { p: p, wsp: wsp };
+            });
+            const opis = naj ? ('paczka ' + naj.p.id + (naj.p.nazwa ? (' „' + naj.p.nazwa + '”') : '')
+                               + ' (' + naj.p.kiedy + (naj.p.kto ? (', ' + naj.p.kto) : '') + ') ma ' + naj.wsp + ' z ' + nr.length
+                               + ' zamówień tej wypłaty') : '';
+            if (naj && naj.wsp * 2 >= nr.length){
+                zatrz[k] = 1;
+                stop.push({ j: j, powod: 'już zaimportowana — ' + opis });
+                mkTrescZastosuj(j, '⛔ Ta wypłata jest już zaimportowana: ' + opis
+                    + '. Nie importuję jej drugi raz — sprawdź tę paczkę w Import payments.',
+                    { paczka: naj.p.id, nazwa: naj.p.nazwa, wspolnych: naj.wsp, zamowien: nr.length });
+                continue;
+            }
+            const u = [];
+            if (naj) u.push(opis + ' — sprawdź, zanim potwierdzisz');
+            if (w.obcietych > 0 || w.niepelna)
+                u.push('sprawdziłem tylko ' + w.paczki.length + ' najnowszych paczek importu ' + bank + ' z okna od ' + od);
+            if (u.length) uwaga[k] = u.join('; ');
+        }
+        return { dalej: (sel || []).filter(function (j){ return !zatrz[mkKlucz(j)]; }), stop: stop, uwaga: uwaga };
+    }
     async function impBook(id, ids){
         const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK
                    + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
@@ -56644,6 +57103,29 @@
                 return;
             }
         }
+        // Wyplata zaimportowana RECZNIE (MK_IMP_PO_TRESCI, dzis Castorama PL): te same numery zamowien w paczkach
+        // banku zlecenia. Zatrzymane nie ida, reszta normalnie — tak jak przy Furniture 1.
+        let tStop = [], tUwaga = {};
+        if (sel.some(mkPoTresci)){
+            b.disabled = true;
+            let tk;
+            try { tk = await mkTrescPrzedImportem(sel); }
+            catch (e){
+                tk = { dalej: sel.filter(function (j){ return !mkPoTresci(j); }), uwaga: {},
+                       stop: sel.filter(mkPoTresci).map(function (j){
+                           return { j: j, powod: 'kontrola paczek importu nie przeszła: ' + ((e && e.message) || e) }; }) };
+            }
+            b.disabled = false;
+            tStop = tk.stop; tUwaga = tk.uwaga || {};
+            sel = tk.dalej;
+            if (tStop.length) render();
+            if (!sel.length){
+                say('Nie importuję: ' + tStop.concat(f1Stop).map(function (x){
+                    return ((x.j.data && x.j.data.shop) || x.j.mp || '') + ' ' + (x.j.date || '') + ' ' + f2(x.j.amount) + ' — ' + x.powod;
+                }).join(' · '), '#c00');
+                return;
+            }
+        }
         // Trzy zapory przed powtorzeniem cudzej pracy — sprawdzane PRZED wyslaniem.
         b.disabled = true; say('Sprawdzam, czy to już nie zostało zrobione…');
         let dupSheet = [], dupFile = [], shErr = '';
@@ -56689,6 +57171,7 @@
             if (df) flag += df.f.exact
                 ? ('   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')')
                 : ('   ⚠ tego dnia szedł już import z tego sklepu, ale na inną kwotę (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ') — sprawdź');
+            if (tUwaga[mkKlucz(j)]) flag += '   ⚠ ' + tUwaga[mkKlucz(j)];
             return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(mkKwotaImportu(j)) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')' + flag
                  + (j.kind === 'f1' ? f1LinieImportu(j) : '')
                  // OBI CH: w pliku ida same faktury po brutto, a zwroty i potracenia obok.
@@ -56710,6 +57193,9 @@
         if (!confirm('Zaimportować ' + sel.length + ' zestawień (wgrać paczki importu do prologistics), razem ' + cnt + ' zamówień na ' + f2(tot) + '?\n\n'
             + lines.join('\n') + warn
             + (f1Stop.length ? ('\n\n⛔ FURNITURE 1 — NIE IMPORTUJĘ (' + f1Stop.length + '):\n' + f1Stop.map(function (x){
+                  return '  • ' + ((x.j.data && x.j.data.shop) || '') + '  ' + (x.j.date || '') + '  ' + f2(x.j.amount) + ' — ' + x.powod;
+              }).join('\n')) : '')
+            + (tStop.length ? ('\n\n⛔ JUŻ W PACZCE IMPORTU ALBO NIESPRAWDZONE — NIE IMPORTUJĘ (' + tStop.length + '):\n' + tStop.map(function (x){
                   return '  • ' + ((x.j.data && x.j.data.shop) || '') + '  ' + (x.j.date || '') + '  ' + f2(x.j.amount) + ' — ' + x.powod;
               }).join('\n')) : '')
             + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
@@ -68347,7 +68833,9 @@
             SAL_AWYNIK = most.tekst(SAL_AMZ, k, SAL_AEXP.zle);
             out.innerHTML = most.render(SAL_AMZ, k, SAL_AEXP.zle);
             kop.style.display = '';
-            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length;
+            // claimyBez — claim bez noty na swoja kwote (5.59.8); starszy most go nie zna, stad „|| []".
+            const blady = k.brakuje.length + k.zleKonto.length + k.zlaKwota.length + k.brakZwrot.length
+                        + (k.claimyBez || []).length;
             salSay(blady ? ('Do sprawdzenia: ' + blady + ' pozycji.') : 'Wszystko się zgadza.',
                    blady ? '#c47f00' : '#0a7a2f');
         } catch (e){
@@ -84172,6 +84660,58 @@
         (wb.SheetNames || []).forEach(function (sn){ if (RCN_LXW_ARK[rcnNorm(sn)]) sa.push(sn); });
         return sa;
     }
+    // Arkusze „Debitor" i „Kreditor" lexware'owego bilansu: detal sub-ksiegi, czyli to, co stoi
+    // ZA kontem zbiorczym naleznosci i zobowiazan. Doszly w eksporcie z 07.10.2026 i to wlasnie
+    // one mowia, CZYJA jest naleznosc — bez nich w uzgodnieniu IC zostaje samo „01400 Forderungen
+    // aus Lieferungen und Leistungen", a partnera nie widac wcale.
+    //
+    // Uklad wiersza jest inny niz w arkuszach bilansu: „Konto” | numer | nazwa | kwota, czyli DWIE
+    // komorki liczbowe. Regula „dokladnie jedna liczba w wierszu", na ktorej stoi czytnik bilansu,
+    // nie ma tu zastosowania — numer konta tez jest liczba.
+    //
+    // Arkusz dzieli sie na SEKCJE, a znak bierzemy z naglowka sekcji, nie z nazwy arkusza:
+    // „… mit Soll-Saldo" liczymy jak Bilanz AKTIVA (+1), „… mit Haben-Saldo" jak PASSIVA (−1).
+    // Arkusz „Debitor" ma sekcje „Debitoren mit Soll-Saldo" i „Kreditoren mit Soll-Saldo”,
+    // „Kreditor" — ich odpowiedniki po stronie Haben. Zmierzone na trzech plikach z 07.10.2026:
+    // KAZDA niepusta sekcja odpowiada osobnemu kontu bilansu, a u 1020 to samo konto 01400 stoi
+    // po obu stronach z roznymi kwotami (AKTIVA 5 353,21 i PASSIVA −360 302,38). Dlatego
+    // dopasowujemy SEKCJE, nie arkusze.
+    var RCN_LXW_DET = { debitor: 'należności', kreditor: 'zobowiązania' };
+    function rcnLexWycSekcje(m, nazwaArk, uwagi){
+        var sekcje = [], biez = null;
+        (m || []).forEach(function (row, r){
+            var teksty = [], liczby = [], iKonto = -1;
+            (row || []).forEach(function (c, ci){
+                if (typeof c === 'number' && isFinite(c)) liczby.push({ v: c, ci: ci });
+                else if (rcnBiale(c)){
+                    teksty.push(rcnBiale(c));
+                    if (iKonto < 0 && rcnNorm(c) === 'konto') iKonto = ci;
+                }
+            });
+            if (!teksty.length) return;
+            var t0 = rcnNorm(teksty[0]);
+            var ms = /^(debitoren|kreditoren) mit (soll|haben) saldo$/.exec(t0);
+            if (ms){
+                biez = { naglowek: teksty[0], znak: (ms[2] === 'soll') ? 1 : -1, wiersze: [] };
+                sekcje.push(biez);
+                return;
+            }
+            if (/^gesamt\b/.test(t0)) return;        // wiersze sum — sume liczymy z pozycji
+            if (iKonto < 0) return;                  // to nie jest wiersz pozycji
+            var po = liczby.filter(function (x){ return x.ci > iKonto; });
+            if (!biez || po.length < 2){
+                uwagi.push('arkusz „' + nazwaArk + '”, wiersz ' + (r + 1) + ': '
+                    + (!biez ? 'pozycja przed nagłówkiem sekcji — nie wiem, po której jest stronie'
+                             : 'nie widzę w niej numeru konta i kwoty') + ', wiersz pomijam');
+                return;
+            }
+            var nazwa = '';
+            teksty.forEach(function (t){ if (!nazwa && rcnNorm(t) !== 'konto') nazwa = t; });
+            biez.wiersze.push({ konto: rcnKonto(String(po[0].v).replace(/^0+(?=\d)/, '')), nazwa: nazwa,
+                                total: biez.znak * po[po.length - 1].v, sekcja: biez.naglowek });
+        });
+        return sekcje.filter(function (x){ return x.wiersze.length; });
+    }
     function rcnParseLexWyciag(wb, fileName, X){
         var W = rcnWycNowy('lexwyciag', 'bilans i RZiS', fileName, '');
         W.waluta = 'EUR';
@@ -84208,6 +84748,45 @@
                 W.konta.push({ konto: konto, nazwa: rcnBiale(mk[2]), strona: cfg.strona, waluta: '',
                                fw: null, total: cfg.zn * liczby[0], arkusz: sn, znak: '', znakZ: '' });
             });
+        });
+        // Detal sub-ksiegi PODMIENIA konto zbiorcze, a nie dochodzi obok niego — inaczej ta sama
+        // naleznosc liczylaby sie dwa razy i suma bilansu przestalaby sie zgadzac. Podmieniamy
+        // tylko wtedy, gdy suma sekcji trafia DOKLADNIE w jedno konto bilansu; przy zerowym albo
+        // wielokrotnym trafieniu zostaje konto zbiorcze i uwaga — zla kwota jest gorsza niz brak
+        // detalu (ta sama zasada, co przy „gotowej saldoliscie", usterka U1).
+        // Kandydatem jest wylacznie wiersz z arkusza bilansu: wstawiony wczesniej detal nie moze
+        // zostac podmieniony przez nastepna sekcje.
+        (wb.SheetNames || []).forEach(function (sn){
+            if (!RCN_LXW_DET[rcnNorm(sn)]) return;
+            var ws = wb.Sheets[sn];
+            if (!ws || !ws['!ref']) return;
+            var co = RCN_LXW_DET[rcnNorm(sn)];
+            rcnLexWycSekcje(X.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }), sn, W.uwagi)
+                .forEach(function (sek){
+                    var sumaGr = sek.wiersze.reduce(function (a, d){ return a + rcnGr(d.total); }, 0);
+                    var kand = [];
+                    W.konta.forEach(function (k, i){
+                        if (RCN_LXW_ARK[rcnNorm(k.arkusz || '')] && rcnGr(k.total) === sumaGr) kand.push(i);
+                    });
+                    var ile = sek.wiersze.length + ' ' + rcnPlural(sek.wiersze.length, 'konto', 'konta', 'kont');
+                    if (kand.length !== 1){
+                        W.uwagi.push('arkusz „' + sn + '”, sekcja „' + sek.naglowek + '” (' + ile + ' na '
+                            + rcnKw(sumaGr / 100) + '): '
+                            + (kand.length ? 'pasuje do ' + kand.length + ' kont bilansu — nie zgaduję, które jest zbiorcze'
+                                           : 'nie trafia w żadne konto bilansu')
+                            + '; zostaje konto zbiorcze, detalu nie biorę');
+                        return;
+                    }
+                    var zb = W.konta[kand[0]];
+                    sek.wiersze.forEach(function (d){
+                        d.strona = 'B'; d.waluta = ''; d.fw = null; d.arkusz = sn;
+                        d.znak = ''; d.znakZ = ''; d.zamiast = zb.konto;
+                    });
+                    W.konta.splice.apply(W.konta, [kand[0], 1].concat(sek.wiersze));
+                    W.uwagi.push('arkusz „' + sn + '”: konto zbiorcze ' + zb.konto + ' (' + rcnKw(zb.total)
+                        + ', ' + co + ') zastąpione detalem sub-księgi — ' + ile
+                        + ' z sekcji „' + sek.naglowek + '”');
+                });
         });
         return W.konta.length ? W : null;
     }
@@ -86832,9 +87411,10 @@
             // Naglowek bilansu Infoniqi niesie ROK OBROTOWY, nie dzien wydruku - sam rozjazd
             // napisow niczego nie dowodzi i nie strasze nim na czerwono.
             if (R.naglowekInny)
-                h += '<div class="rcn-mut">Nagłówek wyciągu mówi o innym dniu niż koniec saldolisty. U Infoniqi w nagłówku '
-                   + 'bilansu stoi <b>rok obrotowy</b>, a nie dzień wydruku, więc sam ten napis nic nie rozstrzyga — '
-                   + 'rozstrzygają konta, które się różnią.</div>';
+                h += '<div class="rcn-mut">Nagłówek wyciągu mówi o innym dniu niż koniec saldolisty. U Infoniqi stoi tam dzień, '
+                   + 'na który wyciąg wydrukowano — a gdy nikt nie ustawi ogranicznika daty, jest to koniec roku obrotowego '
+                   + '(na plikach z 30.09.2026 było to „per 31.12.2026”). Sam ten napis więc nie rozstrzyga, '
+                   + 'czy dane są z innego dnia — rozstrzygają konta, które się różnią.</div>';
             if (R.ileRoznych)
                 h += '<div class="rcn-msg rcn-err"><b>Różni się ' + R.ileRoznych + ' '
                    + rcnPlural(R.ileRoznych, 'konto', 'konta', 'kont') + '.</b> Najczęstsza przyczyna to wyciąg '
@@ -87127,7 +87707,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'dab032c · 07.10.2026 09:16';
+    const HUB_BUDOWA = '0d0f01e · 07.10.2026 13:15';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
