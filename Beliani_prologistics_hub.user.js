@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.02
+// @version      5.60.03
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11,6 +11,7 @@
 // @match        https://*.myvtex.com/*
 // @match        https://partners.wayfair.com/*
 // @match        https://partner.bol.com/*
+// @match        https://merchant.shoepping.at/*
 // @match        https://toolbox.manomano.com/*
 // @match        https://clientes.eupago.pt/*
 // @match        https://seller.octopia.com/*
@@ -46,6 +47,7 @@
 // @connect      galaxus.ch
 // @connect      wayfair.com
 // @connect      bol.com
+// @connect      shoepping.at
 // @connect      ebay.de
 // @connect      check24.de
 // @connect      mc.moebel.check24.de
@@ -107,6 +109,8 @@
     // Portal sprzedawcy bol.com — tak samo jak Wayfair: modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
     // Rozliczenia pobiera sie z prologistics; karta portalu odpowiada, gdy zapytanie wprost zostanie odbite.
     const onBol     = () => /^partner\.bol\.com$/i.test(H);
+    // Portal sprzedawcy Shöpping — tak samo: modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
+    const onShoep   = () => /^merchant\.shoepping\.at$/i.test(H);
     // Panel ManoMano — wchodzimy tam WYLACZNIE po to, zeby podejrzec token sesji.
     const onMano    = () => /(^|\.)toolbox\.manomano\.com$/i.test(H);
     // Cnova FR stoi na Octopii. Dopasowanie jest szerokie (cala domena), bo panel
@@ -28291,7 +28295,9 @@
     const onWayf   = /^partners\.wayfair\.com$/i.test(location.hostname);
     // Portal bol.com — tak samo: tylko wykonawca mostu (blok „BOL.COM"), bez guzika i bez panelu.
     const onBolP   = /^partner\.bol\.com$/i.test(location.hostname);
-    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP) return;
+    // Portal Shöpping — tak samo: tylko wykonawca mostu (blok „SHÖPPING AT"), bez guzika i bez panelu.
+    const onShpP   = /^merchant\.shoepping\.at$/i.test(location.hostname);
+    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP && !onShpP) return;
     // Dwa te same przyciski braly sie stad, ze panel VTEX osadza aplikacje w ramce —
     // skrypt startowal i w oknie glownym, i w ramce, a kazde ma wlasny dokument, wiec
     // sprawdzanie samego identyfikatora nic nie dawalo. Pracujemy tylko w oknie glownym.
@@ -28572,6 +28578,8 @@
         // bol.com NL: import 28 „Bol.com NL", konto 1329, booking 9 (Fulfillment No — „Bestelnummer" ze specyfikacji
         // to numer fulfilmentu). Odczytane 08.10.2026 z ustawienia #28 i ze 112 recznych paczek tego ustawienia.
         'Bol · Bol NL':           { bank: '28', booking: '9', acct: '1329' },
+        // Shöpping AT: ustawienie 235 „Shoepping AT", konto 1377, booking 9 (Fulfillment No) — odczytane 08.10.2026.
+        'Shoepping · Shoepping AT': { bank: '235', booking: '9', acct: '1377' },
         // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
         // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
         'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
@@ -40970,6 +40978,10 @@
         // Host wpisany wprost, nie przez MK_BOL_HOST — ta stala jest deklarowana nizej (martwa strefa).
         { label: 'Bol NL',     mp: 'Bol', brand: 'Bol', short: 'Bol', kind: 'bol',
           host: 'partner.bol.com', shop: 'Bol NL', cur: 'EUR' },
+        // Shöpping AT — wyplata Adyen co tydzien, dopasowanie po KWOCIE wyplaty z ruchow konta w portalu. Etykieta jak
+        // w arkuszu („Shoepping AT", konto 1377). Host wpisany wprost, nie przez MK_SHP_HOST (martwa strefa).
+        { label: 'Shoepping AT', mp: 'Shoepping', brand: 'Shoepping', short: 'Shoepping', kind: 'shoep',
+          host: 'merchant.shoepping.at', shop: 'Shoepping AT', cur: 'EUR' },
         // Limango nie ma u nas portalu — rozliczenie wrzuca sie plikiem, a wplate
         // dodaje z wyciagu albo recznie.
         { label: 'Limango DE', mp: 'Limango', brand: 'Limango', short: 'Limango', kind: 'lim',
@@ -42402,6 +42414,539 @@
              + 'font-size:11px;color:#1e3a8a">' + h + '</div>';
     }
 
+    // ================= SHÖPPING AT (Shoepping AT) =================
+    // Shöpping (Österreichische Post) wyplaca przez Adyen: co wtorek ok. 23:30 automatyczna wyplata („SHOEPPING automatische
+    // Auszahlung von Konto BA…"). Prowizji z wyplaty Shöpping nie potraca (platnosc = cena brutto, prowizja idzie osobna
+    // faktura). Zrodlem zlecenia jest WIERSZ ARKUSZA „Shoepping AT" (konto 1377, data = dzien wplywu, zwykle sroda po
+    // wyplacie) — wyciagu tego konta HUB nie czyta.
+    // KTORE RUCHY SKLADAJA SIE NA WYPLATE — 34 wyplaty na 34 co do grosza (02–10.2026, 386 ruchow, zmierzone 08.10.2026):
+    // Adyen wyplaca tyle, ile jest naraz DOSTEPNE (ruchy z data waluty do chwili wyplaty) i ZAKSIEGOWANE (ruchy z data
+    // ksiegowania do niej) — mniejsza z tych sum minus to, co juz wyplacil. Zwykle mniejsza jest suma po dacie waluty, czyli
+    // wyplata = ruchy z data waluty od poprzedniej wyplaty. Gdy jednak ruchy zaksiegowane przed wyplata, a jeszcze bez waluty,
+    // daja razem minus (zwrot zaksiegowany w dniu wyplaty), rozstrzyga data ksiegowania: zwrot i platnosci z tych dni wchodza
+    // do tej wyplaty, a nastepna juz ich nie ma (31.03 i 04.08.2026). Wtorek, w ktorym nie ma czego wyplacic, nie ma wyplaty
+    // (25.08) — nastepna obejmuje dwa tygodnie.
+    // Dane z API strony „Kontoübersicht & Transaktionen" (200 z karty portalu 08.10.2026, tylko odczyt; autoryzacja
+    // ciasteczkami HttpOnly domeny shoepping.at):
+    //   GET api.shoepping.at/v1/merchants/payments/adyen/transactions?limit=100&createdSince=<ISO>&createdUntil=<ISO>
+    //   -> { data: { transactions: [{ id, type, amount, status, createdAt, bookingDate, valueDate, description, reference }] } }
+    // API oddaje NAJWYZEJ 100 ruchow, a przy wiekszej liczbie NIE sa to najwczesniejsze — stronicowanie „od ostatniego ruchu
+    // porcji" gubilo platnosci (3 na 386). Pytamy wiec oknami po tygodniu: createdUntil strona sama nie wysyla, ale API je
+    // honoruje (200, same ruchy z okna — 08.10.2026). Okno, ktore oddalo pelne 100, dzielimy na pol.
+    // Ruchy: capture (+, platnosc klienta, przy wysylce), internalTransfer „Gutschein <zamowienie> …" (+, doplata Shöpping
+    // z kuponu, przy zamowieniu), refund (−, „refund of <zamowienie>"), internalTransfer „Refund-GS <zamowienie> …" (−, oddanie
+    // kuponu przy zwrocie), bankTransfer (−, wyplata na bank).
+    // NUMER ZAMOWIENIA = pole `reference` (przed „|", przy zwrocie bez „refund_"), NIE opis. Opis bez dopisku „(Beliani)" ma
+    // inna ostatnia grupe (71 z 255 platnosci 03–10.2026) i takiego numeru w prologistics nie ma (0 z 28); `reference` to
+    // fulfilment auftragu (36 z 36). Tabela portalu pokazuje tylko opis — stad reczne ucinanie numeru do 9 znakow.
+    const MK_SHP_HOST = 'merchant.shoepping.at';
+    const MK_SHP_API = 'https://api.shoepping.at/v1/merchants/payments/adyen/transactions';
+    const MK_SHP_MERCHANT = '1001371569';
+    const MK_SHP_PANEL = 'https://' + MK_SHP_HOST + '/transactions?merchantUid=' + MK_SHP_MERCHANT;
+    const MK_SHP_SHOP = 'Shoepping AT';
+    const MK_SHP_NA_STRONIE = 100;              // tyle oddaje API na jedno zapytanie (wiecej nie da)
+    const MK_SHP_OKNO = 7;                      // dni jednego okna zapytania (tydzien to zwykle kilkanascie ruchow)
+    const MK_SHP_ZAPYTAN = 80;                  // najwyzej tyle zapytan jednego pobrania
+    const MK_SHP_WSTECZ = 60;                   // tyle dni przed data z arkusza zaczynamy pobierac ruchy
+    const SHP_NR = /^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i;
+
+    // ---------- trzy drogi do API portalu (uklad jak przy bol i Wayfairze) ----------
+    /* bez  — wprost (GM_xmlhttpRequest), ciasteczka dobiera menedzer skryptow;
+       z    — wprost z Cookie zdjetym przez GM_cookie;
+       most — zlecenie GM-magazynem do OTWARTEJ karty merchant.shoepping.at; ta pyta u siebie fetch-em (z karty portalu API
+              odpowiada 200 — sprawdzone) i odsyla odpowiedz. Na portalu NIE MA guzika ani panelu.
+       Magazynem jedzie wylacznie okno dat (createdSince, createdUntil) — adres sklada kazda strona sama (shpSciezka). Czasy mostu
+       te same co przy bol (BOL_MOST_*). Droge, ktora zadzialala, zapamietujemy. */
+    const MK_SHP_MZ = 'mkt_shp_most_z';         // zlecenie: prologistics -> karta portalu
+    const MK_SHP_MO = 'mkt_shp_most_o';         // odpowiedz: karta portalu -> prologistics
+    const MK_SHP_DR = 'mkt_shp_droga';          // ktora droga ostatnio zadzialala
+    const MK_SHP_MP = 'mkt_shp_most_puls';      // znak zycia karty portalu (czas ostatniego)
+    const SHP_DROGI = { bez: 'wprost', z: 'wprost z ciasteczkiem', most: 'przez kartę portalu' };
+    const SHP_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}:\d{2}|Z)$/;
+    function shpSciezka(od, doo){
+        const a = String(od == null ? '' : od), b = String(doo == null ? '' : doo);
+        if (!SHP_ISO.test(a) || !SHP_ISO.test(b))
+            throw new Error('Shöpping: niepoprawne okno dat „' + a.slice(0, 32) + ' – ' + b.slice(0, 32) + '”');
+        return MK_SHP_API + '?limit=' + MK_SHP_NA_STRONIE + '&createdSince=' + encodeURIComponent(a) + '&createdUntil=' + encodeURIComponent(b);
+    }
+    const SHP_NAGL = { 'accept': 'application/json, text/plain, */*' };
+    async function shpWprost(od, doo, zCiastkiem){
+        const url = shpSciezka(od, doo);
+        const hdrs = { 'accept': SHP_NAGL.accept, 'referer': 'https://' + MK_SHP_HOST + '/' };
+        if (zCiastkiem){
+            const ck = await gmCookies('https://api.shoepping.at/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        const r = await new Promise(function (ok, nie){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ nie(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({ method: 'GET', url: url, headers: hdrs, timeout: 60000, onload: ok,
+                onerror: function (){ nie(new Error('nie mogę połączyć się z api.shoepping.at'
+                    + ' — jeśli ScriptCat pyta o dostęp do shoepping.at, zgódź się')); },
+                ontimeout: function (){ nie(new Error('api.shoepping.at nie odpowiedziało na czas')); } });
+        });
+        const typ = (String(r.responseHeaders || '').match(/^content-type:\s*([^\r\n;]+)/im) || ['', ''])[1].trim();
+        const host = String(r.finalUrl || '').split('/')[2] || '';
+        return { status: r.status, typ: typ, tekst: String(r.responseText || ''), host: host };
+    }
+    // Odpowiedz przyjmujemy, gdy jest TYM, o co pytalismy: JSON z „data.transactions".
+    function shpDobra(x){
+        if (!x || x.status !== 200) return false;
+        let j = null;
+        try { j = JSON.parse(x.tekst || ''); } catch (e){ return false; }
+        return !!(j && j.data && Array.isArray(j.data.transactions));
+    }
+    // Jak WYGLADA odrzucona odpowiedz — nigdy jej tresc (to dane rozliczen, a strona logowania bywa z tokenem).
+    function shpKsztalt(x){
+        const cz = [], t = String((x && x.tekst) || '');
+        cz.push('odpowiedź ' + t.length + ' znaków');
+        if (!t.length) cz.push('treść PUSTA — zapytanie mogło zostać zablokowane, zanim wyszło');
+        else if (/^\s*</.test(t)) cz.push('strona HTML, nie JSON — logowanie albo ochrona portalu');
+        else {
+            let j = null;
+            try { j = JSON.parse(t); } catch (e){}
+            cz.push(j ? ('JSON z polami: ' + (Object.keys(j).join(', ') || '(pusty obiekt)')) : 'treść nie jest JSON-em');
+        }
+        if (x && x.typ) cz.push('typ ' + x.typ);
+        if (x && x.host && !/(^|\.)shoepping\.at$/i.test(x.host)) cz.push('przekierowanie na ' + x.host);
+        return ' [' + cz.join(' · ') + ']';
+    }
+
+    // ----- pytajacy (prologistics) -----
+    const shpCzeka = {};           // id zlecenia -> odbiorca odpowiedzi
+    let shpMostBrak = 0;           // kiedy ostatnio karta portalu nie odpowiedziala
+    function shpMostOdbior(txt){
+        if (!txt) return;
+        let o = null;
+        try { o = JSON.parse(txt); } catch (e){ return; }
+        if (o && o.id && shpCzeka[o.id]) shpCzeka[o.id](o);
+    }
+    if (onProlo){
+        try { GM_addValueChangeListener(MK_SHP_MO, function (k, s, n){ shpMostOdbior(n); }); } catch (e){}
+    }
+    // Oddaje odpowiedz w ksztalcie shpWprost; null, gdy zadna karta portalu nie przyjela zlecenia; rzuca, gdy przyjela i padla.
+    function shpMost(od, doo){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_setValue === 'undefined' || typeof GM_getValue === 'undefined'){ resolve(null); return; }
+            const t0 = Date.now();
+            const id = t0.toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+            let koniec = false, przyjete = 0, zegar = null, powiedziane = false, puls = 0;
+            try { puls = Number(GM_getValue(MK_SHP_MP, 0)) || 0; } catch (e){}
+            const ack = (puls && t0 - puls < 5 * BOL_MOST_PULS) ? BOL_MOST_ACK_SPI : BOL_MOST_ACK;
+            function sprzataj(){
+                koniec = true;
+                delete shpCzeka[id];
+                if (zegar) clearInterval(zegar);
+                // Odpowiedz niesie ruchy konta — nie zostaje w magazynie.
+                try { GM_setValue(MK_SHP_MZ, ''); GM_setValue(MK_SHP_MO, ''); } catch (e){}
+            }
+            shpCzeka[id] = function (o){
+                if (koniec) return;
+                if (o.etap === 'przyjete'){ if (!przyjete) przyjete = Date.now(); return; }
+                if (o.etap !== 'wynik') return;
+                sprzataj();
+                if (!o.ok){ reject(new Error(String(o.blad || 'karta portalu nie wykonała zapytania'))); return; }
+                resolve({ status: o.status, typ: String(o.typ || '').split(';')[0].trim(), host: MK_SHP_HOST, tekst: String(o.tresc || '') });
+            };
+            zegar = setInterval(function (){
+                try { shpMostOdbior(String(GM_getValue(MK_SHP_MO, '') || '')); } catch (e){}
+                if (koniec) return;
+                const dt = Date.now() - t0;
+                if (!przyjete && dt > ack){ sprzataj(); shpMostBrak = Date.now(); resolve(null); }
+                else if (!przyjete && dt > BOL_MOST_ACK && !powiedziane){
+                    powiedziane = true;
+                    try { say('Shöpping — karta portalu jest otwarta, ale śpi w tle. Czekam, aż się odezwie (do '
+                            + Math.round(ack / 1000) + ' s); szybciej będzie, gdy na nią zajrzysz.'); } catch (e){}
+                }
+                else if (przyjete && Date.now() - przyjete > BOL_MOST_MAX){
+                    sprzataj();
+                    reject(new Error('karta portalu przyjęła zapytanie, ale nie odpowiedziała w '
+                                   + Math.round(BOL_MOST_MAX / 1000) + ' s'));
+                }
+            }, 250);
+            try { GM_setValue(MK_SHP_MZ, JSON.stringify({ id: id, od: String(od), doo: String(doo), kiedy: t0 })); }
+            catch (e){ sprzataj(); resolve(null); }
+        });
+    }
+
+    // ----- wykonawca (karta merchant.shoepping.at) -----
+    // Nie stawia guzika ani panelu. Slucha zlecen i odpowiada; nic wiecej.
+    if (onShpP){
+        const widziane = {};
+        const odpowiedz = function (o){
+            o.kiedy = Date.now();
+            try { GM_setValue(MK_SHP_MO, JSON.stringify(o)); } catch (e){}
+        };
+        const obsluz = async function (txt){
+            if (!txt) return;
+            let z = null;
+            try { z = JSON.parse(txt); } catch (e){ return; }
+            if (!z || !z.id || widziane[z.id]) return;
+            widziane[z.id] = 1;
+            // Zlecenie starsze niz dwie minuty jest nieaktualne — pytajacy dawno przestal czekac.
+            if (!z.kiedy || Date.now() - z.kiedy > 120000) return;
+            odpowiedz({ id: z.id, etap: 'przyjete' });
+            let o;
+            try {
+                const res = await fetch(shpSciezka(z.od, z.doo), { credentials: 'include', headers: SHP_NAGL });
+                o = { id: z.id, etap: 'wynik', ok: true, status: res.status, typ: String(res.headers.get('content-type') || ''),
+                      tresc: await res.text() };
+            } catch (e){
+                o = { id: z.id, etap: 'wynik', ok: false, blad: String((e && e.message) || e) };
+            }
+            // Pytajacy trzyma zlecenie w magazynie, dopoki nie dostanie wyniku. Gdy go tam juz nie ma, wynik (ruchy konta)
+            // nie idzie do magazynu wcale.
+            let czeka = false;
+            try { czeka = String(GM_getValue(MK_SHP_MZ, '') || '').indexOf('"' + z.id + '"') >= 0; } catch (e){}
+            if (!czeka) return;
+            odpowiedz(o);
+            setTimeout(function (){
+                try {
+                    const t = String(GM_getValue(MK_SHP_MO, '') || '');
+                    if (t && t.indexOf('"' + z.id + '"') >= 0) GM_setValue(MK_SHP_MO, '');
+                } catch (e){}
+            }, 30000);
+        };
+        let pulsKiedy = 0;
+        const puls = function (){
+            const t = Date.now();
+            if (t - pulsKiedy < BOL_MOST_PULS) return;
+            pulsKiedy = t;
+            try { GM_setValue(MK_SHP_MP, t); } catch (e){}
+        };
+        const tyknij = function (){
+            puls();
+            let v = '';
+            try { v = String(GM_getValue(MK_SHP_MZ, '') || ''); } catch (e){ return; }
+            obsluz(v);
+        };
+        try { GM_addValueChangeListener(MK_SHP_MZ, function (k, s, n){ obsluz(n); }); } catch (e){}
+        try { window.addEventListener('pagehide', function (){ try { GM_setValue(MK_SHP_MP, 0); } catch (e){} }); } catch (e){}
+        // Zegar to zapas za nasluchem magazynu: Worker z blob-a (karta w tle dlawi setInterval), a gdy padnie — zwykly zegar.
+        let tykow = 0, zapas = false;
+        const zapasowy = function (){ if (zapas) return; zapas = true; setInterval(tyknij, 1000); };
+        try {
+            const url = URL.createObjectURL(new Blob(['setInterval(function(){ postMessage(1); }, 1000);'],
+                                                     { type: 'text/javascript' }));
+            const w = new Worker(url);
+            w.onmessage = function (){ tykow++; tyknij(); };
+            w.onerror = zapasowy;
+            setTimeout(function (){ if (tykow < 1) zapasowy(); }, 4000);
+        } catch (e){ zapasowy(); }
+        tyknij();
+        try {
+            if (!sessionStorage.getItem('hub_shp_gotowa')){
+                sessionStorage.setItem('hub_shp_gotowa', '1');
+                mkToast('HUB ' + MK_VER + ': ta karta podaje wypłaty Shöpping do prologistics. Nic tu nie trzeba klikać — wystarczy, że jest otwarta.');
+            }
+        } catch (e){}
+    }
+
+    async function shpZapytaj(od, doo){
+        let pamiec = '';
+        try { pamiec = String(GM_getValue(MK_SHP_DR, '') || ''); } catch (e){}
+        const kolej = ['bez', 'z', 'most'];
+        if (kolej.indexOf(pamiec) > 0){ kolej.splice(kolej.indexOf(pamiec), 1); kolej.unshift(pamiec); }
+        const proby = [];
+        let r = null, droga = '', ostatni = '';
+        for (let i = 0; i < kolej.length && !r; i++){
+            const d = kolej[i];
+            let x = null;
+            try {
+                if (d === 'most'){
+                    if (Date.now() - shpMostBrak < 20000){ proby.push(SHP_DROGI[d] + ': karta nie odpowiada'); continue; }
+                    x = await shpMost(od, doo);
+                    if (!x){ proby.push(SHP_DROGI[d] + ': żadna karta ' + MK_SHP_HOST + ' nie odpowiedziała'); continue; }
+                } else x = await shpWprost(od, doo, d === 'z');
+            } catch (e){
+                proby.push(SHP_DROGI[d] + ': ' + ((e && e.message) || e));
+                continue;
+            }
+            // Przez most takze 401/403 — to prawdziwy stan sesji na portalu.
+            if (shpDobra(x) || (d === 'most' && (x.status === 401 || x.status === 403))){ r = x; droga = d; }
+            else {
+                const opis = 'HTTP ' + x.status + shpKsztalt(x);
+                proby.push(SHP_DROGI[d] + ': ' + (opis === ostatni ? 'to samo' : opis));
+                ostatni = opis;
+            }
+        }
+        if (!r){
+            throw new Error('Shöpping: nie dotarłem do portalu (ruchy konta Adyen ' + String(od).slice(0, 10) + ' – ' + String(doo).slice(0, 10) + '). Otwórz '
+                + MK_SHP_PANEL + ' w drugiej karcie, zaloguj się i zostaw ją otwartą (jeśli już jest otwarta — odśwież ją),'
+                + ' potem kliknij „⬇ Pobierz zestawienia” jeszcze raz TUTAJ. Na portalu nic nie trzeba klikać.'
+                + ' [próby: ' + proby.join(' · ') + ']');
+        }
+        try { mkLog('shoep', 'ruchy ' + String(od).slice(0, 16) + ' – ' + String(doo).slice(0, 16) + ' — droga: ' + SHP_DROGI[droga] + ', HTTP ' + r.status
+                            + (proby.length ? (' (wcześniej: ' + proby.join(' · ') + ')') : '')); } catch (e){}
+        if (!shpDobra(r))
+            throw new Error('Shöpping odrzucił zapytanie (HTTP ' + r.status + ') — zaloguj się na ' + MK_SHP_PANEL);
+        if (droga !== pamiec){ try { GM_setValue(MK_SHP_DR, droga); } catch (e){} }
+        return r;
+    }
+    // Ruchy konta z dni [od, doo) (RRRR-MM-DD, czas lokalny), oknami po MK_SHP_OKNO dni. Okno, ktore oddalo pelne 100 ruchow,
+    // dzielimy na pol (do godziny) — przy wiekszej liczbie API nie oddaje najwczesniejszych, tylko jakies 100. Okna zachodza
+    // na siebie o sekunde (nie wiadomo, czy granice sa wlaczne); ruchy odsiewamy po id. „pelna" = kazde okno przyszlo w calosci.
+    async function shpRuchy(od, doo){
+        const out = [], byl = {};
+        let zapytan = 0, pelna = true;
+        const okno = async function (a, b){
+            if (zapytan >= MK_SHP_ZAPYTAN){ pelna = false; return; }
+            zapytan++;
+            const r = await shpZapytaj(shpIso(a), shpIso(new Date(b.getTime() + 1000)));
+            const d = (JSON.parse(r.tekst) || {}).data || {};
+            const T = Array.isArray(d.transactions) ? d.transactions : [];
+            if (T.length >= MK_SHP_NA_STRONIE){
+                if (b.getTime() - a.getTime() > 3600000){
+                    const m = new Date(Math.round((a.getTime() + b.getTime()) / 2000) * 1000);
+                    await okno(a, m);
+                    await okno(m, b);
+                    return;
+                }
+                pelna = false;
+            }
+            T.forEach(function (t){
+                if (!t || t.id == null || byl[t.id]) return;
+                byl[t.id] = 1; out.push(t);
+            });
+        };
+        const p = String(od).split('-'), k = String(doo).split('-');
+        const koniec = new Date(+k[0], +k[1] - 1, +k[2]);
+        let a = new Date(+p[0], +p[1] - 1, +p[2]);
+        while (a < koniec && pelna){
+            const b = new Date(a.getFullYear(), a.getMonth(), a.getDate() + MK_SHP_OKNO);
+            await okno(a, b < koniec ? b : koniec);
+            a = b;
+        }
+        return { lista: out, stron: zapytan, pelna: pelna };
+    }
+    // Czas lokalny z przesunieciem, jak wysyla go strona („2026-10-06T00:00:00+02:00").
+    function shpIso(d){
+        const off = -d.getTimezoneOffset(), a = Math.abs(off);
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':'
+             + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()) + (off >= 0 ? '+' : '-') + pad2(Math.floor(a / 60)) + ':' + pad2(a % 60);
+    }
+    function shpMs(iso){ const t = Date.parse(String(iso || '')); return isFinite(t) ? t : null; }
+    function shpDzien(iso){ const m = String(iso || '').match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : ''; }
+    // „dd.mm.rrrr gg:mm" — jak w tabeli portalu, czas taki, jak zapisal go portal (lokalny, z przesunieciem).
+    function shpCzas(iso){
+        const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+        return m ? (m[3] + '.' + m[2] + '.' + m[1] + ' ' + m[4] + ':' + m[5]) : '';
+    }
+    // Polnoc czasu lokalnego danego dnia, z przesunieciem („…T00:00:00+02:00").
+    function shpOdIso(dzien){
+        const m = String(dzien || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? shpIso(new Date(+m[1], +m[2] - 1, +m[3])) : '';
+    }
+    // Data z arkusza to dzien wplywu: zwykle dzien po wyplacie (wtorek 23:30 -> sroda); weekend i swieta przesuwaja dalej.
+    function shpWOknie(dataArk, iso){
+        const a = mkDay(dataArk), b = mkDay(shpDzien(iso));
+        if (a == null || b == null) return false;
+        const dni = Math.round((a - b) / 86400000);
+        return dni >= -1 && dni <= 6;
+    }
+    // Wplata, ktora przelot moze obsluzyc. TEN SAM warunek liczy licznik — PULAPKI: „Licznik i przelot muszą stawiać ten sam
+    // warunek".
+    function shpDoPobrania(j){
+        return !!j && j.kind === 'shoep' && mkTodo(j) && j.amount != null && isFinite(j.amount)
+            && /^\d{4}-\d{2}-\d{2}$/.test(String(j.date || ''));
+    }
+
+    // ---------- rozliczenie jednej wyplaty ----------
+    // Ruchy z data waluty po poprzedniej wyplacie i nie pozniej niz ta. Wynik:
+    //   ord     — zamowienie -> kwota do importu: platnosc + kupon z TEJ wyplaty, jeden wiersz na zamowienie (wiersz scalony
+    //             wchodzi w paczce jako OK; osobne dawaly CHECK + OK — paczka 1732745);
+    //   kupony  — zamowienia, ktore maja w tej wyplacie SAM kupon (platnosc przy wysylce przyszla albo przyjdzie w innej) —
+    //             prologistics da im CHECK, a HUB zaksieguje je jako czesciowa platnosc (decyzja uzytkownika 08.10.2026);
+    //   ref     — zamowienie -> zwrot (zwrot klientowi + oddany kupon) — tak ksieguje je zespol (279,99 = 264,99 + 15);
+    //   bledy   — powody „wymaga sprawdzenia".
+    function shpRozlicz(lista, w, poprz){
+        const p = { wyplata: { id: String(w.id), kwota: r2(-Number(w.amount)), kiedy: String(w.bookingDate || '') },
+                    poprz: poprz ? { id: String(poprz.id), kwota: r2(-Number(poprz.amount)), kiedy: String(poprz.bookingDate || '') } : null,
+                    ord: {}, kupony: {}, ref: {}, poz: {}, kolej: [], inne: [], bledy: [],
+                    platnosci: 0, kuponySuma: 0, zwrotySuma: 0, kuponyOddane: 0, inneSuma: 0, sprzedaz: 0, zwroty: 0,
+                    nRuchow: 0, suma: 0, csv: '' };
+        const tW = shpMs(w.bookingDate), tP = poprz ? shpMs(poprz.bookingDate) : null;
+        if (tW == null || tP == null){ p.bledy.push('nie znam granic tej wypłaty (brak poprzedniej wypłaty)'); return p; }
+        // Regula z opisu bloku: w chwili T rozstrzyga data waluty, chyba ze ruchy zaksiegowane do T, a jeszcze bez waluty, daja
+        // razem minus — wtedy data ksiegowania. Do tej wyplaty naleza ruchy rozliczone w chwili tej wyplaty, a nie poprzedniej.
+        const zwykle = (lista || []).filter(function (t){ return t && t.type !== 'bankTransfer'; });
+        const poKsieg = function (T){
+            let s = 0;
+            zwykle.forEach(function (t){
+                const b = shpMs(t.bookingDate), v = shpMs(t.valueDate);
+                if (b != null && v != null && b <= T && v > T) s += Number(t.amount) || 0;
+            });
+            return r2(s) < 0;
+        };
+        p.ksiegW = poKsieg(tW); p.ksiegP = poKsieg(tP);
+        const rozliczony = function (t, T, ks){ const x = shpMs(ks ? t.bookingDate : t.valueDate); return x != null && x <= T; };
+        const ruchy = zwykle.filter(function (t){ return rozliczony(t, tW, p.ksiegW) && !rozliczony(t, tP, p.ksiegP); })
+            .sort(function (a, b){ return (shpMs(a.createdAt) || 0) - (shpMs(b.createdAt) || 0); });
+        // Ruch rozliczony juz z poprzednia wyplata (po dacie ksiegowania), a w tej — po dacie waluty — jeszcze nie: w 02–10.2026
+        // nie wystapil. Pliku z pozycja „cofnieta" nie skladamy.
+        zwykle.forEach(function (t){
+            if (rozliczony(t, tP, p.ksiegP) && !rozliczony(t, tW, p.ksiegW))
+                p.bledy.push('ruch ' + String(t.type || '?') + ' ' + f2(Number(t.amount)) + ' zaksięgowany ' + shpCzas(t.bookingDate)
+                           + ' wszedł do poprzedniej wypłaty, a w tej jeszcze nie ma waluty (' + shpCzas(t.valueDate) + ') — nie wiem, gdzie go dać');
+        });
+        p.nRuchow = ruchy.length;
+        const poz = {};
+        ruchy.forEach(function (t){
+            const kw = Number(t.amount);
+            if (!isFinite(kw)){ p.bledy.push('ruch ' + t.id + ' bez kwoty'); return; }
+            p.suma += kw;
+            if (String(t.status || '') !== 'booked') p.bledy.push('ruch ' + t.id + ' ma status „' + String(t.status || '') + '”, a nie „booked”');
+            const nr = String(t.reference || '').split('|')[0].trim().replace(/^refund_/i, '');
+            const opis = String(t.description || '');
+            let rodzaj = '';
+            if (t.type === 'capture' && kw > 0) rodzaj = 'cap';
+            else if (t.type === 'refund' && kw < 0) rodzaj = 'zw';
+            else if (t.type === 'internalTransfer' && kw > 0 && /^Gutschein\b/i.test(opis)) rodzaj = 'gut';
+            else if (t.type === 'internalTransfer' && kw < 0 && /^Refund-GS\b/i.test(opis)) rodzaj = 'rgs';
+            if (!rodzaj || !SHP_NR.test(nr)){
+                p.inne.push({ typ: String(t.type || '?'), kw: r2(kw), opis: opis.slice(0, 80), nr: SHP_NR.test(nr) ? nr : '',
+                              kiedy: String(t.createdAt || '') });
+                p.inneSuma += kw;
+                return;
+            }
+            const z = poz[nr] || (poz[nr] = { cap: 0, gut: 0, zw: 0, rgs: 0, id: '', pierwszy: '', ksieg: '', waluta: '' });
+            z[rodzaj] = r2(z[rodzaj] + kw);
+            if (!z.pierwszy) z.pierwszy = String(t.createdAt || '');
+            // Wiersz pliku niesie dane PLATNOSCI klienta; przy samym kuponie — kuponu.
+            if (rodzaj === 'cap' || (rodzaj === 'gut' && !z.id)){
+                z.id = String(t.id); z.ksieg = String(t.bookingDate || ''); z.waluta = String(t.valueDate || '');
+            }
+        });
+        Object.keys(poz).forEach(function (nr){
+            const z = poz[nr];
+            const wpl = r2(z.cap + z.gut), zw = r2(-(z.zw + z.rgs));
+            p.platnosci = r2(p.platnosci + z.cap); p.kuponySuma = r2(p.kuponySuma + z.gut);
+            p.zwrotySuma = r2(p.zwrotySuma - z.zw); p.kuponyOddane = r2(p.kuponyOddane - z.rgs);
+            if (wpl > 0){ p.ord[nr] = wpl; if (!(z.cap > 0)) p.kupony[nr] = wpl; }
+            if (zw > 0) p.ref[nr] = zw;
+        });
+        p.kolej = Object.keys(p.ord).sort(function (a, b){ return (shpMs(poz[a].pierwszy) || 0) - (shpMs(poz[b].pierwszy) || 0); });
+        p.poz = poz;
+        p.suma = r2(p.suma); p.inneSuma = r2(p.inneSuma);
+        p.sprzedaz = r2(p.kolej.reduce(function (s, k){ return s + p.ord[k]; }, 0));
+        p.zwroty = r2(Object.keys(p.ref).reduce(function (s, k){ return s + p.ref[k]; }, 0));
+        if (!eq(p.suma, p.wyplata.kwota)){
+            // Przy komplecie ruchow regula zgadza sie co do grosza (34 na 34). Rozjazd znaczy, ze portal nie oddal wszystkich ruchow
+            // albo Adyen rozliczyl cos inaczej niz dotad. Nie zgadujemy: wypisujemy ruchy z granicy wyplat — zaksiegowane przed
+            // wyplata, z data waluty po niej — od nich zaczyna sie sprawdzanie.
+            const gran = (lista || []).filter(function (t){
+                if (!t || t.type === 'bankTransfer') return false;
+                const b = shpMs(t.bookingDate), v = shpMs(t.valueDate);
+                return b != null && v != null && ((b <= tW && v > tW) || (b <= tP && v > tP && v <= tW));
+            }).sort(function (x, y){ return (shpMs(x.bookingDate) || 0) - (shpMs(y.bookingDate) || 0); });
+            const nazwa = function (t){
+                const kw = Number(t.amount);
+                return t.type === 'capture' ? 'płatność' : (t.type === 'refund' ? 'zwrot'
+                     : (t.type === 'internalTransfer' ? (kw < 0 ? 'kupon oddany' : 'kupon') : String(t.type || '?')));
+            };
+            p.bledy.push('ruchy od poprzedniej wypłaty sumują się do ' + f2(p.suma) + ', a wypłata Adyen to ' + f2(p.wyplata.kwota)
+                + ' (różnica ' + f2(r2(p.wyplata.kwota - p.suma)) + ')'
+                + (gran.length ? ('; na granicy wypłat (zaksięgowane przed wypłatą, waluta po niej): ' + gran.slice(0, 6).map(function (t){
+                      return nazwa(t) + ' ' + f2(Number(t.amount)) + ' ' + String(t.reference || '').split('|')[0].replace(/^refund_/i, '').slice(0, 9)
+                           + ' (księgowanie ' + shpCzas(t.bookingDate) + ', waluta ' + shpCzas(t.valueDate) + ')';
+                  }).join(' · ') + (gran.length > 6 ? (' · … +' + (gran.length - 6)) : '')) : '')
+                + ' — sprawdź te ruchy w portalu; tej wypłaty HUB nie zaimportuje');
+        }
+        if (p.inne.length)
+            p.bledy.push('ruchy, których HUB nie zna: ' + p.inne.map(function (x){
+                return x.typ + ' ' + f2(x.kw) + (x.opis ? (' „' + x.opis + '”') : '');
+            }).join(' · ') + ' — sprawdź je w portalu');
+        if (!p.kolej.length) p.bledy.push('w tej wypłacie nie ma ani jednej płatności do importu');
+        p.csv = shpCsvTekst(p);
+        return p;
+    }
+    // Plik do importu na ustawienie 235 — tak, jak wgrywal go zespol (tabela portalu, bez naglowka, srednik, CRLF, kwota
+    // z kropka), tylko jeden wiersz na zamowienie i PELNY numer zamowienia z `reference` w kolumnie 8. Ustawienie czyta
+    // kolumny 1 (data — i tak nadpisywana data z arkusza), 4 (kwota) i 8 (numer, booking 9 = Fulfillment No).
+    function shpCsvTekst(p){
+        const L = p.kolej.map(function (nr){
+            const z = p.poz[nr];
+            const typ = (z.cap > 0 && z.gut > 0) ? 'capture+Gutschein' : (z.cap > 0 ? 'capture' : 'Gutschein');
+            return [shpCzas(z.pierwszy), z.id, '', p.ord[nr].toFixed(2), typ, shpCzas(z.ksieg), shpCzas(z.waluta), nr].join(';');
+        });
+        return L.length ? (L.join('\r\n') + '\r\n') : '';
+    }
+    function mkCsvShp(p){ return (p && p.csv) ? p.csv : ''; }
+    function shpZastosuj(j, p){
+        const bad = p.bledy.slice();
+        if (!eq(p.wyplata.kwota, j.amount)) bad.unshift('wypłata Adyen ' + f2(p.wyplata.kwota) + ' ≠ ' + f2(j.amount) + ' z arkusza');
+        const both = Object.keys(p.ord).filter(function (k){ return p.ref[k] != null; });
+        j.data = { shoep: p, shop: j.shop || MK_SHP_SHOP, gross: p.sprzedaz, refund: p.zwroty, net: p.wyplata.kwota,
+                   netOk: !bad.length, ord: p.ord, ref: p.ref, unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: p.kolej.length, total: p.kolej.length, pages: 1,
+                   how: 'wypłata Adyen ' + shpCzas(p.wyplata.kiedy) };
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        const nk = Object.keys(p.kupony).length;
+        j.note = 'do importu płatności i kupony, jeden wiersz na zamówienie (' + p.kolej.length + ')'
+               + (nk ? (' · sam kupon bez płatności klienta w tej wypłacie: ' + nk
+                        + ' — przy księgowaniu pójdzie jako częściowa płatność na auftragu') : '')
+               + (p.zwroty ? (' · zwroty ' + Object.keys(p.ref).length + ' na ' + f2(p.zwroty) + ' — idą na listę zwrotów') : '');
+        return bad;
+    }
+    // Ramka przy zleceniu: z czego sklada sie wyplata, odnosnik do ruchow tego okresu w portalu, kupony bez platnosci.
+    function shpBox(j){
+        if (!onProlo || j.kind !== 'shoep' || !j.data || !j.data.shoep || !j.data.shoep.wyplata) return '';
+        const p = j.data.shoep, w = p.wyplata;
+        const kwOk = eq(j.data.net, j.amount);
+        const dmy = function (iso){ const d = shpDzien(iso); return d ? (d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4)) : ''; };
+        const link = MK_SHP_PANEL + '&since=' + dmy(p.poprz ? p.poprz.kiedy : w.kiedy) + '&until=' + dmy(w.kiedy) + '&limit=100';
+        const plus = function (x){ return (x < 0 ? ' − ' : ' + ') + f2(Math.abs(x)); };
+        let h = '<div>wypłata Adyen <b>' + esc(shpCzas(w.kiedy)) + '</b>'
+              + (p.poprz ? (' · ruchy od wypłaty z ' + esc(shpCzas(p.poprz.kiedy))) : '')
+              + ' · <a href="' + esc(link) + '" target="_blank" rel="noopener" style="color:#1d4ed8">transakcje w portalu</a></div>'
+              + '<div>płatności <b>' + f2(p.platnosci) + '</b>'
+              + (p.kuponySuma ? (plus(p.kuponySuma) + ' kupony Shöpping') : '')
+              + (p.zwrotySuma ? (plus(-p.zwrotySuma) + ' zwroty') : '')
+              + (p.kuponyOddane ? (plus(-p.kuponyOddane) + ' kupony oddane przy zwrotach') : '')
+              + (p.inneSuma ? (plus(p.inneSuma) + ' inne') : '')
+              + ' = <b>' + f2(p.suma) + '</b> '
+              + (kwOk ? '<b style="color:#0a7a2f">✓ wpłata z arkusza</b>' : ('<b style="color:#c00">✗ arkusz: ' + f2(j.amount) + '</b>'))
+              + '</div>';
+        if (p.ksiegW)
+            h += '<div style="margin-top:3px;color:#64748b">Wypłata liczona po dacie księgowania: przed nią zaksięgowano zwrot z datą waluty'
+               + ' po niej, więc Adyen rozliczył od razu ruchy z tych dni (zwrot i płatności) — następna wypłata już ich nie zawiera.</div>';
+        if (p.ksiegP)
+            h += '<div style="margin-top:3px;color:#64748b">Poprzednia wypłata była liczona po dacie księgowania — ruchy, które już'
+               + ' rozliczyła, tu nie wchodzą.</div>';
+        const nk = Object.keys(p.kupony || {});
+        if (nk.length)
+            h += '<div style="margin-top:3px">Sam kupon, bez płatności klienta w tej wypłacie (płatność przy wysyłce przychodzi'
+               + ' w innym tygodniu): ' + nk.map(function (nr){ return esc(nr) + ' <b>' + f2(p.kupony[nr]) + '</b>'; }).join(' · ')
+               + ' — przy księgowaniu pójdzie jako częściowa płatność na auftragu.</div>';
+        if ((p.inne || []).length)
+            h += '<div style="margin-top:3px;color:#b45309">Ruchy, których HUB nie zna: ' + p.inne.map(function (x){
+                     return esc(x.typ) + ' <b>' + f2(x.kw) + '</b>' + (x.opis ? (' „' + esc(x.opis) + '”') : '');
+                 }).join(' · ') + '</div>';
+        // „Wymaga sprawdzenia" nie wraca do „⬇ Pobierz zestawienia" samo (mkTodo bierze tylko nowe i bledy).
+        if (j.status === 'partial' && !j.juzWPaczce)
+            h += '<div style="margin-top:3px"><button class="mk-shpponow" data-k="' + esc(mkKlucz(j)) + '" '
+               + 'style="padding:1px 7px;border:1px solid #1d4ed8;border-radius:5px;background:#fff;color:#1d4ed8;font-size:10px;cursor:pointer">'
+               + '↻ Pobierz z Shöpping jeszcze raz</button> <span style="color:#64748b">— zlecenie wróci do „⬇ Pobierz zestawienia”</span></div>';
+        return '<div style="margin-top:4px;padding:4px 7px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:5px;'
+             + 'font-size:11px;color:#1e3a8a">' + h + '</div>';
+    }
+    // Kupon Shöpping zaplacony w innym tygodniu niz platnosc klienta: w paczce stoi sam, wiec prologistics daje mu CHECK
+    // (kwota mniejsza niz open amount). Decyzja uzytkownika 08.10.2026: ksiegujemy go jako CZESCIOWA platnosc na auftragu,
+    // jak robil to zespol recznie (np. 15.00 z 15.07.2026 na 15205762). Bierzemy tylko wiersz: ze zlecenia Shöpping, z numerem
+    // zamowienia z listy kuponow tej wyplaty, o tej samej kwocie, dopasowany do auftragu, gdy auftrag ma jeszcze do zaplaty
+    // co najmniej tyle (bez nadplaty). Kazdy inny CHECK zostaje dla czlowieka.
+    function shpKuponyWiersze(job, rows){
+        const kup = (job && job.kind === 'shoep' && job.data && job.data.shoep && job.data.shoep.kupony) || null;
+        if (!kup || !Object.keys(kup).length) return [];
+        return (rows || []).filter(function (x){
+            if (!x || String(x.state) !== 'CHECK') return false;
+            const v = kup[String(x.payment_descr || '').trim()];
+            if (v == null || !String(x.auction_number || '').trim()) return false;
+            const kw = impNum(x.amount), o = impNum(x.open_amount);
+            return kw != null && eq(kw, v) && o != null && o >= kw - 0.005;
+        });
+    }
+
     // Pliki Galaxusa sa w windows-1252 i tak wlasnie prologistics je dotad przyjmowal.
     // Gdybysmy wyslali UTF-8, umlauty w nazwach i apostrof tysiecy przyszlyby polamane,
     // wiec dla tego jednego marketplace'u kodujemy plik bajt po bajcie.
@@ -42450,6 +42995,7 @@
         if (j.kind === 'hd'   && j.data && j.data.hd)   return mkCsvHd(j.data.hd);
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         if (j.kind === 'bol'  && j.data && j.data.bol)  return mkCsvBol(j.data.bol);
+        if (j.kind === 'shoep' && j.data && j.data.shoep) return mkCsvShp(j.data.shoep);
         if (j.kind === 'f1'   && j.data && Array.isArray(j.data.pozycje)) return f1PlikImportu(j).tekst;
         return mkCsvText(pairsOf(j), j.mp, j.data && j.data.shop);
     }
@@ -44648,7 +45194,8 @@
     // Portal WAYFAIRA: tak samo bez guzika i bez panelu. Modul jest tam wykonawca mostu —
     // rozliczenia pobiera sie z prologistics, a otwarta karta portalu tylko odpowiada.
     // Portal bol.com — jak Wayfair: bez guzika i bez panelu, karta tylko odpowiada na zapytania z prologistics.
-    if (!onMirakl && !onWayf && !onBolP){
+    // Portal Shöpping — tak samo.
+    if (!onMirakl && !onWayf && !onBolP && !onShpP){
         (document.body || document.documentElement).appendChild(btn);
         (document.body || document.documentElement).appendChild(panel);
     }
@@ -45103,9 +45650,10 @@
             t = jak === 'vtex' ? '→ pobierz z karty panelu OBI (baner nad listą) albo wgraj CSV z panelu: „📎 Dodaj pliki”'
               : (jak === 'plik' ? '→ wgraj raport: „📎 Dodaj pliki”'
               : (st === 'err' ? '→ usuń przyczynę i ponów krok 2'
-              // bol nie ma drogi plikiem — specyfikacje bierze tylko z portalu (wprost albo przez otwarta karte bol).
+              // bol i Shöpping nie maja drogi plikiem — dane biora tylko z portalu (wprost albo przez otwarta karte portalu).
               : (j.kind === 'bol' ? '→ krok 2: „⬇ Pobierz zestawienia” (portal bol zalogowany w tej przeglądarce)'
-              : '→ krok 2: „⬇ Pobierz zestawienia” albo raport plikiem')));
+              : (j.kind === 'shoep' ? '→ krok 2: „⬇ Pobierz zestawienia” (portal Shöpping zalogowany w tej przeglądarce)'
+              : '→ krok 2: „⬇ Pobierz zestawienia” albo raport plikiem'))));
         }
         else if (st === 'partial') t = '→ import wstrzymany: powód obok';
         else if (st === 'ready') t = importBlokada(j) ? '→ import wstrzymany: powód niżej'
@@ -45597,6 +46145,7 @@
                 if (j.note) det += '<div style="color:#666">' + esc(j.note) + '</div>';
                 det += manorBox(j) + manorOdBox(j);
                 det += bolBox(j);
+                det += shpBox(j);
                 det += obiChKontrolaHtml(j);
                 det += obiChRefBox(j);
                 // Po zaksiegowaniu to juz nie ostrzezenie — szare, i bez „jeszcze NIEZAKSIĘGOWANA".
@@ -46030,6 +46579,18 @@
                 delete j.data;
                 jobsSave(jobs); render();
                 say('Zlecenie bol na ' + f2(j.amount) + ' wróciło do pobrania — kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
+            };
+        });
+        // Shöpping „wymaga sprawdzenia" (shpBox) — jak przy bol: po wyjasnieniu przyczyny zlecenie wraca do pobrania.
+        out.querySelectorAll('.mk-shpponow').forEach(function (b){
+            b.onclick = function(){
+                if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+                const k = b.getAttribute('data-k'), jobs = jobsLoad(), j = jobs[k];
+                if (!j || j.kind !== 'shoep' || j.status !== 'partial' || j.juzWPaczce) return;
+                j.status = 'new'; j.msg = ''; j.note = '';
+                delete j.data;
+                jobsSave(jobs); render();
+                say('Zlecenie Shöpping na ' + f2(j.amount) + ' wróciło do pobrania — kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
             };
         });
         // Numer dokumentu od Manora → PDF z panelu.
@@ -48307,7 +48868,7 @@
                             lim: 'Limango',
                             c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
                             joy: 'JOOM', vtex: 'OBI', bank: 'wyciag', f1: 'Furniture 1',
-                            obich: 'OBI CH', bol: 'bol.com',
+                            obich: 'OBI CH', bol: 'bol.com', shoep: 'Shöpping',
                             // Manor, Vente-Unique i Home24 jada wspolna sciezka Mirakla —
                             // w logu i tak stoi obok lista sklepow, wiec wiadomo ktory to.
                             mirakl: 'Mirakl' };
@@ -51113,7 +51674,8 @@
             say('Dodano wpłatę bez wyciągu: ' + w.label + ' · ' + f2(kwota) + ' ' + w.cur + ' z ' + data
                 + (w.kind === 'ebay' ? ' — kliknij „⬇ Pobierz zestawienia", żeby moduł rozpoznał, która to wypłata.'
                    : (w.kind === 'bol' ? ' — kliknij „⬇ Pobierz zestawienia" (portal bol zalogowany w tej przeglądarce).'
-                   : ' — teraz wgraj raport z portalu.')), '#0a7a2f');
+                   : (w.kind === 'shoep' ? ' — kliknij „⬇ Pobierz zestawienia" (portal Shöpping zalogowany w tej przeglądarce).'
+                   : ' — teraz wgraj raport z portalu.'))), '#0a7a2f');
         };
 
         // ---------- niezaksięgowane z arkusza ----------
@@ -53973,6 +54535,97 @@
         function bolLeft(jobs){
             return Object.keys(jobs).filter(function (k){ return bolDoPobrania(jobs[k]); }).length;
         }
+        // Przejscie po zleceniach Shöpping: ruchy konta Adyen z portalu (od najwczesniejszej daty z arkusza − MK_SHP_WSTECZ dni),
+        // dopasowanie wyplaty (bankTransfer) po KWOCIE i dacie, rozliczenie ruchow od poprzedniej wyplaty, kontrola i plik
+        // importu. Zwraca liczbe zamknietych zlecen.
+        async function shpPass(jobs){
+            const left = Object.keys(jobs).filter(function (k){ return shpDoPobrania(jobs[k]); });
+            if (!left.length) return 0;
+            let lo = '';
+            left.forEach(function (k){ const d = String(jobs[k].date || ''); if (d && (!lo || d < lo)) lo = d; });
+            // Komunikat musi zostac PRZY ZLECENIU, nie tylko na pasku — pasek nadpisze nastepna platforma.
+            const wszystkim = function (tekst, blad){
+                left.forEach(function (k){ jobs[k].msg = tekst; if (blad) jobs[k].status = 'err'; });
+                jobsSave(jobs); render();
+                say('Shöpping: ' + tekst, '#c47f00');
+            };
+            // Koniec: dwa dni po najpozniejszej dacie z arkusza — wyplata bywa dzien po dacie wplywu (shpWOknie).
+            let hi = '';
+            left.forEach(function (k){ const d = String(jobs[k].date || ''); if (d && (!hi || d > hi)) hi = d; });
+            const od = mkShift(lo, -MK_SHP_WSTECZ), doo = mkShift(hi, 2);
+            say('Shöpping — pobieram ruchy konta Adyen ' + od + ' – ' + doo + '…');
+            let L;
+            try { L = await shpRuchy(od, doo); }
+            catch (e){ wszystkim(withLogin({ brand: 'Shoepping', shop: MK_SHP_SHOP, host: MK_SHP_HOST }, (e && e.message) || String(e)), true); return 0; }
+            // Wyplata to suma ruchow — z niepelnej listy wyszlaby zla suma albo zly podzial na zamowienia.
+            if (!L.pelna){
+                wszystkim('portal Shöpping oddał ' + L.lista.length + ' ruchów w ' + L.stron + ' zapytaniach, ale nie każde okno dat przyszło'
+                          + ' w całości — z niepełnych danych wypłat nie liczę', true);
+                return 0;
+            }
+            const wyplaty = L.lista.filter(function (t){
+                return t && t.type === 'bankTransfer' && Number(t.amount) < 0 && shpMs(t.bookingDate) != null;
+            }).sort(function (a, b){ return shpMs(a.bookingDate) - shpMs(b.bookingDate); });
+            if (!wyplaty.length){
+                wszystkim('portal Shöpping nie pokazał ani jednej wypłaty od ' + od + ' — sprawdź, czy jesteś zalogowany na ' + MK_SHP_PANEL, true);
+                return 0;
+            }
+            const tOd = shpMs(shpOdIso(od));
+            let ok = 0;
+            for (let i = 0; i < left.length; i++){
+                const j = jobs[left[i]];
+                const hit = wyplaty.filter(function (w){ return eq(r2(-Number(w.amount)), j.amount) && shpWOknie(j.date, w.bookingDate); });
+                if (!hit.length){
+                    // Sama informacja „nie ma" jest bezuzyteczna — dopisujemy wyplaty, ktore portal pokazuje.
+                    const bliskie = wyplaty.slice()
+                        .sort(function (a, b){ return Math.abs(-Number(a.amount) - j.amount) - Math.abs(-Number(b.amount) - j.amount); })
+                        .slice(0, 3)
+                        .map(function (w){ return f2(r2(-Number(w.amount))) + ' z ' + shpCzas(w.bookingDate); });
+                    j.msg = 'w Shöpping nie ma wypłaty na ' + f2(j.amount) + ' z okolic ' + j.date
+                          + (bliskie.length ? ('. Najbliższe: ' + bliskie.join(' · ')) : '');
+                    jobsSave(jobs); continue;
+                }
+                if (hit.length > 1){
+                    j.msg = 'kilka wypłat Shöpping na tę samą kwotę (' + hit.map(function (w){ return shpCzas(w.bookingDate); }).join(', ')
+                          + ') — nie zgaduję, która';
+                    jobsSave(jobs); continue;
+                }
+                const w = hit[0];
+                // Ta sama wyplata przy INNYM zleceniu (dwa wiersze arkusza na te sama wyplate) — drugi raz jej nie bierzemy,
+                // bo poszedlby drugi import tej samej wyplaty.
+                const zajete = Object.keys(jobs).filter(function (k){
+                    const x = jobs[k];
+                    return k !== left[i] && x && x.kind === 'shoep' && x.data && x.data.shoep && x.data.shoep.wyplata
+                        && x.data.shoep.wyplata.id === String(w.id);
+                });
+                if (zajete.length){
+                    const x = jobs[zajete[0]];
+                    j.msg = 'wypłata Shöpping z ' + shpCzas(w.bookingDate) + ' (' + f2(r2(-Number(w.amount))) + ') jest już przy zleceniu z '
+                          + (x.date || '?') + ' na ' + f2(x.amount) + ' — to ta sama wypłata dwa razy?';
+                    jobsSave(jobs); continue;
+                }
+                // Poczatek okna wyznacza POPRZEDNIA wyplata. Musi lezec w pobranym zakresie, i to z zapasem: ruch zalozony przed
+                // poczatkiem pobierania, a z data waluty po poprzedniej wyplacie, by nam umknal (sume i tak sprawdzamy nizej).
+                const ix = wyplaty.indexOf(w), poprz = ix > 0 ? wyplaty[ix - 1] : null;
+                if (!poprz || shpMs(poprz.bookingDate) - tOd < 7 * 86400000){
+                    j.status = 'err';
+                    j.msg = 'nie widzę wypłaty Shöpping sprzed ' + shpCzas(w.bookingDate) + ' w pobranych ruchach (od ' + od
+                          + ') — nie wiem, od kiedy liczyć ruchy tej wypłaty';
+                    jobsSave(jobs); render(); continue;
+                }
+                try {
+                    const p = shpRozlicz(L.lista, w, poprz);
+                    shpZastosuj(j, p);
+                    j.data.pages = L.stron;
+                    ok++;
+                } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
+        function shpLeft(jobs){
+            return Object.keys(jobs).filter(function (k){ return shpDoPobrania(jobs[k]); }).length;
+        }
 
         // Ile zlecen zostalo do pobrania na platformach obslugiwanych PETLA PO HOSTACH
         // (Mirakl i VTEX). Galaxus i Wayfair maja wlasne liczniki i sa dokladane osobno —
@@ -53993,7 +54646,7 @@
                 const kind = j.kind || 'mirakl';
                 // Furniture 1 ma numer z tytulu i nie ma hosta — bez tego liczylaby sie jako Mirakl
                 // i zawyzala „zostało N na innych sklepach". Liczy ja f1Left.
-                if (kind === 'joy' || kind === 'galx' || kind === 'wayf' || kind === 'f1' || kind === 'bol') return false;
+                if (kind === 'joy' || kind === 'galx' || kind === 'wayf' || kind === 'f1' || kind === 'bol' || kind === 'shoep') return false;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
                 // Zlecenie „NN" z kilkoma panelami nalezy do KAZDEGO z nich, dopoki
                 // ktorys nie odda rozliczenia.
@@ -54405,9 +55058,9 @@
             const b = this, b2 = $('#mk-run');
             MK_PRZELOT++;                  // nowy przelot — patrz mkKandZapisz
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nBol = bolLeft(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nBol = bolLeft(jobs), nShp = shpLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nBol){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nBol && !nShp){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -54430,13 +55083,16 @@
             const f1n  = obca ? 0 : nF1;
             // bol — lista faktur i specyfikacja z partner.bol.com (wprost albo przez otwarta karte portalu): z prologistics.
             const bol  = obca ? 0 : nBol;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb && !hd && !f1n && !bol){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            // Shöpping — ruchy konta Adyen z api.shoepping.at (wprost albo przez otwarta karte portalu): z prologistics.
+            const shp  = obca ? 0 : nShp;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb && !hd && !f1n && !bol && !shp){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
                               .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
                               .concat(mano ? [MK_MM_HOST] : []).concat(cnov ? [MK_CN_HOST] : [])
                               .concat(bb ? [MK_BB_HOST] : []).concat(hd ? [MK_HD_HOST] : [])
-                              .concat(f1n ? [F1_PRZELOT_NAZWA] : []).concat(bol ? [MK_BOL_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov + bb + hd + f1n + bol) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                              .concat(f1n ? [F1_PRZELOT_NAZWA] : []).concat(bol ? [MK_BOL_HOST] : [])
+                              .concat(shp ? [MK_SHP_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov + bb + hd + f1n + bol + shp) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
@@ -54447,7 +55103,8 @@
                     .concat(bb ? ['  • ' + MK_BB_HOST + ' — ' + bb + ' szt.'] : [])
                     .concat(hd ? ['  • ' + MK_HD_HOST + ' — ' + hd + ' szt.'] : [])
                     .concat(f1n ? ['  • ' + F1_PRZELOT_NAZWA + ' — ' + f1n + ' szt.'] : [])
-                    .concat(bol ? ['  • ' + MK_BOL_HOST + ' — ' + bol + ' szt.'] : []).join('\n')
+                    .concat(bol ? ['  • ' + MK_BOL_HOST + ' — ' + bol + ' szt.'] : [])
+                    .concat(shp ? ['  • ' + MK_SHP_HOST + ' — ' + shp + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -54518,6 +55175,11 @@
                 seen++;
                 try { ok += await mkPrzelot('bol', 'bol', MK_BOL_HOST, 'Bol', bolPass); }
                 catch (e){ problem.push(MK_BOL_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (shp){
+                seen++;
+                try { ok += await mkPrzelot('Shöpping', 'shoep', MK_SHP_HOST, 'Shoepping', shpPass); }
+                catch (e){ problem.push(MK_SHP_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -54701,7 +55363,7 @@
             // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
             // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
             const jl = jobsLoad();
-            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl) + c24Left(jl) + hdLeft(jl) + f1Left(jl) + bolLeft(jl);
+            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl) + c24Left(jl) + hdLeft(jl) + f1Left(jl) + bolLeft(jl) + shpLeft(jl);
             // Ostrzezenie o duplikatach nie moze zaslaniac problemow przelotu — idzie razem z nimi.
             if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.'
                 + (problem.length ? (' Problemy: ' + problem.join('; ')) : ''), '#c00');
@@ -55957,7 +56619,11 @@
     //   - nie dalo sie sprawdzic = nie importujemy (zapora, nie podpowiedz), zlecenie zostaje „gotowe" do ponowienia.
     // Klucz to marketplace: o tym, ze wyplaty importuje sie tez recznie, wiemy per rynek, nie per bank.
     // bol: wyplaty importowano dotad recznie pod roznymi nazwami („02.09.2026 Bol1.csv", „invoice_specification_…csv").
-    const MK_IMP_PO_TRESCI = { 'Mirakl (Castorama PL)': 1, 'Bol': 1 };
+    // Shöpping: wyplaty importowal zespol recznie („DD.MM.RRRR Shoepping AT.csv") — od kwietnia 2026 z numerem uciętym do
+    // 9 znakow (opis transakcji w portalu bywa inny niz numer zamowienia, zgodne sa tylko dwie pierwsze grupy).
+    const MK_IMP_PO_TRESCI = { 'Mirakl (Castorama PL)': 1, 'Bol': 1, 'Shoepping': 1 };
+    // Jak porownywac numery, gdy paczki reczne niosly je w innej postaci (dzis tylko Shöpping: pierwsze 9 znakow).
+    const MK_TRESC_KLUCZ = { 'Shoepping': function (n){ return String(n || '').trim().toLowerCase().slice(0, 9); } };
     const MK_TRESC_OKNO = 10;
     const MK_TRESC_MAX = 8;
     function mkPoTresci(j){
@@ -56005,7 +56671,9 @@
         const doS = (sel || []).filter(mkPoTresci);
         for (let i = 0; i < doS.length; i++){
             const j = doS[i], k = mkKlucz(j);
-            const nr = Object.keys(j.data.ord).map(function (n){ return String(n).trim(); }).filter(Boolean);
+            const kl = MK_TRESC_KLUCZ[String(j.mp || '')] || null;
+            const nr = Object.keys(j.data.ord).map(function (n){ return kl ? kl(n) : String(n).trim(); })
+                           .filter(function (n, ix, a){ return n && a.indexOf(n) === ix; });
             if (!nr.length) continue;
             const bank = String((sets[setKey(j.mp, j.data.shop)] || {}).bank || '').trim();
             if (!/^\d+$/.test(bank)){
@@ -56026,8 +56694,10 @@
             }
             let naj = null;
             w.paczki.forEach(function (p){
+                let pn = p.nr;
+                if (kl){ pn = {}; Object.keys(p.nr).forEach(function (n){ pn[kl(n)] = 1; }); }
                 let wsp = 0;
-                nr.forEach(function (n){ if (p.nr[n]) wsp++; });
+                nr.forEach(function (n){ if (pn[n]) wsp++; });
                 if (wsp && (!naj || wsp > naj.wsp)) naj = { p: p, wsp: wsp };
             });
             const opis = naj ? ('paczka ' + naj.p.id + (naj.p.nazwa ? (' „' + naj.p.nazwa + '”') : '')
@@ -56566,6 +57236,8 @@
         const by = {};
         rows.forEach(function (x){ const s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
         const ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
+        // Shöpping: kupony bez platnosci klienta w tej wyplacie — CHECK, ktory ksiegujemy jako czesciowa platnosc.
+        const kup = shpKuponyWiersze(job, chk);
         // Auftragi wierszy NOT FOUND, ktorych w tej sesji jeszcze nie sprawdzano — ida same, raz na paczke naraz.
         mkImpWidok = String(job.impId || '');
         const refs0 = (job.data && job.data.ref) || {};
@@ -56600,7 +57272,8 @@
         // koncowkach (mkKoncWiersze). Zostaja w grupie „Open amount 0" ponizej, do wgladu.
         const near = chk.filter(function (x){
             const o = impNum(x.open_amount);
-            return o != null && Math.abs(o) >= 0.005 && Math.abs(o) <= tol && String(x.auction_number || '').trim();
+            return o != null && Math.abs(o) >= 0.005 && Math.abs(o) <= tol && String(x.auction_number || '').trim()
+                && kup.indexOf(x) < 0;
         });
         // Wiersze, w ktorych na auftragu NIE MA juz nic do zaplaty. Prologistics oznacza je
         // jako CHECK, bo wplata nie zgadza sie z zerem — ale to nie jest rozbieznosc do
@@ -56618,7 +57291,7 @@
             const o = impNum(x.open_amount);
             return o != null && Math.abs(o) < 0.005;
         });
-        const doWyj = chk.filter(function (x){ return zeroOpen.indexOf(x) < 0; });
+        const doWyj = chk.filter(function (x){ return zeroOpen.indexOf(x) < 0 && kup.indexOf(x) < 0; });
 
         let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
               + '<span class="mk-kn">4</span>'
@@ -56631,7 +57304,7 @@
         Object.keys(by).sort().forEach(function (s){
             // Przy CHECK dopisujemy, ile z tego zostaje naprawde do wyjasnienia — inaczej
             // licznik u gory mowilby „10", a sekcja nizej „1", i nie wiadomo, ktore prawdziwe.
-            const doda = (s === 'CHECK' && zeroOpen.length) ? (' (do wyjaśnienia ' + doWyj.length + ')') : '';
+            const doda = (s === 'CHECK' && (zeroOpen.length || kup.length)) ? (' (do wyjaśnienia ' + doWyj.length + ')') : '';
             h += '<span style="font-size:11px;color:' + esc(col[s] || '#374151') + ';font-weight:700">'
               +  esc(s) + ': ' + by[s].length + esc(doda) + '</span>';
         });
@@ -56647,7 +57320,7 @@
         // Niezgodna, jeszcze niewczytana albo spoza HUB-a — „Zaksięguj OK" stoi; „↻ Odśwież" liczy od nowa.
         const f1Widok = f1PaczkaWidok(job, kluczJob, jobsK0, rows);
         if (f1Widok.html) h += f1Widok.html;
-        const chkTabela = function (lista){
+        const chkTabela = function (lista, czesc){
             let t = '<table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
                   + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Zamówienie</td><td style="padding:1px 6px;text-align:right">Wpłata</td>'
                   + '<td style="padding:1px 6px;text-align:right">Open amount</td><td style="padding:1px 6px;text-align:right">Różnica</td><td style="padding:1px 6px">Auftrag</td></tr>';
@@ -56659,7 +57332,7 @@
                 t += '<tr style="border-top:1px solid #f1f5f9' + (small ? ';background:#f0fdf4' : '') + '"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
-                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + (small ? '#0a7a2f' : '#c00') + '">'
+                  +  '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + (small ? '#0a7a2f' : (czesc ? '#1d4ed8' : '#c00')) + '">'
                   +  (df == null ? '—' : f2(df)) + (small ? ' ✓' : '') + '</td>'
                   +  '<td style="padding:2px 6px">' + (au
                         ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td></tr>';
@@ -56672,6 +57345,15 @@
             if (doWyj.length){
                 h += '<b style="font-size:11px;color:#c47f00">CHECK — kwota nie zgadza się z open amount ('
                   +  doWyj.length + ')</b>' + chkTabela(doWyj);
+            }
+            // Shöpping: kupon bez platnosci klienta w tej wyplacie — wejdzie razem z OK jako czesciowa platnosc na auftragu
+            // (decyzja uzytkownika 08.10.2026; tak ksiegowal je zespol recznie).
+            if (kup.length){
+                h += '<div' + (doWyj.length ? ' style="margin-top:6px"' : '') + '><b style="font-size:11px;color:#1d4ed8">'
+                  +  'Kupon Shöpping bez płatności klienta w tej wypłacie (' + kup.length + ') — pójdzie razem z OK jako częściowa płatność na auftragu</b>'
+                  +  '<div style="font-size:10px;color:#888;margin-top:2px">Płatność klienta przychodzi przy wysyłce, często w innym tygodniu niż kupon. '
+                  +  'Prologistics daje CHECK, bo kupon jest mniejszy niż open amount. „▶ Zaksięguj OK” ustawi im status OK i zaksięguje je razem z pozycjami OK.</div>'
+                  +  chkTabela(kup, true) + '</div>';
             }
             // Zera zwiniete pod jedna linijke — sa pod reka, ale nie zajmuja uwagi.
             if (zeroOpen.length){
@@ -56814,7 +57496,7 @@
         // zbiorczy. Pusty napis = wolno ksiegowac.
         const typBlok = mkTypBlokada(jbNow);
         const typSt = jbNow.typStan || null;
-        const canBook = ok.length > 0 && !jbNow.booked && !typBlok && !f1Widok.stop;
+        const canBook = (ok.length > 0 || kup.length > 0) && !jbNow.booked && !typBlok && !f1Widok.stop;
         h += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
         // JEDEN guzik, ktory zmienia napis wraz ze stanem: Sprawdz -> (nie odczytalem N,
         // sprawdz jeszcze raz) -> Zmien typy klientow -> Zaksieguj.
@@ -56851,7 +57533,8 @@
         } else {
             h += '<button id="mk-book"' + (canBook ? '' : ' disabled')
               +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (canBook ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (canBook ? 'pointer' : 'default') + ';font-size:11px">'
-              +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')') : ('▶ Zaksięguj OK (' + ok.length + ')')) + '</button>';
+              +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')')
+                  : ('▶ Zaksięguj OK (' + ok.length + ')' + (kup.length ? (' + kupony (' + kup.length + ')') : ''))) + '</button>';
             if (f1Widok.stop && !jbNow.booked) h += '<span style="font-size:11px;color:#c47f00">' + esc(f1Widok.stop) + '</span>';
             const biegN = jestAmz ? mkTypBieg[jbNow.ref] : null;
             if (jestAmz) h += '<button id="mk-typ-run" data-ref="' + esc(String(jbNow.ref || '')) + '" data-cel="sprawdz"' + (biegN ? ' disabled' : '')
@@ -57017,12 +57700,28 @@
             if (blokT){ say('Nie księguję: ' + blokT + '.', '#c47f00'); return; }
             const mimoPrzed = !!jKlik.typMimo;          // zgoda „mimo to" z chwili decyzji — zapis bramki w locie jej nie skasuje
             if (!confirm('Zaksięgować ' + ok.length + ' pozycji ze statusem OK na koncie głównym?\n\n'
+                + (kup.length ? ('Razem z nimi kupony Shöpping jako częściowa płatność na auftragu (status CHECK → OK): ' + kup.length + '\n'
+                    + kup.map(function (x){ return '  • ' + x.payment_descr + '  ' + f2(impNum(x.amount)) + '  (open ' + f2(impNum(x.open_amount)) + ')'; }).join('\n')
+                    + '\n\n') : '')
                 + 'Paczka ' + job.impId + ' · ' + (job.data ? job.data.shop : '') + '\n'
                 + 'Odpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
             bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
             mkImpBieg++; mkKsiegBieg++;
             try {
-                await impBook(job.impId, ok.map(function (x){ return x.id; }));
+                // Kupony Shöpping: swiezy odczyt — idzie tylko to, co dalej jest CHECK z kwota kuponu i open amount, ktory ja
+                // pokrywa (miedzy narysowaniem a kliknieciem ktos mogl je zaksiegowac recznie).
+                let kupNow = [];
+                if (kup.length){
+                    const idsK = {};
+                    kup.forEach(function (x){ idsK[String(x.id)] = 1; });
+                    kupNow = shpKuponyWiersze(job, (await impRows(job.impId)).rows).filter(function (x){ return idsK[String(x.id)]; });
+                    for (let i = 0; i < kupNow.length; i++){
+                        m.textContent = 'kupony: status OK ' + (i + 1) + '/' + kupNow.length + '…';
+                        await impState(job.impId, kupNow[i].id, 'OK');
+                    }
+                    m.textContent = 'księguję…';
+                }
+                await impBook(job.impId, ok.map(function (x){ return x.id; }).concat(kupNow.map(function (x){ return x.id; })));
                 const jobs = jobsLoad();
                 const kj = kluczJob;
                 if (jobs[kj]){
@@ -57034,10 +57733,11 @@
                     // a robota niedokonczona. Notatka „ksiegowanie" przezywa Booked „Tak".
                     // NOT FOUND liczymy bez wplat zniesionych zwrotem z tego samego rozliczenia (impNfZostaje).
                     const nfZ = impNfZostaje(jobs[kj], nf);
-                    if (chk.length || nfZ)
+                    const chkZ = chk.length - kupNow.length;          // kupony Shöpping weszly razem z OK
+                    if (chkZ || nfZ)
                         mkProblemUstawW(jobs[kj], 'ksiegowanie', 'księgowanie paczki ' + job.impId,
-                            'zaksięgowane ' + ok.length + ' poz., ale zostały w paczce: '
-                            + [chk.length ? ('CHECK ' + chk.length) : '', nfZ ? ('NOT FOUND ' + nfZ) : ''].filter(Boolean).join(', ')
+                            'zaksięgowane ' + (ok.length + kupNow.length) + ' poz., ale zostały w paczce: '
+                            + [chkZ ? ('CHECK ' + chkZ) : '', nfZ ? ('NOT FOUND ' + nfZ) : ''].filter(Boolean).join(', ')
                             + ' — te pozycje nie weszły');
                     else mkProblemZdejmijZ(jobs[kj], 'ksiegowanie');
                     jobsSave(jobs);
@@ -57756,12 +58456,14 @@
                 // bo decyzja „mimo to" dotyczy konkretnej paczki ogladanej przez czlowieka.
                 // Na SWIEZYM zleceniu — list[i] to migawka z chwili klikniecia, a odczyt paczek trwa.
                 const stopTyp = mkTypBlokada(jobsLoad()[mkKlucz(list[i])] || list[i]);
-                plan.push({ j: list[i], ok: ok, chk: chk, nf: nf, dup: dup, rows: d.rows,
+                // Shöpping: kupony bez platnosci klienta — ida razem z OK jako czesciowa platnosc (jak w widoku paczki).
+                const kup = shpKuponyWiersze(list[i], d.rows);
+                plan.push({ j: list[i], ok: ok, kup: kup, chk: chk, nf: nf, dup: dup, rows: d.rows,
                             nfRows: d.rows.filter(function (x){ return String(x.state) === 'NOT FOUND'; }),
                             stop: f1BlokadaKsiegowania(list[i], d.rows) || stopTyp });
             } catch (e){ plan.push({ j: list[i], err: (e && e.message) || String(e) }); }
         }
-        const good = plan.filter(function (p){ return p.ok && p.ok.length && !p.stop; });
+        const good = plan.filter(function (p){ return p.ok && (p.ok.length || (p.kup && p.kup.length)) && !p.stop; });
         if (!good.length){
             b.disabled = false;
             // Do 5.59 ten komunikat brzmial „zadna paczka nie ma pozycji OK" takze wtedy, gdy pozycje OK byly,
@@ -57777,12 +58479,17 @@
         const txt = plan.map(function (p){
             if (p.err) return '  • paczka ' + p.j.impId + ' — BŁĄD ODCZYTU: ' + p.err;
             if (p.stop) return '  • paczka ' + p.j.impId + '  ' + (p.j.data ? p.j.data.shop : '') + ' — POMIJAM: ' + p.stop;
+            const nk = (p.kup || []).length;
             return '  • paczka ' + p.j.impId + '  ' + (p.j.data ? p.j.data.shop : '') + '  OK ' + p.ok.length
-                 + (p.chk ? (', CHECK ' + p.chk) : '') + (p.nf ? (', NOT FOUND ' + p.nf) : '')
+                 + (nk ? (' + kupony Shöpping ' + nk + ' (częściowa płatność)') : '')
+                 + ((p.chk - nk) ? (', CHECK ' + (p.chk - nk)) : '') + (p.nf ? (', NOT FOUND ' + p.nf) : '')
                  + (p.dup ? ('   ⚠ ' + p.dup + ' już znanych systemowi') : '');
         }).join('\n');
         if (!confirm('Zaksięgować pozycje OK z ' + good.length + ' paczek?\n\n' + txt
-            + '\n\nCHECK i NOT FOUND zostaną nietknięte.\nOdpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')){
+            + '\n\nCHECK i NOT FOUND zostaną nietknięte.'
+            + (good.some(function (p){ return (p.kup || []).length; })
+               ? '\nWyjątek: kupony Shöpping dostaną status OK i pójdą razem z OK jako częściowa płatność na auftragu.' : '')
+            + '\nOdpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')){
             b.disabled = false; return;
         }
         let done = 0; const bad = [];
@@ -57795,30 +58502,39 @@
             if (blokTeraz){ bad.push(p.j.impId + ': pominięta — ' + blokTeraz); render(); continue; }
             say('Księguję paczkę ' + (i + 1) + '/' + good.length + ' — ' + p.j.impId + '…');
             try {
-                await impBook(p.j.impId, p.ok.map(function (x){ return x.id; }));
+                // Kupony Shöpping — na swiezym odczycie, jak w widoku paczki.
+                let kupNow = [];
+                if ((p.kup || []).length){
+                    const idsK = {};
+                    p.kup.forEach(function (x){ idsK[String(x.id)] = 1; });
+                    kupNow = shpKuponyWiersze(jTeraz, (await impRows(p.j.impId)).rows).filter(function (x){ return idsK[String(x.id)]; });
+                    for (let q = 0; q < kupNow.length; q++) await impState(p.j.impId, kupNow[q].id, 'OK');
+                }
+                await impBook(p.j.impId, p.ok.map(function (x){ return x.id; }).concat(kupNow.map(function (x){ return x.id; })));
+                const nZaks = p.ok.length + kupNow.length, chkZ = p.chk - kupNow.length;
                 const jobs = jobsLoad();
                 const kj = mkKlucz(p.j);
                 if (jobs[kj]){
                     jobs[kj].booked = true;
                     jobs[kj].checked = true;
                     if (jTeraz.typMimo) jobs[kj].typMimo = true;     // slad „mimo to" wchodzi do ksiag razem z paczka
-                    jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg) + ' · zaksięgowane ' + p.ok.length + ' poz.';
+                    jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg) + ' · zaksięgowane ' + nZaks + ' poz.';
                     // Pozycje CHECK i NOT FOUND zostaja w paczce — to jest wlasnie „newralgiczna
                     // pozycja": zlecenie zaksiegowane, a robota niedokonczona. Notatka idzie w sekcji
                     // „ksiegowanie" (5.53): Booked „Tak" i zwroty jej nie zdejmuja, pobranie, kontrola
                     // i import znikaja razem z ksiegowaniem. Czysta paczka zdejmuje stary problem.
                     const nfZ = impNfZostaje(jobs[kj], p.nfRows);     // bez wplat zniesionych zwrotem
-                    if (p.chk || nfZ)
+                    if (chkZ || nfZ)
                         mkProblemUstawW(jobs[kj], 'ksiegowanie', 'księgowanie paczki ' + p.j.impId,
-                            'zaksięgowane ' + p.ok.length + ' poz., ale zostały w paczce: '
-                            + [p.chk ? ('CHECK ' + p.chk) : '', nfZ ? ('NOT FOUND ' + nfZ) : ''].filter(Boolean).join(', ')
+                            'zaksięgowane ' + nZaks + ' poz., ale zostały w paczce: '
+                            + [chkZ ? ('CHECK ' + chkZ) : '', nfZ ? ('NOT FOUND ' + nfZ) : ''].filter(Boolean).join(', ')
                             + ' — te pozycje nie weszły');
                     else mkProblemZdejmijZ(jobs[kj], 'ksiegowanie');
                     jobsSave(jobs);
                     // Otwarty widok tej paczki ma jeszcze czynny „▶ Zaksięguj OK" — gasimy go od razu.
                     if (mkImpWidok === String(p.j.impId)){
                         const bx = document.getElementById('mk-imp-box'), g = bx ? bx.querySelector('#mk-book') : null;
-                        if (g){ g.disabled = true; g.textContent = '✔ Zaksięgowane (' + p.ok.length + ')'; }
+                        if (g){ g.disabled = true; g.textContent = '✔ Zaksięgowane (' + nZaks + ')'; }
                     }
                     await shAfterBook(jobs, kj);
                 }
@@ -89121,7 +89837,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'dc8023a · 08.10.2026 14:55';
+    const HUB_BUDOWA = '21d52c1 · 08.10.2026 17:03';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -89132,7 +89848,7 @@
         { id: 'spmost',   name: 'Saferpay — most do panelu', test: onSaferpay,  init: init_spmost },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
-        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol(), init: init_mkt },
+        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol() || onShoep(), init: init_mkt },
         { id: 'bank',     name: 'Bank Import',               test: onProlo,   init: init_bank },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
