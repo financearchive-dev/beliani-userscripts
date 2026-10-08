@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60
+// @version      5.60.01
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -37951,10 +37951,7 @@
         try {
             const L = await impListaBanku(bank);
             w.listaNiepelna = !!L.niepelna;
-            const wOknie = L.lista.filter(function (x){
-                const d = impDataYmd(x && x.import_datetime_from);
-                return !d || !od || d >= od;
-            });
+            const wOknie = impWOknie(L.lista, od);
             w.wOknie = wOknie.length;
             const brane = wOknie.slice(0, F1_MAX_PACZEK);
             w.obcietych = wOknie.length - brane.length;
@@ -55832,6 +55829,25 @@
             .sort(function (a, c){ return (Number(c.file_id) || 0) - (Number(a.file_id) || 0); });
         return { lista: lista, niepelna: d.parsing_list.length >= naStronie, naStronie: naStronie };
     }
+    // Paczki z listy banku zaimportowane od dnia `od` (kolejnosc listy zostaje). Paczka BEZ daty importu — stare
+    // paczki maja import_datetime_from = null (bank 28: 28 paczek z 2019–2020, ostatnia 12189, a pierwsza z data to
+    // 13111 z 06.2020) — liczy sie do okna tylko wtedy, gdy powstala PO kazdej paczce z data sprzed okna: numery
+    // paczek rosna z czasem. Wczesniej brana byla zawsze — i paczka 10214 z 2020 roku, ktora nie ma wierszy,
+    // zatrzymywala kazdy import bol (zgloszenie z panelu 08.10.2026). Bez paczki z data sprzed okna paczka bez
+    // daty zostaje w oknie, jak dotad: nie wiemy wtedy, kiedy powstala.
+    function impWOknie(lista, od){
+        let granica = 0;
+        if (od) (lista || []).forEach(function (x){
+            const d = impDataYmd(x && x.import_datetime_from);
+            if (d && d < od) granica = Math.max(granica, Number(x && x.file_id) || 0);
+        });
+        return (lista || []).filter(function (x){
+            if (!od) return true;
+            const d = impDataYmd(x && x.import_datetime_from);
+            if (d) return d >= od;
+            return !granica || (Number(x && x.file_id) || 0) > granica;
+        });
+    }
     // Druga kontrola: czy ten sam plik nie zostal juz kiedys wgrany. Nazwy nadajemy
     // deterministycznie, wiec powtorka jest rozpoznawalna PRZED utworzeniem paczki.
     // Szukamy po DACIE I SKLEPIE, a nie po pelnej nazwie: do nazw doszla kwota, wiec
@@ -55928,10 +55944,7 @@
         const kc = String(bank) + '|' + String(od || '');
         if (cache && cache[kc]) return cache[kc];
         const L = await impListaBanku(bank);
-        const wOknie = L.lista.filter(function (x){
-            const d = impDataYmd(x && x.import_datetime_from);
-            return !d || !od || d >= od;
-        });
+        const wOknie = impWOknie(L.lista, od);
         const brane = wOknie.slice(0, MK_TRESC_MAX);
         const w = { paczki: [], obcietych: wOknie.length - brane.length, niepelna: !!L.niepelna };
         for (let i = 0; i < brane.length; i++){
@@ -84388,11 +84401,12 @@
     // Zapis obrotowek do folderu Drive „0004 Reconciliation › Lucanet import". OSOBNY projekt
     // Apps Script („Apps Script — Reconciliation zapis LucaNet.js"), nie skrypt mapowan: tamten
     // ma zakres drive.readonly i fizycznie nie moze niczego zmienic na Dysku — i tak ma zostac
-    // (decyzja uzytkownika 08.10.2026: „boje sie o zawartosc innych folderow"). Adres wdrozenia
-    // skryptu zapisu zna dopiero uzytkownik po wdrozeniu, wiec wbudowany jest PUSTY — do czasu
-    // wpisania adresu w „⚙ Połączenie z Drive” guzik zapisu stoi wyszarzony. Klucz jest inny niz
-    // klucz mapowan: adres i klucz do odczytu nie otwieraja zapisu.
-    var RCN_URL_ZAPIS_DEF = '';
+    // (decyzja uzytkownika 08.10.2026: „boje sie o zawartosc innych folderow"). Wdrozenie z 08.10.2026
+    // (konto finance.archive, dostep „Anyone”, sonda GET oddaje akcje ping/lucanet i wersje
+    // 2026-10-08) — wbudowane na prosbe uzytkownika, jak adres mapowan wyzej. Puste pole w panelu
+    // znaczy „wartosc wbudowana”; nowe wdrozenie (nie nowa wersja) zmienia adres i trzeba go tu
+    // podmienic. Klucz jest inny niz klucz mapowan: adres i klucz do odczytu nie otwieraja zapisu.
+    var RCN_URL_ZAPIS_DEF = 'https://script.google.com/macros/s/AKfycbxHXe5KI9hfdFtaf7nB-vdc9nMF65fg3Si-Hmra8UiEMWdt9bxHnv2yhhSok5mHqwfm/exec';
     var RCN_SECRET_ZAPIS_DEF = 'FfpOoDw693hSFDv7jA1zLNiC8BPLnWsp';
     var RCN_TOL_DEF = 0.05;
     // Tolerancja pary od 18.09.2026: max(tol ; min(sufit ; wzgledny% × baza)), baza =
@@ -89082,7 +89096,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '6fe8174 · 08.10.2026 13:29';
+    const HUB_BUDOWA = '6291c3f · 08.10.2026 13:58';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
