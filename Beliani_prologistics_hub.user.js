@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.01
+// @version      5.60.02
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12952,7 +12952,9 @@
         <div id="tm-fmt-depo" style="font-size:11px;color:#666;margin-bottom:4px;">
             <code style="background:#f5f5f5;padding:1px 4px;">20730 ⇥ nazwa dostawcy ⇥ 2527.5</code>
             — numer orderu w pierwszej kolumnie, kwota w ostatniej. Opis brany z komentarzy orderu
-            (deposit XX%), po zaksięgowaniu status kontenera zmienia się na „waiting for SM".
+            (deposit XX%), po zaksięgowaniu kontener w „in payment" albo „deposit booked" przechodzi
+            na „waiting for SM". Gdy takich kontenerów na orderze jest kilka albo nie ma żadnego —
+            status zostaje, a log mówi, co stoi na stronie.
         </div>
         <textarea id="tm-order-input"
             placeholder="20730&#9;ZHANGZHOU YOKA&#9;2527.5"
@@ -15431,24 +15433,47 @@
             : { ok:false, error:`HTTP ${resp.status}` };
     }
 
+    // Status kontenera po depozycie: „in payment" albo „deposit booked" → „waiting for SM".
+    // Strona orderu pokazuje TEZ kontenery innych orderow (np. 22007 niesie na gorze 51532
+    // z 22005). Do 5.60.01 brane bylo pierwsze pole z gory — 24.09.2026 przestawilo to
+    // wstrzymany depozyt 22005 („deposit ON HOLD") na „waiting for SM". Teraz kontener
+    // wybieramy po statusie: dokladnie jeden w „in payment"/„deposit booked" → zmieniamy;
+    // zaden albo kilka → nic nie ruszamy i mowimy, co stoi na stronie.
+    const DEPO_ST_Z = /^(in payment|deposit booked)$/i;
     async function ensureContainerStatus(orderId) {
         try {
             const doc = await fetchOrderDoc(orderId);
-            const sel = doc.querySelector('select[data-field="status_id"]') || doc.querySelector('select[id^="status_id["]');
-            if (!sel) return { html: ' <span style="color:#b45309">| status: nie znaleziono pola na op_order</span>' };
-            const cid = sel.getAttribute('data-container-id') || ((sel.id.match(/status_id\[(\d+)\]/) || [])[1]);
-            if (!cid) return { html: ' <span style="color:#b45309">| status: brak container-id</span>' };
-            const opt = Array.from(sel.options).find(function(o){ return /waiting for SM/i.test(o.textContent || ''); });
-            const targetVal = opt ? opt.value : '18';
-            const curVal = String(sel.value || '');
-            const curLabel = ((sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : curVal) || '').trim();
-            if (curVal === String(targetVal)) {
-                return { html: ' <span style="color:#0f766e">| status juz: waiting for SM</span>' };
+            let sels = Array.from(doc.querySelectorAll('select[data-field="status_id"]'));
+            if (!sels.length) sels = Array.from(doc.querySelectorAll('select[id^="status_id["]'));
+            if (!sels.length) return { html: ' <span style="color:#b45309">| status: nie znaleziono pola na op_order</span>' };
+            const kont = sels.map(function (s) {
+                const o = s.options[s.selectedIndex];
+                return {
+                    sel: s,
+                    cid: s.getAttribute('data-container-id') || ((s.id.match(/status_id\[(\d+)\]/) || [])[1]) || '',
+                    label: ((o ? o.textContent : s.value) || '').trim()
+                };
+            });
+            const opis = kont.map(function (k) { return (k.cid || '?') + ' „' + k.label + '"'; }).join(', ');
+            const kand = kont.filter(function (k) { return DEPO_ST_Z.test(k.label); });
+            if (kand.length > 1) {
+                return { html: ' <span style="color:#dc2626">| status: NIE zmieniam — kilka kontenerów w „in payment"/„deposit booked" (' +
+                    opis + '); nie wiem, który jest tego orderu — ustaw ręcznie</span>' };
             }
+            if (!kand.length) {
+                return { html: ' <span style="color:#b45309">| status: nic nie zmieniam — żaden kontener nie stoi na „in payment"/„deposit booked" (' +
+                    opis + ')</span>' };
+            }
+            const sel = kand[0].sel, cid = kand[0].cid;
+            if (!cid) return { html: ' <span style="color:#b45309">| status: brak container-id</span>' };
+            const opt = Array.from(sel.options).find(function(o){ return /^waiting for SM$/i.test((o.textContent || '').trim()); });
+            if (!opt) return { html: ' <span style="color:#b45309">| status: na liście statusów nie ma „waiting for SM" — nic nie zmieniam</span>' };
+            const targetVal = opt.value;
+            const curLabel = kand[0].label;
             const body = 'fn=change_op_container&field=status_id&container_id=' + encodeURIComponent(cid) + '&value=' + encodeURIComponent(targetVal);
             const resp = await fetch('/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body });
             if (!resp.ok) return { html: ' <span style="color:#dc2626">| status: BLAD zmiany (HTTP ' + resp.status + ')</span>' };
-            return { html: ' <span style="color:#16a34a">| status: zmieniono na waiting for SM (bylo: ' + curLabel + ')</span>' };
+            return { html: ' <span style="color:#16a34a">| status: kontener ' + cid + ' zmieniony na waiting for SM (było: ' + curLabel + ')</span>' };
         } catch (e) {
             return { html: ' <span style="color:#dc2626">| status: blad (' + e.message + ')</span>' };
         }
@@ -89096,7 +89121,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '6291c3f · 08.10.2026 13:58';
+    const HUB_BUDOWA = 'dc8023a · 08.10.2026 14:55';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
