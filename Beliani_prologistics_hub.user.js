@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.04
+// @version      5.60.05
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12,6 +12,7 @@
 // @match        https://partners.wayfair.com/*
 // @match        https://partner.bol.com/*
 // @match        https://merchant.shoepping.at/*
+// @match        https://marketplace.altex.ro/*
 // @match        https://toolbox.manomano.com/*
 // @match        https://clientes.eupago.pt/*
 // @match        https://seller.octopia.com/*
@@ -48,6 +49,7 @@
 // @connect      wayfair.com
 // @connect      bol.com
 // @connect      shoepping.at
+// @connect      altex.ro
 // @connect      ebay.de
 // @connect      check24.de
 // @connect      mc.moebel.check24.de
@@ -111,6 +113,8 @@
     const onBol     = () => /^partner\.bol\.com$/i.test(H);
     // Portal sprzedawcy Shöpping — tak samo: modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
     const onShoep   = () => /^merchant\.shoepping\.at$/i.test(H);
+    // Panel sprzedawcy Altex RO — tak samo: modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
+    const onAltex   = () => /^marketplace\.altex\.ro$/i.test(H);
     // Panel ManoMano — wchodzimy tam WYLACZNIE po to, zeby podejrzec token sesji.
     const onMano    = () => /(^|\.)toolbox\.manomano\.com$/i.test(H);
     // Cnova FR stoi na Octopii. Dopasowanie jest szerokie (cala domena), bo panel
@@ -30873,7 +30877,9 @@
     const onBolP   = /^partner\.bol\.com$/i.test(location.hostname);
     // Portal Shöpping — tak samo: tylko wykonawca mostu (blok „SHÖPPING AT"), bez guzika i bez panelu.
     const onShpP   = /^merchant\.shoepping\.at$/i.test(location.hostname);
-    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP && !onShpP) return;
+    // Panel Altex — tak samo: tylko wykonawca mostu (blok „ALTEX RO"), bez guzika i bez panelu.
+    const onAlxP   = /^marketplace\.altex\.ro$/i.test(location.hostname);
+    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP && !onShpP && !onAlxP) return;
     // Dwa te same przyciski braly sie stad, ze panel VTEX osadza aplikacje w ramce —
     // skrypt startowal i w oknie glownym, i w ramce, a kazde ma wlasny dokument, wiec
     // sprawdzanie samego identyfikatora nic nie dawalo. Pracujemy tylko w oknie glownym.
@@ -31148,6 +31154,12 @@
         // domyslny booking Fulfillment No, numer w kolumnie 5, kwota w 15 — czyli domyslny uklad MK_HDR.
         // Odczytane 07.10.2026 z ustawienia #210 i z 34 recznych paczek tego ustawienia.
         'Mirakl (Castorama PL) · Castorama PL': { bank: '210', booking: '9', acct: '1523' },
+        // Cultura FR: panel culturafr-prod.mirakl.net, jeden sklep 3534 (w MK_SHOPID z jawna nazwa
+        // „Cultura FR" — panel nazywa go „Beliani.fr"). Import 257 „Cultura FR": EUR, konto 1376, subkonto
+        // 8100, domyslny booking Fulfillment No, data w kolumnie 3, numer w 5, kwota w 15 — czyli domyslny
+        // uklad MK_HDR, jak Castorama PL. Odczytane 13.10.2026 z ustawienia #257 (paczek importu jeszcze
+        // nie ma — dotad zespol ksiegowal brutto zamowienia recznie na auftragu, na 1376).
+        'Mirakl (Cultura) · Cultura FR': { bank: '257', booking: '9', acct: '1376' },
         // Homedeco NL: import 32 „Homedeco NL", konto 1349, booking 9 (Fulfillment No —
         // ordernumber z pliku to numer fulfilmentu). Potwierdzone przez uzytkownika 16.09.2026.
         'Homedeco · Homedeco NL': { bank: '32', booking: '9', acct: '1349' },
@@ -31156,6 +31168,9 @@
         'Bol · Bol NL':           { bank: '28', booking: '9', acct: '1329' },
         // Shöpping AT: ustawienie 235 „Shoepping AT", konto 1377, booking 9 (Fulfillment No) — odczytane 08.10.2026.
         'Shoepping · Shoepping AT': { bank: '235', booking: '9', acct: '1377' },
+        // Altex RO: ustawienie 258 „Altex RO" (zalozone przez uzytkownika 13.10.2026): RON, konto 1378, booking 9 (Fulfillment
+        // No — numer „ATX…-1259" to ff_number auftragu), numer w kolumnie 5, kwota w 14 (MK_KOL_KWOTA), bez kolumny daty.
+        'Altex · Altex RO':       { bank: '258', booking: '9', acct: '1378' },
         // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
         // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
         'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
@@ -32035,13 +32050,18 @@
     // moze byc niespodzianka przy uzgadnianiu konta 1369.
     // „sumPotr" to Abzug WSZYSTKICH pozycji, czyli faktury minus cofniety przy zwrotach —
     // dokladnie ta liczba stoi w Gesamt-Summe awiza (47163214: 259,84).
+    // Obciazenia centrali OBI (rynek 950, od 07.10.2026 — patrz OBI_CH_CENTRALA) to trzecia rzecz,
+    // ktora nie idzie nigdzie: ani do pliku, ani do ticketu. Bez nich rownanie awiza 47163830 nie
+    // domknieloby sie o 3 565,35. Zlecenia sprzed tej zmiany nie maja „obciazenia" — wychodzi 0.
     function obiChKwoty(j){
         const o = (j && j.data && j.data.obich) || null;
         if (!o) return null;
         const zwB = r2((o.zwroty || []).reduce(function (a, z){ return a + Math.abs(z.brutto); }, 0));
-        const wynik = r2(r2(o.sumImport - zwB) - o.sumPotr);
+        const obc = r2((o.obciazenia || []).reduce(function (a, z){ return a + Math.abs(z.brutto); }, 0));
+        const wynik = r2(r2(r2(o.sumImport - zwB) - obc) - o.sumPotr);
         return { imp: o.sumImport, nImp: (o.doImportu || []).length,
                  zwrot: zwB, nZwrot: (o.zwroty || []).length,
+                 obc: obc, nObc: (o.obciazenia || []).length,
                  potr: o.sumPotr, wynik: wynik, przelew: o.przelew,
                  ok: (o.przelew != null) && eq(wynik, o.przelew),
                  waluta: o.waluta || '' };
@@ -32051,10 +32071,11 @@
         if (!k) return '';
         return 'import ' + k.nImp + ' × brutto ' + f2(k.imp) + ' ' + k.waluta
              + (k.nZwrot ? (' − zwroty poza importem (' + k.nZwrot + ') brutto ' + f2(k.zwrot)) : '')
+             + (k.nObc ? (' − obciążenia OBI Systemzentrale (' + k.nObc + ') ' + f2(k.obc)) : '')
              + ' − potrącenia OBI ' + f2(k.potr) + ' = ' + f2(k.wynik)
              + (k.przelew == null ? ' (awizo nie podaje kwoty przelewu)'
                                   : (' wobec przelewu ' + f2(k.przelew) + (k.ok ? ' ✓' : ' ✗')))
-             + ' · potrąceń HUB nie księguje nigdzie';
+             + ' · potrąceń' + (k.nObc ? ' ani obciążeń centrali' : '') + ' HUB nie księguje nigdzie';
     }
     function obiChKontrolaHtml(j){
         const k = obiChKwoty(j);
@@ -32067,6 +32088,8 @@
         return '<div style="margin-top:4px"><table style="border-collapse:collapse;font-size:10px">'
              + w('plik importu (' + k.nImp + ' faktur, brutto)', k.imp, 'tyle naprawdę idzie w pliku')
              + (k.nZwrot ? w('− zwroty poza importem (' + k.nZwrot + ', brutto)', k.zwrot, 'idą do ticketu, nie do pliku') : '')
+             + (k.nObc ? w('− obciążenia OBI Systemzentrale (' + k.nObc + ')', k.obc,
+                           'dokumenty centrali OBI — HUB ich NIE księguje, zostają na koncie rozliczeniowym (numery w opisie)') : '')
              + w('− potrącenia OBI (Abzug)', k.potr, 'HUB ich NIE księguje — zostają na koncie rozliczeniowym')
              + w('= po odjęciu', k.wynik, (k.przelew == null ? 'awizo nie podaje kwoty przelewu'
                      : ('przelew ' + f2(k.przelew) + (k.ok ? ' — zgadza się' : ' — NIE zgadza się'))),
@@ -33572,7 +33595,9 @@
         "237": "BRICO DEPOT PT", "240": "JOYBUY DE", "241": "Leroy Merlin PT", "243": "VIVRE HU",
         "244": "XXX Lutz CH", "245": "Allegro CZ", "246": "Allegro HU", "247": "Allegro SK",
         "248": "PayPal SI/HR - automatic booking", "249": "Momax DE Beliani DE", "250": "InPost Pay", "251": "Zadbano CZ",
-        "252": "Order Payment $"
+        "252": "Order Payment $",
+        // Dopisane recznie poza zrzutem z 15.09.2026: ustawienia Cultury i Altexa, odczytane 13.10.2026.
+        "257": "Cultura FR", "258": "Altex RO"
     };
     function bsPobrane(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsReczne(){ try { return JSON.parse(GM_getValue(MK_BS_RECZNE, '{}')) || {}; } catch (e){ return {}; } }
@@ -33708,7 +33733,7 @@
         'CONFORAMA|FR':                      'https://conforama-prod.mirakl.net/login',
         'CONFORAMA|PT':                      'https://conforamaiberia-prod.mirakl.net/login',
         'COOP/JUMBO|CH':                     'https://app.ecosio.com/account/login',
-        'CULTURA|FR':                        'https://culturafr-prod.mirakl.net/mmp/shop/onboarding',
+        'CULTURA|FR':                        'https://culturafr-prod.mirakl.net/marketplace-dashboard?skip-onboarding=true',
         'DARTY|FR':                          'https://drt-prod.mirakl.net/login',
         'DEINDEAL MARKETPLACE|CH':           'https://dsp.deindeal.cloud',
         'DEINDEAL|CH':                       'https://dsp.deindeal.cloud',
@@ -33933,7 +33958,7 @@
         // „OBI CH" kolumna pokazywala „OBI CH CH".
         // Waluta celu — OBI CH placi w CHF. Bez niej zlecenie zalozone z arkusza albo
         // recznie dostawalo domyslne EUR („cur: w.cur || 'EUR'” przy zakladaniu).
-        // Walute niosa tylko reguly OBI CH i Castoramy PL (PLN) — mkCele przepisuje ja stad.
+        // Walute niosa reguly OBI CH, Manora (CHF, od 13.10.2026) i Castoramy PL (PLN) — mkCele przepisuje ja stad.
           brand: 'OBI', short: 'OBI', kind: 'obich', shop: 'OBI CH', cur: 'CHF' },
         // Galaxus: referencja to UUID wypisany w „Reason for payment", ktory wyciag lamie
         // spacja w srodku — dlatego wzorzec musi trafiac takze po sklejeniu bialych znakow.
@@ -33973,10 +33998,13 @@
         // np. samo 247638) nie trafial w te regule, spadal do zapasowej z /ROC/ — a ta nie
         // ma „docs" — i konczyl z komunikatem o „SIEHE AVIS", chociaz numery staly
         // w tytule przelewu. Fakture i tak promujemy na klucz nizej, w mkDetect.
+        // Waluta celu — Manor placi wylacznie w CHF (panel: kazdy cykl „currencyUnit": CHF). Bez niej
+        // zlecenie z arkusza dostawalo domyslne EUR („cur: w.cur || 'EUR'"), a awizo w CHF odbijalo sie
+        // potem od „jest w CHF, a wpłata w EUR" (08.10.2026). Obie reguly Manora musza ja miec.
         { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
           ref:  /NR\s*\.?\s*([A-Z0-9-]{4,20}?)\s*\/\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4}/i,
           docs: /NR\s*\.?\s*([A-Z0-9-]{4,20}?)\s*\/\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{4}/gi,
-          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
+          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH', cur: 'CHF' },
         // Raz na kilka miesiecy Manor nie wypisuje numerow, tylko „SIEHE AVIS VOM …"
         // (2 razy na 47 przelewow w roku). Bez tej reguly taka wplata nie utworzylaby
         // ZADNEGO zlecenia i po prostu by zniknela — a cicho pominieta wplata to
@@ -33984,7 +34012,7 @@
         // platniczego Manora z „/ROC/", ktory wystepuje w kazdym ich przelewie.
         { mp: 'Manor',          ok: true,  payer: /MANOR\s*AG/i,
           ref:  /\/ROC\/(\d+)/,
-          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH' },
+          brand: 'Manor', short: 'Manor', host: 'manor-prod.mirakl.net', shop: 'Manor CH', cur: 'CHF' },
         // ManoMano placi przez Mangopay, tak samo jak inne Mirakle, wiec sam platnik nie
         // wystarczy — rozstrzyga referencja „MANOMANO-<RYNEK>-<data>-<kontrakt>". Ta regula
         // MUSI stac przed ogolna regula Mangopay, bo mkDetect bierze pierwsze trafienie.
@@ -34248,6 +34276,18 @@
         // z arkusza (mkCele, lista paneli: HORNBACH|DE prowadzi na ten sam host).
         { mp: 'Mirakl (Hornbach)', ok: true, payer: /HORNBACH/i,
           brand: 'Hornbach', short: 'Hornbach', host: 'hornbach-mp.mirakl.net' },
+        // Cultura FR — panel culturafr-prod.mirakl.net (domena Mirakla, wystarcza @connect
+        // mirakl.net), jeden sklep 3534 „Beliani.fr" (MK_SHOPID), EUR. Odczytane 13.10.2026 z panelu:
+        // cykle ida bez posrednika (pspName NOT_SPECIFIED), payOut bez „reference", zamykane 10., 20.
+        // i ostatniego dnia (gdy byla sprzedaz), wyplata ok. 2,5 h po zamknieciu. Platnik to SOCULTUR SAS,
+        // ale linii z wyciagu nie widzielismy — i decyzja uzytkownika z 13.10.2026 brzmi: Cultura
+        // „tylko z arkusza". Regula NIE rozpoznaje wiec zadnej wplaty z wyciagu: wzorzec platnika
+        // „(?!)" nie trafia nigdy (mkDetect jako jedyny czyta r.payer). Zostaje po to, zeby dac HOST:
+        // mkLeft i mkPass nie biora zlecenia bez numeru i bez hosta, a mkCele bez reguly ok:true
+        // na tym hoscie nie zna marketplace'u „Mirakl (Cultura)" — tak samo jak przy Castoramie PL.
+        // Cykl dobiera sie po kwocie (mkMatchAmt), waluta celu to domyslne EUR.
+        { mp: 'Mirakl (Cultura)', ok: true, payer: /(?!)/,
+          brand: 'Cultura', short: 'Cultura', host: 'culturafr-prod.mirakl.net' },
         // Bloop PT placi przez Stripe: platnik „STRIPE PAYMENTS UK LTD", tytul „BLOOP <kod>".
         { mp: 'Bloop',          ok: false, payer: /STRIPE/i, ref: /(BLOOP)/i, ark: 'Bloop PT' },
         // Furniture 1 — DWOCH platnikow, jedno konto 1124, dwie etykiety (ustalone 17.09.2026):
@@ -34824,7 +34864,12 @@
         // uuid 2370, jedyny sklep tego loginu; przelaczenie na cudzy numer panel odrzuca 403).
         // Nazwe wpisujemy jawnie, bo „Beliani DE" z panelu nie jest etykieta z _Markety.
         '2370': { mp: 'Mirakl (Hornbach)', brand: 'Hornbach', short: 'Hornbach',
-                  host: 'hornbach-mp.mirakl.net', shop: 'Hornbach DE' }
+                  host: 'hornbach-mp.mirakl.net', shop: 'Hornbach DE' },
+        // Cultura FR: 3534 odczytany 13.10.2026 wprost z panelu (currentShopUUID na stronie glownej,
+        // shops/current: „Beliani.fr", EUR; jedyny sklep loginu). Nazwe wpisujemy jawnie, bo „Beliani.fr"
+        // z panelu nie jest etykieta z _Markety — tak jak przy Hornbachu i Castoramie PL.
+        '3534': { mp: 'Mirakl (Cultura)', brand: 'Cultura', short: 'Cultura',
+                  host: 'culturafr-prod.mirakl.net', shop: 'Cultura FR' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -35168,7 +35213,9 @@
         // kwote z 14. kolumny (N), a domyslny uklad Mirakla stawia ja w 15. (O). Zaczelo sie
         // od dowodu na PT („03.08.2026 Leroy PT do prolo.csv" — 26 kolumn, „Amount" w N),
         // a 27.08.2026 potwierdzone przez uzytkownika dla calego panelu ADEO.
-        'Mirakl (Leroy)': 13 };
+        'Mirakl (Leroy)': 13,
+        // Altex RO — ustawienie 258 czyta kwote z 14. kolumny (N), numer z 5. (odczyt ustawienia 13.10.2026).
+        'Altex': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -35242,6 +35289,26 @@
     // To jest DRUGI, niezalezny od znaku sposob rozpoznania zwrotu — trzymamy oba,
     // zeby rozjazd miedzy nimi dalo sie zauwazyc, a nie przeoczyc.
     const OBI_CH_KOREKTA = /^15\d{9}$/;
+    // Rynek „965 OBI Schweiz GmbH" to sklepy OBI: nasze faktury (do importu) i ich korekty (zwroty).
+    // Awizo 47163830 (07.10.2026) przynioslo po raz pierwszy „950 OBI Systemzentrale": szesc
+    // dokumentow SAMEJ centrali — ujemnych, bez potracenia (Abzug 0,00, warunki SK0000), z numerem
+    // 9-cyfrowym (268004407…268004413, razem 3 565,35 CHF). W szesciu wczesniejszych awizach
+    // (luty–wrzesien 2026, 129 pozycji) stal wylacznie rynek 965. To nie zwrot klienta (ten ma rynek
+    // 965 i numer korekty 15…) ani faktura do importu, tylko obciazenie Beliani przez centrale OBI.
+    // HUB go nie importuje, nie wysyla do ticketu i nie ksieguje — tak jak potracen (Abzug) — tylko
+    // pokazuje w kontroli kwot i w opisie zlecenia. Do 13.10.2026 takie pozycje wpadaly do „spornych"
+    // (minus bez numeru korekty) i awizo w ogole sie nie doczepialo.
+    // Wszystko inne spoza rynku 965 — centrala na plus, centrala z potraceniem, nieznany rynek —
+    // zostaje sporne i zatrzymuje awizo. Nie zgadujemy, co OBI wprowadzilo tym razem.
+    const OBI_CH_RYNEK = '965', OBI_CH_CENTRALA = '950';
+    function obiChSporny(p){
+        if (p.obciazenie) return '';
+        if (p.rynek && p.rynek !== OBI_CH_RYNEK)
+            return (p.rynek === OBI_CH_CENTRALA)
+                ? 'dokument centrali OBI (rynek 950) inny niż ujemne obciążenie bez potrącenia'
+                : ('nieznany rynek ' + p.rynek + (p.nazwa ? (' „' + p.nazwa + '”') : ''));
+        return ((p.netto < 0) !== p.korekta) ? 'rozjazd znaku i numeru korekty' : '';
+    }
     function obiChCzyAwizo(txt){
         const t = String(txt || '');
         return /OBI\s*Schweiz\s*GmbH/i.test(t)
@@ -35257,10 +35324,13 @@
             if (!d) continue;                       // kwota bez numeru dokumentu nie jest pozycja
             const brutto = obiChKw(m[4]), potr = obiChKw(m[5]), netto = obiChKw(m[6]);
             if (brutto === null || netto === null) continue;
+            const korekta = OBI_CH_KOREKTA.test(d[1]);
             poz.push({
                 nr: d[1], data: obiChYmd(d[2]), sap: d[3], dataSap: obiChYmd(d[4]),
                 waluta: m[3], brutto: brutto, potr: potr, netto: netto,
-                korekta: OBI_CH_KOREKTA.test(d[1]),
+                rynek: m[1], nazwa: String(m[2] || '').trim(),
+                korekta: korekta,
+                obciazenie: m[1] === OBI_CH_CENTRALA && netto < 0 && !korekta && !potr,
                 warunki: (i + 2 < ls.length) ? ls[i + 2].trim() : ''
             });
         }
@@ -35275,15 +35345,19 @@
         const sB = r2(poz.reduce(function (a, p){ return a + p.brutto; }, 0));
         const sP = r2(poz.reduce(function (a, p){ return a + (p.potr || 0); }, 0));
         const sN = r2(poz.reduce(function (a, p){ return a + p.netto; }, 0));
-        const zwroty = poz.filter(function (p){ return p.netto < 0; });
+        const zwroty = poz.filter(function (p){ return p.netto < 0 && !p.obciazenie; });
+        const obciazenia = poz.filter(function (p){ return p.obciazenie; });
         const doImportu = poz.filter(function (p){ return p.brutto > 0; });
         // Rozjazd miedzy znakiem a numerem korekty znaczy, ze OBI zmienilo ktoras
-        // z zasad. Lepiej o tym powiedziec, niz cicho przyjac jedna z nich.
-        const sporne = poz.filter(function (p){ return (p.netto < 0) !== p.korekta; });
+        // z zasad. Lepiej o tym powiedziec, niz cicho przyjac jedna z nich. To samo
+        // z pozycja spoza rynku 965, ktora nie jest obciazeniem centrali (obiChSporny).
+        const sporne = poz.filter(function (p){ p.sporny = obiChSporny(p); return !!p.sporny; });
         return {
             beleg: zap ? zap.beleg : '', dataPrzelewu: zap ? zap.data : '',
             waluta: (poz[0] && poz[0].waluta) || (zap && zap.waluta) || 'CHF',
             poz: poz, doImportu: doImportu, zwroty: zwroty, sporne: sporne,
+            obciazenia: obciazenia,
+            sumObc: r2(obciazenia.reduce(function (a, p){ return a + Math.abs(p.brutto); }, 0)),
             sumBrutto: sB, sumPotr: sP, sumNetto: sN,
             sumImport: r2(doImportu.reduce(function (a, p){ return a + p.brutto; }, 0)),
             dok: dok, przelew: zap ? zap.kwota : null,
@@ -43717,6 +43791,10 @@
         // w arkuszu („Shoepping AT", konto 1377). Host wpisany wprost, nie przez MK_SHP_HOST (martwa strefa).
         { label: 'Shoepping AT', mp: 'Shoepping', brand: 'Shoepping', short: 'Shoepping', kind: 'shoep',
           host: 'merchant.shoepping.at', shop: 'Shoepping AT', cur: 'EUR' },
+        // Altex RO — raport komisoane co pol miesiaca, dopasowanie po KWOCIE wyplaty liczonej z raportu (blok „ALTEX RO").
+        // Etykieta jak w arkuszu („Altex RO", konto 1378), waluta RON. Host wpisany wprost, nie przez MK_ALX_HOST (martwa strefa).
+        { label: 'Altex RO',   mp: 'Altex', brand: 'Altex', short: 'Altex', kind: 'altex',
+          host: 'marketplace.altex.ro', shop: 'Altex RO', cur: 'RON' },
         // Limango nie ma u nas portalu — rozliczenie wrzuca sie plikiem, a wplate
         // dodaje z wyciagu albo recznie.
         { label: 'Limango DE', mp: 'Limango', brand: 'Limango', short: 'Limango', kind: 'lim',
@@ -45682,6 +45760,643 @@
         });
     }
 
+    // ================= ALTEX RO =================
+    // Panel marketplace.altex.ro (Sonata/Symfony, NIE Mirakl). Rozliczenie to „Raport comisioane" co pol miesiaca (1–15
+    // i 16–koniec), tworzony 1. i 16. ok. 06:02; wyplata RON od „ALTEX ROMANIA SRL" na UniCredit RON 5–12 dni pozniej.
+    // Regula zmierzona 13.10.2026 na 9 przelewach 05–10.2026 (pamiec `altex-ro-analiza`):
+    //   wyplata = Σ wierszy PRZEDPLACONYCH (Plata Online/PayU, Credex, Ordin de plata — wszystko poza „Plata la livrare";
+    //             „Valoare totala" + „Taxe", razem z ujemnymi wierszami zwrotow)
+    //           + Σ „Valoare totala" ujemnych wierszy POBRAN (zwrot pobrania oddany klientowi przez Altex, potracony nam)
+    //           − Σ „Comision de facturat" (prowizja NETTO; „Payout seller recalculat" liczy ja z VAT-em i wyplaty NIE daje),
+    //   a raport o wyniku ≤ 0 (same pobrania) przechodzi na nastepna wyplate (11.08 = raport 16–31.07 + prowizja 01–15.07).
+    //   8 z 9 co do grosza (±0,01 — zaokraglenia prowizji). 09.10: bez JEDNEJ pozycji (509,00 − prowizja 33,65 = 475,35,
+    //   jedyna kombinacja wierszy) — Altex ja wstrzymal. Decyzja uzytkownika 13.10.2026 „pomin i pokaz": importujemy to, co
+    //   zaplacone, wstrzymana pozycja stoi przy zleceniu jako „czeka na wyplate", a pozniejsza wyplata wyzsza DOKLADNIE o nia
+    //   bierze ja do swojego importu (albo czlowiek odhacza ja jako zalatwiona poza HUB-em).
+    // Import: ustawienie 258 „Altex RO" (RON, konto 1378, booking 9, numer kol. 5, KWOTA kol. 14 — MK_KOL_KWOTA). Ida brutto
+    // zamowien przedplaconych (numer = ff_number auftragu, „ATX000062626143-1259"), jak ksiegowal je zespol recznie. Pobrania
+    // ida przez kurierow (konta COD) — do importu nie wchodza. Zwroty (przedplacone i pobrania oddane przez Altex) — na liste
+    // „Zwroty". Wyciagu UniCredit RON HUB nie czyta — Altex przychodzi z arkusza albo z „+ Dodaj wpłatę".
+    // UWAGA: „exportReport/<id>?format=csv" ZAKLADA zadanie eksportu w panelu — nie wolamy go, czytamy widok raportu.
+    // Kolumna „Nume client" niesie dane osobowe: tabele czytamy od razu tam, gdzie przyszla strona (takze w karcie panelu
+    // przy moscie), i dalej idzie wylacznie 7 potrzebnych kolumn — ani nazwisko, ani HTML strony nie trafia do magazynu.
+    const MK_ALX_HOST = 'marketplace.altex.ro';
+    const MK_ALX_LISTA = '/admin/market/base/sellerorderreport-report/list';
+    const MK_ALX_RAP = '/admin/market/base/sellerorderreport-reporttransaction/list';
+    const MK_ALX_PANEL = 'https://' + MK_ALX_HOST + MK_ALX_LISTA;
+    const MK_ALX_SHOP = 'Altex RO';
+    const MK_ALX_NA_STRONIE = 256;      // najwieksze „Per pagina" panelu
+    const MK_ALX_STRON = 4;             // najwyzej tyle stron jednego raportu
+    const MK_ALX_LANCUCH = 6;           // najwyzej tyle raportow wstecz ogladamy przy doliczaniu raportow bez wyplaty
+    const MK_ALX_TOL = 0.02;            // zaokraglenia prowizji (zmierzone ±0,01)
+    const MK_ALX_OKNO = [1, 25];        // dni od utworzenia raportu do daty wplywu (zmierzone 5–12)
+    const MK_ALX_ZESTAW = 4;            // wstrzymane/doplata: zestawy najwyzej tylu pozycji, jednoznacznosc sprawdzana wsrod nich
+    const MK_ALX_MZ = 'mkt_alx_most_z';         // zlecenie: prologistics -> karta panelu
+    const MK_ALX_MO = 'mkt_alx_most_o';         // odpowiedz: karta panelu -> prologistics
+    const MK_ALX_DR = 'mkt_alx_droga';          // ktora droga ostatnio zadzialala
+    const MK_ALX_MP = 'mkt_alx_most_puls';      // znak zycia karty panelu
+    const MK_ALX_SLAD = 'mkt_alx_slad';         // trwaly slad zaimportowanych wyplat (przezywa „🗑 Wyczyść wszystko")
+    const ALX_DROGI = { bez: 'wprost', z: 'wprost z ciasteczkiem', most: 'przez kartę panelu' };
+    const ALX_NAGL = { 'accept': 'text/html,application/xhtml+xml' };
+    const ALX_NR = /^ATX\d{6,}-\d{1,6}$/;
+    // Kolumny, ktore wychodza poza strone panelu. Reszta (z „Nume client") zostaje w dokumencie roboczym.
+    const ALX_KOL = {
+        lista:  ['De la data', 'Pana la data', 'Comision de facturat', 'Adaugat la'],
+        raport: ['Data comanda', 'Numar comanda', 'Status comanda', 'Metode de plata', 'Valoare totala', 'Taxe', 'Comision de facturat']
+    };
+    // Metody placenia przedplacone (pieniadze ida przez Altex). Pobranie rozpoznajemy osobno; KAZDA inna metoda to blad —
+    // nie zgadujemy, czy idzie przez Altex.
+    const ALX_COD = /pl[aă]t[aă]\s+la\s+livrare/i;
+    const ALX_PRZEDPL = /pl[aă]t[aă]\s+online|credex|ordin\s+de\s+pl[aă]t[aă]/i;
+    // Adres sklada KAZDA strona sama — magazynem jedzie tylko nazwa operacji i liczby (biala lista, tylko GET).
+    function alxSciezka(op, a, s){
+        const q = function (k, v){ return encodeURIComponent(k) + '=' + encodeURIComponent(v); };
+        if (op === 'lista')
+            return MK_ALX_LISTA + '?' + [q('filter[_sort_by]', 'startDate'), q('filter[_sort_order]', 'DESC'),
+                                         q('filter[_page]', '1'), q('filter[_per_page]', '32')].join('&');
+        if (op === 'raport'){
+            const id = String(a == null ? '' : a), st = String(s == null ? '1' : s);
+            if (!/^\d{1,10}$/.test(id) || !/^[1-9]\d?$/.test(st)) throw new Error('Altex: niepoprawny numer raportu „' + id.slice(0, 12) + '”');
+            return MK_ALX_RAP + '?' + [q('reportId', id), q('filter[_page]', st), q('filter[_per_page]', String(MK_ALX_NA_STRONIE))].join('&');
+        }
+        throw new Error('Altex: nieznana operacja „' + String(op).slice(0, 20) + '”');
+    }
+    async function alxWprost(op, a, s, zCiastkiem){
+        const url = 'https://' + MK_ALX_HOST + alxSciezka(op, a, s);
+        const hdrs = { 'accept': ALX_NAGL.accept, 'referer': MK_ALX_PANEL };
+        if (zCiastkiem){
+            const ck = await gmCookies('https://' + MK_ALX_HOST + '/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        const r = await new Promise(function (ok, nie){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ nie(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({ method: 'GET', url: url, headers: hdrs, timeout: 60000, onload: ok,
+                onerror: function (){ nie(new Error('nie mogę połączyć się z ' + MK_ALX_HOST
+                    + ' — jeśli ScriptCat pyta o dostęp do altex.ro, zgódź się')); },
+                ontimeout: function (){ nie(new Error(MK_ALX_HOST + ' nie odpowiedział na czas')); } });
+        });
+        const typ = (String(r.responseHeaders || '').match(/^content-type:\s*([^\r\n;]+)/im) || ['', ''])[1].trim();
+        const fin = String(r.finalUrl || '');
+        return alxSkroc({ status: r.status, typ: typ, tekst: String(r.responseText || ''), host: fin.split('/')[2] || '',
+                          sciezka: fin.replace(/^https?:\/\/[^/]+/, '').split('?')[0] }, op);
+    }
+    // Co przyszlo: tabela Sonaty (ok), pusta lista Sonaty („Niciun rezultat" — raport bez pozycji), strona logowania,
+    // sciana Akamai albo cos innego. Panel po wygasnieciu sesji oddaje 302 -> /login -> 200, wiec po samym statusie sie
+    // tego nie pozna. Strona Akamai pisze „Reference&#32;&#35;18…" encjami — stad oba zapisy.
+    function alxRodzaj(x){
+        const t = String((x && x.tekst) || '');
+        if (/<input[^>]+type=["']?password/i.test(t) || /\/login\b/i.test(String((x && x.sciezka) || ''))) return 'logowanie';
+        if (/Access\s+Denied/i.test(t) && /Reference(?:\s|&#32;|&nbsp;)*(?:#|&#35;)|edgesuite/i.test(t)) return 'akamai';
+        if (x && x.status === 200 && /<table[^>]*\bsonata-ba-list\b/i.test(t)) return 'ok';
+        if (x && x.status === 200 && /Niciun\s+rezultat/i.test(t)) return 'pusty';
+        return 'inne';
+    }
+    // Odpowiedz w postaci, ktora wolno wyniesc poza strone panelu: rodzaj, dlugosc i tabela z samymi potrzebnymi kolumnami.
+    function alxSkroc(x, op){
+        const rodzaj = alxRodzaj(x);
+        return { status: x.status, typ: x.typ || '', host: x.host || MK_ALX_HOST, sciezka: x.sciezka || '',
+                 dl: String(x.tekst || '').length, rodzaj: rodzaj,
+                 T: (rodzaj === 'ok' || rodzaj === 'pusty') ? alxTabela(x.tekst, ALX_KOL[op] || []) : null };
+    }
+    // Jak WYGLADA odrzucona odpowiedz — nigdy jej tresc (strona niesie dane klientow i token formularzy).
+    function alxKsztalt(x){
+        const cz = [];
+        cz.push('odpowiedź ' + (x && x.dl || 0) + ' znaków');
+        if (!(x && x.dl)) cz.push('treść PUSTA — zapytanie mogło zostać zablokowane, zanim wyszło');
+        else if (x.rodzaj === 'logowanie') cz.push('strona logowania');
+        else if (x.rodzaj === 'akamai') cz.push('ochrona Akamai („Access Denied”)');
+        else cz.push('strona bez tabeli raportów');
+        if (x && x.typ) cz.push('typ ' + x.typ);
+        if (x && x.host && x.host !== MK_ALX_HOST) cz.push('przekierowanie na ' + x.host);
+        else if (x && x.sciezka && x.sciezka.indexOf('/admin/market/base/sellerorderreport') !== 0) cz.push('przekierowanie na ' + x.sciezka.slice(0, 60));
+        return ' [' + cz.join(' · ') + ']';
+    }
+    // ----- odczyt stron panelu (DOMParser, nic nie trafia do drzewa strony) -----
+    function alxTxt(el){ return String((el && el.textContent) || '').replace(/\s+/g, ' ').trim(); }
+    function alxD10(t){ const m = String(t || '').match(/(\d{4}-\d{2}-\d{2})/); return m ? m[1] : ''; }
+    // Tabela listy Sonaty, zawezona do kolumn `kol` (pozostale odpadaja od razu). Na stronie stoja tez tabele kalendarza
+    // z wlasnymi <th> — bierzemy wylacznie table.sonata-ba-list. Brak tabeli przy „Niciun rezultat" = 0 wierszy.
+    function alxTabela(html, kol){
+        const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+        const pg = alxTxt(d.body).match(/(\d+)\s*\/\s*(\d+)\s*-\s*(\d+)\s*rezultate/i);
+        const tb = d.querySelector('table.sonata-ba-list');
+        if (!tb) return { hdr: (kol || []).slice(), rows: [], strona: 1, stron: 1, wynikow: 0, brakTabeli: true };
+        const pelny = Array.prototype.map.call(tb.querySelectorAll('thead th'), alxTxt);
+        const ix = (kol || []).map(function (n){ return pelny.indexOf(n); });
+        const rows = [];
+        Array.prototype.forEach.call(tb.querySelectorAll('tbody tr'), function (tr){
+            const c = Array.prototype.map.call(tr.children, alxTxt);
+            if (c.length < 2) return;
+            const td = tr.querySelector('td[objectid]');
+            rows.push({ id: td ? String(td.getAttribute('objectid') || '') : '', c: ix.map(function (i){ return i < 0 ? null : c[i]; }) });
+        });
+        return { hdr: (kol || []).map(function (n, k){ return ix[k] < 0 ? null : n; }), rows: rows,
+                 strona: pg ? +pg[1] : 1, stron: pg ? +pg[2] : 1, wynikow: pg ? +pg[3] : null };
+    }
+    function alxKolumny(T, nazwy, co){
+        const ix = {};
+        nazwy.forEach(function (n){ ix[n] = T.hdr.indexOf(n); });
+        const brak = nazwy.filter(function (n){ return ix[n] < 0; });
+        if (brak.length) throw new Error('Altex: ' + co + ' nie ma kolumn: ' + brak.join(', ') + ' — zmienił się układ panelu');
+        return ix;
+    }
+    // Lista raportow: [{id, od, doo, kom, utw}], od najnowszego (po dacie utworzenia).
+    function alxLista(T){
+        if (!T || T.brakTabeli) throw new Error('Altex: w odpowiedzi nie ma listy raportów');
+        const ix = alxKolumny(T, ALX_KOL.lista, 'lista raportów');
+        return T.rows.map(function (r){
+            return { id: r.id, od: alxD10(r.c[ix['De la data']]), doo: alxD10(r.c[ix['Pana la data']]),
+                     kom: mkNum(r.c[ix['Comision de facturat']]) || 0, utw: alxD10(r.c[ix['Adaugat la']]) };
+        }).filter(function (m){ return /^\d{1,10}$/.test(m.id) && /^\d{4}-\d{2}-\d{2}$/.test(m.utw); })
+          .sort(function (a, b){ return a.utw < b.utw ? 1 : (a.utw > b.utw ? -1 : (+b.id - +a.id)); });
+    }
+    // Wiersze jednej strony raportu.
+    function alxRaportStrona(T, id){
+        if (!T) throw new Error('Altex: w odpowiedzi nie ma tabeli raportu ' + id);
+        if (T.brakTabeli) return { wiersze: [], strona: 1, stron: 1, wynikow: 0 };
+        const ix = alxKolumny(T, ALX_KOL.raport, 'raport ' + id);
+        const wiersze = T.rows.map(function (r){
+            const c = r.c, met = String(c[ix['Metode de plata']] || '');
+            const val = mkNum(c[ix['Valoare totala']]);
+            if (val == null) throw new Error('Altex: raport ' + id + ' — wiersz ' + String(c[ix['Numar comanda']] || '?').slice(0, 30) + ' bez wartości');
+            return { nr: String(c[ix['Numar comanda']] || '').trim(), data: alxD10(c[ix['Data comanda']]),
+                     st: String(c[ix['Status comanda']] || ''), met: met,
+                     cod: ALX_COD.test(met), znana: ALX_COD.test(met) || ALX_PRZEDPL.test(met),
+                     val: r2(val), tax: r2(mkNum(c[ix['Taxe']]) || 0), kom: r2(mkNum(c[ix['Comision de facturat']]) || 0) };
+        });
+        return { wiersze: wiersze, strona: T.strona, stron: T.stron, wynikow: T.wynikow };
+    }
+
+    // ----- pytajacy (prologistics) — uklad jak przy Shöpping -----
+    const alxCzeka = {};
+    let alxMostBrak = 0;
+    function alxMostOdbior(txt){
+        if (!txt) return;
+        let o = null;
+        try { o = JSON.parse(txt); } catch (e){ return; }
+        if (o && o.id && alxCzeka[o.id]) alxCzeka[o.id](o);
+    }
+    if (onProlo){
+        try { GM_addValueChangeListener(MK_ALX_MO, function (k, s, n){ alxMostOdbior(n); }); } catch (e){}
+    }
+    function alxMost(op, a, s){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_setValue === 'undefined' || typeof GM_getValue === 'undefined'){ resolve(null); return; }
+            const t0 = Date.now();
+            const id = t0.toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+            let koniec = false, przyjete = 0, zegar = null, powiedziane = false, puls = 0;
+            try { puls = Number(GM_getValue(MK_ALX_MP, 0)) || 0; } catch (e){}
+            const ack = (puls && t0 - puls < 5 * BOL_MOST_PULS) ? BOL_MOST_ACK_SPI : BOL_MOST_ACK;
+            function sprzataj(){
+                koniec = true;
+                delete alxCzeka[id];
+                if (zegar) clearInterval(zegar);
+                try { GM_setValue(MK_ALX_MZ, ''); GM_setValue(MK_ALX_MO, ''); } catch (e){}
+            }
+            alxCzeka[id] = function (o){
+                if (koniec) return;
+                if (o.etap === 'przyjete'){ if (!przyjete) przyjete = Date.now(); return; }
+                if (o.etap !== 'wynik') return;
+                sprzataj();
+                if (!o.ok){ reject(new Error(String(o.blad || 'karta panelu nie wykonała zapytania'))); return; }
+                resolve({ status: o.status, typ: String(o.typ || '').split(';')[0].trim(), host: MK_ALX_HOST,
+                          sciezka: String(o.sciezka || ''), dl: Number(o.dl) || 0, rodzaj: String(o.rodzaj || 'inne'),
+                          T: o.T || null });
+            };
+            zegar = setInterval(function (){
+                try { alxMostOdbior(String(GM_getValue(MK_ALX_MO, '') || '')); } catch (e){}
+                if (koniec) return;
+                const dt = Date.now() - t0;
+                if (!przyjete && dt > ack){ sprzataj(); alxMostBrak = Date.now(); resolve(null); }
+                else if (!przyjete && dt > BOL_MOST_ACK && !powiedziane){
+                    powiedziane = true;
+                    try { say('Altex — karta panelu jest otwarta, ale śpi w tle. Czekam, aż się odezwie (do '
+                            + Math.round(ack / 1000) + ' s); szybciej będzie, gdy na nią zajrzysz.'); } catch (e){}
+                }
+                else if (przyjete && Date.now() - przyjete > BOL_MOST_MAX){
+                    sprzataj();
+                    reject(new Error('karta panelu Altex przyjęła zapytanie, ale nie odpowiedziała w '
+                                   + Math.round(BOL_MOST_MAX / 1000) + ' s'));
+                }
+            }, 250);
+            try { GM_setValue(MK_ALX_MZ, JSON.stringify({ id: id, op: String(op), a: String(a == null ? '' : a),
+                                                          s: String(s == null ? '' : s), kiedy: t0 })); }
+            catch (e){ sprzataj(); resolve(null); }
+        });
+    }
+
+    // ----- wykonawca (karta marketplace.altex.ro) — bez guzika i bez panelu, tylko odpowiada -----
+    // Strone czyta SAM (alxSkroc): do magazynu idzie rodzaj odpowiedzi i 7 kolumn tabeli, nigdy HTML ani „Nume client".
+    if (onAlxP){
+        const widziane = {};
+        const odpowiedz = function (o){
+            o.kiedy = Date.now();
+            try { GM_setValue(MK_ALX_MO, JSON.stringify(o)); } catch (e){}
+        };
+        const obsluz = async function (txt){
+            if (!txt) return;
+            let z = null;
+            try { z = JSON.parse(txt); } catch (e){ return; }
+            if (!z || !z.id || widziane[z.id]) return;
+            widziane[z.id] = 1;
+            if (!z.kiedy || Date.now() - z.kiedy > 120000) return;
+            let sciezka = '';
+            try { sciezka = alxSciezka(z.op, z.a, z.s); } catch (e){ return; }   // spoza bialej listy — bez odpowiedzi
+            odpowiedz({ id: z.id, etap: 'przyjete' });
+            let o;
+            try {
+                const res = await fetch('https://' + MK_ALX_HOST + sciezka, { credentials: 'include', headers: ALX_NAGL });
+                let sc = '';
+                try { sc = new URL(res.url).pathname; } catch (e){}
+                const x = alxSkroc({ status: res.status, typ: String(res.headers.get('content-type') || ''),
+                                     tekst: await res.text(), host: MK_ALX_HOST, sciezka: sc }, z.op);
+                o = { id: z.id, etap: 'wynik', ok: true, status: x.status, typ: x.typ, sciezka: x.sciezka, dl: x.dl,
+                      rodzaj: x.rodzaj, T: x.T };
+            } catch (e){
+                o = { id: z.id, etap: 'wynik', ok: false, blad: String((e && e.message) || e) };
+            }
+            let czeka = false;
+            try { czeka = String(GM_getValue(MK_ALX_MZ, '') || '').indexOf('"' + z.id + '"') >= 0; } catch (e){}
+            if (!czeka) return;
+            odpowiedz(o);
+            setTimeout(function (){
+                try {
+                    const t = String(GM_getValue(MK_ALX_MO, '') || '');
+                    if (t && t.indexOf('"' + z.id + '"') >= 0) GM_setValue(MK_ALX_MO, '');
+                } catch (e){}
+            }, 30000);
+        };
+        let pulsKiedy = 0;
+        const puls = function (){
+            const t = Date.now();
+            if (t - pulsKiedy < BOL_MOST_PULS) return;
+            pulsKiedy = t;
+            try { GM_setValue(MK_ALX_MP, t); } catch (e){}
+        };
+        const tyknij = function (){
+            puls();
+            let v = '';
+            try { v = String(GM_getValue(MK_ALX_MZ, '') || ''); } catch (e){ return; }
+            obsluz(v);
+        };
+        try { GM_addValueChangeListener(MK_ALX_MZ, function (k, s, n){ obsluz(n); }); } catch (e){}
+        try { window.addEventListener('pagehide', function (){ try { GM_setValue(MK_ALX_MP, 0); } catch (e){} }); } catch (e){}
+        let tykow = 0, zapas = false;
+        const zapasowy = function (){ if (zapas) return; zapas = true; setInterval(tyknij, 1000); };
+        try {
+            const url = URL.createObjectURL(new Blob(['setInterval(function(){ postMessage(1); }, 1000);'],
+                                                     { type: 'text/javascript' }));
+            const w = new Worker(url);
+            w.onmessage = function (){ tykow++; tyknij(); };
+            w.onerror = zapasowy;
+            setTimeout(function (){ if (tykow < 1) zapasowy(); }, 4000);
+        } catch (e){ zapasowy(); }
+        tyknij();
+        try {
+            if (!sessionStorage.getItem('hub_alx_gotowa')){
+                sessionStorage.setItem('hub_alx_gotowa', '1');
+                mkToast('HUB ' + MK_VER + ': ta karta podaje raporty Altex do prologistics. Nic tu nie trzeba klikać — wystarczy, że jest otwarta.');
+            }
+        } catch (e){}
+    }
+
+    // Panel stoi za Akamai: gdy karta panelu niedawno dala znak zycia, pytamy najpierw przez nia, inaczej zaczyna droga,
+    // ktora ostatnio zadzialala. Strona logowania z drogi WPROST nie jest stanem sesji (ciasteczko moglo nie pojechac),
+    // z mostu — jest. Most pomijamy po porazce 20 s, chyba ze karta dala znak zycia juz PO tej porazce.
+    async function alxZapytaj(op, a, s){
+        let pamiec = '', puls = 0;
+        try { pamiec = String(GM_getValue(MK_ALX_DR, '') || ''); } catch (e){}
+        try { puls = Number(GM_getValue(MK_ALX_MP, 0)) || 0; } catch (e){}
+        const kolej = ['bez', 'z', 'most'];
+        const pierwsza = (puls && Date.now() - puls < 5 * BOL_MOST_PULS) ? 'most' : pamiec;
+        if (kolej.indexOf(pierwsza) > 0){ kolej.splice(kolej.indexOf(pierwsza), 1); kolej.unshift(pierwsza); }
+        const proby = [];
+        let r = null, droga = '', ostatni = '';
+        for (let i = 0; i < kolej.length && !r; i++){
+            const d = kolej[i];
+            let x = null;
+            try {
+                if (d === 'most'){
+                    if (Date.now() - alxMostBrak < 20000 && !(puls > alxMostBrak)){ proby.push(ALX_DROGI[d] + ': karta nie odpowiada'); continue; }
+                    x = await alxMost(op, a, s);
+                    if (!x){ proby.push(ALX_DROGI[d] + ': żadna karta ' + MK_ALX_HOST + ' nie odpowiedziała'); continue; }
+                } else x = await alxWprost(op, a, s, d === 'z');
+            } catch (e){
+                proby.push(ALX_DROGI[d] + ': ' + ((e && e.message) || e));
+                continue;
+            }
+            const dobra = x.rodzaj === 'ok' || (op === 'raport' && x.rodzaj === 'pusty');
+            if (dobra || (d === 'most' && x.rodzaj === 'logowanie')){ r = x; droga = d; }
+            else {
+                const opis = 'HTTP ' + x.status + alxKsztalt(x);
+                proby.push(ALX_DROGI[d] + ': ' + (opis === ostatni ? 'to samo' : opis));
+                ostatni = opis;
+            }
+        }
+        if (!r){
+            throw new Error('Altex: nie dotarłem do panelu (' + (op === 'raport' ? ('raport ' + a) : 'lista raportów') + '). Otwórz '
+                + MK_ALX_PANEL + ' w drugiej karcie, zaloguj się i zostaw ją otwartą (jeśli już jest otwarta — odśwież ją),'
+                + ' potem kliknij „⬇ Pobierz zestawienia” jeszcze raz TUTAJ. Na panelu nic nie trzeba klikać.'
+                + ' [próby: ' + proby.join(' · ') + ']');
+        }
+        try { mkLog('altex', (op === 'raport' ? ('raport ' + a + ' str. ' + s) : 'lista raportów') + ' — droga: ' + ALX_DROGI[droga]
+                            + ', HTTP ' + r.status + (proby.length ? (' (wcześniej: ' + proby.join(' · ') + ')') : '')); } catch (e){}
+        if (r.rodzaj === 'logowanie')
+            throw new Error('Altex: panel pokazał stronę logowania — zaloguj się na ' + MK_ALX_PANEL);
+        if (droga !== pamiec){ try { GM_setValue(MK_ALX_DR, droga); } catch (e){} }
+        return r;
+    }
+    async function alxRaport(id){
+        const out = [];
+        let stron = 1, wynikow = null;
+        for (let s = 1; s <= stron && s <= MK_ALX_STRON; s++){
+            const t = alxRaportStrona((await alxZapytaj('raport', id, s)).T, id);
+            t.wiersze.forEach(function (w){ out.push(w); });
+            stron = t.stron;
+            if (t.wynikow != null) wynikow = t.wynikow;
+        }
+        if (stron > MK_ALX_STRON) throw new Error('Altex: raport ' + id + ' ma ' + stron + ' stron po ' + MK_ALX_NA_STRONIE + ' pozycji — niepełnego nie liczę');
+        if (wynikow != null && wynikow !== out.length)
+            throw new Error('Altex: raport ' + id + ' — panel mówi o ' + wynikow + ' pozycjach, odczytałem ' + out.length + ' — niepełnego nie liczę');
+        return out;
+    }
+    // Wynik raportu wg reguly z opisu bloku (bez pozycji wstrzymanych i doplat).
+    function alxWynik(wiersze){
+        let s = 0;
+        (wiersze || []).forEach(function (w){
+            if (w.cod) s += (w.val < 0 ? w.val : 0) - w.kom;
+            else s += w.val + w.tax - w.kom;
+        });
+        return r2(s);
+    }
+    function alxDni(dataArk, utw){
+        const a = mkDay(dataArk), b = mkDay(utw);
+        return (a == null || b == null) ? null : Math.round((a - b) / 86400000);
+    }
+    // Wplata, ktora przelot moze obsluzyc. TEN SAM warunek liczy licznik (PULAPKI: „Licznik i przelot muszą stawiać ten sam warunek").
+    function alxDoPobrania(j){
+        return !!j && j.kind === 'altex' && mkTodo(j) && j.amount != null && isFinite(j.amount)
+            && /^\d{4}-\d{2}-\d{2}$/.test(String(j.date || ''));
+    }
+    // Zestawy pozycji (najwyzej MK_ALX_ZESTAW), ktorych netto daje `cel` z dokladnoscia MK_ALX_TOL. Prowizja to staly
+    // odsetek, wiec rowne sumy brutto daja prawie rowne netto — jednoznacznosc sprawdzamy wsrod WSZYSTKICH rozmiarow do
+    // MK_ALX_ZESTAW (zestaw 3-pozycyjny nie jest „jedyny", gdy pasuje tez 4-pozycyjny). Zestawy o tej samej tresci (dwie
+    // identyczne sztuki) licza sie raz. Oddaje najwyzej dwa — wiecej niz jeden znaczy „nie zgaduje". Przy dlugiej liscie
+    // (ponad 40 pozycji) czworek nie sprawdzamy i wtedy jednoznaczny musi byc zestaw jednej pozycji.
+    function alxZestawy(linie, cel){
+        const L = (linie || []).slice(0, 80), out = [], byl = {};
+        const maks = L.length > 40 ? 3 : MK_ALX_ZESTAW;
+        const dodaj = function (ix){
+            const z = ix.map(function (i){ return L[i]; });
+            const sig = z.map(function (x){ return x.nr + '|' + f2(x.brutto); }).sort().join(',');
+            if (byl[sig]) return;
+            byl[sig] = 1; out.push(z);
+        };
+        const traf = function (s){ return Math.abs(r2(s) - cel) <= MK_ALX_TOL; };
+        const n = L.length;
+        for (let a = 0; a < n && out.length < 2; a++){
+            if (traf(L[a].netto)) dodaj([a]);
+            for (let b = a + 1; b < n && out.length < 2; b++){
+                if (traf(L[a].netto + L[b].netto)) dodaj([a, b]);
+                if (maks < 3) continue;
+                for (let c = b + 1; c < n && out.length < 2; c++){
+                    if (traf(L[a].netto + L[b].netto + L[c].netto)) dodaj([a, b, c]);
+                    if (maks < 4) continue;
+                    for (let d = c + 1; d < n && out.length < 2; d++)
+                        if (traf(L[a].netto + L[b].netto + L[c].netto + L[d].netto)) dodaj([a, b, c, d]);
+                }
+            }
+        }
+        // Przy dlugiej liscie czworek nie widac — wtedy zestaw wielu pozycji nie jest pewny.
+        if (out.length === 1 && maks < MK_ALX_ZESTAW && out[0].length > 1) out.niepewne = true;
+        return out;
+    }
+    function alxPozId(x){ return x.nr + '|' + f2(x.brutto) + '|' + x.rap; }
+
+    // ----- trwaly slad zaimportowanych wyplat -----
+    // Wstrzymane pozycje, doplaty, odhaczenia i raporty uzyte przez wyplaty JUZ ZAIMPORTOWANE musza przezyc „🗑 Wyczyść
+    // wszystko" (to on jest od 08.10 na pasku) — inaczej pozniejsza doplata nie ma do czego trafic, a raport wraca do puli.
+    // Zapisujemy tylko zlecenia zaimportowane (status done), 180 dni. Zlecenie, ktore jest na liscie, ma pierwszenstwo.
+    function alxSladLoad(){
+        try { const o = JSON.parse(GM_getValue(MK_ALX_SLAD, '{}')); return (o && typeof o === 'object') ? o : {}; } catch (e){ return {}; }
+    }
+    function alxSladZapisz(jobs){
+        const s = alxSladLoad(), granica = Date.now() - 180 * 86400000;
+        let zm = false;
+        Object.keys(jobs || {}).forEach(function (k){
+            const x = jobs[k];
+            if (!x || x.kind !== 'altex' || x.status !== 'done' || !x.data || !x.data.altex || x.data.netOk !== true) return;
+            const p = x.data.altex;
+            const w = { data: String(x.date || ''), kwota: x.amount, raporty: (p.raporty || []).slice(),
+                        wstrzymane: (p.wstrzymane || []).slice(), doplaty: (p.doplaty || []).slice(),
+                        zal: Object.assign({}, x.alxZal || {}) };
+            const st = s[k];
+            if (st && JSON.stringify(Object.assign({}, st, { t: 0 })) === JSON.stringify(Object.assign({}, w, { t: 0 }))) return;
+            w.t = Date.now(); s[k] = w; zm = true;
+        });
+        Object.keys(s).forEach(function (k){ if (!(s[k] && s[k].t > granica)){ delete s[k]; zm = true; } });
+        if (zm){ try { GM_setValue(MK_ALX_SLAD, JSON.stringify(s)); } catch (e){} }
+    }
+    // Wyplaty Altexa z rozliczeniem, ktore przeszlo kontrole (netOk) — z listy i ze sladu (tych, ktorych na liscie juz nie ma).
+    // Zlecenie „wymaga sprawdzenia" niczego nie rezerwuje: ani raportu, ani pozycji wstrzymanych, ani doplat.
+    function alxPewne(jobs, wlasny){
+        const out = [];
+        Object.keys(jobs || {}).forEach(function (k){
+            const x = jobs[k];
+            if (k === wlasny || !x || x.kind !== 'altex' || !x.data || !x.data.altex || x.data.netOk !== true) return;
+            const p = x.data.altex;
+            out.push({ klucz: k, data: String(x.date || ''), raporty: p.raporty || [], wstrzymane: p.wstrzymane || [],
+                       doplaty: p.doplaty || [], zal: x.alxZal || {} });
+        });
+        const s = alxSladLoad();
+        Object.keys(s).forEach(function (k){
+            if (k === wlasny || (jobs && jobs[k])) return;
+            const w = s[k] || {};
+            out.push({ klucz: k, data: String(w.data || ''), raporty: w.raporty || [], wstrzymane: w.wstrzymane || [],
+                       doplaty: w.doplaty || [], zal: w.zal || {}, zeSladu: true });
+        });
+        return out;
+    }
+    // Pozycje wstrzymane przy INNYCH wyplatach, ktorych zadna wyplata jeszcze nie wziela jako doplaty i ktorych nikt nie
+    // odhaczyl jako zalatwionych poza HUB-em.
+    function alxOczekujace(jobs, wlasny){
+        const P = alxPewne(jobs, wlasny), wziete = {}, out = [];
+        P.forEach(function (x){ (x.doplaty || []).forEach(function (d){ wziete[alxPozId(d)] = 1; }); });
+        P.forEach(function (x){
+            (x.wstrzymane || []).forEach(function (w){
+                const id = alxPozId(w);
+                if (!wziete[id] && !(x.zal || {})[id]) out.push(Object.assign({}, w, { zKlucz: x.klucz, zData: x.data }));
+            });
+        });
+        return out;
+    }
+    // Raporty uzyte juz przez INNE wyplaty (glowny i doliczone) — drugi raz ich nie bierzemy.
+    function alxZajete(jobs, wlasny){
+        const z = {};
+        alxPewne(jobs, wlasny).forEach(function (x){ (x.raporty || []).forEach(function (id){ z[id] = x.klucz; }); });
+        return z;
+    }
+    // Rozliczenie jednej wyplaty z lancucha raportow (od najstarszego; ostatni = glowny).
+    function alxRozlicz(lancuch, kwota, oczekujace){
+        const glow = lancuch[lancuch.length - 1].meta;
+        const p = { raport: { id: glow.id, od: glow.od, doo: glow.doo, utw: glow.utw, kom: glow.kom },
+                    raporty: lancuch.map(function (R){ return R.meta.id; }), przeniesione: [],
+                    ord: {}, ref: {}, linie: [], wstrzymane: [], doplaty: [], kolej: [],
+                    sprzedaz: 0, zwrotyPrzed: 0, zwrotyCod: 0, prowizja: 0, wynikRaportu: 0,
+                    wyplata: r2(kwota), roznica: 0, dokladnie: false, bledy: [], nWierszy: 0 };
+        lancuch.forEach(function (R, ri){
+            let kom = 0;
+            R.wiersze.forEach(function (w){
+                p.nWierszy++;
+                kom += w.kom;
+                if (!ALX_NR.test(w.nr)) p.bledy.push('raport ' + R.meta.id + ': wiersz bez numeru zamówienia ATX… („' + w.nr.slice(0, 30) + '”)');
+                if (!w.znana) p.bledy.push('raport ' + R.meta.id + ': ' + (w.nr || '?') + ' ma metodę płatności „' + w.met.slice(0, 40)
+                    + '”, której HUB nie zna — nie wiem, czy pieniądze idą przez Altex');
+                if (w.cod){
+                    if (w.val < 0){ const z = r2(-w.val); p.zwrotyCod = r2(p.zwrotyCod + z); p.ref[w.nr] = r2((p.ref[w.nr] || 0) + z); }
+                    return;
+                }
+                const b = r2(w.val + w.tax);
+                if (w.val < 0){ p.zwrotyPrzed = r2(p.zwrotyPrzed - b); p.ref[w.nr] = r2((p.ref[w.nr] || 0) - b); return; }
+                p.sprzedaz = r2(p.sprzedaz + b);
+                p.linie.push({ nr: w.nr, brutto: b, kom: w.kom, netto: r2(b - w.kom), rap: R.meta.id });
+                p.ord[w.nr] = r2((p.ord[w.nr] || 0) + b);
+            });
+            p.prowizja = r2(p.prowizja + kom);
+            // Kompletnosc: prowizja wierszy = prowizja raportu z listy.
+            if (Math.abs(r2(kom) - r2(R.meta.kom)) > 0.011)
+                p.bledy.push('raport ' + R.meta.id + ': prowizja wierszy ' + f2(kom) + ' ≠ ' + f2(R.meta.kom) + ' z listy raportów — odczyt niepełny');
+            const wyn = alxWynik(R.wiersze);
+            p.wynikRaportu = r2(p.wynikRaportu + wyn);
+            if (ri < lancuch.length - 1) p.przeniesione.push({ id: R.meta.id, od: R.meta.od, doo: R.meta.doo, wynik: wyn });
+        });
+        p.roznica = r2(p.wyplata - p.wynikRaportu);
+        p.dokladnie = Math.abs(p.roznica) <= MK_ALX_TOL;
+        if (!p.dokladnie){
+            const opis = function (z){ return z.map(function (x){ return x.nr + ' ' + f2(x.brutto) + ' (netto ' + f2(x.netto) + ')'; }).join(' + '); };
+            if (p.roznica < 0){
+                const zs = alxZestawy(p.linie, -p.roznica);
+                if (zs.length === 1 && !zs.niepewne){
+                    p.wstrzymane = zs[0].map(function (x){ return Object.assign({}, x); });
+                    p.wstrzymane.forEach(function (x){ p.ord[x.nr] = r2((p.ord[x.nr] || 0) - x.brutto); });
+                } else if (zs.length > 1 || zs.niepewne)
+                    p.bledy.push('wpłata ' + f2(p.wyplata) + ' jest o ' + f2(-p.roznica) + ' niższa niż raport ' + f2(p.wynikRaportu)
+                        + ', a brak pasuje do kilku zestawów pozycji (' + zs.map(opis).join(' albo ') + (zs.niepewne ? ', a przy tylu pozycjach innych zestawów nie wykluczę' : '') + ') — nie zgaduję, której Altex nie zapłacił');
+                else
+                    p.bledy.push('wpłata ' + f2(p.wyplata) + ' jest o ' + f2(-p.roznica) + ' niższa niż raport ' + f2(p.wynikRaportu)
+                        + ' i nie tłumaczy tego żaden zestaw do ' + MK_ALX_ZESTAW + ' pozycji — sprawdź w panelu Altex');
+            } else {
+                const zs = alxZestawy(oczekujace || [], p.roznica);
+                if (zs.length === 1 && !zs.niepewne){
+                    p.doplaty = zs[0].map(function (x){ return Object.assign({}, x); });
+                    p.doplaty.forEach(function (x){ p.ord[x.nr] = r2((p.ord[x.nr] || 0) + x.brutto); });
+                } else if (zs.length > 1 || zs.niepewne)
+                    p.bledy.push('wpłata ' + f2(p.wyplata) + ' jest o ' + f2(p.roznica) + ' wyższa niż raport ' + f2(p.wynikRaportu)
+                        + ', a nadwyżka pasuje do kilku zestawów wstrzymanych wcześniej pozycji (' + zs.map(opis).join(' albo ') + ') — nie zgaduję');
+                else
+                    p.bledy.push('wpłata ' + f2(p.wyplata) + ' jest o ' + f2(p.roznica) + ' wyższa niż raport ' + f2(p.wynikRaportu)
+                        + ' i nadwyżki nie tłumaczy żadna pozycja wstrzymana wcześniej — sprawdź w panelu Altex');
+            }
+        }
+        Object.keys(p.ord).forEach(function (k){ if (!(p.ord[k] > 0.005)) delete p.ord[k]; });
+        p.kolej = Object.keys(p.ord).sort();
+        if (!p.kolej.length && !p.bledy.length) p.bledy.push('w tej wypłacie nie ma ani jednego zamówienia przedpłaconego do importu');
+        return p;
+    }
+    function alxZastosuj(j, p){
+        const bad = p.bledy.slice();
+        const ord = {};
+        p.kolej.forEach(function (k){ ord[k] = p.ord[k]; });
+        const gross = r2(p.kolej.reduce(function (s, k){ return s + ord[k]; }, 0));
+        const zw = r2(Object.keys(p.ref).reduce(function (s, k){ return s + p.ref[k]; }, 0));
+        const sumN = function (l){ return r2((l || []).reduce(function (s, x){ return s + x.netto; }, 0)); };
+        const sumK = function (l){ return r2((l || []).reduce(function (s, x){ return s + x.kom; }, 0)); };
+        const net = r2(p.wynikRaportu - sumN(p.wstrzymane) + sumN(p.doplaty));
+        // Rozliczenie, ktore nie przeszlo kontroli, nie wystawia zwrotow na liste „Zwroty" (refGroups bierze je z kazdego
+        // zlecenia z danymi) — raport mogl byc dopasowany zle. Zwroty sa w p.ref i widac je w ramce.
+        // „both" zostaje puste: wspolny opis Mirakla „rozliczone i zwrócone w tym samym cyklu — pieniądze się znoszą" nie
+        // pasuje do Altexa (sprzedaz i zwrot to rozne pozycje zamowienia).
+        j.data = { altex: p, shop: j.shop || MK_ALX_SHOP, gross: gross, refund: bad.length ? 0 : zw, net: net,
+                   netOk: !bad.length, ord: ord, ref: bad.length ? {} : p.ref, unknown: {}, skipped: {}, full: true, both: [],
+                   pays: 1, split: false, rows: p.kolej.length, total: p.kolej.length, pages: p.raporty.length,
+                   how: 'raport Altex ' + p.raport.id + ' (' + p.raport.od + ' – ' + p.raport.doo + ')' };
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        // Prowizja, ktora z TEJ wyplaty zostaje na koncie 1378: prowizja raportow bez wstrzymanych pozycji, z doplaconymi.
+        // Stan wstrzymanych (czeka / doplacone / zalatwione) pokazuje ramka — tu go nie utrwalamy, bo by sie zestarzal.
+        j.note = 'do importu brutto zamówień przedpłaconych (' + p.kolej.length + '), prowizja '
+               + f2(r2(p.prowizja - sumK(p.wstrzymane) + sumK(p.doplaty))) + ' zostaje na koncie'
+               + (zw ? (' · zwroty ' + Object.keys(p.ref).length + ' na ' + f2(zw) + (bad.length ? '' : ' — idą na listę zwrotów')) : '');
+        return bad;
+    }
+    // Ktore wstrzymane pozycje zlecenia czekaja jeszcze na doplate: zadna wyplata, ktora przeszla kontrole, ich nie wziela
+    // i nikt ich nie odhaczyl.
+    let _alxWziete = { t: 0, m: null };
+    function alxWziete(){
+        if (_alxWziete.m && Date.now() - _alxWziete.t < 500) return _alxWziete.m;
+        const m = {};
+        alxPewne(jobsLoad(), '').forEach(function (x){
+            (x.doplaty || []).forEach(function (d){ m[alxPozId(d)] = { klucz: x.klucz, data: x.data }; });
+        });
+        _alxWziete = { t: Date.now(), m: m };
+        return m;
+    }
+    function alxCzekaNaDoplate(j){
+        if (!j || j.kind !== 'altex' || !j.data || !j.data.altex || j.data.netOk !== true) return [];
+        const m = alxWziete(), zal = j.alxZal || {};
+        return (j.data.altex.wstrzymane || []).filter(function (w){ const id = alxPozId(w); return !m[id] && !zal[id]; });
+    }
+    // Ramka przy zleceniu: z czego sklada sie wyplata, raporty, wstrzymane i doplacone pozycje.
+    function alxBox(j){
+        if (!onProlo || j.kind !== 'altex' || !j.data || !j.data.altex || !j.data.altex.raport) return '';
+        const p = j.data.altex, R = p.raport;
+        const kwOk = j.data.netOk === true && Math.abs(r2(j.data.net - j.amount)) <= MK_ALX_TOL;
+        const plus = function (x){ return (x < 0 ? ' − ' : ' + ') + f2(Math.abs(x)); };
+        const dmy = function (d){ return d ? (d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4)) : ''; };
+        let h = '<div>raport Altex <b>' + esc(R.id) + '</b> ' + esc(dmy(R.od)) + ' – ' + esc(dmy(R.doo))
+              + (p.przeniesione.length ? (' · doliczone raporty bez wypłaty: ' + p.przeniesione.map(function (x){
+                    return esc(x.id) + ' (' + esc(dmy(x.od)) + ' – ' + esc(dmy(x.doo)) + ', ' + f2(x.wynik) + ')'; }).join(', ')) : '')
+              + ' · <a href="' + esc(MK_ALX_PANEL) + '" target="_blank" rel="noopener" style="color:#1d4ed8">raporty w panelu</a></div>'
+              + '<div>przedpłacone <b>' + f2(p.sprzedaz) + '</b>'
+              + (p.zwrotyPrzed ? (plus(-p.zwrotyPrzed) + ' zwroty') : '')
+              + (p.zwrotyCod ? (plus(-p.zwrotyCod) + ' zwroty pobrań oddane przez Altex') : '')
+              + plus(-p.prowizja) + ' prowizja netto'
+              + ' = <b>' + f2(p.wynikRaportu) + '</b>';
+        const sw = (p.wstrzymane || []).reduce(function (s, x){ return s + x.netto; }, 0);
+        const sd = (p.doplaty || []).reduce(function (s, x){ return s + x.netto; }, 0);
+        if (sw) h += plus(-r2(sw)) + ' wstrzymane';
+        if (sd) h += plus(r2(sd)) + ' dopłata';
+        if (sw || sd) h += ' = <b>' + f2(j.data.net) + '</b>';
+        h += ' ' + (kwOk ? '<b style="color:#0a7a2f">✓ wpłata ' + f2(j.amount) + '</b>' : ('<b style="color:#c00">✗ wpłata: ' + f2(j.amount) + '</b>')) + '</div>';
+        if ((p.wstrzymane || []).length){
+            const m = alxWziete(), zal = j.alxZal || {};
+            h += '<div style="margin-top:3px;color:#b45309">Altex nie zapłacił w tej wypłacie: ' + p.wstrzymane.map(function (x){
+                     const id = alxPozId(x), d = m[id], z = zal[id];
+                     return '<b>' + esc(x.nr) + '</b> ' + f2(x.brutto) + ' (netto ' + f2(x.netto) + ') — '
+                          + (d ? ('<span style="color:#0a7a2f">dopłacone w wypłacie z ' + esc(d.data) + '</span>')
+                             : (z ? ('<span style="color:#0a7a2f">załatwione poza HUB-em (' + esc(mkCzasLok(z.kiedy)) + ')</span> '
+                                     + '<a href="#" class="mk-alxzal" data-k="' + esc(mkKlucz(j)) + '" data-p="' + esc(id) + '" data-z="0" style="color:#64748b">↶ cofnij</a>')
+                                  : ('czeka na wypłatę, nie idzie do importu'
+                                     + (j.data.netOk === true ? (' <a href="#" class="mk-alxzal" data-k="' + esc(mkKlucz(j)) + '" data-p="' + esc(id)
+                                        + '" data-z="1" style="color:#1d4ed8">✓ załatwione poza HUB-em</a>') : ''))));
+                 }).join(' · ') + '</div>';
+        }
+        if ((p.doplaty || []).length)
+            h += '<div style="margin-top:3px">Dopłata pozycji wstrzymanych wcześniej: ' + p.doplaty.map(function (x){
+                     return '<b>' + esc(x.nr) + '</b> ' + f2(x.brutto) + ' (z wypłaty ' + esc(x.zData || '?') + ')';
+                 }).join(' · ') + ' — idą do importu tej wypłaty.</div>';
+        if (j.data.netOk !== true && Object.keys(p.ref || {}).length)
+            h += '<div style="margin-top:3px;color:#64748b">Zwroty z tego raportu (' + Object.keys(p.ref).map(function (k){
+                     return esc(k) + ' ' + f2(p.ref[k]); }).join(' · ') + ') pójdą na listę zwrotów dopiero po zgodnym rozliczeniu.</div>';
+        // „Wymaga sprawdzenia" nie wraca do „⬇ Pobierz zestawienia" samo (mkTodo bierze tylko nowe i bledy).
+        if (j.status === 'partial' && !j.juzWPaczce)
+            h += '<div style="margin-top:3px"><button class="mk-alxponow" data-k="' + esc(mkKlucz(j)) + '" '
+               + 'style="padding:1px 7px;border:1px solid #1d4ed8;border-radius:5px;background:#fff;color:#1d4ed8;font-size:10px;cursor:pointer">'
+               + '↻ Pobierz z Altex jeszcze raz</button> <span style="color:#64748b">— zlecenie wróci do „⬇ Pobierz zestawienia”</span></div>';
+        return '<div style="margin-top:4px;padding:4px 7px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:5px;'
+             + 'font-size:11px;color:#1e3a8a">' + h + '</div>';
+    }
+
     // Pliki Galaxusa sa w windows-1252 i tak wlasnie prologistics je dotad przyjmowal.
     // Gdybysmy wyslali UTF-8, umlauty w nazwach i apostrof tysiecy przyszlyby polamane,
     // wiec dla tego jednego marketplace'u kodujemy plik bajt po bajcie.
@@ -46554,7 +47269,9 @@
                        // Maison du Monde — adres wprost z zapisu ruchu panelu.
                        'maisonsdumonde-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
                        // Terract (Gamm Vert i Jardiland) — adres wprost z zapisu ruchu panelu.
-                       'teractfr-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
+                       'teractfr-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       // Cultura FR — ten sam wykaz rozliczen; adres sprawdzony 13.10.2026 (200, bez logowania).
+                       'culturafr-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -46925,6 +47642,14 @@
                           + 'wszystkie sklepy tej platformy i pobiorę rozliczenia z prologistics.');
                     return;
                 }
+                // Panel, ktorego sklepy stoja w MK_SHOPID (Cultura FR 3534, Hornbach 2370, Castorama PL 2316 —
+                // loginy z jednym sklepem), nie ma czego dopelniac: przelot i tak bierze numery z mapy. Gdy
+                // wszystkie widoczne numery sa w mapie tego hosta, ostrzezenie o niepelnej liscie byloby
+                // falszywe (zgloszone w przegladzie Cultury 13.10.2026), wiec go nie pokazujemy.
+                const znane = mkSklepyPanelu(mkHost());
+                let widac = [];
+                try { widac = mkShopIds().map(String); } catch (e){}
+                if (znane.length && widac.length && widac.every(function (x){ return znane.indexOf(x) >= 0; })) return;
                 mkToast('Znam tylko ' + (ile || 'jeden') + ' sklep tej platformy (' + mkHost() + '). '
                       + 'Rozwiń przełącznik sklepu w nagłówku — przy zwiniętym, albo gdy wszedłeś na inną '
                       + 'zakładkę sklepu, w drzewie strony stoi wyłącznie sklep bieżący. Bez pełnej listy '
@@ -47929,8 +48654,8 @@
     // Portal WAYFAIRA: tak samo bez guzika i bez panelu. Modul jest tam wykonawca mostu —
     // rozliczenia pobiera sie z prologistics, a otwarta karta portalu tylko odpowiada.
     // Portal bol.com — jak Wayfair: bez guzika i bez panelu, karta tylko odpowiada na zapytania z prologistics.
-    // Portal Shöpping — tak samo.
-    if (!onMirakl && !onWayf && !onBolP && !onShpP){
+    // Portal Shöpping i panel Altex — tak samo.
+    if (!onMirakl && !onWayf && !onBolP && !onShpP && !onAlxP){
         (document.body || document.documentElement).appendChild(btn);
         (document.body || document.documentElement).appendChild(panel);
     }
@@ -48234,9 +48959,23 @@
               + ', a ta wpłata na ' + f2(j.amount) + ' ' + (j.cur || '') + ' — to awizo innej wpłaty. Numerów nie wpisuję.', '#c00');
             return '';
         }
+        // Waluta. Zlecenie z wyciagu ma walute z banku — to fakt, wiec awizo w innej walucie to inna wplata.
+        // Zlecenie z arkusza albo dodane recznie (j.manual) ma walute celu, a do 13.10.2026 regula Manora jej
+        // nie niosla — dostawalo domyslne EUR, choc Manor placi wylacznie w CHF. Tak odbilo sie awizo z 08.10
+        // („jest w CHF, a wpłata w EUR"). Tam walute bierzemy z awiza, jak przy OBI CH; kwota musi sie
+        // zgadzac i tak (warunek wyzej).
+        let walutaBylo = '';
         if (j.cur && av.cur && String(j.cur).toUpperCase() !== String(av.cur).toUpperCase()){
-            say('Awizo „' + nazwa + '” jest w ' + av.cur + ', a wpłata w ' + j.cur + ' — numerów nie wpisuję.', '#c00');
-            return '';
+            if (!j.manual){
+                say('Awizo „' + nazwa + '” jest w ' + av.cur + ', a wpłata z wyciągu w ' + j.cur + ' — numerów nie wpisuję.', '#c00');
+                return '';
+            }
+            walutaBylo = String(j.cur);
+        }
+        if (av.cur && (walutaBylo || !j.cur)){
+            mkLog('manor', 'waluta zlecenia ' + (j.cur || '—') + ' → ' + String(av.cur).toUpperCase()
+                  + ' (z awiza ' + nazwa + ')');
+            j.cur = String(av.cur).toUpperCase();
         }
         j.docs = av.poz.map(function (p){ return p.nr; });
         j.avis = { plik: nazwa, nr: av.nr, valuta: av.valuta, suma: av.suma, sumaBetrag: av.sumaBetrag, cur: av.cur,
@@ -48245,7 +48984,9 @@
         jobsSave(jobs); render();
         return 'Z awiza „' + nazwa + '”' + (av.nr ? (' (płatność ' + av.nr + (av.valuta ? (', valuta ' + av.valuta) : '') + ')') : '')
              + ' wpisałem numery dokumentów (' + j.docs.length + '): ' + j.docs.join(', ')
-             + ' — suma ' + f2(av.suma) + ' ' + (av.cur || '') + ' = wpłata.';
+             + ' — suma ' + f2(av.suma) + ' ' + (av.cur || '') + ' = wpłata.'
+             + (walutaBylo ? (' Waluta zlecenia poprawiona z ' + walutaBylo + ' na ' + j.cur
+                              + ' — z awiza (zlecenie z arkusza miało domyślne ' + walutaBylo + ').') : '');
     }
     // Po zapisaniu numerow (recznie albo z awiza) dokumenty spinaja sie z wplata od razu — przez
     // mkManorTeraz, czyli te sama droge i te same kontrole, co „⬇ Pobierz zestawienia".
@@ -48361,6 +49102,9 @@
         if (j.data && j.data.amz && (j.data.amz.cofN || j.data.amz.gwKolizja)) return true;
         // Dokumenty od Manora (manorOdBox) HUB pomija — zlecenie czeka, az ktos je odhaczy (decyzja 07.10.2026, przejsciowo).
         if (String(j.mp || '') === 'Manor' && (j.manorOd || []).length && !j.manorOdZal) return true;
+        // Altex: pozycja wstrzymana przez Altex (alxBox) czeka na doplate — po zaksiegowaniu zlecenie zostaje w ⑤, dopoki
+        // pozniejsza wyplata jej nie wezmie (decyzja uzytkownika 13.10.2026 „pomin i pokaz").
+        if (alxCzekaNaDoplate(j).length) return true;
         const tf = shTrafienie(j, mkSheet[mkJobId(j)]);            // cudzy zaksiegowany wiersz w arkuszu = mozliwy dubel
         if (tf && tf.zaks && !tf.wlasny) return true;
         return false;
@@ -48388,7 +49132,8 @@
               // bol i Shöpping nie maja drogi plikiem — dane biora tylko z portalu (wprost albo przez otwarta karte portalu).
               : (j.kind === 'bol' ? '→ krok 2: „⬇ Pobierz zestawienia” (portal bol zalogowany w tej przeglądarce)'
               : (j.kind === 'shoep' ? '→ krok 2: „⬇ Pobierz zestawienia” (portal Shöpping zalogowany w tej przeglądarce)'
-              : '→ krok 2: „⬇ Pobierz zestawienia” albo raport plikiem'))));
+              : (j.kind === 'altex' ? '→ krok 2: „⬇ Pobierz zestawienia” (panel Altex zalogowany w tej przeglądarce)'
+              : '→ krok 2: „⬇ Pobierz zestawienia” albo raport plikiem')))));
         }
         else if (st === 'partial') t = '→ import wstrzymany: powód obok';
         else if (st === 'ready') t = importBlokada(j) ? '→ import wstrzymany: powód niżej'
@@ -48881,6 +49626,7 @@
                 det += manorBox(j) + manorOdBox(j);
                 det += bolBox(j);
                 det += shpBox(j);
+                det += alxBox(j);
                 det += obiChKontrolaHtml(j);
                 det += obiChRefBox(j);
                 // Po zaksiegowaniu to juz nie ostrzezenie — szare, i bez „jeszcze NIEZAKSIĘGOWANA".
@@ -49326,6 +50072,33 @@
                 delete j.data;
                 jobsSave(jobs); render();
                 say('Zlecenie Shöpping na ' + f2(j.amount) + ' wróciło do pobrania — kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
+            };
+        });
+        // Altex „wymaga sprawdzenia" (alxBox) — jak przy Shöpping: po wyjasnieniu przyczyny zlecenie wraca do pobrania.
+        out.querySelectorAll('.mk-alxponow').forEach(function (b){
+            b.onclick = function(){
+                if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+                const k = b.getAttribute('data-k'), jobs = jobsLoad(), j = jobs[k];
+                if (!j || j.kind !== 'altex' || j.status !== 'partial' || j.juzWPaczce) return;
+                j.status = 'new'; j.msg = ''; j.note = '';
+                delete j.data;
+                jobsSave(jobs); render();
+                say('Zlecenie Altex na ' + f2(j.amount) + ' wróciło do pobrania — kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
+            };
+        });
+        // Altex — pozycja wstrzymana zalatwiona poza HUB-em (osobny przelew, zwrot klientowi…): odhaczenie i „↶ cofnij".
+        out.querySelectorAll('.mk-alxzal').forEach(function (b){
+            b.onclick = function(ev){
+                if (ev) ev.preventDefault();
+                const k = b.getAttribute('data-k'), id = b.getAttribute('data-p'), tak = b.getAttribute('data-z') === '1';
+                const jobs = jobsLoad(), j = jobs[k];
+                if (!j || j.kind !== 'altex' || !id) return;
+                j.alxZal = j.alxZal || {};
+                if (tak) j.alxZal[id] = { kiedy: new Date().toISOString().slice(0, 16).replace('T', ' ') };
+                else delete j.alxZal[id];
+                jobsSave(jobs);
+                try { alxSladZapisz(jobs); } catch (e){}
+                render();
             };
         });
         // Numer dokumentu od Manora → PDF z panelu.
@@ -51603,7 +52376,7 @@
                             lim: 'Limango',
                             c24: 'CHECK24', c24pdf: 'CHECK24', galx: 'Galaxus',
                             joy: 'JOOM', vtex: 'OBI', bank: 'wyciag', f1: 'Furniture 1',
-                            obich: 'OBI CH', bol: 'bol.com', shoep: 'Shöpping',
+                            obich: 'OBI CH', bol: 'bol.com', shoep: 'Shöpping', altex: 'Altex',
                             // Manor, Vente-Unique i Home24 jada wspolna sciezka Mirakla —
                             // w logu i tak stoi obok lista sklepow, wiec wiadomo ktory to.
                             mirakl: 'Mirakl' };
@@ -54410,7 +55183,8 @@
                 + (w.kind === 'ebay' ? ' — kliknij „⬇ Pobierz zestawienia", żeby moduł rozpoznał, która to wypłata.'
                    : (w.kind === 'bol' ? ' — kliknij „⬇ Pobierz zestawienia" (portal bol zalogowany w tej przeglądarce).'
                    : (w.kind === 'shoep' ? ' — kliknij „⬇ Pobierz zestawienia" (portal Shöpping zalogowany w tej przeglądarce).'
-                   : ' — teraz wgraj raport z portalu.'))), '#0a7a2f');
+                   : (w.kind === 'altex' ? ' — kliknij „⬇ Pobierz zestawienia" (panel Altex zalogowany w tej przeglądarce).'
+                   : ' — teraz wgraj raport z portalu.')))), '#0a7a2f');
         };
 
         // ---------- niezaksięgowane z arkusza ----------
@@ -55841,7 +56615,16 @@
             if (o.dok && !o.zgodaBrutto) zle.push('suma brutto ' + f2(o.sumBrutto) + ' ≠ Gesamt-Summe ' + f2(o.dok.brutto));
             if (o.dok && !o.zgodaNetto)  zle.push('suma netto ' + f2(o.sumNetto) + ' ≠ Gesamt-Summe ' + f2(o.dok.netto));
             if (o.przelew != null && !o.zgodaPrzelew) zle.push('kwota przelewu ' + f2(o.przelew) + ' ≠ suma netto ' + f2(o.sumNetto));
-            if (o.sporne.length) zle.push('rozjazd znaku i numeru korekty: ' + o.sporne.map(function (x){ return x.nr; }).join(', '));
+            // Sporne grupami wg powodu (obiChSporny) — „rozjazd znaku i numeru korekty" dotyczy juz
+            // tylko rynku 965; pozycja z innego rynku mowi, z jakiego.
+            if (o.sporne.length){
+                const grupy = {};
+                o.sporne.forEach(function (x){
+                    const pw = x.sporny || 'rozjazd znaku i numeru korekty';
+                    (grupy[pw] = grupy[pw] || []).push(x.nr);
+                });
+                Object.keys(grupy).forEach(function (pw){ zle.push(pw + ': ' + grupy[pw].join(', ')); });
+            }
             if (zle.length){ say('OBI CH — awizo się nie zgadza: ' + zle.join(' · ') + '. Nie doczepiam.', '#c00'); return; }
 
             const jobs = jobsLoad();
@@ -55865,6 +56648,13 @@
                 return;
             }
             const j = jobs[hit[0]];
+            // Zaimportowanego zlecenia awizo nie podmienia. Ponizej status wraca bezwarunkowo na „ready",
+            // wiec ponowne wgranie tego samego awiza stawialo zaimportowana wplate znowu w „③ gotowe do
+            // importu" — ta sama zapora co w pozostalych czytnikach („To rozliczenie jest już zaksięgowane").
+            if (j.status === 'done'){
+                say('Awizo OBI CH nr ' + (o.beleg || '?') + ': ta wpłata jest już zaimportowana — awiza nie podmieniam.', '#c47f00');
+                return;
+            }
             // WALUTA Z AWIZA. Zlecenie z wyciagu ma ja z banku, ale zalozone recznie albo
             // z arkusza dostaje domyslne EUR — a OBI CH placi w CHF, wiec kwota na liscie
             // i w arkuszu szla z niewlasciwa waluta. Awizo jest tu zrodlem, nie domyslem.
@@ -55908,6 +56698,10 @@
                            + 'której moduł ticketa niczego nie potwierdził — zajrzyj do ticketu, zanim pójdą znowu') : '')
                     + (zr.brak ? (' · ' + zr.brak + ' bez numeru fulfilmentu, wpisz go niżej') : ''));
             }
+            if ((o.obciazenia || []).length)
+                czesci.push('OBCIĄŻENIA OBI SYSTEMZENTRALE (' + o.obciazenia.length + ') ' + f2(kw.obc || 0) + ' ' + o.waluta
+                    + ' — dokumenty centrali OBI: nie idą do importu ani do ticketów i HUB ich nie księguje: '
+                    + o.obciazenia.map(function (z){ return z.nr + ' (' + f2(Math.abs(z.brutto)) + ')'; }).join(', '));
             if (waluta0) czesci.push('waluta zlecenia poprawiona z ' + waluta0 + ' na ' + o.waluta + ' — z awiza');
             if (poKwocie) czesci.push('dopasowane po KWOCIE, nie po numerze przelewu — sprawdź, czy to ten');
             j.note = czesci.join(' · ');
@@ -55916,6 +56710,8 @@
                 + 'do importu ' + o.doImportu.length + ' na ' + f2(o.sumImport) + ' ' + o.waluta
                 + (o.zwroty.length ? (', zwrotów ' + o.zwroty.length + ' poza importem na '
                                       + f2(kw.zwrot || 0) + ' brutto') : '')
+                + ((o.obciazenia || []).length ? (', obciążeń OBI Systemzentrale ' + o.obciazenia.length + ' na '
+                                      + f2(kw.obc || 0) + ' — HUB ich nie księguje (lista w opisie zlecenia)') : '')
                 + '. Sumy zgodne z dokumentem.', '#0a7a2f');
         }
 
@@ -56117,6 +56913,9 @@
                 + 'Zostają: ⚙ Konta i ustawienia oraz ślad zaksięgowanych zwrotów i opisów — chroni przed zaksięgowaniem drugi raz.\n'
                 + 'W prologistics nic się nie zmienia.'
                 + (notatek ? ('\nZ arkusza zejdą notatki HUB-a o problemach przy tych wpłatach (' + notatek + ') — HUB zdejmuje notatki zleceń, których już nie ma.') : ''))) return;
+            // Altex: zaimportowane wyplaty (raporty, pozycje wstrzymane i doplaty) zostaja w trwalym sladzie — pozniejsza
+            // doplata ma do czego trafic, a raport nie wraca do puli.
+            try { alxSladZapisz(jobsLoad()); } catch (e){}
             jobsSave({});
             // Pamiec strony o zleceniach: zaznaczenia do importu, typy, „Sprawdź auftragi" potracen i Joybuy.
             [mkSel, mkTyp, mkTypPusto, mkCrState, mkJoyState].forEach(function (o){ Object.keys(o).forEach(function (k){ delete o[k]; }); });
@@ -57361,6 +58160,89 @@
         function shpLeft(jobs){
             return Object.keys(jobs).filter(function (k){ return shpDoPobrania(jobs[k]); }).length;
         }
+        // Altex RO — lista raportow i raporty z panelu (wprost albo przez otwarta karte panelu). Kandydaci: raporty utworzone
+        // MK_ALX_OKNO dni przed data wplywu, od najnowszego; do kazdego doliczamy starsze raporty bez wlasnej wyplaty (wynik ≤ 0).
+        // Wygrywa raport zgodny z wplata CO DO GROSZA; dopiero gdy takiego nie ma — pierwszy wytlumaczony pozycja wstrzymana
+        // albo doplata; gdy zaden — zlecenie dostaje rozbicie najnowszego jako „wymaga sprawdzenia" (i niczego nie rezerwuje).
+        // Zlecenia idziemy od najstarszej wplaty: doplata pozniejszej wyplaty szuka pozycji wstrzymanej przy wczesniejszej.
+        async function alxPass(jobs){
+            alxSladZapisz(jobs);
+            const left = Object.keys(jobs).filter(function (k){ return alxDoPobrania(jobs[k]); }).sort(function (a, b){
+                const x = jobs[a], y = jobs[b];
+                return String(x.date) < String(y.date) ? -1 : (String(x.date) > String(y.date) ? 1 : (Number(x.amount) - Number(y.amount)));
+            });
+            if (!left.length) return 0;
+            const wszystkim = function (tekst, blad){
+                left.forEach(function (k){ jobs[k].msg = tekst; if (blad) jobs[k].status = 'err'; });
+                jobsSave(jobs); render();
+                say('Altex: ' + tekst, '#c47f00');
+            };
+            say('Altex — pobieram listę raportów z panelu…');
+            let lista;
+            try { lista = alxLista((await alxZapytaj('lista')).T); }
+            catch (e){ wszystkim(withLogin({ brand: 'Altex', shop: MK_ALX_SHOP, host: MK_ALX_HOST }, (e && e.message) || String(e)), true); return 0; }
+            if (!lista.length){
+                wszystkim('panel Altex nie pokazał ani jednego raportu — sprawdź, czy jesteś zalogowany na ' + MK_ALX_PANEL, true);
+                return 0;
+            }
+            const pamiec = {};                                   // id raportu -> wiersze (jeden odczyt na przelot)
+            const wiersze = async function (m){
+                // Czytamy KAZDY raport, takze z prowizja 0 na liscie: sprzedaz i zwrot pobrania w tym samym pol miesiaca daja
+                // prowizje 0, a wynik −zwrot (Altex oddal pieniadze klientowi). Pusty raport to „Niciun rezultat" — 0 wierszy.
+                if (!pamiec[m.id]){ say('Altex — czytam raport ' + m.id + ' (' + m.od + ' – ' + m.doo + ')…'); pamiec[m.id] = await alxRaport(m.id); }
+                return pamiec[m.id];
+            };
+            let ok = 0;
+            for (let i = 0; i < left.length; i++){
+                const j = jobs[left[i]];
+                const zajete = alxZajete(jobs, left[i]);
+                const kand = lista.filter(function (m){
+                    const dni = alxDni(j.date, m.utw);
+                    return dni != null && dni >= MK_ALX_OKNO[0] && dni <= MK_ALX_OKNO[1] && !zajete[m.id];
+                }).slice(0, 3);
+                if (!kand.length){
+                    j.msg = 'w panelu Altex nie ma wolnego raportu utworzonego ' + MK_ALX_OKNO[0] + '–' + MK_ALX_OKNO[1] + ' dni przed ' + j.date
+                          + ' (najnowsze: ' + lista.slice(0, 3).map(function (m){ return m.id + ' z ' + m.utw + (zajete[m.id] ? ' — już przy innym zleceniu' : ''); }).join(' · ') + ')';
+                    jobsSave(jobs); continue;
+                }
+                let wybor = null, pierwszy = null, zastepczy = null;
+                try {
+                    const ocz = alxOczekujace(jobs, left[i]);
+                    for (let c = 0; c < kand.length && !wybor; c++){
+                        const m = kand[c], gl = await wiersze(m);
+                        if (!(alxWynik(gl) > 0)) continue;              // sam raport bez wyplaty nie jest wyplata
+                        const lanc = [{ meta: m, wiersze: gl }];
+                        for (let k = lista.indexOf(m) + 1, kroki = 0; k < lista.length && kroki < MK_ALX_LANCUCH; k++, kroki++){
+                            const s = lista[k];
+                            if (zajete[s.id]) break;
+                            const w = await wiersze(s);
+                            if (!w.length) continue;                   // pusty — nic nie wnosi, patrzymy dalej
+                            if (alxWynik(w) > 0) break;                // ten raport mial wlasna wyplate
+                            lanc.unshift({ meta: s, wiersze: w });
+                        }
+                        const p = alxRozlicz(lanc, j.amount, ocz);
+                        if (!pierwszy) pierwszy = p;
+                        if (!p.bledy.length){ if (p.dokladnie) wybor = p; else if (!zastepczy) zastepczy = p; }
+                    }
+                } catch (e){
+                    j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e));
+                    jobsSave(jobs); render(); continue;
+                }
+                const p = wybor || zastepczy || pierwszy;
+                if (!p){
+                    j.msg = 'raporty Altex z okolic ' + j.date + ' (' + kand.map(function (m){ return m.id; }).join(', ')
+                          + ') nie dają wypłaty — same pobrania albo zwroty';
+                    jobsSave(jobs); continue;
+                }
+                alxZastosuj(j, p);
+                ok++;
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
+        function alxLeft(jobs){
+            return Object.keys(jobs).filter(function (k){ return alxDoPobrania(jobs[k]); }).length;
+        }
 
         // Ile zlecen zostalo do pobrania na platformach obslugiwanych PETLA PO HOSTACH
         // (Mirakl i VTEX). Galaxus i Wayfair maja wlasne liczniki i sa dokladane osobno —
@@ -57381,7 +58263,7 @@
                 const kind = j.kind || 'mirakl';
                 // Furniture 1 ma numer z tytulu i nie ma hosta — bez tego liczylaby sie jako Mirakl
                 // i zawyzala „zostało N na innych sklepach". Liczy ja f1Left.
-                if (kind === 'joy' || kind === 'galx' || kind === 'wayf' || kind === 'f1' || kind === 'bol' || kind === 'shoep') return false;
+                if (kind === 'joy' || kind === 'galx' || kind === 'wayf' || kind === 'f1' || kind === 'bol' || kind === 'shoep' || kind === 'altex') return false;
                 const h = j.host || (kind === 'mirakl' ? 'venteunique-prod.mirakl.net' : '');
                 // Zlecenie „NN" z kilkoma panelami nalezy do KAZDEGO z nich, dopoki
                 // ktorys nie odda rozliczenia.
@@ -57793,9 +58675,9 @@
             const b = this, b2 = $('#mk-run');
             MK_PRZELOT++;                  // nowy przelot — patrz mkKandZapisz
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nBol = bolLeft(jobs), nShp = shpLeft(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nBol = bolLeft(jobs), nShp = shpLeft(jobs), nAlx = alxLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nBol && !nShp){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nBol && !nShp && !nAlx){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -57820,14 +58702,16 @@
             const bol  = obca ? 0 : nBol;
             // Shöpping — ruchy konta Adyen z api.shoepping.at (wprost albo przez otwarta karte portalu): z prologistics.
             const shp  = obca ? 0 : nShp;
-            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb && !hd && !f1n && !bol && !shp){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
+            // Altex RO — raporty z marketplace.altex.ro (wprost albo przez otwarta karte panelu): z prologistics.
+            const alx  = obca ? 0 : nAlx;
+            if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb && !hd && !f1n && !bol && !shp && !alx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
                               .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
                               .concat(mano ? [MK_MM_HOST] : []).concat(cnov ? [MK_CN_HOST] : [])
                               .concat(bb ? [MK_BB_HOST] : []).concat(hd ? [MK_HD_HOST] : [])
                               .concat(f1n ? [F1_PRZELOT_NAZWA] : []).concat(bol ? [MK_BOL_HOST] : [])
-                              .concat(shp ? [MK_SHP_HOST] : []);
-            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov + bb + hd + f1n + bol + shp) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
+                              .concat(shp ? [MK_SHP_HOST] : []).concat(alx ? [MK_ALX_HOST] : []);
+            if (!confirm('Pobrać ' + (mkLeft(jobs) + galx + wayf + ebay + c24p + mano + cnov + bb + hd + f1n + bol + shp + alx) + ' rozliczeń z ' + plat.length + ' platform?\n\n'
                 + hosts.concat(vhosts).map(function (h){ return '  • ' + h + ' — ' + mkLeft(jobs, h) + ' szt.'; })
                     .concat(galx ? ['  • ' + MK_GALX_HOST + ' — ' + galx + ' szt.'] : [])
                     .concat(wayf ? ['  • ' + MK_WAYF_HOST + ' — ' + wayf + ' szt.'] : [])
@@ -57839,7 +58723,8 @@
                     .concat(hd ? ['  • ' + MK_HD_HOST + ' — ' + hd + ' szt.'] : [])
                     .concat(f1n ? ['  • ' + F1_PRZELOT_NAZWA + ' — ' + f1n + ' szt.'] : [])
                     .concat(bol ? ['  • ' + MK_BOL_HOST + ' — ' + bol + ' szt.'] : [])
-                    .concat(shp ? ['  • ' + MK_SHP_HOST + ' — ' + shp + ' szt.'] : []).join('\n')
+                    .concat(shp ? ['  • ' + MK_SHP_HOST + ' — ' + shp + ' szt.'] : [])
+                    .concat(alx ? ['  • ' + MK_ALX_HOST + ' — ' + alx + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -57915,6 +58800,11 @@
                 seen++;
                 try { ok += await mkPrzelot('Shöpping', 'shoep', MK_SHP_HOST, 'Shoepping', shpPass); }
                 catch (e){ problem.push(MK_SHP_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (alx){
+                seen++;
+                try { ok += await mkPrzelot('Altex', 'altex', MK_ALX_HOST, 'Altex', alxPass); }
+                catch (e){ problem.push(MK_ALX_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -58011,12 +58901,14 @@
                     // Rada „wejdz raz na panel" ma sens TYLKO wtedy, gdy lista sklepow moze
                     // sie jeszcze uzupelnic. Gdy komplet numerow stoi w MK_SHOPID (Hornbach,
                     // Brico Depot), wejscie na panel niczego nie zmieni — i nie ma po co tam
-                    // wysylac czlowieka.
+                    // wysylac czlowieka. Warunek „< 2" przepuszczal panele z JEDNYM sklepem
+                    // w mapie (Hornbach, Castorama PL, Cultura FR) — rada idzie wiec tylko
+                    // tam, gdzie mapa nie zna zadnego sklepu tego hosta.
                     const gdzie = ile
                         ? (' Sprawdziłem ' + ile + ' sklep'
                            + (ile === 1 ? '' : (ile < 5 ? 'y' : 'ów'))
                            + ' na tym panelu: ' + odwiedzone.join(', ') + '.'
-                           + ((ile === 1 && mkSklepyPanelu(host).length < 2)
+                           + ((ile === 1 && !mkSklepyPanelu(host).length)
                                 ? ' Jeśli sklepów jest więcej, wejdź raz na panel — moduł zapamięta ich listę.'
                                 : ''))
                         : '';
@@ -58098,7 +58990,7 @@
             // „Nieznalezione" musi liczyc tak samo jak okno potwierdzenia — czyli razem
             // z Galaxusem i Wayfairem, ktore mkLeft celowo pomija.
             const jl = jobsLoad();
-            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl) + c24Left(jl) + hdLeft(jl) + f1Left(jl) + bolLeft(jl) + shpLeft(jl);
+            const left = mkLeft(jl) + galxLeft(jl) + wayfLeft(jl) + ebayLeft(jl) + c24Left(jl) + hdLeft(jl) + f1Left(jl) + bolLeft(jl) + shpLeft(jl) + alxLeft(jl);
             // Ostrzezenie o duplikatach nie moze zaslaniac problemow przelotu — idzie razem z nimi.
             if (dup) say('UWAGA: ' + dup + ' z pobranych jest już w arkuszu — sprawdź, zanim zaksięgujesz.'
                 + (problem.length ? (' Problemy: ' + problem.join('; ')) : ''), '#c00');
@@ -60593,6 +61485,9 @@
     function mkNrZestawienia(j){
         if (!j) return '';
         if (j.ref) return String(j.ref);
+        // Altex: numery raportow komisoane (glowny i doliczone bez wyplaty).
+        if (j.kind === 'altex' && j.data && j.data.altex && (j.data.altex.raporty || []).length)
+            return 'raport ' + j.data.altex.raporty.join(', ');
         const c = j.data && j.data.cycle;
         if (!c) return '';
         return 'cykl ' + String(c).split(',').map(function (x){
@@ -92572,7 +93467,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2ed1fd0 · 13.10.2026 08:44';
+    const HUB_BUDOWA = '9464de6 · 13.10.2026 12:53';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -92583,7 +93478,7 @@
         { id: 'spmost',   name: 'Saferpay — most do panelu', test: onSaferpay,  init: init_spmost },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
-        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol() || onShoep(), init: init_mkt },
+        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol() || onShoep() || onAltex(), init: init_mkt },
         { id: 'bank',     name: 'Bank Import',               test: onProlo,   init: init_bank },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
