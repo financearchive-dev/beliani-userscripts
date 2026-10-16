@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.08
+// @version      5.60.09
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -63,6 +63,8 @@
 // @connect      www.ebay.de
 // @connect      storage.googleapis.com
 // @connect      googleapis.com
+// @connect      docs.google.com
+// @connect      googleusercontent.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @connect      merchant.clearhaus.com
@@ -7756,7 +7758,9 @@
             gdzie stoi request: przy requeście z <b>ticketu</b> zaksięgowanej <b>noty kredytowej</b> w tym tickecie,
             przy requeście z <b>auftragu</b> <b>ujemnej płatności</b> na auftragu. Kwota z requestu, data zmiany
             statusu na Refund Done, konto Saferpay tego rynku. Po Open amount tego nie widać.
-            Niewyksięgowane pokazuje na górze listy, z opcją zaksięgowania i sprawdzeniem po zapisie.
+            Niewyksięgowane pokazuje na górze listy, z opcją zaksięgowania i sprawdzeniem po zapisie.<br>
+            Pusty <b>Broken Items</b> zgłasza jako <b>BRAK ARTYKUŁU</b> — najpierw dodaj właściwy produkt ręcznie.
+            Takiej pozycji nie proponuje do automatycznego księgowania; status Refund Done nie oznacza, że powstała nota.
             To osobna robota od sprawdzania zwrotów — w tym trybie HUB <b>nic nie zaznacza</b> na liście importów.
         </div>
         <button id="tm-refund-btn" style="
@@ -8948,7 +8952,9 @@
                     // Nota potrzebuje pozycji z polem konta. Bez niej most i tak by nie
                     // zaksiegowal, a konto ustawilby po cichu na cokolwiek (fillTicket
                     // nie zglasza braku konta na liscie).
-                    if (!Object.keys(kontaTic).length)
+                    if (refundBrakArtykulow(docTic))
+                        przeszkody.push('BRAK ARTYKUŁU w sekcji Broken Items — request ma status Refund Done, ale zwrot NIE jest wyksięgowany. Bez produktu nie można zaksięgować noty w tickecie. Dodaj właściwy artykuł ręcznie i ponów sprawdzenie — nie wykonuj ponownie zwrotu do klienta');
+                    else if (!Object.keys(kontaTic).length)
                         przeszkody.push('na tickecie nie ma pola konta noty (cost_account) — nie ma na czym zaksięgować, zrób to ręcznie albo powiedz, czy księgować nogą na auftragu');
                     else if (wpis.konto && !kontaTic[wpis.konto])
                         przeszkody.push('konta ' + wpis.konto + ' nie ma na liście kont ticketu');
@@ -9442,6 +9448,42 @@
     // zwroty z tej samej wplaty — na tym tickecie i na jego auftragu — nie przekraczaja tego,
     // co z niej zostalo. Requestow z ticketow auftrag NIE pokazuje (sprawdzone na 15272213),
     // wiec o auftrag pytamy osobno.
+    // 5.60.09: tylko glowna tabela Broken Items, nie puste tabele magazynowe
+    // ani lista rozwijana Add new (opcje nie sa dodanymi produktami).
+    // Brak sekcji nie jest dowodem braku artykulow.
+    function refundBrakArtykulow(doc) {
+        const table = doc.querySelector('#broken-items-table')
+            || doc.querySelector('#broken_items')?.closest('table');
+        if (!table) return false;
+        if (table.querySelector('input.broken-items-delart, select[name^="cost_account["]')) return false;
+        return Array.from(table.querySelectorAll('td')).some(td =>
+            td.closest('table') === table && !td.querySelector('table')
+                && /^no articles$/i.test(normalizeText(td.textContent)));
+    }
+
+    function refundProblemArtykulow(doc, requesty, dAuf) {
+        if (!refundBrakArtykulow(doc)) return [];
+        const noty = notyTicketu(doc);
+        const platnosci = dAuf ? platnosciAuftragu(dAuf) : [];
+        return requesty.flatMap(w => {
+            const done = /^refund done$/i.test(w.stan);
+            if (!done && !/^refund approved$/i.test(w.stan)) return [];
+            const data = String(w.zatwierdzono || '').slice(0, 10);
+            // Nie oglaszamy braku ksiegowania, jesli jest dowod jego wykonania.
+            if (done && w.kwota != null && /^\d{4}-\d{2}-\d{2}$/.test(data)
+                && (dopasujNote(noty, w.kwota, data).stan === 'jest'
+                    || platnosci.some(p => p.kwota < 0 && p.data === data
+                        && Math.abs(Math.abs(p.kwota) - w.kwota) < 0.02))) return [];
+            const kanal = rodzinaMetody(w.bank || w.metodaP);
+            return ['import ' + w.importId + ': BRAK ARTYKUŁU w sekcji Broken Items — '
+                + (done ? ('request ' + (kanal || 'zwrotu') + ' ma status Refund Done, ale nie potwierdzono wyksięgowania; ')
+                        : 'request Refund approved; ')
+                + 'bez dodanego produktu nie można zaksięgować noty w tickecie. '
+                + 'Dodaj właściwy artykuł ręcznie i ponów sprawdzenie'
+                + (done ? ' — nie wykonuj ponownie zwrotu do klienta' : '')];
+        });
+    }
+
     async function checkTicketRefund(rmaId, importIds, walutaTok) {
         const wynik = { ticket: true, auftragNumber: rmaId, ok: false, refundAmount: 0, transakcje: [], uwagi: [] };
         try {
@@ -9476,9 +9518,11 @@
             let naAuftragu = [];
             let skasowany = null;
             let vat0 = null;
+            let dAuf = null;
             if (wynik.auftrag) {
                 try {
                     const sAuf = await refundStrona(wynik.auftrag);
+                    dAuf = sAuf.doc;
                     skasowany = auftragSkasowany(sAuf.html);
                     vat0 = auftragVat0(sAuf.doc);
                     naAuftragu = refundRequestWiersze(sAuf.doc) || [];
@@ -9489,6 +9533,7 @@
                 problemy.push('nie znalazłem na tickecie numeru auftragu — requestów na auftragu nie sprawdziłem');
             }
 
+            problemy.push(...refundProblemArtykulow(doc, moje, dAuf));
             const uwagi = [];
             let ileAut = 0, ileOk = 0, ileNiewym = 0;
             for (const m of moje) {
@@ -15933,6 +15978,13 @@
         <div style="font-weight:bold;margin-bottom:8px;color:#111;font-size:15px;">
             📦 Auto-księgowanie orderów
         </div>
+        <div style="padding:8px;margin-bottom:10px;background:#fff7df;border:1px solid #e5c864;border-radius:6px;">
+            <label>Data listy <input type="date" id="tm-sheet-book-date"></label>
+            <button id="tm-sheet-book-fetch">Pobierz DEPO / Balance z Sheets</button>
+            <button id="tm-sheet-book-retry">Ponów zapis dat</button>
+            <div style="font-size:11px;margin-top:4px;">Po potwierdzonym księgowaniu data z panelu trafi do żółtej kolumny J odpowiednich wierszy. Data listy i data księgowania mogą być różne.</div>
+            <div id="tm-sheet-book-status" style="font-size:11px;margin-top:4px;"></div>
+        </div>
         <div style="font-size:12px;font-weight:bold;color:#0369a1;margin-bottom:3px;">Depozyty</div>
         <div id="tm-fmt-depo" style="font-size:11px;color:#666;margin-bottom:4px;">
             <code style="background:#f5f5f5;padding:1px 4px;">20730 ⇥ nazwa dostawcy ⇥ 2527.5</code>
@@ -18755,6 +18807,67 @@
         return wrap;
     }
 
+    // Most jest przypisany przez Wprowadzanie; ustawienia i polaczenie pozostaja wspolne.
+    let chnBookApi = null, chnBookLoaded = null;
+    const chnBookPendingKey = 'chn_booking_marks_pending_v1';
+    function chnBookTexts(){ return {dep:panel.querySelector('#tm-order-input').value,bal:panel.querySelector('#tm-bal-input').value}; }
+    function chnBookMatches(){ const t=chnBookTexts();return chnBookLoaded && t.dep===chnBookLoaded.depText && t.bal===chnBookLoaded.balText; }
+    function chnBookAttach(rows){
+        if(!chnBookMatches())return;
+        rows.forEach(row=>{
+            const kind=row.src==='depo'?'dep':'bal', ref=chnBookLoaded[kind].refs[row.line-1];
+            if(ref && String(row.id)===ref.order){ row._sheetRef=ref;row._sheetDate=chnBookLoaded.date;row._sheetAmount=String(row.amount); }
+        });
+    }
+    function chnBookConfirmed(rows, results){
+        const groups={};
+        rows.forEach((row,i)=>{
+            const ref=row._sheetRef;if(!ref)return;
+            const key=ref.gid+':'+ref.row, g=groups[key]||(groups[key]={ref:ref,ok:true});
+            const r=results[i];
+            if(String(row.amount)!==row._sheetAmount || !r || !r.ok || r.innaData || r.verifyNote || !(r.verified===true || r.alreadyBooked))g.ok=false;
+        });
+        return Object.values(groups).filter(g=>g.ok).map(g=>g.ref);
+    }
+    function chnBookPending(){ try{return JSON.parse(GM_getValue(chnBookPendingKey,'[]'))||[];}catch(e){return [];} }
+    async function chnBookFlush(){
+        const status=panel.querySelector('#tm-sheet-book-status'), retry=panel.querySelector('#tm-sheet-book-retry');
+        retry.disabled=true;
+        try{
+            if(!chnBookApi)throw new Error('Połączenie Sheets nie jest gotowe.');
+            let pending=chnBookPending(), marked=0;
+            while(pending.length){
+                const job=pending[0];status.textContent='Wpisuję potwierdzone daty do kolumny J…';
+                const res=await chnBookApi.request(job);
+                marked+=res.count;pending.shift();GM_setValue(chnBookPendingKey,JSON.stringify(pending));
+            }
+            status.textContent=marked?'Wpisano datę księgowania w J: '+marked+' wierszy.':'Brak oczekujących oznaczeń w J.';
+        }catch(e){status.textContent='Księgowania pozostają w prologistics. Nie oznaczono J: '+e.message+' Użyj „Ponów zapis dat” — bez ponownego księgowania.';}
+        finally{retry.disabled=false;}
+    }
+    panel.querySelector('#tm-sheet-book-retry').onclick=chnBookFlush;
+    panel.querySelector('#tm-sheet-book-fetch').onclick=async function(){
+        const btn=this,status=panel.querySelector('#tm-sheet-book-status');
+        if(panel.querySelector('#tm-book-btn').disabled || panel.querySelector('#tm-check-btn').disabled){status.textContent='Poczekaj na zakończenie sprawdzania / księgowania.';return;}
+        const date=panel.querySelector('#tm-sheet-book-date').value;
+        if(!date){status.textContent='Wybierz datę listy.';return;}
+        const before=chnBookTexts();
+        if((before.dep.trim()||before.bal.trim())&&!confirm('Zastąpić obie wklejki listami z '+date+'?'))return;
+        btn.disabled=true;status.textContent='Pobieram DEPO i Balance z '+date+'…';
+        try{
+            if(!chnBookApi)throw new Error('Połączenie Sheets nie jest gotowe.');
+            const data=await chnBookApi.request({action:'loadBooking',date:date});
+            const now=chnBookTexts();
+            if(now.dep!==before.dep||now.bal!==before.bal || panel.querySelector('#tm-book-btn').disabled || panel.querySelector('#tm-check-btn').disabled)throw new Error('W czasie pobierania zmieniono dane lub rozpoczęto przetwarzanie. Pobierz ponownie.');
+            data.depText=data.dep.lines.join('\n');data.balText=data.bal.lines.join('\n');chnBookLoaded=data;
+            panel.querySelector('#tm-order-input').value=data.depText;panel.querySelector('#tm-bal-input').value=data.balText;
+            previewRows=[];panel.querySelector('#tm-preview-section').style.display='none';updateTextPreview();
+            status.textContent='Pobrano DEPO: '+data.dep.refs.filter(Boolean).length+', Balance: '+data.bal.refs.filter(Boolean).length+' pozycji. Ustaw datę księgowania i kliknij „Sprawdź ordery”.';
+        }catch(e){status.textContent='Nie pobrano list: '+e.message;}
+        finally{btn.disabled=false;}
+    };
+    if(chnBookPending().length)panel.querySelector('#tm-sheet-book-status').textContent='Oczekuje zapis dat po wcześniejszym księgowaniu. Użyj „Ponów zapis dat”.';
+
     panel.querySelector('#tm-check-btn').onclick = async () => {
         // Jeden przycisk czyta OBA pola — depozyty i balance ida do jednej listy. Kazdy blad
         // parsowania, w ktoryms kolwiek polu, blokuje calosc: ani jeden zly wiersz nie moze
@@ -18771,6 +18884,7 @@
             return;
         }
         const rows = r.entries.map(e => Object.assign({}, e, { loading: true }));
+        chnBookAttach(rows);
 
         document.getElementById('tm-preview-section').style.display = 'block';
         document.getElementById('tm-progress').style.display = 'none';
@@ -18908,6 +19022,9 @@
 
     panel.querySelector('#tm-book-btn').onclick = async () => {
         if (!previewRows.length) return;
+        const bookRows=previewRows.slice(), sheetResults=[];
+        const sheetSourceValid=!!chnBookMatches(), sheetSourceDate=chnBookLoaded && chnBookLoaded.date;
+        const sheetBookingDate=currentBookingDate();
 
         const currency = document.getElementById('tm-currency').value;
         const month    = document.getElementById('tm-month').value;
@@ -18944,13 +19061,13 @@
         // oraz wspolny formDataCache). Rownolegle pracujemy wiec na roznych orderach.
         const groups = [];
         const byId = {};
-        previewRows.forEach((row, i) => {
+        bookRows.forEach((row, i) => {
             if (!byId[row.id]) { byId[row.id] = []; groups.push(byId[row.id]); }
             byId[row.id].push(i);
         });
 
         async function processOne(w, i) {
-            const row = previewRows[i];
+            const row = bookRows[i];
             const tag = workers > 1 ? `[W${w}] ` : '';
             const kindTag = row.kind ? ` <span style="color:#6b7280">(${row.kind})</span>` : '';
             const logRow = logLine(`⏳ ${tag}<strong>${row.id}</strong>${kindTag} — ${row.amount} ${currency} | ${row.debit}/${row.credit} | <em>${row.comment||'brak opisu'}</em>…`);
@@ -18961,6 +19078,7 @@
             } catch (e) {
                 result = { ok:false, error: e.message };
             }
+            sheetResults[i]=result;
             const statusCell = document.getElementById(statusCellId(row));
 
             if (result.ok) {
@@ -19023,6 +19141,15 @@
                 : parts.join(' &nbsp; ');
             summary.style.color = fail===0 ? '#16a34a' : '#b45309';
 
+            if(sheetSourceValid){
+                const refs=chnBookConfirmed(bookRows,sheetResults);
+                if(refs.length){
+                    const pending=chnBookPending();
+                    pending.push({action:'markBooking',date:sheetSourceDate,bookingDate:sheetBookingDate,refs:refs});
+                    GM_setValue(chnBookPendingKey,JSON.stringify(pending));
+                    await chnBookFlush();
+                }else panel.querySelector('#tm-sheet-book-status').textContent='Nie wpisano dat do J: brak wierszy z potwierdzonym kompletem księgowań.';
+            }
             bookBtn.disabled = false;
             bookBtn.textContent = '🚀 Zaksięguj wszystkie w tle';
         }
@@ -19117,6 +19244,9 @@
           + '<div style="flex:1;min-width:300px">'
           +   '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:24px">'
           +     '<label style="font-weight:600;font-size:12px;color:#750000">BALANCE (wklej z systemu — z linkami):</label>'
+          +     '<input id="wp-bal-date" type="date" aria-label="Data listy BALANCE" style="font-size:11px;padding:2px;border:1px solid #FFCCB7;border-radius:4px">'
+          +     '<button id="wp-bal-today" class="chn-btn ghost" style="padding:2px 6px;font-size:11px">Dzisiaj</button>'
+          +     '<button id="wp-bal-fetch" class="chn-btn ghost" style="padding:2px 8px;font-size:11px" title="Odczytuje listę CASH INVOICES z Google Sheets pod wybraną datą. Zachowuje linki, kolory i notatki. Nie zmienia arkusza.">⬇ Pobierz z Sheets</button>'
           +   '</div>'
           +   '<div id="wp-balance" contenteditable="true" style="width:100%;height:140px;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;overflow:auto;padding:4px;background:#fff;margin-top:4px"></div>'
           + '</div>'
@@ -19139,6 +19269,7 @@
           + '<button id="wp-refresh" class="chn-btn ghost" style="display:none">↻ Odśwież z uwagami</button>'
           + '<button id="wp-copy-bal" class="chn-btn ghost">\ud83d\udccb Kopiuj Balance</button>'
           + '<button id="wp-copy-dep" class="chn-btn ghost">\ud83d\udccb Kopiuj Depo</button>'
+          + '<button id="wp-transfer" class="chn-btn ghost" title="Przenieś obie przetworzone listy do arkusza Chińskie — z datą i podsumowaniem">Przenieś ordery</button>'
           + '<button id="wp-copy-titles" class="chn-btn ghost">\ud83d\udccb Kopiuj tytuły</button>'
           + '<button id="wp-pain" class="chn-btn maroon" title="Zbuduj plik przelewow ISO 20022 pain.001.001.09 (Swiss Payment Standards) ze wszystkich platnosci z tabeli \u2014 jedna platnosc na dostawce, waluta USD.">\ud83c\udfe6 pain.001 do banku</button>'
           + '<button id="wp-pc-all" class="chn-btn ghost" title="Zaznacz/odznacz wszystkie w tabeli DEPO">\u2611 Zaznacz wszystkie</button>'
@@ -19470,6 +19601,81 @@
             }
             return { rows: rows, names: names };
         }
+        // BALANCE z CASH INVOICES: naglowek daty w C, dane C:H, suma calej listy w G.
+        var BAL_SHEET_BASE = 'https://docs.google.com/spreadsheets/d/1EJ0EZhvozgw3iAkumExq-VJBmfjvRHlxZsoR0BTG8aw/';
+        function balSheetToday(){
+            var p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+            function v(t){ return p.filter(function(x){ return x.type === t; })[0].value; }
+            return v('year') + '-' + v('month') + '-' + v('day');
+        }
+        function balSheetDate(cell, X){
+            if (!cell || cell.v == null) return '';
+            if (cell.t === 'n' && X.SSF.is_date(cell.z || '')) {
+                var d = X.SSF.parse_date_code(cell.v);
+                return d ? d.y + '-' + String(d.m).padStart(2, '0') + '-' + String(d.d).padStart(2, '0') : '';
+            }
+            var s = String(cell.w || cell.v).trim(), m;
+            if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+            if ((m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/))) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+            return '';
+        }
+        function balSheetParse(ws, date, X){
+            if (!ws || !ws['!ref']) throw new Error('Brak zakładki CASH INVOICES 2024/25.');
+            function cell(c, r){ return ws[c + r] || {}; }
+            function txt(c, r){ var x = cell(c, r); return String(x.w != null ? x.w : x.v == null ? '' : x.v).trim(); }
+            var end = X.utils.decode_range(ws['!ref']).e.r + 1, headers = [], all = [];
+            for (var r = 1; r <= end; r++) {
+                var key = balSheetDate(cell('C', r), X);
+                if (key && !txt('D', r) && !txt('F', r)) { all.push(r); if (key === date) headers.push(r); }
+            }
+            if (!headers.length) throw new Error('Brak listy BALANCE dla ' + date + '.');
+            if (headers.length !== 1) throw new Error('Więcej niż jedna lista dla ' + date + ' — wklej właściwą ręcznie.');
+            var start = headers[0], next = all.filter(function(r){ return r > start; })[0] || end + 1;
+            var rows = [], total = null, sum = 0;
+            for (var i = start + 1; i < next; i++) {
+                var values = ['C','D','E','F','G','H'].map(function(c){ return txt(c, i); });
+                if (!values.some(Boolean)) continue;
+                // Suma CALEJ listy nie moze trafic do balSplitSums jako suma ostatniego dostawcy.
+                if (!values[0] && !values[1] && !values[2] && !values[3] && !values[5] && values[4]) {
+                    if (total !== null) throw new Error('Wiele sum listy — sprawdź wiersz ' + i + '.');
+                    total = Number(cell('G', i).v);
+                    if (!isFinite(total)) throw new Error('Nieprawidłowa suma w wierszu ' + i + '.');
+                    continue;
+                }
+                if (total !== null) throw new Error('Dane poniżej sumy listy — sprawdź wiersz ' + i + '.');
+                if (!values[0] || !/^\d{4,7}$/.test(values[3]) || cell('G', i).t !== 'n' || !isFinite(cell('G', i).v))
+                    throw new Error('Niepełny lub nierozpoznany wiersz ' + i + ' — wklej dane ręcznie.');
+                var cells = ['C','D','E','F','G','H'].map(function(c, k){
+                    var x = cell(c, i), u = x.l && x.l.Target || '', rgb = x.s && x.s.fgColor && x.s.fgColor.rgb || '';
+                    if (!/^https:\/\/(www\.)?prologistics\.info\//i.test(u)) u = '';
+                    // Tak jak w widoku Sheets: dwie cyfry po kropce. Surowe 60.775
+                    // parser wklejki rozpoznaje jako separator tysiecy (60775).
+                    return { text: k === 4 ? X.SSF.format('0.00', x.v) : values[k], url: u, bg: /^[0-9a-f]{6}$/i.test(rgb) ? '#' + rgb : '' };
+                });
+                rows.push(cells); sum += cell('G', i).v;
+            }
+            if (!rows.length) throw new Error('Lista dla ' + date + ' jest pusta.');
+            if (total === null) throw new Error('Brak sumy kontrolnej listy dla ' + date + '.');
+            if (Math.abs(sum - total) > 0.011) throw new Error('Suma wierszy ' + sum.toFixed(2) + ' różni się od sumy arkusza ' + total.toFixed(2) + '.');
+            var html = '<table><tbody>' + rows.map(function(row){ return '<tr>' + row.map(function(c){
+                return '<td' + (c.bg ? ' style="background-color:' + c.bg + '"' : '') + '>'
+                    + (c.url ? '<a href="' + esc(c.url) + '">' + esc(c.text) + '</a>' : esc(c.text)) + '</td>';
+            }).join('') + '</tr>'; }).join('') + '</tbody></table>';
+            return { html: html, count: rows.length, total: total, range: 'C' + (start + 1) + ':H' + (start + rows.length) };
+        }
+        function balSheetFetch(){
+            return new Promise(function(resolve, reject){
+                GM_xmlhttpRequest({ method: 'GET', url: BAL_SHEET_BASE + 'export?format=xlsx&gid=433623051', responseType: 'arraybuffer', timeout: 180000,
+                    onload: function(r){
+                        if (r.status !== 200 || !r.response || new Uint8Array(r.response)[0] !== 80) { reject(new Error('Google nie zwrócił arkusza. Sprawdź dostęp do Sheets w przeglądarce.')); return; }
+                        resolve(r.response);
+                    },
+                    onerror: function(){ reject(new Error('Nie udało się połączyć z Google Sheets.')); },
+                    ontimeout: function(){ reject(new Error('Przekroczony czas pobierania Google Sheets.')); }
+                });
+            });
+        }
+
         // ===== DEPO: automatyczne pobranie zamiast wklejania =====
         // Domyślny filtr = ten, którego używamy do wprowadzania: kontenery w statusie
         // „in payment” (cont_status=17), bez tych, które już w całości dotarły.
@@ -20308,6 +20514,7 @@
             } catch (e){}
 
             sect('1. WKLEJONE DANE — BALANCE (surowe)', function(){
+            L.push('Źródło: ' + ((D.raw && D.raw.balSrc) ? D.raw.balSrc : 'wklejone ręcznie'));
             L.push((D.raw && D.raw.bal) ? D.raw.bal : '(puste)'); });
             sect('2. WKLEJONE DANE — DEPO (surowe)', function(){
             L.push('Źródło: ' + ((D.raw && D.raw.depSrc) ? D.raw.depSrc : 'wklejone ręcznie'));
@@ -28827,6 +29034,31 @@
             if (!v) this.value = DEPO_URL_DEF;
             wp.querySelector('#wp-status').textContent = v ? 'Zapisano adres pobierania DEPO.' : 'Przywrócono domyślny adres pobierania DEPO.';
         };
+        wp.querySelector('#wp-bal-today').onclick = function(){ wp.querySelector('#wp-bal-date').value = balSheetToday(); };
+        wp.querySelector('#wp-bal-date').value = balSheetToday();
+        wp.querySelector('#wp-bal-fetch').onclick = async function(){
+            var btn = this, status = wp.querySelector('#wp-status'), target = wp.querySelector('#wp-balance');
+            var date = wp.querySelector('#wp-bal-date').value || balSheetToday(), before = target.innerHTML;
+            if (state._wpBusy || state._odsw || state._przelicz) { status.textContent = 'Poczekaj na zakończenie przetwarzania.'; return; }
+            if (target.textContent.trim() && !confirm('Zastąpić obecną zawartość BALANCE listą z ' + date + '?')) return;
+            btn.disabled = true; status.textContent = 'Pobieram BALANCE z Google Sheets dla ' + date + '…';
+            try {
+                var X = getXLSX(); if (!X) throw new Error('Brak biblioteki XLSX — odśwież stronę.');
+                var buf = await balSheetFetch();
+                var names = X.read(buf, { type: 'array', bookSheets: true }).SheetNames;
+                var name = names.filter(function(n){ return n.replace(/[^a-z0-9]/gi, '').toUpperCase() === 'CASHINVOICES202425'; });
+                if (name.length !== 1) throw new Error('Nie znaleziono jednoznacznej zakładki CASH INVOICES 2024/25.');
+                var wb = X.read(buf, { type: 'array', sheets: name, cellStyles: true, cellNF: true });
+                var result = balSheetParse(wb.Sheets[name[0]], date, X);
+                if (target.innerHTML !== before || state._wpBusy || state._odsw || state._przelicz)
+                    throw new Error('W czasie pobierania zmieniono dane lub rozpoczęto przetwarzanie. Pobierz ponownie.');
+                target.innerHTML = result.html;
+                state.balanceSrc = 'Google Sheets, ' + date + ', ' + result.range + ', pobrano ' + pcNow();
+                status.textContent = 'Pobrano BALANCE: ' + result.count + ' wierszy dla ' + date + ', suma ' + result.total.toFixed(2) + '. Sprawdź dane i kliknij „Przetwórz”.';
+            } catch(e) { status.textContent = 'BALANCE: ' + e.message + ' Dotychczasowe dane pozostawiono bez zmian.'; }
+            finally { btn.disabled = false; }
+        };
+        wp.querySelector('#wp-balance').addEventListener('input', function(){ state.balanceSrc = 'wklejone / zmienione ręcznie'; });
         wp.querySelector('#wp-depo-fetch').onclick = async function(){
             var status = wp.querySelector('#wp-status'), btn = this, lab = btn.textContent, url = depoUrl();
             btn.disabled = true; btn.textContent = 'Pobieram…';
@@ -28861,7 +29093,7 @@
             var status = wp.querySelector('#wp-status');
             status.style.color = '';   // czerwien z poprzedniego ↻ nie moze przejsc na „Gotowe"
             // Nowy przebieg = czysty log. Zapisujemy tez surowe wklejki, zeby dalo sie odtworzyc wejscie.
-            state.diag = { bal: {}, dep: {}, raw: { bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo'), depSrc: state.depoSrc || 'wklejone ręcznie' }, started: pcNow(), log: [] };
+            state.diag = { bal: {}, dep: {}, raw: { balSrc: state.balanceSrc || 'wklejone ręcznie', bal: pcPasteTxt('#wp-balance'), dep: pcPasteTxt('#wp-depo'), depSrc: state.depoSrc || 'wklejone ręcznie' }, started: pcNow(), log: [] };
             var balP = parseBalance(wp.querySelector('#wp-balance')), balRows = balP.rows;
             var dep = parseDepo(wp.querySelector('#wp-depo'));
             if (!balRows.length && !dep.rows.length) { dlog('Przerwano: nic nie wklejono.'); status.textContent = 'Wklej dane.'; return; }
@@ -29515,6 +29747,132 @@
                 } finally { busy = false; }
             };
         })();
+        // Przenoszenie korzysta z tych samych tabel co Kopiuj — po poprawkach i bez kosza.
+        var CHN_TRANSFER_KEY = 'chn_transfer_settings_v1';
+        var CHN_TRANSFER_URL = 'https://script.google.com/macros/s/AKfycbxvn9s4kOmbhhZ2vRZgHZ2EYu3A_hJyFnVu7tVJ4vp0MLEB0ZXzJObfAct6biUr6z_K/exec';
+        var CHN_TRANSFER_SECRET = 'qazNimDaWsxHsX87654567865ssjdbsajdbxzbxczvshdgsaydgs3434242a';
+        function chnTransferSettings(){
+            var saved = {};
+            try { saved = JSON.parse(GM_getValue(CHN_TRANSFER_KEY, '{}')) || {}; } catch(e){}
+            return { url: saved.url || CHN_TRANSFER_URL, secret: saved.secret || CHN_TRANSFER_SECRET };
+        }
+        function chnTransferRows(html, kind){
+            var doc = new DOMParser().parseFromString(html, 'text/html'), width = kind === 'bal' ? 6 : 5;
+            return Array.from(doc.querySelectorAll('tr')).map(function(tr){
+                return Array.from(tr.querySelectorAll('td')).slice(0, width).map(function(td, col){
+                    var text = (td.textContent || '').trim(), value = text;
+                    if ((kind === 'bal' && col === 4 || kind === 'dep' && (col === 3 || col === 4)) && text) {
+                        if (!/^-?\d+\.\d{2}$/.test(text)) throw new Error('Nieprawidłowa kwota: ' + text);
+                        value = Number(text);
+                    }
+                    return { value: value, bg: td.style.backgroundColor || '', bold: tr.style.fontWeight === 'bold' || !!td.querySelector('b') };
+                });
+            });
+        }
+        function chnTransferPayload(date){
+            var counts = { bal: 0, dep: 0 }, sums = { bal: 0, dep: 0 }, unique = {};
+            ['bal', 'dep'].forEach(function(kind){
+                state[kind].order.forEach(function(sup){ pcAktywne(state[kind].groups[sup]).forEach(function(r){
+                    var amount = kind === 'bal' ? pcBalAmtVal(r) : pcDepAmt(r);
+                    if (!/^\d{4,7}$/.test(String(r.order)) || amount == null || !isFinite(amount)) throw new Error('Order ' + (r.order || '?') + ': brak prawidłowego numeru lub kwoty.');
+                    counts[kind]++; sums[kind] += Math.round(Number(amount.toFixed(2)) * 100); unique[String(r.order)] = 1;
+                }); });
+            });
+            if (!counts.bal && !counts.dep) throw new Error('Najpierw kliknij „Przetwórz”.');
+            return { version: 1, date: date,
+                bal: chnTransferRows(renderBal(true).html, 'bal'), dep: chnTransferRows(renderDepo(true).html, 'dep'),
+                counts: counts, sums: { bal: sums.bal / 100, dep: sums.dep / 100 }, unique: Object.keys(unique).length };
+        }
+        function chnTransferRequest(cfg, data){
+            return new Promise(function(resolve, reject){
+                GM_xmlhttpRequest({ method: 'POST', url: cfg.url, headers: { 'Content-Type': 'application/json' },
+                    data: JSON.stringify(Object.assign({}, data, { secret: cfg.secret })), timeout: 90000,
+                    onload: function(r){
+                        try { var result = JSON.parse(r.responseText); if (!result.ok) throw new Error(result.error || 'Błąd zapisu.'); resolve(result); }
+                        catch(e){ reject(new Error('Apps Script: ' + (e instanceof SyntaxError ? 'nie zwrócił JSON. Sprawdź adres /exec i wdrożenie.' : e.message))); }
+                    },
+                    onerror: function(){ reject(new Error('Brak odpowiedzi. Ponów tę samą paczkę — identyfikator chroni przed duplikatem.')); },
+                    ontimeout: function(){ reject(new Error('Upłynął czas oczekiwania. Ponów tę samą paczkę — zapis mógł się zakończyć.')); }
+                });
+            });
+        }
+        chnBookApi = {request:function(data){return chnTransferRequest(chnTransferSettings(),data);}};
+        panel.querySelector('#tm-sheet-book-date').value=balSheetToday();
+        wp.querySelector('#wp-transfer').onclick = function(){
+            if (state._wpBusy || state._odsw || state._przelicz) { wp.querySelector('#wp-status').textContent = 'Poczekaj na zakończenie przetwarzania.'; return; }
+            var cfg = chnTransferSettings(), box = document.createElement('div');
+            box.style.cssText = 'position:fixed;inset:0;background:#0008;z-index:2147483600;display:flex;align-items:center;justify-content:center;font:13px Arial;color:#332524';
+            box.innerHTML = '<div style="background:white;padding:22px;border-radius:12px;width:650px;max-width:95vw;max-height:90vh;overflow:auto">'
+                + '<h3 style="margin-top:0">Przenieś ordery do arkusza „Chińskie”</h3>'
+                + '<p>Balance i DEPO trafią do osobnych zakładek, z linkami i kolorami. W nagłówku każdej listy będzie data oraz suma tylko tej listy. Przenoszone są aktywne wiersze z przetworzonej tabeli.</p>'
+                + '<label>Data listy <input type="date" data-date></label>'
+                + '<details data-config><summary style="margin:12px 0;cursor:pointer">Połączenie z Apps Script (ustaw raz)</summary>'
+                + '<label>Adres wdrożenia /exec<input data-url type="url" style="display:block;width:100%" placeholder="https://script.google.com/macros/s/…/exec"></label>'
+                + '<label>Klucz połączenia<input data-secret type="password" autocomplete="off" style="display:block;width:100%"></label>'
+                + '<p>Adres wdrożenia jest już wpisany. Klucz wpisz raz — będzie automatycznie zapamiętany w tej przeglądarce.</p></details>'
+                + '<p data-summary></p><p data-msg style="white-space:pre-wrap"></p>'
+                + '<div data-actions style="display:flex;gap:8px;flex-wrap:wrap"><button data-check>Sprawdź i przenieś</button><button data-close>Zamknij</button></div></div>';
+            document.body.appendChild(box);
+            var dateEl = box.querySelector('[data-date]'), msg = box.querySelector('[data-msg]'), summary = box.querySelector('[data-summary]');
+            dateEl.value = balSheetToday(); box.querySelector('[data-url]').value = cfg.url || ''; box.querySelector('[data-secret]').value = cfg.secret || '';
+            box.querySelector('[data-config]').open = !cfg.secret;
+            box.querySelector('[data-secret]').addEventListener('input', function(){
+                var saved = chnTransferSettings();
+                saved.secret = this.value.trim();
+                GM_setValue(CHN_TRANSFER_KEY, JSON.stringify(saved));
+            });
+            var busy = false;
+            box.querySelector('[data-close]').onclick = function(){ if (!busy) box.remove(); };
+            function summarize(){ try { var p = chnTransferPayload(dateEl.value); summary.textContent = 'Balance: ' + p.counts.bal + ' pozycji / ' + p.sums.bal.toFixed(2) + '; DEPO: ' + p.counts.dep + ' pozycji / ' + p.sums.dep.toFixed(2) + '; łącznie: ' + (p.sums.bal + p.sums.dep).toFixed(2) + ' · ' + p.unique + ' różnych orderów.'; } catch(e){ summary.textContent = e.message; } }
+            summarize(); dateEl.onchange = summarize;
+            box.querySelectorAll('input').forEach(function(input){ input.addEventListener('input', function(){ box.querySelectorAll('[data-choice]').forEach(function(el){ el.remove(); }); }); });
+            function freeze(on){ busy = on; box.querySelectorAll('button,input').forEach(function(el){ el.disabled = on; }); }
+            async function send(mode, preview, payload){
+                if (busy) return;
+                freeze(true); msg.textContent = 'Zapisuję obie listy…';
+                try {
+                    var fingerprint = JSON.stringify({ payload: payload, mode: mode });
+                    var saved = JSON.parse(GM_getValue('chn_transfer_pending_v1', 'null'));
+                    if (!saved || saved.fingerprint !== fingerprint) {
+                        saved = { fingerprint: fingerprint, id: 'chn-' + Date.now() + '-' + Math.random().toString(36).slice(2), url: cfg.url };
+                        GM_setValue('chn_transfer_pending_v1', JSON.stringify(saved));
+                    }
+                    if (saved.url !== cfg.url) throw new Error('Paczka oczekuje na wynik pod poprzednim adresem wdrożenia. Przywróć ten adres.');
+                    var result = await chnTransferRequest(cfg, { action: 'write', payload: payload, mode: mode, expected: preview.snapshot, id: saved.id });
+                    // ID sluzy tylko do ponowienia operacji bez potwierdzenia.
+                    // Po sukcesie nastepny swiadomy zapis musi dostac nowe ID.
+                    GM_setValue('chn_transfer_pending_v1', 'null');
+                    msg.textContent = (result.replayed ? 'Potwierdzono wcześniejszy zapis; teraz nie zmieniono arkusza. Aby ponownie zastąpić lub dopisać listę, kliknij „Sprawdź i przenieś” i wybierz operację. Poprzedni zapis: ' : 'Zapisano. ') + result.message;
+                    wp.querySelector('#wp-status').textContent = msg.textContent;
+                    // Znikaja przyciski tej operacji; kolejna wymaga nowego podgladu.
+                    box.querySelectorAll('[data-choice]').forEach(function(el){ el.remove(); });
+                } catch(e){ msg.textContent = e.message; }
+                finally { freeze(false); }
+            }
+            box.querySelector('[data-check]').onclick = async function(){
+                freeze(true); msg.textContent = 'Sprawdzam zakładki i istniejące listy…';
+                box.querySelectorAll('[data-choice]').forEach(function(el){ el.remove(); });
+                try {
+                    cfg = { url: box.querySelector('[data-url]').value.trim(), secret: box.querySelector('[data-secret]').value.trim() };
+                    if (!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(cfg.url) || cfg.secret.length < 24) throw new Error('Uzupełnij adres /exec oraz klucz połączenia (minimum 24 znaki).');
+                    var payload = chnTransferPayload(dateEl.value);
+                    GM_setValue(CHN_TRANSFER_KEY, JSON.stringify(cfg));
+                    var preview = await chnTransferRequest(cfg, { action: 'preview', payload: payload });
+                    msg.textContent = preview.message;
+                    var choices = preview.exists ? [['Zastąp istniejącą listę', 'replace'], ['Dodaj poniżej mimo to', 'append']] : [['Przenieś obie listy', 'append']];
+                    choices.forEach(function(choice){
+                        var button = document.createElement('button'); button.textContent = choice[0]; button.setAttribute('data-choice', '1');
+                        button.onclick = function(){
+                            if (choice[1] === 'replace' && !confirm('Zastąpić wszystkie bloki z ' + payload.date + ' w obu zakładkach?\nUsunięte zostaną też ręczne wpisy w tych blokach (osoby, daty, księgowanie).\n' + preview.message)) return;
+                            send(choice[1], preview, payload);
+                        };
+                        box.querySelector('[data-actions]').prepend(button);
+                    });
+                } catch(e){ msg.textContent = e.message; }
+                finally { freeze(false); }
+            };
+        };
+
         wp.querySelector('#wp-copy-bal').onclick = function(){
             var status = wp.querySelector('#wp-status');
             if (!state.bal.order.length) { status.textContent = 'Najpierw Przetw\u00f3rz.'; return; }
