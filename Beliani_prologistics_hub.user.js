@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.09
+// @version      5.60.10
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -73693,6 +73693,7 @@
     // reszty modulu — trzeba tylko wskazac rodzine w polu `grupa`. Kolejnosci nie
     // ustawiamy recznie: oba ekrany sortuja alfabetycznie po nazwie operatora.
     const SAL_LISTA = [
+        { id: 'p24', grupa: 'fp', nazwa: 'Przelewy24 ↔ Export payments', opis: 'raport XLSX · konto 1031 · dopasowanie po ID i mailu', gotowe: true },
         { id: 'paypal', grupa: 'fp', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
         // Saferpay parujemy po Transaction ID — obie strony go niosa. Przy okazji
         // sprawdzamy terminal: cztery sa reczne i tam zdarza sie zly wybor.
@@ -73953,6 +73954,7 @@
         p.querySelectorAll('.sal-poz').forEach(function (d){
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
             if (x && x.gotowe) d.onclick = function (){
+                if (x.id === 'p24'){ salRysujP24(); return; }
                 (x.id === 'bank' ? salRysujBank
                     : (x.id === 'amazon' ? salRysujAmz
                     : (x.id === 'mano' ? salRysujMM
@@ -73963,6 +73965,252 @@
                     : (x.id === 'mobilepay' ? salRysujMP : salRysujPP))))))))();
             };
         });
+    }
+
+
+    // ================= PRZELEWY24: raport plikowy i odczyt Prologistics =================
+    let P24_FILE = null, P24_REFUNDS = null, P24_RUN = false;
+    function p24Text(v){ return String(v == null ? '' : v).trim(); }
+    function p24Stamp(v){
+        const s = p24Text(v).replace('T', ' ');
+        const m = s.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})(?::(\d{2}))?$/);
+        if (!m || !Number.isFinite(Date.parse(m[1] + 'T' + m[2] + ':' + (m[3] || '00')))) throw new Error('Nieprawidłowa data: ' + s);
+        return m[1] + ' ' + m[2] + ':' + (m[3] || '00');
+    }
+    function p24Read(rows){
+        const h = (rows[0] || []).map(p24Text), names = ['ID transakcji','Wpłata','Kwota','Waluta','Opis','Status'];
+        const k = {}; names.forEach(n=>{ k[n]=h.indexOf(n); if(k[n]<0) throw new Error('Brak kolumny P24: '+n); });
+        const seen = new Set(), out=[];
+        rows.slice(1).forEach((r,i)=>{
+            if(!r || !r.some(v=>p24Text(v))) return;
+            const id=p24Text(r[k['ID transakcji']]).toUpperCase(), cents=Number(r[k.Kwota]);
+            if(!id || seen.has(id)) throw new Error('Brak lub powtórzony ID P24 w wierszu '+(i+2));
+            seen.add(id);
+            if(!Number.isSafeInteger(cents)||cents<=0) throw new Error('Nieprawidłowa kwota w groszach, wiersz '+(i+2));
+            const email=(p24Text(r[k.Opis]).match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[])[0]||'';
+            const description=p24Text(r[k.Opis]),orderNum=(description.match(/^(?:(?:Beliani\s+)?zam[oó]wienie\s+)?(\d{7,})\s*\/\s*\d+\s*$/i)||[])[1]||'';
+            out.push({id,cents,email:email.toLowerCase(),orderNum,description,date:p24Stamp(r[k['Wpłata']]),currency:p24Text(r[k.Waluta]).toUpperCase(),status:p24Text(r[k.Status]).toLowerCase(),row:i+2});
+        });
+        if(!out.length) throw new Error('Raport P24 jest pusty.');
+        return out;
+    }
+    function p24Ledger(rows){
+        const h=(rows[0]||[]).map(p24Text), k={};
+        ['Payment Date','Amount','Debit','Credit','Transaction ID','Comment','Auftrag number'].forEach(n=>{k[n]=h.indexOf(n);if(k[n]<0)throw new Error('Brak kolumny Export payments: '+n);});
+        return rows.slice(1).filter(r=>r&&p24Text(r[k.Amount])).map((r,i)=>{
+            const amount=slKwota(r[k.Amount]);if(amount==null)throw new Error('Nieprawidłowa kwota Export payments');
+            const ids=new Set((p24Text(r[k['Transaction ID']])+' '+p24Text(r[k.Comment])).toUpperCase().match(/\b[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}\b/g)||[]);
+            const order=(p24Text(r[k['Auftrag number']]).match(/^(\d+)\s*\/\s*(\d+)$/)||[]);
+            return {key:i,row:i+2,date:p24Stamp(r[k['Payment Date']]),cents:Math.round(amount*100),debit:p24Text(r[k.Debit]),credit:p24Text(r[k.Credit]),ids,order:order[1]?order[1]+'/'+order[2]:'',vatAccount:p24Text(r[h.indexOf('VAT Account')]),invoice:p24Text(r[h.indexOf('Invoice Number')]),used:false};
+        });
+    }
+    function p24Match(transactions,ledger){
+        const result=[];
+        transactions.forEach(t=>{
+            const hits=ledger.filter(p=>p.debit==='1031'&&p.ids.has(t.id));
+            const exact=hits.filter(p=>p.cents===t.cents&&!p.used);
+            const orders=new Set(exact.map(p=>p.order));
+            // A later reclassification may repeat the same incoming amount. Accept only
+            // when an opposite entry cancels every extra incoming record on that order.
+            const cancel=ledger.filter(p=>p.credit==='1031'&&p.ids.has(t.id)&&p.cents===t.cents&&orders.has(p.order));
+            const valid=exact.length===1 || (exact.length>1&&orders.size===1&&orders.has('')===false&&cancel.length===exact.length-1);
+            if(valid){exact.forEach(p=>{p.used=true;}); result.push({t,kind:'id',orders:[...orders].filter(Boolean),hits:exact});}
+            else result.push({t,kind:hits.length?'difference':'missing',orders:[],hits});
+        });
+        return result;
+    }
+    function p24EmailMatch(results,ledger,found){
+        const pending=results.filter(r=>r.kind!=='id'), proposals=new Map();
+        pending.forEach(r=>{
+            const info=r.t.orderNum?{orders:[...new Set(ledger.filter(p=>p.order.split('/')[0]===r.t.orderNum).map(p=>p.order))]}:found.get(r.t.email);
+            if(!info || info.error){r.searchError=info?info.error:'Brak maila w raporcie P24';return;}
+            r.orders=info.orders;
+            const options=ledger.filter(p=>!p.used&&p.debit==='1031'&&p.cents===r.t.cents&&info.orders.includes(p.order));
+            proposals.set(r,options);
+        });
+        pending.forEach(r=>{
+            const options=proposals.get(r)||[];
+            if(options.length===1 && [...proposals.values()].filter(a=>a.includes(options[0])).length===1){
+                options[0].used=true;r.kind=r.t.orderNum?'order':'email';r.hits=options;r.orders=[options[0].order];
+            }
+            else if(options.length) r.reason='Kilka wpłat lub księgowań pasuje do tego samego maila i kwoty';
+            else if(!r.searchError) r.reason=r.orders.length?'Zamówienie znalezione po mailu, brak zgodnej wpłaty w eksporcie':'Nie znaleziono zamówienia po mailu';
+        });
+        return results;
+    }
+    async function p24FindEmail(email){
+        if(!email) return {orders:[],error:'Brak maila w raporcie P24'};
+        const url='/search.php?express&what=email&email='+encodeURIComponent(email);
+        const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),30000);
+        try{
+            const res=await fetch(url,{credentials:'same-origin',signal:controller.signal});
+            if(!res.ok)throw new Error('HTTP '+res.status);
+            const doc=new DOMParser().parseFromString(await res.text(),'text/html');
+            if(/login\.php/i.test(res.url)||doc.querySelector('input[type="password"]'))throw new Error('Sesja Prologistics wygasła');
+            const orders=new Set();
+            const take=u=>{const a=new URL(u,location.origin);if(a.origin!==location.origin||!a.pathname.endsWith('/auction.php'))return;const n=a.searchParams.get('number'),t=a.searchParams.get('txnid');if(/^\d+$/.test(n||'')&&/^\d+$/.test(t||''))orders.add(n+'/'+t);};
+            take(res.url);doc.querySelectorAll('a[href*="auction.php?"]').forEach(a=>take(a.getAttribute('href')));
+            if(!orders.size&&!/search|szuk|no .*found|nothing found/i.test(doc.body.textContent))throw new Error('Nierozpoznana odpowiedź wyszukiwarki');
+            return {orders:[...orders]};
+        }finally{clearTimeout(timer);}
+    }
+    function p24Links(orders){return orders.map(o=>{const a=o.split('/');return '<a target="_blank" rel="noopener" href="/auction.php?number='+encodeURIComponent(a[0])+'&txnid='+encodeURIComponent(a[1])+'">'+salEsc(o.replace('/',' / '))+'</a>';}).join(', ');}
+    function p24Render(results,ignored){
+        const ok=results.filter(r=>['id','email','order'].includes(r.kind)),bad=results.filter(r=>!ok.includes(r));
+        const money=n=>(n/100).toLocaleString('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2});
+        const table=items=>'<div style="overflow:auto"><table style="width:100%;font-size:11px;border-collapse:collapse"><thead><tr><th>Wpłata P24</th><th>ID / mail lub opis</th><th>PLN</th><th>Zamówienie</th><th>Wynik</th></tr></thead><tbody>'+items.map(r=>'<tr style="border-bottom:1px solid #ddd"><td>'+salEsc(r.t.date)+'</td><td>'+salEsc(r.t.id)+'<br>'+salEsc(r.t.email||r.t.description)+'</td><td style="text-align:right">'+money(r.t.cents)+'</td><td>'+p24Links(r.orders)+'</td><td>'+salEsc(r.kind==='id'?'Dopasowane po ID i kwocie':r.kind==='order'?'Dopasowane po numerze zamówienia i kwocie':r.kind==='email'?'Dopasowane po mailu, zamówieniu i kwocie':r.searchError?'Błąd wyszukiwania: '+r.searchError:r.reason||'ID znalezione, kwota lub liczba zapisów nie pasuje')+'</td></tr>').join('')+'</tbody></table></div>';
+        return '<p><b>Sprawdzone: '+results.length+' · dopasowane: '+ok.length+' · do wyjaśnienia: '+bad.length+'</b><br>Po mailu: '+ok.filter(r=>r.kind==='email').length+' · poza okresem / statusem dokonana: '+ignored+'</p>'
+          +'<p>Po numerze zamówienia z opisu: '+ok.filter(r=>r.kind==='order').length+'. Brak dopasowania dotyczy konta 1031 i wybranego okresu.</p>'
+          +(bad.length?table(bad):'<p>Wszystkie wybrane wpłaty mają dopasowanie.</p>')
+          +'<details><summary>Dopasowane ('+ok.length+')</summary>'+table(ok)+'</details>';
+    }
+    function p24ReadRefunds(rows){
+        const h=(rows[0]||[]).map(p24Text),k={},occurrences=new Map();
+        ['ID transakcji','Data zlecenia','Data wykonania','Kwota','Waluta','Status','ID wypłaty'].forEach(n=>{k[n]=h.indexOf(n);if(k[n]<0)throw new Error('Brak kolumny zwrotów: '+n);});
+        return rows.slice(1).filter(r=>r&&r.some(v=>p24Text(v))).map((r,i)=>{
+            const id=p24Text(r[k['ID transakcji']]).toUpperCase(),cents=Number(r[k.Kwota]),status=p24Text(r[k.Status]).toLowerCase();
+            if(!id||!Number.isSafeInteger(cents)||cents<=0)throw new Error('Nieprawidłowy zwrot w wierszu '+(i+2));
+            const item={id,cents,status,currency:p24Text(r[k.Waluta]).toUpperCase(),date:status==='wykonany'?p24Stamp(r[k['Data wykonania']]):'',requested:p24Stamp(r[k['Data zlecenia']]),payout:p24Text(r[k['ID wypłaty']])};
+            const signature=JSON.stringify(item),occurrence=occurrences.get(signature)||0;occurrences.set(signature,occurrence+1);
+            return {...item,occurrence};
+        });
+    }
+    function p24RefundCompare(refunds,ledger,start,end){
+        const selected=ledger.filter(p=>p.date>=start&&p.date<=end),cancelled=new Set(),reclassificationPairs=[];
+        // The original receipt can predate the report. Require a unique reversing/rebooking
+        // pair with the same ID, order, amount and timestamp, but different counteraccounts.
+        const reversals=selected.filter(p=>p.credit==='1031'&&p.debit!=='1031'&&p.debit&&p.order&&p.ids.size===1&&p.cents>0);
+        const receipts=selected.filter(p=>p.debit==='1031'&&p.credit!=='1031'&&p.credit&&p.order&&p.ids.size===1&&p.cents>0);
+        const isPair=(out,incoming)=>incoming.credit!==out.debit&&incoming.order===out.order&&incoming.date===out.date&&incoming.cents===out.cents&&incoming.ids.has([...out.ids][0])&&(!out.invoice||!incoming.invoice||out.invoice===incoming.invoice);
+        reversals.forEach(out=>{
+            const replacements=receipts.filter(p=>isPair(out,p));
+            if(replacements.length!==1||reversals.filter(p=>isPair(p,replacements[0])).length!==1)return;
+            const incoming=replacements[0];
+            if(cancelled.has(out.key)||cancelled.has(incoming.key))return;
+            cancelled.add(out.key);cancelled.add(incoming.key);
+            reclassificationPairs.push({out,incoming,vatChanged:!!out.vatAccount&&!!incoming.vatAccount&&out.vatAccount!==incoming.vatAccount});
+        });
+        const groups=new Map(),seen=new Set();let duplicates=0,ignored=0;
+        refunds.forEach(r=>{
+            const key=JSON.stringify([r.id,r.requested,r.date,r.cents,r.currency,r.status,r.payout,r.occurrence||0]);
+            if(seen.has(key)){duplicates++;return;}seen.add(key);
+            if(r.status!=='wykonany'||r.date<start||r.date>end){ignored++;return;}
+            if(r.currency!=='PLN')throw new Error('Zwroty zawierają walutę inną niż PLN.');
+            if(!groups.has(r.id))groups.set(r.id,{id:r.id,refunds:[],cents:0,postings:[],orders:[]});
+            const g=groups.get(r.id);g.refunds.push(r);g.cents+=r.cents;
+        });
+        const outgoing=selected.filter(p=>p.credit==='1031'&&p.debit!=='1031'&&!cancelled.has(p.key)),unassigned=[];
+        outgoing.forEach(p=>{
+            const ids=[...p.ids].filter(id=>groups.has(id));
+            if(ids.length===1)groups.get(ids[0]).postings.push(p);else unassigned.push(p);
+        });
+        const rows=[...groups.values()].map(g=>{
+            g.booked=g.postings.reduce((s,p)=>s+p.cents,0);g.orders=[...new Set(g.postings.map(p=>p.order).filter(Boolean))];
+            g.kind=!g.postings.length?'missing':g.booked===g.cents?'id':'difference';
+            g.state=g.kind==='missing'?'Brak dopasowania w Prologistics':g.kind==='id'?'Zgodne':'Różnica kwoty zwrotów';return g;
+        });
+        // Amount suggestions never consume postings or turn an uncertain match into a confirmed one.
+        // A single posting needs no order number; unrelated blank orders must never be summed.
+        const byOrder=new Map(),candidates=unassigned.filter(p=>p.cents>0),claims=new Map();
+        candidates.filter(p=>p.order).forEach(p=>{if(!byOrder.has(p.order))byOrder.set(p.order,[]);byOrder.get(p.order).push(p);});
+        rows.forEach(g=>{
+            g.probable=[];
+            if(g.postings.length)return;
+            const add=(posts,basis)=>{
+                g.probable.push({order:posts[0].order,cents:g.cents,basis,dates:[...new Set(posts.map(p=>p.date))],postings:posts});
+                posts.forEach(p=>{if(!claims.has(p.key))claims.set(p.key,new Set());claims.get(p.key).add(g.id);});
+            };
+            candidates.filter(p=>p.cents===g.cents).forEach(p=>add([p],'kwota zapisu'));
+            byOrder.forEach((posts,order)=>{
+                if(posts.length>1&&posts.reduce((s,p)=>s+p.cents,0)===g.cents)add(posts,'suma zapisów dla Auftragu');
+            });
+            if(g.probable.length){g.kind='probable';g.state='Prawdopodobne dopasowanie po kwocie';}
+        });
+        rows.forEach(g=>g.probable.forEach(c=>{c.shared=c.postings.some(p=>claims.get(p.key).size>1);}));
+        const missingProlo=rows.filter(g=>g.kind==='missing'),missingP24=unassigned.filter(p=>!claims.has(p.key));
+        const counts={matched:rows.filter(g=>g.kind==='id').length,probable:rows.filter(g=>g.kind==='probable').length,missingProlo:missingProlo.length,missingP24:missingP24.length,differences:rows.filter(g=>g.kind==='difference').length};
+        return {rows,unassigned,missingProlo,missingP24,counts,duplicates,ignored,reclassificationPairs,reclassified:reclassificationPairs.length};
+    }
+    function p24RefundRender(r){
+        const money=n=>(n/100).toLocaleString('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2}),c=r.counts;
+        const table=(headers,body)=>'<div style="overflow:auto"><table style="width:100%;font-size:11px;border-collapse:collapse"><thead><tr>'+headers.map(h=>'<th style="text-align:left;padding:5px">'+h+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></div>';
+        const row=cells=>'<tr style="border-bottom:1px solid #ddd">'+cells.map(v=>'<td style="padding:5px;vertical-align:top">'+v+'</td>').join('')+'</tr>';
+        const identity=g=>salEsc(g.id)+'<br><small>'+salEsc([...new Set(g.refunds.map(p=>p.date))].join(', '))+'<br>'+g.refunds.length+' zwrot(y)</small>';
+        const order=o=>o?p24Links([o]):'Brak numeru Auftragu';
+        const postings=items=>items.map(p=>'<div>'+money(p.cents)+' PLN · '+salEsc(p.date)+'<br>'+order(p.order)+'<br><small>ID: '+salEsc([...p.ids].join(', ')||'brak')+' · wiersz eksportu '+p.row+'</small></div>').join('<br>');
+        const comparison=items=>table(['Zwrot P24 / data wykonania','P24 PLN','Prologistics PLN','Auftrag / szczegóły'],items.map(g=>row([identity(g),money(g.cents),money(g.booked),p24Links(g.orders)+'<details><summary>Zapisy Prologistics</summary>'+postings(g.postings)+'</details>'])).join(''));
+        const probable=r.rows.filter(g=>g.kind==='probable'),different=r.rows.filter(g=>g.kind==='difference'),matched=r.rows.filter(g=>g.kind==='id');
+        return '<section id="p24-refund-results"><hr><h3>Zwroty · nadwyżki i pozostałe zwroty</h3>'
+          +'<p><b>Zgodne po ID: '+c.matched+' · prawdopodobne po kwocie: '+c.probable+' · różnice kwot: '+c.differences+'</b><br>Brak dopasowania w Prologistics: '+c.missingProlo+' · brak dopasowania w plikach P24: '+c.missingP24+'.</p>'
+          +'<p>Braki dotyczą wybranego okresu i wgranych raportów. W P24 liczy się data wykonania zwrotu, w Prologistics data księgowania. Dopasowania po kwocie wymagają potwierdzenia i są pokazane osobno.</p>'
+          +'<h4>P24 — brak dopasowania w Prologistics ('+c.missingProlo+')</h4>'
+          +(c.missingProlo?table(['Zwrot P24 / data wykonania','P24 PLN','Wynik'],r.missingProlo.map(g=>row([identity(g),money(g.cents),'Nie znaleziono zapisu po ID ani propozycji po kwocie'])).join('')):'<p>Brak takich pozycji.</p>')
+          +'<h4>Prologistics — brak dopasowania w plikach P24 ('+c.missingP24+')</h4>'
+          +(c.missingP24?table(['Data księgowania','ID P24 w Prologistics','Prologistics PLN','Auftrag'],r.missingP24.map(p=>row([salEsc(p.date),salEsc([...p.ids].join(', ')||'Brak ID'),money(p.cents),order(p.order)])).join('')):'<p>Brak takich pozycji.</p>')
+          +'<h4>Prawdopodobne dopasowania po kwocie ('+c.probable+')</h4>'
+          +(probable.length?table(['Zwrot P24 / data wykonania','P24 PLN','Pasujące zapisy Prologistics','Wynik'],probable.map(g=>row([identity(g),money(g.cents),g.probable.map(p=>'<div>'+postings(p.postings)+'<small>'+salEsc(p.basis)+(p.postings.length>1?' · razem '+money(p.cents)+' PLN':'')+'</small>'+(p.shared?'<br><b>Ten zapis pasuje również do innych zwrotów P24.</b>':'')+'</div>').join('<hr>'),g.probable.length>1?'Kilka możliwości — wymaga potwierdzenia':'Zgodna kwota — wymaga potwierdzenia'])).join('')):'<p>Brak propozycji po kwocie.</p>')
+          +(different.length?'<h4>Różnice kwot dla zgodnego ID ('+c.differences+')</h4>'+comparison(different):'')
+          +'<details><summary>Zgodne zwroty ('+c.matched+')</summary>'+comparison(matched)+'</details>'
+          +'<details><summary>Pominięte przeksięgowania ('+r.reclassified+')</summary><p>Pary −/+ tej samej kwoty, z tym samym ID, Auftrag i czasem księgowania oraz zmianą konta. Pierwotna wpłata może pochodzić sprzed wybranego okresu.</p>'
+          +table(['Data','Auftrag','Kwota przeniesiona PLN','Konta','Rodzaj'],r.reclassificationPairs.map(p=>row([salEsc(p.out.date),order(p.out.order),money(p.out.cents),salEsc(p.out.debit)+' → '+salEsc(p.incoming.credit),p.vatChanged?'Zmiana VAT ('+salEsc(p.out.vatAccount)+' → '+salEsc(p.incoming.vatAccount)+')':'Przeksięgowanie'])).join(''))+'</details>'
+          +'<p><small>Pominięte powtórzone wiersze plików: '+r.duplicates+'; poza okresem lub niewykonane: '+r.ignored+'. Raport P24 nie określa przyczyny zwrotu.</small></p></section>';
+    }
+    function salRysujP24(){
+        const p=salPanel(),u=salUst();let saved={};try{saved=JSON.parse(GM_getValue('sal_p24_dates','{}'))||{};}catch(e){}
+        p.innerHTML='<div style="display:flex;justify-content:space-between;margin-bottom:10px"><b style="color:#750000">Salda · Przelewy24 ↔ Export payments</b><div><button id="p24-back">← lista</button> <button id="p24-close">×</button></div></div>'
+          +'<div style="border:1px solid #eee;border-radius:8px;padding:10px"><b>Raport Przelewy24 · konto 1031 · PLN</b><p>Wybierz lub upuść raport XLSX z panelu P24. Kwoty w raporcie są w groszach.</p><input id="p24-file" type="file" accept=".xlsx"><div id="p24-info"></div></div>'
+          +'<div style="border:1px solid #eee;border-radius:8px;padding:10px;margin-top:8px"><b>Zwroty P24 — opcjonalnie</b><p>Wybierz jeden lub kilka raportów zwrotów XLSX.</p><input id="p24-refunds" type="file" accept=".xlsx" multiple> <button id="p24-clear-refunds">Usuń pliki zwrotów</button><div id="p24-refunds-info"></div></div>'
+          +'<p><label>Od <input id="p24-from" type="date" value="'+salEsc(saved.from||u.od)+'"></label> <label>Do <input id="p24-to" type="date" value="'+salEsc(saved.to||u.do)+'"></label> <label>godz. <input id="p24-time" type="time" step="1" value="'+salEsc(saved.time||'23:59:59')+'"></label></p>'
+          +'<p>Zakres obejmuje datę wpłaty P24 i datę księgowania Prologistics, do wskazanej godziny włącznie, według czasu w raportach.</p>'
+          +'<button id="p24-run" style="padding:6px 14px;border:0;border-radius:6px;background:#750000;color:white">Pobierz Export payments i porównaj</button><p id="p24-status"></p><div id="p24-result"></div>';
+        const $=s=>p.querySelector(s),info=()=>{$('#p24-info').textContent=P24_FILE?P24_FILE.name+' · '+P24_FILE.rows.length+' wpłat':'Nie wczytano pliku';};info();
+        const refundInfo=()=>{$('#p24-refunds-info').textContent=P24_REFUNDS?P24_REFUNDS.names.join(', ')+' · '+P24_REFUNDS.rows.length+' wierszy':'Bez plików zwrotów — sprawdzane będą tylko wpłaty.';};refundInfo();
+        $('#p24-clear-refunds').onclick=()=>{P24_REFUNDS=null;$('#p24-refunds').value='';$('#p24-result').innerHTML='';refundInfo();};
+        $('#p24-refunds').onchange=async e=>{
+            const files=[...e.target.files];if(P24_RUN||!files.length)return;
+            P24_REFUNDS=null;$('#p24-result').innerHTML='';$('#p24-run').disabled=true;
+            try{const rows=[];for(const f of files)rows.push(...p24ReadRefunds(await slXlsx(new Uint8Array(await f.arrayBuffer()))));if(!rows.length)throw new Error('Pliki zwrotów są puste');P24_REFUNDS={names:files.map(f=>f.name),rows};$('#p24-status').textContent='Pliki zwrotów wczytane.';}
+            catch(err){$('#p24-status').textContent='Błąd pliku zwrotów: '+err.message;}finally{$('#p24-run').disabled=false;refundInfo();}
+        };
+        $('#p24-close').onclick=()=>{p.style.display='none';};$('#p24-back').onclick=()=>{if(!P24_RUN){p.ondragover=null;p.ondrop=null;salRysujGrupe('fp');}};
+        const load=async files=>{if(P24_RUN||!files[0])return;P24_FILE=null;$('#p24-result').innerHTML='';info();try{const f=files[0],rows=p24Read(await slXlsx(new Uint8Array(await f.arrayBuffer())));P24_FILE={name:f.name,rows};$('#p24-from').value=rows.reduce((s,r)=>s<r.date?s:r.date,rows[0].date).slice(0,10);$('#p24-to').value=rows.reduce((s,r)=>s>r.date?s:r.date,rows[0].date).slice(0,10);$('#p24-status').textContent='Raport wczytany.';}catch(e){$('#p24-status').textContent='Błąd pliku: '+e.message;}info();};
+        $('#p24-file').onchange=e=>load(e.target.files);p.ondragover=e=>{e.preventDefault();};p.ondrop=e=>{e.preventDefault();load(e.dataTransfer.files);};
+        ['#p24-from','#p24-to','#p24-time'].forEach(s=>{$(s).onchange=()=>{$('#p24-result').innerHTML='';$('#p24-status').textContent='Zakres zmieniony — uruchom porównanie ponownie.';};});
+        $('#p24-run').onclick=async()=>{
+            if(P24_RUN)return;
+            const status=$('#p24-status'),out=$('#p24-result');out.innerHTML='';
+            if(!P24_FILE){status.textContent='Wczytaj raport P24.';return;}
+            const from=$('#p24-from').value,to=$('#p24-to').value,time=$('#p24-time').value;
+            if(!from||!to||!time||from>to){status.textContent='Uzupełnij poprawny zakres dat i godzinę.';return;}
+            if(typeof window.__TM_EXPORT_FETCH!=='function'){status.textContent='Włącz moduł Export payments w Narzędziach.';return;}
+            const end=p24Stamp(to+' '+time),start=from+' 00:00:00';
+            const tx=P24_FILE.rows.filter(r=>r.date>=start&&r.date<=end&&r.status==='dokonana');
+            if(!tx.length){status.textContent='Brak dokonanych wpłat w wybranym okresie.';return;}
+            if(tx.some(r=>r.currency!=='PLN')){status.textContent='Konto 1031 obsługuje PLN — raport zawiera inną walutę.';return;}
+            P24_RUN=true;p.querySelectorAll('input,button').forEach(e=>{e.disabled=true;});
+            const started=Date.now();let stage='Pobieram konto 1031…';
+            const elapsed=()=>Math.floor((Date.now()-started)/1000);
+            const progress=()=>{status.textContent=stage+' · '+elapsed()+' s';};
+            progress();const clock=setInterval(progress,1000);
+            try{
+                GM_setValue('sal_p24_dates',JSON.stringify({from,to,time}));
+                const files=await window.__TM_EXPORT_FETCH(['1031'],from,to,'excel',(i,n,name,step)=>{stage='Pobieram konto 1031'+(step?' — '+step:'…');progress();},null);
+                if(files.length!==1||files[0].blad||!files[0].buf)throw new Error(files[0]&&files[0].blad||'Niepełny eksport konta 1031');
+                stage='Porównuję transakcje…';progress();
+                const ledger=p24Ledger(slXls(files[0].buf)).filter(r=>r.date>=start&&r.date<=end);
+                const results=p24Match(tx,ledger),found=new Map();
+                const emails=[...new Set(results.filter(r=>r.kind!=='id').map(r=>r.t.email).filter(Boolean))];
+                for(let i=0;i<emails.length;i++){
+                    stage='Wyszukuję zamówienia po mailu: '+(i+1)+' / '+emails.length;progress();
+                    try{found.set(emails[i],await p24FindEmail(emails[i]));}catch(e){found.set(emails[i],{orders:[],error:e.name==='AbortError'?'Przekroczono czas oczekiwania':e.message});}
+                }
+                p24EmailMatch(results,ledger,found);
+                const refundResult=P24_REFUNDS?p24RefundCompare(P24_REFUNDS.rows,ledger,start,end):null;
+                out.innerHTML=p24Render(results,P24_FILE.rows.length-tx.length)+(refundResult?p24RefundRender(refundResult):'<p>Zwroty nie były sprawdzane — nie dodano raportu zwrotów.</p>');
+                status.textContent='Porównanie zakończone w '+elapsed()+' s. Źródło: konto 1031, '+start+' – '+end+'.';
+            }catch(e){status.textContent='Nie ukończono porównania po '+elapsed()+' s: '+e.message;}
+            finally{clearInterval(clock);P24_RUN=false;p.querySelectorAll('input,button').forEach(e=>{e.disabled=false;});}
+        };
     }
 
 
@@ -100756,7 +101004,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2424662 · 16.10.2026 09:21';
+    const HUB_BUDOWA = 'lokalna 5.60.10 · 20.10.2026 · Przelewy24';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
