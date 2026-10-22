@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.10
+// @version      5.60.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -148,6 +148,378 @@
         const dom = MOD_OFF[id] ? false : true;
         try { return GM_getValue(HUB + id, dom); } catch (e) { return dom; }
     };
+
+    // ===== Dziennik centralny: logi modulow -> arkusz „HUB Log" =====
+    // Po co: po bledzie u kogos z zespolu nie bylo jak ustalic, KTO, KIEDY i na JAKIEJ wersji to zrobil.
+    // Logi modulow siedza w pamieci karty i znikaja z jej zamknieciem, a plik .txt zapisuje sie tylko recznie.
+    //
+    // Jak dziala: modul woła hubDz(modul, faza, tekst) przy kazdej linii swojego logu. Nadajnik sklada z nich
+    // PRZEBIEGI (seria wpisow jednego modulu, zamknieta wpisem „koniec" albo 40 s ciszy) i wysyla do Apps Script
+    // JEDEN wiersz na przebieg: godzina, kto, komputer, wersja, modul, wynik (✔/⚠/✖), krotki opis i pelny log.
+    // W arkuszu pelny log siedzi w ostatniej kolumnie, widoczny jako jedna linia.
+    //
+    // ZASADY (nie luzowac bez pytania):
+    //  * nigdy nie rzuca bledu i nie blokuje modulu — kazda sciezka siedzi w try/catch,
+    //  * nic nie wysyla, dopoki nie ma adresu wdrozenia (HUB_DZ_URL albo wlasny z launchera) ani gdy ktos go wylaczyl,
+    //  * maskuje numery IBAN, adresy e-mail i naglowki uwierzytelniajace, ZANIM cokolwiek opusci karte,
+    //  * nieudana wysylka wraca do kolejki w GM i idzie przy nastepnej okazji; wiersze maja unikalne ID, wiec
+    //    ponowienie nie robi dubli w arkuszu,
+    //  * „kto" bierze z linku „Logout <imie nazwisko>" w prologistics (inne hosty — ostatnia znana osoba).
+    // Odbiornik: „Apps Script — HUB Log i zmiany.js" (poza gitem). Klucz musi byc ten sam po obu stronach.
+    const HUB_DZ_URL    = 'https://script.google.com/macros/s/AKfycbzu4ZwWf8QRPvmAZU_3Lv-gFrhnB60eZK5tJTllkyUUAPstHDuIcY5Is89vf-m5bQEf/exec';
+    const HUB_DZ_SECRET = '0537c2c859eec51870c0d90d';
+
+    const HUBDZ = (function () {
+        const K_CFG   = HUB + 'dz_cfg_v1';       // { on, url, komp: { id, nazwa } }
+        const K_KOL   = HUB + 'dz_kolejka_v1';   // wiersze, ktore nie wyszly
+        const K_STAN  = HUB + 'dz_stan_v1';      // wynik ostatniej wysylki
+        const K_OSOBA = HUB + 'dz_osoba_v1';     // ostatnia osoba widziana w prologistics
+        const CISZA_MS    = 40000;    // tyle ciszy konczy przebieg
+        const PO_KONCU_MS = 4000;     // tyle ciszy po wpisie „koniec" konczy przebieg
+        const MAX_LINII   = 3000;     // dluzszy przebieg dzielimy na czesci
+        const MAX_LINIA   = 400;
+        const W_PACZCE    = 12;       // wierszy w jednym zapytaniu
+        const MAX_PACZKA  = 600000;   // znakow w jednym zapytaniu
+        const MAX_KOLEJKA = 400000;   // znakow w kolejce GM — starsze wiersze odpadaja
+
+        const przebiegi = {};         // modul -> otwarty przebieg
+        let doWyslania = [];          // zamkniete przebiegi tej karty, jeszcze nie wyslane
+        let timer = null, wysylka = false, nastepna = 0, bledy = 0;
+        let cache = null, cacheT = 0, osobaTxt = '', osobaT = 0;
+
+        function wczytaj(k, d) { try { const s = GM_getValue(k, ''); return s ? JSON.parse(s) : d; } catch (e) { return d; } }
+        function zapisz(k, v) { try { GM_setValue(k, JSON.stringify(v)); return true; } catch (e) { return false; } }
+        function losowe(n) {
+            let s = '';
+            try { const a = new Uint8Array(n); crypto.getRandomValues(a); a.forEach(function (b) { s += ('0' + b.toString(16)).slice(-2); }); }
+            catch (e) { for (let i = 0; i < n; i++) s += ('0' + Math.floor(Math.random() * 256).toString(16)).slice(-2); }
+            return s;
+        }
+        function p2(n) { return n < 10 ? '0' + n : '' + n; }
+        function godz(t, ms) {
+            const d = new Date(t);
+            const r = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+            return ms ? r + '.' + ('00' + d.getMilliseconds()).slice(-3) : r;
+        }
+        function lm(n, a, b, c) {
+            const k = n % 100, d = n % 10;
+            return n + ' ' + (n === 1 ? a : ((d >= 2 && d <= 4 && !(k >= 12 && k <= 14)) ? b : c));
+        }
+
+        function cfg() {
+            const t = Date.now();
+            if (cache && t - cacheT < 15000) return cache;
+            let c = wczytaj(K_CFG, null);
+            if (!c || typeof c !== 'object') c = {};
+            if (!c.komp || !c.komp.id) {
+                c.komp = { id: 'k-' + losowe(3), nazwa: (c.komp && c.komp.nazwa) || '' };
+                zapisz(K_CFG, c);
+            }
+            cache = { on: c.on !== false, url: String(c.url || HUB_DZ_URL || '').trim(), wlasnyUrl: !!c.url, komp: c.komp };
+            cacheT = t;
+            return cache;
+        }
+        function ustaw(poprawka) {
+            const c = wczytaj(K_CFG, {}) || {};
+            Object.keys(poprawka).forEach(function (k) { c[k] = poprawka[k]; });
+            if (!c.komp || !c.komp.id) c.komp = { id: 'k-' + losowe(3), nazwa: '' };
+            zapisz(K_CFG, c);
+            cache = null;
+        }
+
+        // Nazwa komputera w arkuszu: wlasna (z launchera), a gdy jej nie ma — pierwsza osoba widziana tu w prologistics.
+        function etykietaKomp(c) { return c.komp.nazwa || c.komp.auto || ''; }
+
+        function wersja() {
+            let w = '?', b = '';
+            try { w = GM_info.script.version || '?'; } catch (e) {}
+            try {
+                const m = /^\s*(?:zmiana\s+)?([0-9a-f]{7,40})\b/i.exec(String(HUB_BUDOWA));
+                b = m ? m[1] : (/^__/.test(HUB_BUDOWA) ? 'repo' : '');
+            } catch (e) {}
+            return w + (b ? ' · ' + b : '');
+        }
+
+        // Kto pracuje: link „Logout Imie Nazwisko" w prologistics. Poza prologistics (panele marketplace'ow)
+        // — ostatnia znana osoba z tego komputera; starsza niz 12 h dostaje „?".
+        function osoba() {
+            const t = Date.now();
+            if (osobaTxt && t - osobaT < 60000) return osobaTxt;
+            let teraz = '';
+            try {
+                if (onProlo()) {
+                    const as = document.querySelectorAll('a');
+                    for (let i = 0; i < as.length; i++) {
+                        const m = /^Logout\s+(.{2,60})$/.exec((as[i].textContent || '').replace(/\s+/g, ' ').trim());
+                        if (m) { teraz = m[1]; break; }
+                    }
+                }
+            } catch (e) {}
+            if (teraz) {
+                zapisz(K_OSOBA, { n: teraz, t: t });
+                // Pierwsza osoba widziana na tym komputerze staje sie jego domyslna nazwa — nic nie trzeba wpisywac.
+                try { const c = cfg(); if (!c.komp.nazwa && !c.komp.auto) ustaw({ komp: { id: c.komp.id, nazwa: '', auto: teraz } }); } catch (e) {}
+            } else {
+                const z = wczytaj(K_OSOBA, null);
+                if (z && z.n) teraz = z.n + ((t - z.t) > 12 * 3600e3 ? ' ?' : '');
+            }
+            osobaTxt = teraz; osobaT = t;
+            return teraz;
+        }
+
+        // Maskowanie PRZED opuszczeniem karty. „ostro" (Depozyty — numery kont dostawcow) maskuje tez kazdy
+        // ciag 12+ cyfr, co w innych modulach zjadloby numery rozliczen i transakcji, ktore sa w logu potrzebne.
+        function maskuj(s, ostro) {
+            s = String(s)
+                .replace(/\b([A-Z]{2}\d{2})((?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,3})?)\b/g, function (m, a, b) {
+                    const c = (a + b).replace(/ /g, '');
+                    return (c.length >= 15 && /\d/.test(b)) ? c.slice(0, 4) + '…' + c.slice(-4) : m;
+                })
+                .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, function (m) { return m.charAt(0) + '***@' + m.split('@')[1]; })
+                .replace(/\b(Cookie|Set-Cookie|Authorization|X-XSRF-TOKEN|X-CSRF-TOKEN)\s*[:=]\s*[^\n]{4,}/gi, '$1: ***')
+                .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{8,}/g, '$1 ***')
+                .replace(/\b(secret|token|password|passwd|haslo|hasło|klucz)\s*[:=]\s*\S{4,}/gi, '$1=***');
+            if (ostro) s = s.replace(/\d[\d -]{10,}\d/g, function (m) { const d = m.replace(/\D/g, ''); return d.length >= 12 ? '…' + d.slice(-4) : m; });
+            return s;
+        }
+
+        // 2 = blad, 1 = uwaga, 0 = zwykly wpis. Podpowiedz do przegladania arkusza, nie bramka.
+        function poziom(faza, s) {
+            const t = faza + ' ' + s;
+            if (/^(błąd|blad|error)$/i.test(faza)) return 2;
+            if (/✖|❌|wyj[ąa]tek|\bbłąd\b|\bblad\b|\bERROR\b/i.test(t)) return 2;
+            if (/błędy\s+[1-9]/i.test(t)) return 2;        // „… · błędy 3 · już były 1" na koncu przebiegu ksiegowania
+            if (/⚠|\buwaga\b|ostrze[żz]|TIMEOUT|NIEUDANY|nieudan|bez potwierdzenia|nie wiem|odmow/i.test(t)) return 1;
+            return 0;
+        }
+
+        function nowy(modul, t, czesc) {
+            return { modul: modul, t0: t, tN: t, linie: [], n: 0, bl: 0, uw: 0, pierwszyBl: '', pierwszaUw: '',
+                     startTxt: '', koniecTxt: '', koniec: false, czesc: czesc || 1, dalej: false,
+                     kto: osoba(), ostro: false };
+        }
+
+        function wpis(modul, faza, tekst, opcje) {
+            try {
+                const c = cfg();
+                if (!c.on || !c.url) return;
+                const t = Date.now();
+                const f = String(faza == null ? '' : faza).slice(0, 12);
+                let p = przebiegi[modul];
+                // Nowy „start" po „koniec" to nowy przebieg — inaczej dwa kolejne ksiegowania zlalyby sie w jeden wiersz.
+                if (p && p.koniec && f === 'start') { zamknij(modul); p = null; }
+                if (p && p.linie.length >= MAX_LINII) { p.dalej = true; const nast = p.czesc + 1; zamknij(modul); p = null; przebiegi[modul] = nowy(modul, t, nast); p = przebiegi[modul]; }
+                if (!p) p = przebiegi[modul] = nowy(modul, t, 1);
+                if (opcje && opcje.ostro) p.ostro = true;
+                let s = maskuj(String(tekst == null ? '' : tekst), p.ostro).replace(/\s*\r?\n\s*/g, ' ⏎ ');
+                if (s.length > MAX_LINIA) s = s.slice(0, MAX_LINIA) + '…';
+                const lv = poziom(f, s);
+                p.linie.push({ t: t, f: f, s: s, lv: lv });
+                p.tN = t; p.n++;
+                if (lv === 2) { p.bl++; if (!p.pierwszyBl) p.pierwszyBl = s; }
+                else if (lv === 1) { p.uw++; if (!p.pierwszaUw) p.pierwszaUw = s; }
+                if (f === 'start' && !p.startTxt) p.startTxt = s;
+                if (f === 'koniec') p.koniecTxt = s;
+                p.koniec = (f === 'koniec');
+                zegar();
+            } catch (e) {}
+        }
+        // Blad, ktory ma wyjsc od razu (np. modul nie wystartowal) — przebieg zamyka sie po kilku sekundach.
+        function blad(modul, tekst) {
+            wpis(modul, 'błąd', tekst);
+            try { if (przebiegi[modul]) przebiegi[modul].koniec = true; } catch (e) {}
+        }
+
+        function przytnij(L, lv) {
+            const GLOWA = 12000, OGON = 24000, SRODEK = 7000;
+            let tekst = L.join('\n');
+            if (tekst.length <= 45000) return tekst;
+            const glowa = [], ogon = [], srodek = [];
+            let dl = 0, i = 0, j = L.length - 1;
+            for (; i < L.length && dl + L[i].length < GLOWA; i++) { glowa.push(L[i]); dl += L[i].length + 1; }
+            dl = 0;
+            for (; j >= i && dl + L[j].length < OGON; j--) { ogon.unshift(L[j]); dl += L[j].length + 1; }
+            dl = 0;
+            for (let k = i; k <= j; k++) if (lv[k] && dl + L[k].length < SRODEK) { srodek.push(L[k]); dl += L[k].length + 1; }
+            const pomin = (j - i + 1) - srodek.length;
+            return glowa.join('\n') + '\n… pominięto ' + pomin + ' wierszy ze środka (zostawiono tylko błędy i uwagi) …\n'
+                 + (srodek.length ? srodek.join('\n') + '\n' : '') + '… koniec pominięcia …\n' + ogon.join('\n');
+        }
+
+        function zlozWiersz(p) {
+            const c = cfg();
+            const trwa = Math.max(0, Math.round((p.tN - p.t0) / 1000));
+            const kr = function (s) { s = String(s || '').replace(/^[=\s]+/, '').replace(/\s+/g, ' ').trim(); return s.length > 120 ? s.slice(0, 117) + '…' : s; };
+            let skrot;
+            if (p.bl) skrot = '✖ ' + lm(p.bl, 'błąd', 'błędy', 'błędów') + ': ' + kr(p.pierwszyBl);
+            else if (p.uw) skrot = '⚠ ' + lm(p.uw, 'uwaga', 'uwagi', 'uwag') + ': ' + kr(p.pierwszaUw);
+            else skrot = '✔ ' + kr(p.koniecTxt || p.startTxt || (p.linie[0] && p.linie[0].s) || 'przebieg bez uwag');
+            skrot += ' · ' + lm(p.n, 'wpis', 'wpisy', 'wpisów') + ((p.czesc > 1 || p.dalej) ? ' · część ' + p.czesc : '');
+            const kto = p.kto || '';
+            const naglowek = [
+                'HUB ' + wersja() + ' · ' + (kto || '(nieznany)') + ' · ' + (etykietaKomp(c) ? etykietaKomp(c) + ' · ' : '') + c.komp.id + ' · ' + H,
+                p.modul + ' · ' + godz(p.t0) + ' → ' + godz(p.tN) + ' (' + trwa + ' s) · wpisów ' + p.n
+                    + (p.bl ? ' · błędów ' + p.bl : '') + (p.uw ? ' · uwag ' + p.uw : '') + ((p.czesc > 1 || p.dalej) ? ' · część ' + p.czesc : ''),
+                '————————————————————————————————————————'
+            ];
+            const L = p.linie.map(function (l) { return '[' + godz(l.t, true) + '] ' + (l.f + '            ').slice(0, 9) + ' ' + l.s; });
+            const lv = p.linie.map(function (l) { return l.lv > 0; });
+            return {
+                id: Date.now().toString(36) + '-' + c.komp.id + '-' + losowe(3),
+                t: p.t0, kto: kto, komp: c.komp.id, kompNazwa: etykietaKomp(c), wersja: wersja(), modul: p.modul,
+                wynik: p.bl ? '✖ Błąd' : (p.uw ? '⚠ Uwaga' : '✔ OK'),
+                skrot: skrot, trwa: trwa, n: p.n,
+                szczegoly: naglowek.join('\n') + '\n' + przytnij(L, lv)
+            };
+        }
+
+        function zamknij(modul) {
+            const p = przebiegi[modul];
+            if (!p) return;
+            delete przebiegi[modul];
+            try { doWyslania.push(zlozWiersz(p)); } catch (e) {}
+        }
+
+        function zegar() { if (!timer) timer = setInterval(tyk, 5000); }
+        function tyk() {
+            try {
+                const t = Date.now();
+                Object.keys(przebiegi).forEach(function (m) {
+                    const p = przebiegi[m];
+                    if ((p.koniec && t - p.tN >= PO_KONCU_MS) || t - p.tN >= CISZA_MS) zamknij(m);
+                });
+                const zalega = doWyslania.length || wczytaj(K_KOL, []).length;
+                if (zalega) wyslij();
+                if (!Object.keys(przebiegi).length && !zalega || bledy >= 5) { clearInterval(timer); timer = null; }
+            } catch (e) {}
+        }
+
+        function zapiszStan(ok, info) { zapisz(K_STAN, { ok: ok, t: Date.now(), info: String(info || '').slice(0, 160) }); }
+        function wroc(paczka) {
+            let gm = wczytaj(K_KOL, []).concat(paczka);
+            let razem = 0;
+            for (let i = gm.length - 1; i >= 0; i--) { razem += (gm[i].szczegoly || '').length + 400; if (razem > MAX_KOLEJKA) { gm = gm.slice(i + 1); break; } }
+            zapisz(K_KOL, gm);
+        }
+
+        // Zapytanie do Apps Script jak w arkuszu Marketplace: text/plain (bez zapytania wstepnego CORS), odpowiedz JSON.
+        function zadanie(url, body, cb) {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'POST', url: url, data: body, timeout: 45000,
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    onload: function (r) {
+                        let j = null;
+                        try { j = JSON.parse(r.responseText); } catch (e) {}
+                        if (!j) {
+                            const txt = String(r.responseText || '').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                                .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                            cb(txt ? txt.slice(0, 140) : ('nieczytelna odpowiedź, HTTP ' + r.status)); return;
+                        }
+                        if (!j.ok) { cb(j.err || 'arkusz odrzucił zapis'); return; }
+                        cb(null, j);
+                    },
+                    onerror: function () { cb('brak połączenia z arkuszem'); },
+                    ontimeout: function () { cb('arkusz nie odpowiedział na czas'); }
+                });
+            } catch (e) { cb('brak GM_xmlhttpRequest'); }
+        }
+
+        function wyslij() {
+            try {
+                if (wysylka) return;
+                const c = cfg();
+                if (!c.on || !c.url || Date.now() < nastepna) return;
+                let paczka = doWyslania.splice(0, W_PACZCE);
+                if (paczka.length < W_PACZCE) {
+                    const gm = wczytaj(K_KOL, []);
+                    if (gm.length) { paczka = gm.splice(0, W_PACZCE - paczka.length).concat(paczka); zapisz(K_KOL, gm); }
+                }
+                if (!paczka.length) return;
+                const mk = function () { return JSON.stringify({ secret: HUB_DZ_SECRET, action: 'log', rows: paczka }); };
+                let body = mk();
+                while (body.length > MAX_PACZKA && paczka.length > 1) { doWyslania.unshift(paczka.pop()); body = mk(); }
+                wysylka = true;
+                zadanie(c.url, body, function (err, j) {
+                    wysylka = false;
+                    if (err) {
+                        wroc(paczka); bledy++;
+                        nastepna = Date.now() + Math.min(300000, 20000 * Math.pow(2, Math.min(bledy, 4)));
+                        zapiszStan(false, err);
+                    } else {
+                        bledy = 0; nastepna = 0;
+                        zapiszStan(true, 'dodano ' + (j.dodano || 0) + (j.pominieto ? ', pominięto ' + j.pominieto : ''));
+                    }
+                });
+            } catch (e) { wysylka = false; }
+        }
+
+        // Sonda z launchera: POST „ping" niczego nie zapisuje w arkuszu, ale sprawdza adres, klucz i obie zakladki.
+        function sprawdz(cb) {
+            const c = cfg();
+            if (!c.url) { cb('brak adresu wdrożenia'); return; }
+            zadanie(c.url, JSON.stringify({ secret: HUB_DZ_SECRET, action: 'ping' }), function (err, j) {
+                if (err) { zapiszStan(false, err); cb(err); return; }
+                const o = function (x) { return x ? (x.nazwa + ': ' + x.wiersze + ' wierszy') : 'BRAK zakładki'; };
+                const txt = 'Apps Script ' + (j.wersja || '?') + ' · zmiany → ' + o(j.zmiany) + ' · log → ' + o(j.log);
+                zapiszStan(true, txt);
+                cb(null, txt);
+            });
+        }
+
+        // Karta zamykana w trakcie przebiegu: otwarte przebiegi zamykamy i wszystko, co nie wyszlo, odkladamy do GM —
+        // pójdzie z nastepna karta (wiersze maja ID, wiec dubla w arkuszu nie bedzie).
+        try {
+            window.addEventListener('pagehide', function () {
+                try {
+                    Object.keys(przebiegi).forEach(zamknij);
+                    if (doWyslania.length) { wroc(doWyslania); doWyslania = []; }
+                } catch (e) {}
+            });
+            if (window.top === window) setTimeout(function () { try { if (wczytaj(K_KOL, []).length) { zegar(); wyslij(); } } catch (e) {} }, 10000);
+        } catch (e) {}
+
+        function esc(s) { return String(s == null ? '' : s).replace(/[<>&"]/g, function (ch) { return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[ch]; }); }
+        // Stopka launchera: wynik ostatniej wysylki + kilka ustawien.
+        function stopka() {
+            const c = cfg(), st = wczytaj(K_STAN, null), os = osoba();
+            const kim = esc(os || 'nieznana osoba') + ' · <b>' + esc(c.komp.nazwa ? c.komp.nazwa + ' / ' : '') + esc(c.komp.id) + '</b>';
+            const linki = ' <a href="#" data-dz="nazwa">własna nazwa (opcja)</a> · <a href="#" data-dz="adres">adres</a> · <a href="#" data-dz="sprawdz">sprawdź</a>'
+                        + (c.url ? ' · <a href="#" data-dz="onoff">' + (c.on ? 'wyłącz' : 'włącz') + '</a>' : '');
+            let stan;
+            if (!c.url) stan = 'nieaktywny — brak adresu wdrożenia';
+            else if (!c.on) stan = 'wyłączony na tym komputerze';
+            else if (!st) stan = 'czeka na pierwszy przebieg';
+            else stan = (st.ok ? '✔ ' : '✖ ') + (st.ok ? 'wysłano ' : 'nie wysłano ') + godz(st.t) + (st.ok ? '' : ' — ' + esc(st.info));
+            return 'Dziennik: ' + stan + '<br>' + kim + '<br>' + linki;
+        }
+        function klik(co, odswiez) {
+            try {
+                const c = cfg();
+                if (co === 'nazwa') {
+                    const n = prompt('OPCJONALNIE: własna nazwa tego komputera w dzienniku zdarzeń (np. „Ula — biurko"). Pusta = domyślna, czyli imię i nazwisko pierwszej osoby widzianej tu w prologistics' + (c.komp.auto ? ' („' + c.komp.auto + '").' : '.'), c.komp.nazwa || '');
+                    if (n !== null) ustaw({ komp: { id: c.komp.id, nazwa: n.trim().slice(0, 40), auto: c.komp.auto || '' } });
+                } else if (co === 'adres') {
+                    const a = prompt('Adres wdrożenia Apps Script „HUB Log i zmiany" (kończy się na /exec). Pusty = wbudowany.', c.wlasnyUrl ? c.url : '');
+                    if (a !== null) {
+                        const v = a.trim();
+                        if (v && !/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(v)) alert('To nie wygląda na adres wdrożenia (https://script.google.com/macros/s/…/exec). Nic nie zmieniam.');
+                        else ustaw({ url: v });
+                    }
+                } else if (co === 'onoff') {
+                    ustaw({ on: !c.on });
+                } else if (co === 'sprawdz') {
+                    sprawdz(function (err, txt) { alert(err ? ('Dziennik: BŁĄD — ' + err) : ('Dziennik: połączenie działa.\n' + txt)); odswiez(); });
+                    return;
+                }
+            } catch (e) {}
+            odswiez();
+        }
+
+        return { wpis: wpis, blad: blad, stopka: stopka, klik: klik, cfg: cfg };
+    })();
+    // Jedyne wejscie dla modulow: hubDz('Nazwa modulu', 'faza', 'tekst', { ostro: true dla modulow z numerami kont }).
+    function hubDz(modul, faza, tekst, opcje) { HUBDZ.wpis(modul, faza, tekst, opcje); }
 
     // ===== Rejestrator zapytan panelu marketplace'u (v4.24) =====
     // Po co: zeby dodac nowy marketplace do ksiegowania, trzeba wiedziec, JAK jego panel
@@ -2048,7 +2420,10 @@
         "1528":"Hobbybox FI Beliani (DE) GmbH",
         "1529":"Bricomarche FR Beliani (DE) GmbH",
         "1540":"Hobbybox SE Beliani (DE) GmbH",
-        "1541":"Hobbybox DK Beliani (DE) GmbH"
+        "1541":"Hobbybox DK Beliani (DE) GmbH",
+        // 21.10.2026 — XXXLutz HR i SE (bez wpisu pole konta w Księgowaniu w tickecie pokazuje „⚠️ nieznane konto")
+        "1463":"XXXLutz HR Beliani (Europe) GmbH",
+        "1536":"XXXLutz SE Beliani (DE) GmbH"
     };
 
     function getAccountLabel(num) {
@@ -2865,6 +3240,7 @@
     function ksLog(faza, tekst){
         ksLogi.push({ t: Date.now(), faza: String(faza || ''), tekst: String(tekst == null ? '' : tekst) });
         if (ksLogi.length > KS_LOG_MAX) ksLogi.splice(0, ksLogi.length - KS_LOG_MAX);
+        hubDz('Księgowanie w tickecie', faza, tekst);
     }
     // Z dlugiego adresu zostawiamy to, co cokolwiek mowi: plik i identyfikator.
     function ksUrlKrotko(u){
@@ -4832,14 +5208,31 @@
         return ` (rozbity na ${entries.length} wpisy: ${parts} = ${Number(splitInfo.amount).toFixed(2)})`;
     }
 
+    // Wpisy tego samego zwrotu jako „kwota (data)"; identyczne zwijamy do „kwota (data) ×N". Zamowienie rozbite na kilkanascie
+    // produktow ma tyle not, ile pozycji (ticket 691849: 21 not = 9 × 68.78 + 3 × 103.46 + 8 × 91.71 + 91.70), a linia logu dluzsza
+    // niz 400 znakow NIE liczy sie jako potwierdzenie (ksLogLinie — dluga linia to zwykle zrzut bledu) — zwrot byl zaksiegowany,
+    // a Marketplace pisal „BEZ potwierdzenia" (21.10.2026). Tez przy wielu ROZNYCH kwotach: pokazujemy 8 pierwszych grup i licznik reszty.
+    function describeEntries(entries) {
+        const grupy = [], idx = {};
+        (entries || []).forEach(e => {
+            const k = e.amount + '|' + e.date;
+            if (idx[k] == null) { idx[k] = grupy.length; grupy.push({ t: `${e.amount} (${e.date})`, n: 0 }); }
+            grupy[idx[k]].n++;
+        });
+        const MAX = 8;
+        const txt = grupy.slice(0, MAX).map(g => g.n > 1 ? `${g.t} ×${g.n}` : g.t).join(' + ');
+        if (grupy.length <= MAX) return txt;
+        const reszta = grupy.slice(MAX).reduce((s, g) => s + g.n, 0);
+        return `${txt} + … (jeszcze ${reszta} wpisów w ${grupy.length - MAX} innych kwotach)`;
+    }
+
     function describeExistingRefund(existingRefund) {
         if (!existingRefund) return '';
         const mt = existingRefund.matchType || 'single';
         if (mt === 'single') {
             return `${existingRefund.amount}, data ${existingRefund.date}`;
         }
-        const parts = (existingRefund.entries || [])
-            .map(e => `${e.amount} (${e.date})`).join(' + ');
+        const parts = describeEntries(existingRefund.entries);
         if (mt === 'subset') {
             return `rozbite: ${parts} = ${existingRefund.amount}`;
         }
@@ -7343,7 +7736,9 @@
         // jedna linijka logu przewrocila przebieg, zanim ruszyl.
         try {
             ksLog('start', '=== przebieg równoległy: ' + previewRows.length + ' poz. · '
-                  + workersCount + ' workerów · × timeout ' + timeoutMult
+                  // „mnożnik czasu", nie „timeout": dziennik centralny (poziom() w nadajniku HUBDZ) bierze samo słowo „timeout"
+                  // za ostrzeżenie, więc każdy przebieg dostawał ⚠ z samej linii startowej (21.10.2026, Home24).
+                  + workersCount + ' workerów · mnożnik czasu ×' + timeoutMult
                   + ' · szybki odczyt: ' + (ksFetchOn() ? 'WŁĄCZONY' : 'wyłączony')
                   + ' · konto ' + accountNum + ' · data ' + bookingDate + ' ===');
             ksProbStart();
@@ -7590,6 +7985,8 @@
         } finally {
             try {
                 ksProbStop();
+                // Wyniki wierszy z listy na ekranie (podmieniane w wierszu, a nie dopisywane przez ksLog) — do dziennika centralnego.
+                try { Array.prototype.forEach.call(progressList.children, function (d){ hubDz('Księgowanie w tickecie', 'wiersz', d.textContent); }); } catch (e4){}
                 const st = computeServerStats();
                 if (st) ksLog('koniec', 'roundtripów ' + st.n + ' · min ' + st.min + ' ms · mediana '
                               + (st.p50 != null ? st.p50 : '?') + ' ms · max ' + st.max + ' ms');
@@ -10581,6 +10978,7 @@
         if (!first(doc, 'CstmrCdtTrfInitn')) throw new Error('To nie wyglada na pain.001 (brak CstmrCdtTrfInitn).');
         xmlDoc = doc;
         model = [];
+        chkReset();   // nowy plik = swieze odczyty z prologistics
         fileCc = ccFromName(fileName);
         Array.from(q(doc, 'PmtInf')).forEach(pmt => {
             Array.from(q(pmt, 'CdtTrfTxInf')).forEach(tx => model.push(makeRow(tx, pmt)));
@@ -10608,7 +11006,7 @@
             ustrd: txt(tx, 'Ustrd'),
             nodes: { tx, amtEl, ibanEl, nmEl },
             pmt, debtorCc: debtorCcOf(pmt),
-            sel: false, errs: [], warns: []
+            sel: false, errs: [], warns: [], chk: null
         };
     }
     // Usuwa pozycje: kasuje wezel transakcji (i cale PmtInf, gdy zostaje puste).
@@ -10693,7 +11091,535 @@
         if (r.zbudowany && cleanupIban(r.iban) === r.zbudowany)
             r.warns.push('IBAN zbudowany z numeru krajowego - cyfry kontrolne policzone, nie sprawdzone; potwierdz numer u odbiorcy');
     }
-    function validateAll() { model.forEach(validateRow); markDuplicates(); }
+    function validateAll() { model.forEach(validateRow); markDuplicates(); chkEval(); }
+
+    // ---------- Sprawdzenie w prologistics (tylko odczyt, samo po wczytaniu pliku) ----------
+    // Dla kazdego wiersza czyta auftrag z E2E/tytulu (7-8 cyfr) albo ticket (6 cyfr) i porownuje
+    // plik z wierszem narzedzia „Refund request", z ktorego powstal: IBAN, kwota, nazwa, stan.
+    // Request zalozony z ticketu auftrag NIE pokazuje (sprawdzone 14.09.2026), wiec gdy na
+    // auftragu nie ma pasujacego, czytamy jego tickety. Zwrot VAT (slowo „VAT" w E2E, tytule albo
+    // requescie) wymaga na auftragu korekty: STORNO faktury i faktury na INNEJ stawce — bez niej
+    // pobranie pliku jest zablokowane (vatGate). Wszystko to tylko GET, nic sie nie zapisuje.
+    // Czytniki tabel sa SKOPIOWANE z init_refund (refundRequestWiersze) i init_ksieg
+    // (parsePaymentsTable): domkniecia init_* sie nie widza.
+    const CHK_NARAZ = 3;          // rownolegle odczyty; ticket bywa wolny (pamiec rma-php-30-sekund)
+    const CHK_TIMEOUT = 90000;
+    const CHK_VAT = /\bvat\b/i;
+    const CHK_KOREKTA_DOK = /korekt|opravn|dobropis|credit\s*note|gutschrift|korrektur|correction/i;
+    // Wplata kartą/portfelem: zwrot idzie pierwotna forma platnosci (chyba ze karta wygasla) — ticket 700151.
+    const CHK_ORYG = /saferpay|paypal|klarna/i;
+    const CHK_KARTA_WYG = /(?:card|karta|karty|karte|carte|carta|cart.o|tarjeta)[^.\n]{0,60}(?:expired|wygas|abgelaufen|expir|caducad|scadut|vencid)|(?:expired|wygas|abgelaufen|expir|caducad|scadut|vencid)[^.\n]{0,60}(?:card|karta|karty|karte|carte|carta|cart.o|tarjeta)/i;
+    const CHK_EU_KONTO = '1232';  // EUPAGO PT Beliani DE (ZW_KONTO w init_zwr)
+    const CHK_EU_MIES = 3;        // eupago zwraca na zrodlo tylko do trzech miesiecy (ZW_MIES w init_zwr)
+    let chkGen = 0;               // numer wczytania pliku: odpowiedzi poprzedniego sa porzucane
+    let chkCache = {};            // 'A:15848550' / 'T:707023' -> { st: 'load' | 'ok' | 'err', ... }
+    let chkQueue = [], chkBusy = 0, chkTimer = null;
+
+    function nsp(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]); }
+    // Kwota z komorki: „270.51", „1,114.61", „1 114,61", „-50.59", z symbolem waluty lub bez.
+    function numOf(s) {
+        const m = String(s == null ? '' : s).replace(/\s/g, '').match(/-?\d[\d.,]*/);
+        if (!m) return NaN;
+        let t = m[0];
+        const lc = t.lastIndexOf(','), ld = t.lastIndexOf('.');
+        if (lc >= 0 && ld >= 0) t = lc > ld ? t.replace(/\./g, '').replace(',', '.') : t.replace(/,/g, '');
+        else if (lc >= 0) t = (t.indexOf(',') === lc && /,\d{1,2}$/.test(t)) ? t.replace(',', '.') : t.replace(/,/g, '');
+        else if ((t.match(/\./g) || []).length > 1) t = t.replace(/\./g, '');
+        const v = parseFloat(t);
+        return isNaN(v) ? NaN : v;
+    }
+    function ccyOf(s) {
+        const t = String(s == null ? '' : s);
+        if (t.indexOf('€') >= 0) return 'EUR';
+        if (t.indexOf('£') >= 0) return 'GBP';
+        const m = t.match(/\b(EUR|USD|GBP|PLN|CHF|CZK|HUF|SEK|NOK|DKK|RON|BGN)\b/);
+        return m ? m[1] : '';
+    }
+    function nnorm(s) { return translit(s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+    function sumC(a) { return Math.round(a.reduce((s, x) => s + x.amt, 0) * 100) / 100; }
+
+    // Numery z pol: 6 cyfr = ticket, 7-8 cyfr = auftrag (inne dlugosci to nie nasze numery).
+    // Kolejnosc jak w tekscie; pierwszy numer E2E jest tym, w ktory prowadzi link ↗.
+    function refsOf() {
+        const out = [], seen = {};
+        for (let i = 0; i < arguments.length; i++) {
+            (String(arguments[i] == null ? '' : arguments[i]).match(/\d+/g) || []).forEach(d => {
+                const k = d.length === 6 ? 'T' : ((d.length === 7 || d.length === 8) ? 'A' : '');
+                if (k && !seen[k + d]) { seen[k + d] = 1; out.push({ k: k, n: d }); }
+            });
+        }
+        return out.slice(0, 3);
+    }
+
+    // Pierwsza tabela bez zagniezdzonych, ktorej wiersz naglowkowy ma obie kolumny (male litery).
+    function chkTabela(doc, hA, hB) {
+        const ts = Array.from(doc.querySelectorAll('table'));
+        for (let k = 0; k < ts.length; k++) {
+            if (ts[k].querySelector('table')) continue;
+            const rows = Array.from(ts[k].querySelectorAll('tr'));
+            for (let i = 0; i < rows.length; i++) {
+                const h = Array.from(rows[i].children).map(c => nsp(c.textContent).toLowerCase());
+                if (h.indexOf(hA) >= 0 && h.indexOf(hB) >= 0) return { rows: rows.slice(i + 1), h: h };
+            }
+        }
+        return null;
+    }
+    // Faktury auftragu: [{ id, date, amt, rate }]; storno to faktura z ujemna kwota. null = nie ma tabeli.
+    function chkFaktury(doc) {
+        const tb = chkTabela(doc, 'invoice date', 'amount');
+        if (!tb) return null;
+        const ix = k => tb.h.indexOf(k);
+        const out = [];
+        tb.rows.forEach(tr => {
+            const c = Array.from(tr.children).map(x => nsp(x.textContent));
+            const id = c[ix('id')] || '';
+            if (!/^\d+\/\d+$/.test(id)) return;
+            const am = numOf(c[ix('amount')]);
+            if (isNaN(am)) return;
+            const rt = ix('vat %') >= 0 ? numOf(c[ix('vat %')]) : NaN;
+            out.push({ id: id, date: (c[ix('invoice date')] || '').slice(0, 10), amt: am, rate: isNaN(rt) ? null : rt });
+        });
+        return out;
+    }
+    // Platnosci auftragu: [{ date, amt, rate }] (storno platnosci to wiersz ujemny). null = nie ma tabeli.
+    function chkPlatnosci(doc) {
+        const tb = chkTabela(doc, 'date', 'clearing account');
+        if (!tb) return null;
+        const ix = k => tb.h.indexOf(k);
+        const out = [];
+        tb.rows.forEach(tr => {
+            const c = Array.from(tr.children).map(x => nsp(x.textContent));
+            const d = c[ix('date')] || '';
+            if (!/^\d{4}-\d{2}-\d{2}/.test(d)) return;
+            const am = numOf(c[ix('amount')]);
+            if (isNaN(am)) return;
+            const rt = ix('vat %') >= 0 ? numOf(c[ix('vat %')]) : NaN;
+            out.push({ date: d.slice(0, 10), amt: am, rate: isNaN(rt) ? null : rt, acct: c[ix('account')] || '' });
+        });
+        out.sort((a, b) => (a.date < b.date ? -1 : (a.date > b.date ? 1 : 0)));
+        return out;
+    }
+    // Wiersze „Refund request" (jak refundRequestWiersze w init_refund + kolumny IBAN i nazwy).
+    // Stan TYLKO z option[selected]: komorka State niesie tekst wszystkich opcji.
+    function chkReqs(doc) {
+        let t = doc.querySelector('table[data-simple-nav="Refund request"]') || doc.getElementById('refundTable');
+        if (!t) {
+            const hd = Array.from(doc.querySelectorAll('td[data-field-name]')).find(td => nsp(td.getAttribute('data-field-name')) === 'Refund amount');
+            if (hd) t = hd.closest('table');
+        }
+        if (!t) return [];
+        const rows = Array.from(t.querySelectorAll('tr'));
+        const hi = rows.findIndex(tr => /Import ID/.test(tr.textContent));
+        if (hi < 0) return [];
+        const h = Array.from(rows[hi].children).map(c => nsp(c.textContent).toLowerCase());
+        const col = p => h.findIndex(x => x.indexOf(p) === 0);
+        const ci = { id: col('import id'), pm: col('payment method'), bk: col('bank name'), st: col('state'), cu: col('customer name'), ib: col('iban'), am: col('refund amount'), co: col('company name'), ms: col('message') };
+        const out = [];
+        rows.slice(hi + 1).forEach(tr => {
+            const c = Array.from(tr.children);
+            const cell = i => (i >= 0 && c[i]) ? nsp(c[i].textContent) : '';
+            const id = cell(ci.id);
+            if (!/^\d{5,}$/.test(id)) return;
+            const sel = (ci.st >= 0 && c[ci.st]) ? c[ci.st].querySelector('select.state-select option[selected]') : null;
+            out.push({ id: id, pm: cell(ci.pm), bk: cell(ci.bk), st: sel ? nsp(sel.textContent) : '', iban: cell(ci.ib), kwota: numOf(cell(ci.am)), cu: cell(ci.cu), co: cell(ci.co), ms: cell(ci.ms) });
+        });
+        return out;
+    }
+    // Nazwy kont z list rozwijanych strony („1022, Saferpay Beliani EUR"): numer konta -> nazwa.
+    function chkKonta(doc) {
+        const m = {};
+        doc.querySelectorAll('option').forEach(op => {
+            const x = /^(\d{3,5})\s*[,:]\s*(.+)$/.exec(nsp(op.textContent));
+            if (x && !m[x[1]]) m[x[1]] = x[2];
+        });
+        return m;
+    }
+    // Wplaty eupago na auftragu: tabelka „Eupago/MBWay Payments" (data-simple-nav „Eupago Payments",
+    // kolumny Date, Amount, Referencia, Token — jak euTabela w init_zwr; sprawdzone na 16009784).
+    function chkEupago(doc) {
+        const t = doc.querySelector('table[data-simple-nav="Eupago Payments"]');
+        if (!t) return [];
+        const out = [];
+        t.querySelectorAll('tr').forEach(tr => {
+            const td = tr.querySelectorAll('td');
+            if (td.length < 4) return;
+            const d = nsp(td[0].textContent);
+            if (!/^\d{4}-\d{2}-\d{2}/.test(d)) return;
+            out.push({ date: d.slice(0, 10), amt: numOf(td[1].textContent), ref: nsp(td[2].textContent) });
+        });
+        return out;
+    }
+    // Pliki dolaczone do auftragu: tabela „Attached documents" (File name, Date/time, Responsible person,
+    // Type). Etykiety przesylek maja pusta nazwe pliku — pomijamy je. null = nie ma tabeli.
+    function chkDokumenty(doc) {
+        const tb = chkTabela(doc, 'file name', 'date/time');
+        if (!tb) return null;
+        const ix = k => tb.h.indexOf(k);
+        const out = [];
+        tb.rows.forEach(tr => {
+            const c = Array.from(tr.children).map(x => nsp(x.textContent));
+            const name = c[ix('file name')] || '';
+            const d = c[ix('date/time')] || '';
+            if (!name || !/^\d{4}-\d{2}-\d{2}/.test(d)) return;
+            out.push({ name: name, date: d.slice(0, 10), who: c[ix('responsible person')] || '' });
+        });
+        return out;
+    }
+    // Pelne miesiace od daty (jak miesiaceOd w init_zwr).
+    function chkMies(data) {
+        const d = new Date(data + 'T12:00:00'), n = new Date();
+        if (isNaN(d.getTime())) return null;
+        return (n.getFullYear() - d.getFullYear()) * 12 + (n.getMonth() - d.getMonth()) + ((n.getDate() < d.getDate()) ? -1 : 0);
+    }
+    function chkParseAuftrag(html) {
+        // Status w zrodle strony (`const isDeleted`), nie w klasie CSS; brak = to nie auftrag (np. logowanie).
+        const dm = html.match(/const\s+isDeleted\s*=\s*([^;\n]{0,40});/);
+        if (!dm) throw new Error('to nie jest strona auftragu (sesja wygasla? zaloguj sie w prologistics)');
+        const dv = dm[1].replace(/[\s+"']/g, '').toLowerCase();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const tix = [];
+        doc.querySelectorAll('a[href*="rma.php"]').forEach(a => {
+            const m = /[?&]rma_id=(\d+)/.exec(a.getAttribute('href') || '');
+            if (m && tix.indexOf(m[1]) < 0) tix.push(m[1]);
+        });
+        // Pierwsze „Total of Payments :" na stronie bywa „(0.00)" — bierzemy to, po ktorym stoi waluta.
+        const cm = (doc.body ? doc.body.textContent : '').match(/Total of Payments\s*:\s*([€£]|[A-Z]{3})(?![A-Za-z])/);
+        const inv = chkFaktury(doc), pay = chkPlatnosci(doc), dks = chkDokumenty(doc);
+        return { st: 'ok', konta: chkKonta(doc), docs: dks || [], docsBrak: !dks, deleted: dv === '1' || dv === 'true', reqs: chkReqs(doc), eu: chkEupago(doc), tix: tix.slice(0, 6),
+                 inv: inv || [], invBrak: !inv, pay: pay || [], payBrak: !pay, ccy: ccyOf(cm ? cm[1] : '') };
+    }
+    function chkParseTicket(html) {
+        if (html.length < 3000 || /type=["']password["']/i.test(html)) throw new Error('to nie jest strona ticketu (sesja wygasla? zaloguj sie w prologistics)');
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const ile = {};
+        doc.querySelectorAll('a[href*="auction.php"]').forEach(a => {
+            const m = /[?&]number=(\d+)/.exec(a.getAttribute('href') || '');
+            if (m) ile[m[1]] = (ile[m[1]] || 0) + 1;
+        });
+        const top = Object.entries(ile).sort((a, b) => b[1] - a[1])[0];
+        // Wzmianka o wygaslej karcie: tylko z komentarzy klienta i wewnetrznych — odpowiedzi supportu
+        // maja szablony, ktore o wygaslych kartach mowia zawsze.
+        const kom = Array.from(doc.querySelectorAll('td.comment-author')).map(td => td.closest('tr')).filter(tr => tr
+            && (tr.getAttribute('data-src') !== 'support' || /^\s*customer/i.test(tr.querySelector('td.comment-author').textContent))).map(tr => tr.textContent).join('\n');
+        return { st: 'ok', reqs: chkReqs(doc), auf: top ? top[0] : '', kartWyg: CHK_KARTA_WYG.test(kom) };
+    }
+    async function chkFetch(url) {
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), CHK_TIMEOUT);
+        try {
+            const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store', signal: ctl.signal });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.text();
+        } catch (e) {
+            throw new Error(e && e.name === 'AbortError' ? 'brak odpowiedzi w ' + (CHK_TIMEOUT / 1000) + ' s' : ((e && e.message) || String(e)));
+        } finally { clearTimeout(to); }
+    }
+    async function chkLoad(key) {
+        const n = key.slice(2);
+        if (key.charAt(0) === 'A') return chkParseAuftrag(await chkFetch('/auction.php?number=' + n + '&txnid=3'));
+        return chkParseTicket(await chkFetch('/rma.php?rma_id=' + n));
+    }
+    function chkEnqueue(key) {
+        if (chkCache[key]) return;
+        chkCache[key] = { st: 'load' };
+        chkQueue.push(key);
+    }
+    function chkPump() {
+        while (chkBusy < CHK_NARAZ && chkQueue.length) {
+            const key = chkQueue.shift(), gen = chkGen;
+            chkBusy++;
+            chkLoad(key).catch(e => ({ st: 'err', err: (e && e.message) || String(e) })).then(d => {
+                chkBusy--;
+                if (gen === chkGen) { chkCache[key] = d; chkEval(); refreshRows(); }
+                chkPump();
+            });
+        }
+    }
+    // Nowe wczytanie pliku i „Sprawdz ponownie": porzuca pamiec (po poprawce w prologistics ma byc swiezo).
+    function chkReset() {
+        chkGen++; chkCache = {}; chkQueue = [];
+        if (chkTimer) { clearTimeout(chkTimer); chkTimer = null; }
+    }
+
+    // Zmiana stawki VAT w systemie: STORNO faktury (ujemna) i nowa faktura na INNEJ stawce. To jeszcze
+    // NIE jest korekta: „Make 0% VAT Invoice" robi storno i nowa fakture pod TYM SAMYM numerem
+    // (11873403/1, /2, /3), wiec klient dostaje te sama fakture raz na 23%, raz na 0% (15848550,
+    // 21.10.2026). Prawidlowa korekta to dokument wystawiony recznie przez dzial finansow i dolaczony
+    // do auftragu (chkKorektaDok); storno i zmiana stawki w systemie ida dopiero po nim (15208528).
+    // Gdy faktury jeszcze nie bylo (wystawiana dopiero przy wysylce), dowodem jest storno platnosci
+    // i zmiana stawki w Payments, a faktury (jesli sa) stoja juz na nowej stawce.
+    function chkVatKorekta(A) {
+        const inv = A.inv, pay = A.pay;
+        const neg = inv.filter(x => x.amt < 0), pos = inv.filter(x => x.amt > 0);
+        for (let i = 0; i < neg.length; i++) {
+            const n = neg[i];
+            const p = pos.find(x => x.rate != null && n.rate != null && x.rate !== n.rate && x.date >= n.date);
+            if (p) return { poz: 'faktury', n: n, p: p };
+        }
+        const pn = pay.filter(x => x.amt < 0);
+        const stawki = pay.map(x => x.rate).filter(v => v != null).filter((v, i, a) => a.indexOf(v) === i);
+        if (!neg.length && pn.length && stawki.length >= 2) {
+            const ost = pay.filter(x => x.rate != null).slice(-1)[0];
+            if (pos.every(p => p.rate == null || p.rate === ost.rate)) return { poz: 'platnosci', pn: pn[0], ost: ost };
+        }
+        return null;
+    }
+    // Dokument korekty dolaczony do auftragu przez dzial finansow („Korekta_11180207-1.pdf",
+    // Attached documents, 15208528). Zwraca pierwszy pasujacy plik albo null.
+    function chkKorektaDok(A) {
+        return (A.docs || []).filter(d => CHK_KOREKTA_DOK.test(d.name))[0] || null;
+    }
+    function chkFakturyOpis(inv) {
+        return inv.slice(0, 5).map(x => x.id + ' ' + x.amt.toFixed(2) + (x.rate == null ? '' : ' (' + x.rate + '%)')).join(', ') || 'brak faktur';
+    }
+
+    // Wynik sprawdzenia jednego wiersza: { notes: [[e|w|ok|i, tekst]], pend, checked, vatNeed, vatOk, fail }.
+    // vatOk: true = korekta jest, false = brak korekty (blokuje pobranie), null = nie umiem sprawdzic.
+    function chkRow(r, needs) {
+        const c = { notes: [], pend: false, checked: false, vatNeed: CHK_VAT.test(String(r.e2e || '') + ' ' + String(r.ustrd || '')), vatOk: null, fail: false };
+        const refs = refsOf(r.e2e, r.ustrd);
+        if (!refs.length) { c.notes.push(['i', 'brak numeru auftragu/ticketu w E2E i tytule - nie sprawdzam w prologistics']); return c; }
+        c.checked = true;
+        const reqs = [], seenQ = {};
+        let A = null, aufNr = '', pend = false;
+        const add = (e, z) => e.reqs.forEach(x => { if (!seenQ[x.id]) { seenQ[x.id] = 1; reqs.push(Object.assign({ z: z }, x)); } });
+        const get = key => {
+            const e = chkCache[key];
+            if (!e) { needs.push(key); pend = true; return null; }
+            if (e.st === 'load') { pend = true; return null; }
+            if (e.st === 'err') { c.fail = true; c.notes.push(['w', 'nie odczytalem ' + (key.charAt(0) === 'A' ? 'auftragu ' : 'ticketu ') + key.slice(2) + ': ' + e.err]); return null; }
+            return e;
+        };
+        refs.forEach(f => {
+            if (f.k === 'A') {
+                aufNr = aufNr || f.n;
+                const e = get('A:' + f.n);
+                if (e) { A = A || e; add(e, 'auftrag ' + f.n); }
+            } else {
+                const e = get('T:' + f.n);
+                if (e) {
+                    add(e, 'ticket ' + f.n);
+                    if (e.auf) {
+                        aufNr = aufNr || e.auf;
+                        const ea = get('A:' + e.auf);
+                        if (ea) { A = A || ea; add(ea, 'auftrag ' + e.auf); }
+                    }
+                }
+            }
+        });
+        const nr = cleanupIban(r.iban), kw = centsOf(r.amt);
+        const exact = () => reqs.filter(x => nr && !isNaN(kw) && cleanupIban(x.iban) === nr && Math.round(x.kwota * 100) === kw);
+        // Request z ticketu auftrag nie pokazuje: bez pasujacego na auftragu czytamy jego tickety.
+        if (A && !exact().length) A.tix.forEach(t => { const e = get('T:' + t); if (e) add(e, 'ticket ' + t); });
+        if (pend) { c.pend = true; c.notes = [['i', 'sprawdzam w prologistics...']]; return c; }
+
+        const zatw = x => /^refund approved$/i.test(x.st);
+        const ex = exact();
+        let rq = null;
+        if (!reqs.length) {
+            c.notes.push(['w', 'brak requestu "Refund request" na ' + (aufNr ? 'auftragu ' + aufNr + ' i jego ticketach' : 'tickecie') + ' (pozycja dodana recznie?)']);
+        } else if (!nr || isNaN(kw)) {
+            c.notes.push(['i', 'IBAN albo kwota puste - nie porownuje z requestem']);
+        } else if (!ex.length) {
+            const zIban = reqs.filter(x => cleanupIban(x.iban) === nr), zKw = reqs.filter(x => Math.round(x.kwota * 100) === kw);
+            const opis = x => 'request ' + x.id + ' (' + x.z + ')';
+            if (zIban.length) c.notes.push(['e', 'IBAN pasuje do ' + opis(zIban[0]) + ', ale kwota w pliku ' + fmt2(kw) + ' rozni sie od kwoty w requescie ' + (isNaN(zIban[0].kwota) ? '?' : zIban[0].kwota.toFixed(2))]);
+            else if (zKw.length) c.notes.push(['e', 'kwota pasuje do ' + opis(zKw[0]) + ', ale IBAN w pliku ...' + nr.slice(-6) + ' rozni sie od IBAN-u w requescie ...' + cleanupIban(zKw[0].iban).slice(-6)]);
+            else c.notes.push(['e', 'zaden request nie pasuje do IBAN-u ani kwoty z pliku (requesty: ' + reqs.slice(0, 3).map(x => x.id + ' ' + (isNaN(x.kwota) ? '?' : x.kwota.toFixed(2)) + ' ...' + cleanupIban(x.iban).slice(-4)).join('; ') + ')']);
+        } else {
+            ex.sort((a, b) => (zatw(b) ? 1 : 0) - (zatw(a) ? 1 : 0));
+            rq = ex[0];
+            if (!rq.st) c.notes.push(['w', 'request ' + rq.id + ' (' + rq.z + ') zgodny z plikiem, ale nie odczytalem jego stanu']);
+            else if (/^refund (?:deactivated|not approved)$/i.test(rq.st)) { c.stanBlok = true; c.notes.push(['e', 'request ' + rq.id + ' (' + rq.z + ') jest NIEAKTYWNY (stan "' + rq.st + '") - nie wykonuj tego zwrotu, usun pozycje z listy']); }
+            else if (!zatw(rq)) { c.stanBlok = true; c.notes.push(['e', 'request ' + rq.id + ' (' + rq.z + ') ma stan "' + rq.st + '", a nie "Refund approved" - zwrot mogl juz byc zrealizowany, usun pozycje z listy']); }
+            else c.notes.push(['ok', 'request ' + rq.id + ' (' + rq.z + '): IBAN, kwota i stan "Refund approved" zgodne z plikiem']);
+            if (ex.filter(zatw).length > 1) c.notes.push(['w', 'kilka zatwierdzonych requestow o tym samym IBAN-ie i kwocie (' + ex.filter(zatw).map(x => x.id).join(', ') + ') - mozliwy podwojny zwrot']);
+            const nmReq = rq.co || rq.cu;
+            if (nmReq && r.nm) {
+                const a = nnorm(r.nm);
+                const zgodna = x => x.length > 0 && (a === x || (x.length >= 8 && a.length >= 8 && (a.indexOf(x) === 0 || x.indexOf(a) === 0)));
+                if (!zgodna(nnorm(rq.co)) && !zgodna(nnorm(rq.cu))) c.notes.push(['w', 'nazwa odbiorcy w pliku "' + r.nm + '" rozni sie od nazwy w requescie "' + nmReq + '"']);
+            }
+            if (validateClean(nr).length) c.notes.push(['w', 'ten sam IBAN stoi w requescie - popraw go w prologistics (zrodlo bledu) i wygeneruj plik od nowa']);
+        }
+        c.reqMsg = rq ? rq.ms : '';
+        // Link ↗ ma prowadzic tam, gdzie JEST request (ticket), a nie do auftragu z E2E (ticket 700151, 21.10.2026).
+        const mtk = rq ? /^ticket (\d+)$/.exec(rq.z) : null;
+        c.rqTicket = mtk ? { id: mtk[1], auf: aufNr } : null;
+        if (c.stanBlok) {
+            // Zdezaktywowany albo wykonany request bywa zastapiony nowym — pokaz go, zeby bylo wiadomo, ze zwrot idzie inna droga.
+            const alt = reqs.filter(x => x !== rq && zatw(x) && !isNaN(kw) && Math.round(x.kwota * 100) === kw)[0];
+            if (alt) c.notes.push(['i', 'jest nowy request ' + alt.id + ' (' + alt.z + '; ' + (alt.pm || '?') + (alt.bk ? ' / ' + alt.bk : '') + ', ' + alt.kwota.toFixed(2) + ', "Refund approved") - zwrot pojdzie ta droga']);
+        }
+
+        let okCcy = true;
+        if (A) {
+            if (A.deleted) c.notes.push(['i', 'auftrag ' + aufNr + ' jest skasowany (Deleted)']);
+            const ccyF = String(r.ccy || '').toUpperCase();
+            okCcy = !A.ccy || !ccyF || A.ccy === ccyF;
+            if (!okCcy) c.notes.push(['w', 'waluta auftragu (' + A.ccy + ') rozni sie od waluty w pliku (' + ccyF + ') - nie porownuje kwot z wplatami']);
+            else if (A.pay.length && !isNaN(kw) && kw / 100 > sumC(A.pay) + 0.005) c.notes.push(['w', 'kwota zwrotu ' + fmt2(kw) + ' przewyzsza wplaty na auftragu (' + sumC(A.pay).toFixed(2) + ')']);
+        }
+        // Wplata przez eupago mlodsza niz 3 miesiace: taki zwrot idzie przez eupago (modul Zwroty),
+        // a przelew z banku to pomylka (16009784, 21.10.2026). Wplata moze siedziec na wczesniejszym
+        // auftragu lancucha — tu widac tylko ten, z E2E.
+        if (A && !(rq && /eupago/i.test(rq.pm || ''))) {
+            const eu = A.eu.length ? A.eu : A.pay.filter(x => x.acct === CHK_EU_KONTO && x.amt > 0);
+            const mlode = eu.filter(x => { const m = chkMies(x.date); return m != null && m < CHK_EU_MIES; });
+            if (mlode.length) {
+                const pokrywa = mlode.filter(x => !isNaN(kw) && x.amt >= kw / 100 - 0.005)[0];
+                const x0 = pokrywa || mlode[0];
+                const opisE = 'wplata przez eupago z ' + x0.date + ' (' + (isNaN(x0.amt) ? '?' : x0.amt.toFixed(2)) + ', ' + chkMies(x0.date) + ' mies.)';
+                if (pokrywa) { c.euBlok = true; c.notes.push(['e', opisE + ' - do ' + CHK_EU_MIES + ' miesiecy zwrot idzie przez eupago (modul Zwroty), a nie przelewem z banku - usun pozycje z listy']); }
+                else c.notes.push(['w', opisE + ' jest mniejsza niz zwrot - sprawdz, czy czesc zwrotu nie powinna isc przez eupago']);
+            } else if (eu.length) c.notes.push(['i', 'wplata przez eupago z ' + eu[0].date + ' ma ponad ' + CHK_EU_MIES + ' mies. - zwrot przelewem jest wlasciwy']);
+        }
+        // Wplata pierwotna karta/portfelem (Saferpay, PayPal, Klarna) a zwrot zlecony PRZELEWEM: zwracamy
+        // pierwotna forma platnosci, chyba ze karta wygasla (ticket 700151, 21.10.2026: wplata Saferpay
+        // na koncie 1022, request przelewowy zdezaktywowany, nowy kartowy). Wyjatek poznajemy po
+        // komentarzach (kartWyg), wiec tickety auftragu sa tu potrzebne — dociagamy je.
+        if (A && !(rq && /eupago/i.test(rq.pm || '')) && (!rq || /bank|transfer|przelew|berweisung/i.test(rq.pm || 'bank transfer'))) {
+            const plat = A.pay.filter(x => x.amt > 0 && CHK_ORYG.test((A.konta || {})[x.acct] || ''));
+            if (plat.length) {
+                A.tix.forEach(t => get('T:' + t));
+                if (pend) { c.pend = true; c.notes = [['i', 'sprawdzam w prologistics...']]; return c; }
+                const tkts = A.tix.concat(refs.filter(f => f.k === 'T').map(f => f.n));
+                const wyg = tkts.some(t => chkCache['T:' + t] && chkCache['T:' + t].kartWyg);
+                const sumaP = sumC(plat);
+                const opisM = 'wplata pierwotna przez ' + A.konta[plat[0].acct] + ' (konto ' + plat[0].acct + ', ' + sumaP.toFixed(2) + '), a zwrot zlecono przelewem';
+                if (wyg) c.notes.push(['i', opisM + ' - komentarze wspominaja o wygaslej karcie, wiec przelew moze byc uzasadniony']);
+                else if (isNaN(kw) || sumaP >= kw / 100 - 0.005) { c.metSoft = true; c.notes.push(['e', opisM + ' - zwracamy pierwotna forma platnosci (karta), chyba ze karta wygasla; komentarze nie wspominaja o wygaslej karcie']); }
+                else c.notes.push(['w', opisM + ' (wplata mniejsza niz zwrot) - sprawdz, czy czesc zwrotu nie powinna isc pierwotna forma platnosci']);
+            }
+        }
+
+        // Zwrot VAT: slowo „VAT" w E2E, tytule albo requescie.
+        if (!c.vatNeed && CHK_VAT.test(String(c.reqMsg || ''))) c.vatNeed = true;
+        if (c.vatNeed) {
+            if (!A) { c.fail = true; c.notes.push(['w', 'zwrot VAT: nie mam auftragu, wiec nie sprawdzilem korekty (storno + zmiana stawki)']); }
+            else {
+                const k = (A.inv.length || A.pay.length) ? chkVatKorekta(A) : null;
+                // Korekta = dokument od finansow w Attached documents ORAZ storno i zmiana stawki w systemie
+                // (15208528). Sama zmiana stawki z systemu nie wystarcza (15848550).
+                const kor = chkKorektaDok(A);
+                if (k && k.poz === 'faktury' && !kor && !A.docsBrak) {
+                    c.vatOk = false;
+                    c.notes.push(['e', 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty wystawionej recznie przez dzial finansow (np. "Korekta_<numer faktury>.pdf"). '
+                        + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach. Zaczekaj na korekte i usun pozycje z listy']);
+                } else if (k && k.poz === 'faktury' && !kor) {
+                    c.fail = true; c.notes.push(['w', 'zwrot VAT: nie odczytalem tabeli Attached documents auftragu ' + aufNr + ' - sprawdz recznie, czy finanse dodaly korekte']);
+                } else if (k) {
+                    c.vatOk = true;
+                    const opisK = (kor ? 'dokument "' + kor.name + '" (' + kor.date + (kor.who ? ', ' + kor.who : '') + '), ' : '') + (k.poz === 'faktury'
+                        ? 'storno ' + k.n.id + ' (' + k.n.amt.toFixed(2) + ', stawka ' + k.n.rate + '%) i faktura ' + k.p.id + ' (' + k.p.amt.toFixed(2) + ', stawka ' + k.p.rate + '%)'
+                        : 'storno platnosci ' + k.pn.amt.toFixed(2) + ' i zmiana stawki na ' + k.ost.rate + '% (faktury: ' + chkFakturyOpis(A.inv) + ')');
+                    const wp = sumC(A.pay), fi = sumC(A.inv), roznica = Math.round((wp - fi) * 100) / 100;
+                    if (A.inv.length && A.pay.length && okCcy && !isNaN(kw) && Math.abs(roznica - kw / 100) > 0.011)
+                        c.notes.push(['w', 'korekta VAT jest (' + opisK + '), ale kwota zwrotu ' + fmt2(kw) + ' rozni sie od roznicy wplat i faktur: ' + wp.toFixed(2) + ' - ' + fi.toFixed(2) + ' = ' + roznica.toFixed(2)]);
+                    else c.notes.push(['ok', 'korekta VAT jest: ' + opisK + (A.inv.length && A.pay.length && okCcy && !isNaN(kw) ? '; wplaty ' + wp.toFixed(2) + ' - faktury ' + fi.toFixed(2) + ' = ' + roznica.toFixed(2) + ' = kwota zwrotu' : '')]);
+                } else if (A.invBrak && A.payBrak) {
+                    c.fail = true; c.notes.push(['w', 'zwrot VAT: nie odczytalem tabel faktur ani platnosci auftragu ' + aufNr + ' - sprawdz korekte recznie']);
+                } else {
+                    c.vatOk = false;
+                    const neg = A.inv.filter(x => x.amt < 0);
+                    c.notes.push(['e', 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': ' + (neg.length ? 'jest storno ' + neg[0].id + ', ale brak nowej faktury na zmienionej stawce' : 'brak storna faktury i faktury na zmienionej stawce') + ' (faktury: ' + chkFakturyOpis(A.inv) + ')' + (kor ? ', jest dokument korekty "' + kor.name + '", ale w systemie brak storna i zmiany stawki' : '') + ' - nie zlecaj, usun pozycje z listy']);
+                }
+            }
+        } else if (A && A.inv.length && A.pay.length && okCcy && !isNaN(kw)) {
+            // Zwrot VAT bez slowa „VAT": podpowiedz, gdy korekta jest, a roznica wplat i faktur = kwota zwrotu.
+            const k = chkVatKorekta(A);
+            if (k && k.poz === 'faktury' && chkKorektaDok(A) && Math.abs(Math.round((sumC(A.pay) - sumC(A.inv)) * 100) / 100 - kw / 100) <= 0.011)
+                c.notes.push(['i', 'wyglada na zwrot VAT (dokument korekty, storno i faktura na zmienionej stawce, roznica wplat i faktur = kwota zwrotu), a w tytule nie ma "VAT"']);
+        }
+        const rk = { e: 0, w: 1, ok: 2, i: 3 };
+        c.notes.sort((a, b) => rk[a[0]] - rk[b[0]]);
+        return c;
+    }
+    // Przelicza sprawdzenie wszystkich wierszy z tego, co jest w pamieci; brakujace odczyty zleca
+    // (pompa rusza chwile pozniej, zeby pisanie w komorce nie odpalalo zapytan przy kazdej literze).
+    function chkEval() {
+        const needs = [];
+        model.forEach(r => {
+            try { r.chk = chkRow(r, needs); }
+            catch (e) { r.chk = { notes: [['w', 'blad sprawdzania: ' + ((e && e.message) || e)]], pend: false, checked: true, vatNeed: false, vatOk: null, fail: true }; }
+        });
+        needs.forEach(chkEnqueue);
+        if (chkQueue.length && !chkTimer) chkTimer = setTimeout(() => { chkTimer = null; chkPump(); }, 400);
+    }
+    function vatBrakIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (r.chk && r.chk.vatNeed && r.chk.vatOk === false) out.push(i); });
+        return out;
+    }
+    // Zwrot przelewem przy wplacie przez eupago mlodszej niz 3 miesiace (c.euBlok).
+    function euBrakIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (r.chk && r.chk.euBlok) out.push(i); });
+        return out;
+    }
+    // Request nieaktywny („Refund Deactivated") albo juz wykonany (stan inny niz „Refund approved").
+    function stanBrakIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (r.chk && r.chk.stanBlok) out.push(i); });
+        return out;
+    }
+    // Zwrot przelewem mimo wplaty karta/portfelem — nie blokuje na stale, pyta (wyjatek: karta wygasla).
+    function metSoftIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (r.chk && r.chk.metSoft) out.push(i); });
+        return out;
+    }
+    function blokIdx() {
+        const a = vatBrakIdx().concat(euBrakIdx(), stanBrakIdx());
+        return a.filter((v, i) => a.indexOf(v) === i).sort((x, y) => x - y);
+    }
+    // Brak korekty VAT i zwrot przelewem przy mlodej wplacie eupago blokuja pobranie (decyzje
+    // uzytkownika 21.10.2026); sprawdzenia, ktorego nie dalo sie zrobic, nie blokuje na stale — pyta.
+    function vatGate() {
+        const brak = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), trwa = [], nieczyt = [];
+        model.forEach((r, i) => {
+            const c = r.chk;
+            if (!c) return;
+            if (c.pend) { trwa.push(i); return; }
+            if (!c.vatNeed || c.vatOk === false) return;
+            if (c.vatOk == null) nieczyt.push(i);
+        });
+        const lista = idx => idx.map(i => 'poz. ' + (i + 1) + ' (' + (model[i].e2e || '?') + ')').join(', ');
+        if (brak.length || eu.length || stn.length) {
+            alert('POBRANIE ZABLOKOWANE.\n\n'
+                + (brak.length ? 'Zwrot VAT bez korekty (potrzebny dokument korekty od finansow oraz storno i zmiana stawki w systemie): ' + lista(brak) + '\n\n' : '')
+                + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lista(stn) + '\n\n' : '')
+                + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago (modul Zwroty), a nie przelewem z banku: ' + lista(eu) + '\n\n' : '')
+                + 'Usun te pozycje z listy (przycisk ✕ w ostatniej kolumnie albo przycisk w czerwonym pasku nad tabela) '
+                + 'i pobierz plik ponownie.');
+            return false;
+        }
+        if (trwa.length) { alert('Trwa sprawdzanie w prologistics: ' + lista(trwa) + '.\n\nPoczekaj chwile i pobierz plik ponownie.'); return false; }
+        if (nieczyt.length && !confirm('Nie udalo sie sprawdzic korekty VAT: ' + lista(nieczyt) + '.\n\nPobrac plik mimo to?')) return false;
+        const met = metSoftIdx();
+        if (met.length && !confirm('Wplata pierwotna karta/portfelem (Saferpay, PayPal, Klarna), a zwrot zlecono przelewem: ' + lista(met) + '.\n\n'
+            + 'Zwracamy pierwotna forma platnosci, chyba ze karta wygasla. Pobrac plik mimo to?')) return false;
+        return true;
+    }
+    function updateVatBan() {
+        const el = document.getElementById('sepa-vatban');
+        if (!el) return;
+        const vat = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), idx = blokIdx();
+        if (!idx.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+        const lst = a => a.map(i => 'poz. ' + (i + 1) + ' (' + esc(model[i].e2e || '?') + ')').join(', ');
+        el.style.display = 'block';
+        el.innerHTML = '<b>Pobranie pliku zablokowane.</b> '
+            + (vat.length ? 'Zwrot VAT bez korekty (potrzebny dokument korekty od finansow oraz storno i zmiana stawki w systemie): ' + lst(vat) + '. ' : '')
+            + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lst(stn) + '. ' : '')
+            + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago, nie przelewem: ' + lst(eu) + '. ' : '')
+            + 'Usun te pozycje z listy (✕) i pobierz plik ponownie. '
+            + '<button id="sepa-vatdel" style="margin-left:6px;padding:3px 9px;border:1px solid #b91c1c;background:#b91c1c;color:#fff;border-radius:5px;cursor:pointer;font:600 12px system-ui">Usun te pozycje (' + idx.length + ')</button>';
+        el.querySelector('#sepa-vatdel').onclick = () => {
+            if (!confirm('Usunac z listy ' + idx.length + ' poz. (zwrot VAT bez korekty albo wplata przez eupago)?')) return;
+            idx.slice().reverse().forEach(i => deleteRow(i));
+        };
+    }
 
     // ---------- Zapis do XML + pobranie ----------
     function writeModelToDoc() {
@@ -10739,14 +11665,15 @@
         return { zle: zle, n: grpN };
     }
     function download() {
+        if (!vatGate()) return;   // zwrot VAT bez korekty (storno + zmiana stawki) nie wychodzi do banku
         const st = writeModelToDoc() || { zle: 0 };
         // Kwota nie do odczytania trafia do pliku doslownie, a do CtrlSum juz nie —
         // NbOfTxs liczy taka transakcje, suma jej nie obejmuje. Taki plik bank odrzuci.
         // Nie blokujemy pobrania (modul nigdzie nie blokuje), ale nie wypuszczamy go
         // po cichu.
-        if (st.zle && !confirm('Uwaga: ' + st.zle + ' poz. ma kwote, ktorej nie da sie odczytac.\\n\\n'
+        if (st.zle && !confirm('Uwaga: ' + st.zle + ' poz. ma kwote, ktorej nie da sie odczytac.\n\n'
             + 'Trafia do pliku bez zmian, ale NIE wchodza do CtrlSum, a NbOfTxs je liczy — '
-            + 'plik bedzie wewnetrznie sprzeczny i bank go odrzuci.\\n\\nPobrac mimo to?')) return;
+            + 'plik bedzie wewnetrznie sprzeczny i bank go odrzuci.\n\nPobrac mimo to?')) return;
         const xml = new XMLSerializer().serializeToString(xmlDoc);
         const blob = new Blob([xml], { type: 'application/xml' });
         const a = document.createElement('a');
@@ -10820,6 +11747,9 @@
         td.st .e{color:#b91c1c;display:block}
         td.st .w{color:#b45309;display:block}
         td.st .ok{color:#15803d}
+        td.st .ok,td.st .i{display:block}
+        td.st .i{color:#64748b}
+        #sepa-vatban{display:none;margin:8px 0;padding:8px 10px;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:6px;font-size:12px;line-height:1.5}
         .sepa-num{width:150px}
         #sepa-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483041;font:13px system-ui;display:none}
         `;
@@ -10905,9 +11835,11 @@
             <button id="sepa-selnone">Odznacz wszystko</button>
             <button id="sepa-add" style="background:#047857;color:#fff;border-color:#047857">➕ Dodaj pozycje</button>
             <button id="sepa-loadfile">📂 Wczytaj plik</button>
+            <button id="sepa-rechk" title="Sprawdzenie w prologistics idzie samo po wczytaniu pliku; ten przycisk czyta wszystko od nowa (np. po poprawce requestu)">↻ Sprawdz ponownie w prologistics</button>
             <button id="sepa-dl" style="background:#1d4ed8;color:#fff;border-color:#1d4ed8">⬇ Pobierz poprawiony XML</button>
             <div class="sepa-sum" id="sepa-summary"></div>
           </div>
+          <div id="sepa-vatban"></div>
           <div style="max-height:60vh;overflow:auto;border:1px solid #e5e7eb;border-radius:6px">
             <table class="sepa-t">
               <thead><tr>
@@ -10933,13 +11865,38 @@
         c.querySelector('#sepa-add').onclick = addRow;
         c.querySelector('#sepa-loadfile').onclick = () => panel.querySelector('#sepa-file').click();
         c.querySelector('#sepa-dl').onclick = download;
+        c.querySelector('#sepa-rechk').onclick = () => { chkReset(); chkEval(); refreshRows(); };
         c.querySelector('#sepa-all').onchange = e => { model.forEach(r => r.sel = e.target.checked); renderTable(); };
         renderTable();
     }
 
+    // Uwagi ze sprawdzenia w prologistics (r.chk.notes) — tekst pochodzi z requestow, wiec ucieczka HTML.
+    function chkHtml(r) {
+        const c = r.chk;
+        if (!c || !c.notes.length) return '';
+        const ik = { e: '✗', w: '▲', ok: '✓', i: 'ℹ' };
+        return c.notes.map(n => `<span class="${n[0]}">${ik[n[0]]} ${esc(n[1])}</span>`).join('');
+    }
     function statusHtml(r) {
-        if (r.errs.length === 0 && r.warns.length === 0) return '<span class="ok">✓ ok</span>';
-        return r.errs.map(e => `<span class="e">✗ ${e}</span>`).join('') + r.warns.map(w => `<span class="w">▲ ${w}</span>`).join('');
+        const c = r.chk;
+        if (r.errs.length === 0 && r.warns.length === 0) return '<span class="ok">✓ ' + (c && c.checked ? 'format ok' : 'ok') + '</span>' + chkHtml(r);
+        return r.errs.map(e => `<span class="e">✗ ${e}</span>`).join('') + r.warns.map(w => `<span class="w">▲ ${w}</span>`).join('') + chkHtml(r);
+    }
+    function rowCls(r) {
+        const c = r.chk, has = n => !!c && c.notes.some(x => x[0] === n);
+        return (r.errs.length || has('e')) ? 'err' : ((r.warns.length || has('w')) ? 'warnrow' : '');
+    }
+    // Odswieza kolumne Status i kolor wierszy bez przerysowania tabeli (pola zostaja z kursorem).
+    function refreshRows() {
+        if (!tbody) return;
+        const trs = tbody.children;
+        for (let i = 0; i < trs.length && i < model.length; i++) {
+            trs[i].className = rowCls(model[i]);
+            if (model[i].syncLink) model[i].syncLink();
+            const st = trs[i].querySelector('td.st');
+            if (st) st.innerHTML = statusHtml(model[i]);
+        }
+        updateSummary();
     }
 
     function renderTable() {
@@ -10947,7 +11904,7 @@
         const frag = document.createDocumentFragment();
         model.forEach((r, i) => {
             const tr = document.createElement('tr');
-            tr.className = r.errs.length ? 'err' : (r.warns.length ? 'warnrow' : '');
+            tr.className = rowCls(r);
             const cbTd = document.createElement('td');
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = r.sel;
             cb.onchange = () => { r.sel = cb.checked; };
@@ -10992,12 +11949,12 @@
                 const trs = body.children;
                 for (let i = 0; i < trs.length && i < model.length; i++) {
                     const rr = model[i], tr = trs[i];
-                    tr.className = rr.errs.length ? 'err' : (rr.warns.length ? 'warnrow' : '');
+                    tr.className = rowCls(rr);
                     const st = tr.querySelector('td.st');
                     if (st) st.innerHTML = statusHtml(rr);
                 }
             } else if (myTr) {
-                myTr.className = r.errs.length ? 'err' : (r.warns.length ? 'warnrow' : '');
+                myTr.className = rowCls(r);
                 const st = myTr.querySelector('td.st');
                 if (st) st.innerHTML = statusHtml(r);
             }
@@ -11013,25 +11970,32 @@
             const a = document.createElement('a');
             a.target = '_blank'; a.rel = 'noopener'; a.textContent = '↗';
             a.style.cssText = 'margin-left:4px;text-decoration:none;font-weight:bold;color:#0a58ca';
+            // Drugi, maly odnosnik „A": auftrag, gdy glowny prowadzi do ticketu z requestem.
+            const b = document.createElement('a');
+            b.target = '_blank'; b.rel = 'noopener'; b.textContent = 'A';
+            b.style.cssText = 'margin-left:4px;text-decoration:none;font-size:11px;color:#64748b';
             const sync = () => {
-                const n = auftragFromRef(inp.value);
-                if (n) { a.href = '/auction.php?number=' + n + '&txnid=3'; a.title = 'Otwórz auftrag ' + n + ' w nowej karcie'; a.style.display = ''; }
+                // Request znaleziony na tickecie (r.chk.rqTicket) wygrywa: tam jest to, co sprawdzamy (ticket 700151).
+                // Bez tego: 6 cyfr = ticket, 7-8 cyfr = auftrag (refsOf), w pierwszy numer z pola.
+                const f = refsOf(inp.value)[0], T = r.chk && r.chk.rqTicket;
+                b.removeAttribute('href'); b.style.display = 'none';
+                if (T) {
+                    a.href = '/rma.php?rma_id=' + T.id + (T.auf ? '&number=' + T.auf + '&txnid=3' : '');
+                    a.title = 'Otwórz ticket ' + T.id + ' (tu jest request) w nowej karcie'; a.style.display = '';
+                    if (T.auf) { b.href = '/auction.php?number=' + T.auf + '&txnid=3'; b.title = 'Otwórz auftrag ' + T.auf + ' w nowej karcie'; b.style.display = ''; }
+                } else if (f) {
+                    a.href = f.k === 'T' ? '/rma.php?rma_id=' + f.n : '/auction.php?number=' + f.n + '&txnid=3';
+                    a.title = 'Otwórz ' + (f.k === 'T' ? 'ticket ' : 'auftrag ') + f.n + ' w nowej karcie'; a.style.display = '';
+                }
                 else { a.removeAttribute('href'); a.style.display = 'none'; }
             };
+            r.syncLink = sync;   // refreshRows odswieza odnosnik, gdy dojdzie wynik sprawdzenia
             sync();
             inp.addEventListener('input', sync);
-            td.appendChild(a);
+            td.appendChild(a); td.appendChild(b);
         }
         return td;
     }
-    // Numer auftraga z pola E2E/ref: najdluzszy ciag co najmniej 6 cyfr. Krotsze pomijamy,
-    // zeby „Refund_2" albo koncowka „-1" nie robily linku prowadzacego donikad.
-    function auftragFromRef(v) {
-        const m = String(v == null ? '' : v).match(/\d{6,}/g);
-        if (!m) return '';
-        return m.sort((a, b) => b.length - a.length)[0];
-    }
-
     function updateSummary() {
         if (!summaryEl) return;
         let cents = 0, bad = 0, errs = 0, warns = 0;
@@ -11042,10 +12006,17 @@
         });
         const hdr = xmlDoc ? txt(first(xmlDoc, 'GrpHdr'), 'CtrlSum') : '';
         const sumOk = hdr && fmt2(cents) === hdr;
+        let cp = 0, ce = 0, cw = 0, cok = 0;
+        model.forEach(r => {
+            const k = r.chk; if (!k || !k.checked) return;
+            if (k.pend) cp++; else if (k.notes.some(n => n[0] === 'e')) ce++; else if (k.notes.some(n => n[0] === 'w')) cw++; else cok++;
+        });
+        const chkLine = (cp + ce + cw + cok) ? `<br>Prologistics: <span style="color:#15803d">✓ ${cok}</span> &nbsp; <span style="color:#b91c1c">✗ ${ce}</span> &nbsp; <span style="color:#b45309">▲ ${cw}</span>` + (cp ? ` &nbsp; sprawdzam: ${cp}` : '') : '';
         summaryEl.innerHTML =
             `Przelewy: <b>${model.length}</b> &nbsp; Suma: <b>${fmt2(cents)}</b> ` +
             (hdr ? `(naglowek: ${hdr}${sumOk ? ' ✓' : ' — zostanie przeliczony przy pobraniu'}) ` : '') +
-            `<br>Pozycje z bledem: <b style="color:${bad ? '#b91c1c' : '#15803d'}">${bad}</b> &nbsp; bledy: ${errs} &nbsp; ostrzezenia: ${warns}`;
+            `<br>Pozycje z bledem: <b style="color:${bad ? '#b91c1c' : '#15803d'}">${bad}</b> &nbsp; bledy: ${errs} &nbsp; ostrzezenia: ${warns}` + chkLine;
+        updateVatBan();
     }
 
     addRow._n = 0;
@@ -19047,6 +20018,7 @@
         bookBtn.textContent = workers > 1 ? `⏳ Księguję (${workers} równolegle)…` : '⏳ Księguję…';
 
         let ok=0, fail=0, already=0, innaDat=0;
+        hubDz('Chińskie (Depozyty)', 'start', 'Księgowanie ' + bookRows.length + ' pozycji · ' + workers + ' równolegle', { ostro: true });
 
         function logLine(html) {
             const div = document.createElement('div');
@@ -19140,6 +20112,8 @@
                 ? `🎉 Zaksięgowano wszystkie <strong>${ok}</strong> ordery poprawnie!`
                 : parts.join(' &nbsp; ');
             summary.style.color = fail===0 ? '#16a34a' : '#b45309';
+            // Wyniki wierszy z listy na ekranie i podsumowanie — do dziennika centralnego.
+            try { Array.prototype.forEach.call(progressList.children, function (d){ hubDz('Chińskie (Depozyty)', 'wiersz', d.textContent, { ostro: true }); }); hubDz('Chińskie (Depozyty)', 'koniec', summary.textContent, { ostro: true }); } catch (e3) {}
 
             if(sheetSourceValid){
                 const refs=chnBookConfirmed(bookRows,sheetResults);
@@ -20176,7 +21150,7 @@
 
         var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {}, depoSrc: '', diag: { bal: {}, dep: {}, raw: { bal: '', dep: '', depSrc: '' }, started: '', log: [] } };
         // Slad przebiegu do pliku log — zapisujemy wszystko, co pozwala odtworzyc decyzje skryptu.
-        function dlog(msg){ try { state.diag.log.push(pcNow() + '  ' + String(msg)); } catch(e){} }
+        function dlog(msg){ try { state.diag.log.push(pcNow() + '  ' + String(msg)); } catch(e){} hubDz('Chińskie (Depozyty)', '', msg, { ostro: true }); }
         function groupRows(rows){
             var order = [], groups = {};
             rows.forEach(function(r){ var k = r.supplier; if (!(k in groups)) { groups[k] = []; order.push(k); } groups[k].push(r); });
@@ -29731,12 +30705,12 @@
                 show('<div style="font-size:12px;color:#666">Czytam ' + (FILES.length + nGrab()) + ' plik(\u00f3w)\u2026</div>');
                 var R = null;
                 try { R = await bcProcess(FILES, say, GRAB); }
-                catch(e){ show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); return; }
+                catch(e){ show('<div style="font-size:12px;color:#c00">B\u0142\u0105d: ' + esc(String(e && e.message || e)) + '</div>'); say('Sprawdzenie nie dosz\u0142o do skutku.', '#c00'); hubDz('Chi\u0144skie (Depozyty)', 'koniec', '\u2716 Sprawdzenie z bankiem nie dosz\u0142o do skutku: ' + String(e && e.message || e), { ostro: true }); return; }
                 if (R && R.err){
                     var extra = (R.errFiles && R.errFiles.length)
                         ? ('<div style="margin-top:6px;font-size:11px;color:#c00">' + R.errFiles.map(function(e){ return esc((e.file || '?') + ' \u2014 ' + e.err); }).join('<br>') + '</div>') : '';
                     show('<div style="font-size:12px;color:#c00">' + esc(R.err) + '</div>' + extra);
-                    say(R.err, '#c00'); return;
+                    say(R.err, '#c00'); hubDz('Chińskie (Depozyty)', 'koniec', '✖ Sprawdzenie z bankiem: ' + R.err, { ostro: true }); return;
                 }
                 LAST = R;
                 SEL = bcInitSel(R);
@@ -29744,6 +30718,8 @@
                 show(bcReportHtml(R, SEL));
                 bindResult();
                 say('Sprawdzenie z bankiem: ' + v.t + '.', v.c);
+                hubDz('Chińskie (Depozyty)', 'koniec', (R.nErr ? '✖ ' : ((R.nWarn || R.nMiss) ? '⚠ ' : '')) + 'Sprawdzenie z bankiem: ' + v.t + ' — zgodne ' + R.nOk + ' · uwagi ' + R.nWarn
+                    + ' · błędy ' + R.nErr + ' · bez potwierdzenia ' + R.nMiss + ' · w banku bez odpowiednika ' + R.nOrphReal, { ostro: true });
                 } finally { busy = false; }
             };
         })();
@@ -33198,6 +34174,14 @@
         // Hobbybox FI zostaje bez wpisu tutaj: jego klucz to nazwa z panelu („Beliani FI"), zapisana juz w ⚙ Konta.
         'Mirakl (Hobbybox) · Hobbybox SE': { bank: '259', booking: '9', acct: '1540' },
         'Mirakl (Hobbybox) · Hobbybox DK': { bank: '260', booking: '9', acct: '1541' },
+        // XXXLutz HR i SE: panel marketplace.xxxlgroup.com, sklepy 7077 (EUR) i 7100 (SEK) — w MK_SHOPID z jawnymi nazwami.
+        // HR: import 261 „xxx Lutz HR" (z /api/bankSettings/index/, 21.10.2026), konto 1463 „XXXLutz HR Beliani (Europe) GmbH".
+        // SE: konto 1536 „XXXLutz SE Beliani (DE) GmbH" jest w planie kont, ale ustawienia importu jeszcze nie ma (ostatni numer 261) —
+        // numer zostaje pusty do wyboru w ⚙ Konta po jego zalozeniu (modul podpowie go po nazwie). Booking 9 („Fulfillment No")
+        // PRZEZ ANALOGIE do pozostalych sklepow Mirakla — NIE odczytany z ustawienia (jego pol nie czyta zaden znany adres API);
+        // gdyby paczka weszla w calosci jako NOT FOUND, przestaw na 12 („Invoice No"), jak przy OBI CH.
+        'Mirakl (XXXLutz) · XXXLutz HR': { bank: '261', booking: '9', acct: '1463' },
+        'Mirakl (XXXLutz) · XXXLutz SE': { bank: '', booking: '9', acct: '1536' },
         // Homedeco NL: import 32 „Homedeco NL", konto 1349, booking 9 (Fulfillment No —
         // ordernumber z pliku to numer fulfilmentu). Potwierdzone przez uzytkownika 16.09.2026.
         'Homedeco · Homedeco NL': { bank: '32', booking: '9', acct: '1349' },
@@ -33474,6 +34458,8 @@
         ["1538", "InPost Pay PL Beliani (PL) GmbH", 1],
         // Dopisane recznie 13.10.2026 — konta ustawien importu 259 i 260 (Hobbybox SE i DK), odczytane z prologistics.
         ["1540", "Hobbybox SE Beliani (DE) GmbH", 1], ["1541", "Hobbybox DK Beliani (DE) GmbH", 1],
+        // Dopisane recznie 21.10.2026 — XXXLutz HR (1463, import 261) i SE (1536, importu jeszcze nie ma), odczytane z /accounts.php.
+        ["1463", "XXXLutz HR Beliani (Europe) GmbH", 1], ["1536", "XXXLutz SE Beliani (DE) GmbH", 1],
         ["1611", "Forderungen Tulip", 1], ["1745", "BCE Verbindlichkeiten", 1],
         ["1756", "Beliani International", 1], ["1770", "Umsatzsteuer 0% DE Out of country, within EU", 1], ["1774", "Umsatzsteuer 23% SK", 1],
         ["1775", "Umsatzsteuer 16% DE", 1], ["1776", "Umsatzsteuer 19% DE", 1], ["1801", "Umsatzsteuer 21% BE", 1],
@@ -34429,7 +35415,8 @@
     // Kod kraju z konca nazwy. „Vente Unique NL" -> „NL"; „Trademax" -> „".
     // LT od 17.09.2026: bez niego „Furniture 1 LT" nie mialo kraju, mkNazwaDoArkusza schodzila do konta
     // 1124 i dawala „Furniture 1 FI". Poza F1 zadna etykieta w module nie konczy sie na „ LT".
-    const MK_KRAJE = ('PL CZ SK HU RO DE AT CH FR IT ES PT NL BE LU UK SE NO DK FI EU IE LT')
+    // HR od 21.10.2026 (XXXLutz HR, sklep 7077): bez niego „XXXLutz HR" nie mialo kraju i nazwa do arkusza schodzila do konta.
+    const MK_KRAJE = ('PL CZ SK HU RO DE AT CH FR IT ES PT NL BE LU UK SE NO DK FI EU IE LT HR')
                      .split(' ');
     function mkKrajZ(v){
         const m = String(v == null ? '' : v).trim().match(/[\s\-_]([A-Za-z]{2})$/);
@@ -35679,7 +36666,9 @@
         "248": "PayPal SI/HR - automatic booking", "249": "Momax DE Beliani DE", "250": "InPost Pay", "251": "Zadbano CZ",
         "252": "Order Payment $",
         // Dopisane recznie poza zrzutem z 15.09.2026: ustawienia Cultury, Altexa i Hobbyboxa SE/DK, odczytane 13.10.2026.
-        "257": "Cultura FR", "258": "Altex RO", "259": "Hobbybox SE", "260": "Hobbybox DK"
+        "257": "Cultura FR", "258": "Altex RO", "259": "Hobbybox SE", "260": "Hobbybox DK",
+        // 261 „xxx Lutz HR" — odczytane 21.10.2026 z /api/bankSettings/index/ (SE jeszcze nie ma: ostatni numer to 261).
+        "261": "xxx Lutz HR"
     };
     function bsPobrane(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsReczne(){ try { return JSON.parse(GM_getValue(MK_BS_RECZNE, '{}')) || {}; } catch (e){ return {}; } }
@@ -35920,7 +36909,9 @@
         'XXXLUTZ|CH':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|CZ':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|DE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
-        'XXXLUTZ|RO':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
+        'XXXLUTZ|HR':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|RO':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|SE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
     };
     // Adres panelu dla zlecenia. Kraj bierzemy z nazwy sklepu — tak samo jak przy
     // zgadywaniu konta w mkAcctGuess. Marka („Vente Unique") bywa inna niz sklep
@@ -36787,6 +37778,13 @@
         if (/OPEN_AMOUNT/.test(s)) return { k: 'skip', ref: ref };
         if (/MANUAL_INVOICE/.test(s)) return { k: 'skip', ref: ref };   // faktury operatora
         if (/PENALTY/.test(s)) return { k: 'skip', ref: ref };          // kary naliczone sprzedawcy
+        // Reczne pozycje operatora (Home24, od 10.2026). JSON: INVOICEABLE_ONE_OFF_DEBIT / MANUAL_CREDIT (+ _TAX / _VAT),
+        // CSV: „One-off debit" / „Manual credit" (+ „ tax"). One-off debit to reczny zwrot dla klienta, ktory operator
+        // odlicza od wyplaty (faktura „Calculation of a manual refund"); Manual credit to uznanie dla sprzedawcy
+        // (nota „Rücknahme Erstattung (Chargeback)"). Oba maja numer zamowienia, ale NIE w polu orderUuid — patrz
+        // mkNrPozycjiRecznej. Do 5.60.11 szly tu jako „unknown" i wstrzymywaly import calego cyklu.
+        if (/(^|_)ONE_OFF_DEBIT(_|$)/.test(s)) return { k: 'oneoff', ref: false };
+        if (/(^|_)MANUAL_CREDIT(_|$)/.test(s)) return { k: 'manualcr', ref: false };
         if (/^(REFUND_)?ORDER_AMOUNT(_TAX)?(_REFUND)?$/.test(s)) return { k: 'gross', ref: ref };
         if (/SHIPPING/.test(s)) return { k: 'gross', ref: ref };   // wysylka + jej podatek
         return { k: 'unknown', ref: ref };
@@ -36798,8 +37796,28 @@
     // dokladnie o te druga wyplate: skladniki 3617.29 vs zapamietane 3604.26, czyli 13.03.
     // Teraz zbieramy wszystkie, a do porownania z wyciagiem bierzemy te, ktorej odnosnik
     // zgadza sie z przelewem.
+    // Numer zamowienia reczniej pozycji operatora. JSON z panelu: zwykle `orderUuid` (Manual credit), a przy One-off debit
+    // pole jest PUSTE, a numer stoi w `references: [{ type: 'ORDER_ID', value: '1025820974-A' }]` (odczyt panelu Home24,
+    // 21.10.2026). Eksport CSV tych wierszy numeru nie niesie wcale (kolumna „Order number" pusta) — jedyna nadzieja to nowa
+    // kolumna „Other reference", wiec ja tez bierzemy, ale tylko jako pojedynczy token. Pusty wynik = pozycji nie przypiszemy.
+    function mkNrPozycjiRecznej(x){
+        const id = String((x && x.orderUuid) || '').trim();
+        if (id) return id;
+        const rf = (x && x.references) || [];
+        for (let i = 0; i < rf.length; i++){
+            const r = rf[i];
+            if (r && /^ORDER_?ID$/i.test(String(r.type || '')) && String(r.value || '').trim()) return String(r.value).trim();
+        }
+        const o = String((x && x.otherReference) || '').trim();
+        return /^\S+$/.test(o) ? o : '';
+    }
     function mkAggregate(data, wantRef){
         const ord = {}, ref = {}, unknown = {}, skipped = {}, pays = [];
+        // Reczne pozycje operatora: `reczne` to wiersze do pokazania czlowiekowi (rodzaj, zamowienie, kwota, dokument),
+        // `manual` — suma Manual credit per zamowienie (idzie na liste zwrotow jako uznanie, nota ze znakiem minus),
+        // `bezNr` — One-off debit / Manual credit, ktorych numeru zamowienia nie znamy (blokada z wyjasnieniem).
+        // `niepewne` — One-off debit, ktorego rodzaju (zwrot czy oplata) nie ustalilismy z PDF-a dokumentu (mkOneOffKlasy).
+        const reczne = {}, manual = {}, bezNr = {}, niepewne = {};
         // „comp" to suma wszystkich pozycji BEZ wierszy Payment — czyli to, co powinno wyjsc
         // na konto. Gdyby liczyc razem z Payment, wynik zawsze bylby zerem (sprawdzone:
         // skladniki +694.52, Payment -694.52), a sciezka zapasowa dla cykli jeszcze bez
@@ -36811,6 +37829,51 @@
             if (c.k === 'payment') { pays.push({ a: a, r: mkPayRef(x) }); return; }
             comp = r2(comp + a);
             if (c.k === 'unknown') { unknown[x.type] = (unknown[x.type] || 0) + 1; return; }
+            if (c.k === 'oneoff' || c.k === 'manualcr'){
+                const rodzaj = (c.k === 'oneoff') ? 'One-off debit' : 'Manual credit';
+                const nr = mkNrPozycjiRecznej(x);
+                // One-off debit bywa ZWROTEM (faktura „Calculation of a manual refund", „Belastung zu … Chargebacks … Refunds") albo
+                // OPLATA („Bearbeitungsgebuehr / Handling fee", 17.50 za zamowienie) — w API wygladaja tak samo, rozni je tylko opis
+                // w PDF-ie dokumentu. Rodzaj ustala mkOneOffKlasy (pole _klasaDok); bez niego nie zgadujemy. Manual credit to zawsze uznanie.
+                const kl = (c.k === 'oneoff') ? String(x._klasaDok || '') : 'zwrot';
+                const dokNr = x.documentNumber ? String(x.documentNumber) : '';
+                if (c.k === 'oneoff' && kl === 'oplata'){
+                    // Oplata operatora (jak prowizja i abonament): siedzi w wyplacie, ale nie jest zwrotem — nie idzie na liste zwrotow.
+                    const SK = 'One-off debit (opłata)';
+                    skipped[SK] = (skipped[SK] || 0) + (a ? 1 : 0);        // wiersze podatku (0.00) nie sa osobna pozycja
+                    const kf = 'oplata|' + (nr || '') + '|' + dokNr;
+                    const wf = reczne[kf] || (reczne[kf] = { rodzaj: 'One-off debit', kl: 'oplata', id: nr || '—', amt: 0, dok: dokNr });
+                    wf.amt = r2(wf.amt + a);
+                    return;
+                }
+                if (!nr){
+                    // Bez numeru zamowienia nie wiadomo, na ktory ticket ta kwota ma pojsc — nie zgadujemy, wstrzymujemy import.
+                    unknown[x.type] = (unknown[x.type] || 0) + 1;
+                    const b = bezNr[rodzaj] || (bezNr[rodzaj] = { n: 0, suma: 0, dok: {} });
+                    if (a) b.n++;                        // wiersze podatku (0.00) nie sa osobna pozycja
+                    b.suma = r2(b.suma + a);
+                    if (x.documentNumber) b.dok[String(x.documentNumber)] = 1;
+                    return;
+                }
+                if (c.k === 'oneoff' && kl !== 'zwrot'){
+                    // Nie wiadomo, czy to zwrot (nota w tickecie) czy oplata (nic nie ksiegujemy) — pomylka w ktorakolwiek strone to blad ksiegowy.
+                    unknown[x.type] = (unknown[x.type] || 0) + 1;
+                    const n = niepewne[dokNr || '?'] || (niepewne[dokNr || '?'] = { n: 0, suma: 0, err: '' });
+                    if (a) n.n++;
+                    n.suma = r2(n.suma + a);
+                    if (x._klasaBlad) n.err = String(x._klasaBlad);
+                    return;
+                }
+                const k = rodzaj + '|' + nr;
+                const w = reczne[k] || (reczne[k] = { rodzaj: rodzaj, kl: 'zwrot', id: nr, amt: 0, dok: '' });
+                w.amt = r2(w.amt + a);
+                if (x.documentNumber) w.dok = String(x.documentNumber);
+                // One-off debit to zwykly zwrot dla klienta (nota na auftragu, rozbita na produkty jak kazdy zwrot) — wpada
+                // do tej samej listy co REFUND_ORDER_AMOUNT. Manual credit idzie osobno: uznanie, nota ze znakiem minus.
+                if (c.k === 'oneoff') ref[nr] = r2((ref[nr] || 0) + a);
+                else manual[nr] = r2((manual[nr] || 0) + a);
+                return;
+            }
             if (c.k !== 'gross') { skipped[x.type] = (skipped[x.type] || 0) + 1; return; }
             const id = String(x.orderUuid || '').trim();
             if (!id) return;
@@ -36823,7 +37886,102 @@
         let pay = null;
         if (wantRef){ const m = pays.filter(function (p){ return p.r.indexOf(wantRef) >= 0; }); if (m.length === 1) pay = m[0].a; }
         if (pay == null && pays.length === 1) pay = pays[0].a;
-        return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay, pays: pays, payAll: payAll };
+        return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay, pays: pays, payAll: payAll,
+                 reczne: Object.keys(reczne).map(function (k){ return reczne[k]; }), manual: manual, bezNr: bezNr, niepewne: niepewne };
+    }
+
+    // ===== One-off debit: zwrot czy oplata — z PDF-a dokumentu =====
+    // Rodzaj (zwrot dla klienta / oplata operatora) stoi wylacznie w opisie pozycji na fakturze. Trzy znane brzmienia
+    // (odczyt 21.10.2026, Home24): „Calculation of a manual refund" (DE, FIN-A-384) i „Belastung zu entstandenen Chargebacks, auf
+    // Grund von nicht fristgerecht bearbeiteten Refunds" (AT, FIN-A-35) — zespol ksieguje je notami zwrotu; „Bearbeitungsgebuehr /
+    // Handling fee (Reverse-Charge-Verfahren)" (AT, FIN-A-127, 17.50 za zamowienie) — oplata, w tickecie nie ma po niej zadnej noty.
+    // Gdy tekst pasuje do obu rodzajow albo do zadnego, wynik to '?' i HUB wstrzymuje import zamiast zgadywac.
+    function mkOneOffKlasaZTekstu(t){
+        const s = String(t || '');
+        const oplata = /Bearbeitungsgeb[uü]e?hr|handling\s+fee/i.test(s);
+        const zwrot = /refund|erstattung|chargeback|r[uü]ckzahlung|r[uü]ckbuchung/i.test(s);
+        if (zwrot && !oplata) return 'zwrot';
+        if (oplata && !zwrot) return 'oplata';
+        return '?';
+    }
+    const MK_ONEOFF_KLASY_KEY = 'mkt_oneoff_klasy';
+    function mkOneOffPamiec(){ try { return JSON.parse(GM_getValue(MK_ONEOFF_KLASY_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function mkOneOffPamiecZapisz(o){
+        // Dokument jest niezmienny, a wpis maly — zostawiamy najnowsze 400.
+        const k = Object.keys(o);
+        while (k.length > 400) delete o[k.shift()];
+        try { GM_setValue(MK_ONEOFF_KLASY_KEY, JSON.stringify(o)); } catch (e){}
+    }
+    // PDF dokumentu z panelu Mirakla — ten sam adres, pod ktory idzie przycisk „PDF" na stronie dokumentu (zapis ruchu 21.10.2026:
+    // GET /document-request/private/documents/<id dokumentu>/PDF/download, <id> = `documentId` pozycji). Pobieranie jak w manorPdf:
+    // na samym panelu zwyklym fetch-em, z prologistics przez GM (ciasteczko sesji dobiera menedzer skryptow). Nic nie zapisuje na dysk.
+    async function mkPdfDokumentu(host, docId){
+        const sciezka = '/document-request/private/documents/' + encodeURIComponent(docId) + '/PDF/download';
+        const h = onMirakl ? location.hostname : String(host || '');
+        let u8;
+        if (onMirakl){
+            const r = await fetch(sciezka, { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' przy pobieraniu PDF-a dokumentu');
+            u8 = new Uint8Array(await r.arrayBuffer());
+        } else {
+            const r = await new Promise(function (ok, nie){
+                if (typeof GM_xmlhttpRequest === 'undefined'){ nie(new Error('brak GM_xmlhttpRequest')); return; }
+                GM_xmlhttpRequest({
+                    method: 'GET', url: 'https://' + h + sciezka, timeout: 90000,
+                    headers: { 'accept': 'application/pdf, */*' }, responseType: 'arraybuffer',
+                    overrideMimeType: 'text/plain; charset=x-user-defined',
+                    onload: ok,
+                    onerror: function (){ nie(new Error('nie mogę połączyć się z ' + h)); },
+                    ontimeout: function (){ nie(new Error(h + ' nie odpowiedział na czas')); }
+                });
+            });
+            if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' przy pobieraniu PDF-a dokumentu');
+            if (r.response && r.response.byteLength != null) u8 = new Uint8Array(r.response);
+            else {
+                const t = String(r.responseText || '');
+                u8 = new Uint8Array(t.length);
+                for (let i = 0; i < t.length; i++) u8[i] = t.charCodeAt(i) & 0xFF;
+            }
+        }
+        let glowa = '';
+        for (let i = 0; i < Math.min(5, u8.length); i++) glowa += String.fromCharCode(u8[i]);
+        if (glowa.indexOf('%PDF') !== 0)
+            throw new Error('zamiast PDF-u przyszło coś innego (' + u8.length + ' B) — najpewniej strona logowania, zaloguj się na ' + h);
+        return u8;
+    }
+    // Ustala rodzaj kazdego dokumentu z pozycjami One-off debit i dopisuje go do pozycji (`_klasaDok`: 'zwrot' | 'oplata' | '?',
+    // przy porazce `_klasaBlad`). Rozstrzygniete wyniki zostaja w pamieci (dokument sie nie zmienia). Wolane po pobraniu pozycji cyklu,
+    // w sklepie, w ktorym lezy cykl — dokument nalezy do tego sklepu. Eksport CSV nie ma identyfikatora dokumentu, wiec tam
+    // nic nie ustalamy (pozycje i tak nie maja numeru zamowienia).
+    async function mkOneOffKlasy(list, host){
+        const dok = {};
+        (list || []).forEach(function (x){
+            if (!x || !x.documentId || mkCls(x.type).k !== 'oneoff') return;
+            dok[x.documentId] = x.documentNumber || '';
+        });
+        const ids = Object.keys(dok);
+        if (!ids.length) return;
+        const pam = mkOneOffPamiec(), wynik = {};
+        let zm = false;
+        for (let i = 0; i < ids.length; i++){
+            const id = ids[i];
+            if (pam[id] === 'zwrot' || pam[id] === 'oplata'){ wynik[id] = { k: pam[id] }; continue; }
+            try {
+                const tekst = await c24PdfTekst(await mkPdfDokumentu(host, id));
+                const k = mkOneOffKlasaZTekstu(tekst);
+                wynik[id] = k === '?' ? { k: '?', err: 'opis pozycji w PDF-ie nie jest ani zwrotem, ani opłatą — nie rozpoznaję go' } : { k: k };
+                if (k !== '?'){ pam[id] = k; zm = true; }
+            } catch (e){
+                wynik[id] = { k: '?', err: String((e && e.message) || e) };
+            }
+        }
+        if (zm) mkOneOffPamiecZapisz(pam);
+        (list || []).forEach(function (x){
+            const w = x && x.documentId && wynik[x.documentId];
+            if (!w || mkCls(x.type).k !== 'oneoff') return;
+            x._klasaDok = w.k;
+            if (w.err) x._klasaBlad = w.err;
+        });
     }
 
     // ===== zestawienie Mirakla wgrane recznie =====
@@ -36915,6 +38073,15 @@
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CZ' },
         '7044': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz RO' },
+        // XXXLutz HR i SE — ten sam panel i login; lista sklepow z 21.10.2026: 2026 Beliani, 3752 AT, 6346 CH (Manual suspension),
+        // 7031 CZ, 7077 HR, 7163 HU (Pending approval), 7012 MMX AT, 6740 MMX DE, 7044 RO, 7100 SE, 6254 SI (Pending approval).
+        // shops/current po przelaczeniu: 7077 „Beliani HR" EUR (cykle c842a1ed 6134.52 i 1c9d1ede 1039.92), 7100 „Beliani SE" SEK
+        // (cykl f5e0cfd2 1128.39). Nazwy jawne jak przy CZ i RO; „cur" — waluta wyplaty sklepu (czyta ja mkWalutaSklepu, bo regula
+        // XXXLutz nie ma waluty: zlecenie z arkusza na „XXXLutz SE" ma byc w SEK, a nie w domyslnych EUR). CH, HU i SI: jeszcze nie wpisane.
+        '7077': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz HR', cur: 'EUR' },
+        '7100': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz SE', cur: 'SEK' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
@@ -36978,7 +38145,17 @@
         // shops/current: „Beliani.fr", EUR; jedyny sklep loginu). Nazwe wpisujemy jawnie, bo „Beliani.fr"
         // z panelu nie jest etykieta z _Markety — tak jak przy Hornbachu i Castoramie PL.
         '3534': { mp: 'Mirakl (Cultura)', brand: 'Cultura', short: 'Cultura',
-                  host: 'culturafr-prod.mirakl.net', shop: 'Cultura FR' }
+                  host: 'culturafr-prod.mirakl.net', shop: 'Cultura FR' },
+        // Home24: JEDEN login, PIEC sklepow (przelacznik w naglowku panelu, 21.10.2026): AT 3481, CH 2999, DE 3319, FR 3436,
+        // NL 4820. Do 5.60.11 HUB znal tylko sklep, na ktorym panel byl otwarty — reszte zapamietywal dopiero po rozwinieciu
+        // przelacznika, wiec na kazdym komputerze przelot sprawdzal „1 sklep: Beliani DE" i nie znajdowal wyplat AT / CH / FR / NL
+        // (zgloszenie 21.10.2026: Home24 AT 8481.42 — rozliczenie caca2af4 lezy w sklepie 3481). Nazwy NIE wpisujemy: poda ja panel
+        // („Beliani AT" itd.), tak jak dotad przy DE, wiec klucze ustawien istniejacych sklepow sie nie zmieniaja.
+        '3319': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        '3481': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        '2999': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        '3436': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        '4820': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -37114,7 +38291,10 @@
                        orderUuid: String(r[ix['Order number']] || '').trim(),
                        transactionNumber: (ix['Transaction Number'] == null) ? '' : String(r[ix['Transaction Number']] || '').trim(),
                        description: (ix['Description'] == null) ? '' : String(r[ix['Description']] || '').trim(),
-                       paymentReference: (ix['Payment reference'] == null) ? '' : String(r[ix['Payment reference']] || '').trim() });
+                       paymentReference: (ix['Payment reference'] == null) ? '' : String(r[ix['Payment reference']] || '').trim(),
+                       // Dokument (faktura / nota) pozycji i nowa od 10.2026 kolumna „Other reference" — patrz mkNrPozycjiRecznej.
+                       documentNumber: (ix['Invoice number'] == null) ? '' : String(r[ix['Invoice number']] || '').trim(),
+                       otherReference: (ix['Other reference'] == null) ? '' : String(r[ix['Other reference']] || '').trim() });
             if (!shopId && ix['Shop ID'] != null) shopId = String(r[ix['Shop ID']] || '').trim();
             if (!shop && ix['Shop'] != null) shop = String(r[ix['Shop']] || '').trim();
             if (!cyc) cyc = String(r[ix['Billing Cycle ID']] || '').trim();
@@ -37197,6 +38377,15 @@
         }
         let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
         let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
+        // Manual credit (uznanie od operatora, np. „Rücknahme Erstattung (Chargeback)"): kwota wplywa do wyplaty, a zespol
+        // ksieguje ja notka ze znakiem MINUS w tickecie zamowienia (ticket 638703: nota −200.99 z data wyplaty). Ta sama droga
+        // co claimy Amazona: pozycja dodatkowa z rodzajem, jedna nota na pierwszej pozycji, kontrola duplikatu bez sum.
+        const refExtra = [];
+        Object.keys(a.manual).forEach(function (id){
+            const v = a.manual[id];
+            if (!v) return;
+            refExtra.push({ id: id, amt: Math.abs(v), sign: v > 0 ? -1 : 1, rodzaj: 'Manual credit' });
+        });
         // Netto rozliczenia = wiersz Payment (a gdy go jeszcze nie ma —
         // suma skladnikow). To ono ma sie zgadzac z kwota z wyciagu.
         // Przy Manorze zawsze suma skladnikow: platnosc idzie poza Miraklem
@@ -37233,7 +38422,7 @@
         j.data = { cycle: cycIds.join(', '), shop: manor ? (j.shop || shopName) : shopName,
                    gross: gross, refund: refund, net: net,
                    netOk: full && (bezKwoty || eq(net, j.amount)), netSkip: bezKwoty,
-                   ord: a.ord, ref: a.ref,
+                   ord: a.ord, ref: a.ref, refExtra: refExtra, reczne: a.reczne,
                    unknown: a.unknown, skipped: a.skipped, full: full,
                    both: both, pays: a.pays.length, split: split,
                    rows: tx.list.length, total: tx.total, pages: tx.pages, how: tx.how };
@@ -37255,7 +38444,21 @@
         if (!full) bad.push(tx.total != null
             ? ('pobrano ' + tx.list.length + ' z ' + tx.total + ' pozycji')
             : ('pobrano ' + tx.list.length + ' pozycji i nie umiem przewinąć dalej — to nie musi być komplet'));
-        if (unk) bad.push('nierozpoznane typy pozycji');
+        if (unk){
+            // Reczne pozycje bez numeru zamowienia (eksport CSV go nie niesie) to osobny, znany przypadek — mowimy, co zrobic.
+            const bn = Object.keys(a.bezNr || {});
+            const inne = Object.keys(a.unknown).filter(function (t){ const k = mkCls(t).k; return k !== 'oneoff' && k !== 'manualcr'; });
+            if (inne.length) bad.push('nierozpoznane typy pozycji');
+            const np = Object.keys(a.niepewne || {});
+            if (np.length) bad.push('One-off debit: nie ustaliłem z PDF-a dokumentu, czy to zwrot dla klienta, czy opłata (' + np.map(function (d){
+                const n = a.niepewne[d];
+                return (d === '?' ? 'dokument bez numeru' : ('dok. ' + d)) + ' ' + f2(n.suma) + (n.err ? (' — ' + n.err) : '');
+            }).join(' · ') + ') — zwrot księgujemy notą w tickecie, opłaty nie; sprawdź dokument w panelu Home24 (Accounting documents) i ponów „⬇ Pobierz zestawienia"');
+            if (bn.length) bad.push('pozycje ręczne operatora bez numeru zamówienia: ' + bn.map(function (r){
+                const b = a.bezNr[r], dok = Object.keys(b.dok);
+                return r + ' ×' + b.n + ' na ' + f2(b.suma) + (dok.length ? (' (dok. ' + dok.join(', ') + ')') : '');
+            }).join(' · ') + ' — plik CSV numeru zamówienia nie niesie; pobierz zestawienie z panelu („⬇ Pobierz zestawienia"), tam numer jest w references');
+        }
         if (!manor && paysAll > 1 && !split) bad.push('cykl ma ' + paysAll + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
         if (!manor && paysAll > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + paysAll + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
         if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
@@ -51211,6 +52414,10 @@
                     return z({ stan: 'zrob', opis: s.juz ? ('płatność HUB-a na auftragu ' + (s.num || '') + ' (' + mkCzasLok(s.kiedy) + '), nota w tickecie ' + (s.rmaNoty || s.rma || '')
                                                             + ' była już wcześniej — nie przez HUB')
                                                          : ('zaksięgowane przez HUB ' + mkCzasLok(s.kiedy) + ' (płatność na auftragu ' + (s.num || '') + ' i nota w tickecie ' + (s.rma || '') + ')') });
+                if (s.auf === 'ok' && (s.tick === 'wysl' || s.tick === 'blad'))
+                    return z({ stan: 'czesc', opis: 'płatność na auftragu ' + (s.num || '') + ' weszła; nota w tickecie ' + (s.rma || '') + ' bez potwierdzenia'
+                                                  + (s.tickBlad ? (' (' + s.tickBlad + ')') : '') + ' — nie dopisuj jej ręcznie: „🔍 Sprawdź” rozstrzygnie z ticketu, '
+                                                  + 'a „▶ Zaksięguj” dokończy samą notę, jeśli jej nie ma' });
                 if (s.auf === 'ok') return z({ stan: 'czesc', opis: 'płatność na auftragu ' + (s.num || '') + ' weszła, noty w tickecie ' + (s.rma || '') + ' nie ma' + (s.tickBlad ? (' (' + s.tickBlad + ')') : '') + ' — „▶ Zaksięguj” dokończy samą notę' });
                 if (s.auf === 'wysl') return z({ stan: 'niepewne', opis: 'płatność wysłana ' + mkCzasLok(s.kiedy) + ' bez potwierdzenia — „🔍 Sprawdź” rozstrzygnie z auftragu ' + (s.num || '') });
             } else {
@@ -51233,7 +52440,8 @@
                 if (s.tick === 'blad'){
                     // Sprawdzenie PO bledzie (np. ktos zaksiegowal note recznie, rozbil ja albo dal inna date) ma pierwszenstwo.
                     if (p.spr && p.spr.stan !== 'do' && String(p.spr.kiedy || '') >= String(s.kiedy || '')) return p.spr;
-                    return z({ stan: 'do', opis: 'nota w tickecie ' + (s.rma || '') + ' nie weszła (' + (s.tickBlad || 'błąd') + ') — „▶ Zaksięguj” spróbuje jeszcze raz' });
+                    return z({ stan: 'do', opis: 'nota w tickecie ' + (s.rma || '') + ' bez potwierdzenia (' + (s.tickBlad || 'błąd') + ') — nie dopisuj jej ręcznie: '
+                                                + '„▶ Zaksięguj” sprawdzi ticket i dokończy, jeśli jej nie ma' });
                 }
             }
         }
@@ -51666,7 +52874,7 @@
             const tick0 = kflTickety(A.exact.concat(A.war));
             let nota = null;
             for (let i = 0; i < tick0.length && i < 6 && !nota; i++){
-                const nt = await kflNotyTicketu(tick0[i]), ob = kflObceNoty(p.k, nt);
+                const nt = await kflNotyTicketu(tick0[i]), ob = kflObceNoty(p.k, nt, p.ff);
                 const zD = nt.filter(function (n){ return n.zaksiegowana && n.znak > 0 && n.data === stPl[0].data && n.kwota != null && !ob[String(n.id)]; });
                 if (zD.length && Math.abs(r2(zD.reduce(function (x, n){ return x + n.kwota; }, 0)) - suma) < 0.01) nota = { rma: tick0[i], n: zD.length };
                 await kflSen(KFL_ODSTEP);
@@ -51689,18 +52897,28 @@
         if (!tick.length) return { stan: 'reka', opis: 'brak ticketu przy auftragu ' + a.num + ' — zrób ręcznie (zespół księgował notę w istniejącym tickecie CS)', num: a.num };
         // Zespol robi czasem najpierw note (rozbita na produkty), a platnosci jeszcze nie — noty jednej daty od poprzedniego miesiaca,
         // ktore daja open auftragu, oznaczaja „dokończ ręcznie" (HUB nie dolozy drugiej noty).
-        const odD = kflPierwszy(p.data, -1), DS = kflDatyStorn();
-        const kand = [DS.biez].concat(DS.poczatek ? [DS.poprz] : []);
+        const odD = kflPierwszy(p.data, -1);
+        // Zwrot tego zamowienia z 1. dnia miesiaca, ktorego zapisu HUB nie potwierdzil: jego nota moze stac z data anulacji, a kontrola not
+        // jej nie widzi (schowana jako cudza) — najpierw rozstrzygniecie zwrotu (piaty przeglad).
+        const slZ = kflSladLoad();
+        const zwN = ((kflPozLoad() || {}).poz || []).filter(function (q){
+            const z = slZ[q.k] || {};
+            return (q.typ === 'E' || q.typ === 'SF') && q.ff === p.ff && /-01$/.test(String(q.data)) && q.data >= odD && (z.tick === 'wysl' || z.tick === 'blad');
+        })[0];
+        if (zwN) return { stan: 'reka', opis: 'zwrot tego zamówienia z ' + zwN.data + ' (' + f2(zwN.kwota) + ') czeka na potwierdzenie zapisu noty — najpierw „🔍 Sprawdź”, '
+                                     + 'potem anulacja', num: a.num };
         for (let i = 0; i < tick.length && i < 6; i++){
-            const poD = {}, nt = await kflNotyTicketu(tick[i]), ob = kflObceNoty(p.k, nt);
+            const poD = {}, nt = await kflNotyTicketu(tick[i]), ob = kflObceNoty(p.k, nt, p.ff);
             kflNotyDodatnie(nt).forEach(function (n){ if (n.data && n.data >= odD && !ob[String(n.id)]) (poD[n.data] = poD[n.data] || []).push(n); });
             await kflSen(KFL_ODSTEP);
             const d = Object.keys(poD).sort().filter(function (x){ return Math.abs(kflSumaNot(poD[x]) - a.open) < 0.01; })[0];
             if (d) return { stan: 'reka', opis: 'w tickecie ' + tick[i] + ' są już noty z ' + d + ' (' + kflOpisNot(poD[d]) + ') na open auftragu ' + a.num
                                  + ', a płatności nie ma — dokończ płatność ręcznie', num: a.num };
-            const dK = kand.filter(function (x){ return poD[x]; })[0];
+            // Noty z 1. dnia miesiaca (data anulacji) od poprzedniego miesiaca — takze czesc rozbitej noty zespolu — bez platnosci: recznie.
+            // Nie zalezy od dzisiejszej daty (piaty przeglad: od 4. dnia miesiaca czesciowa nota z 1. dnia poprzedniego przestawala chronic).
+            const dK = Object.keys(poD).sort().filter(function (x){ return /-01$/.test(x); })[0];
             if (dK) return { stan: 'reka', opis: 'w tickecie ' + tick[i] + ' są już noty z ' + dK + ' (' + kflOpisNot(poD[dK]) + '), a płatności na auftragu ' + a.num
-                                  + ' nie ma — przy zapisie z tą datą HUB nie wyśle płatności; dokończ ręcznie', num: a.num };
+                                  + ' nie ma — anulację ktoś zaczął albo zrobił inaczej; dokończ ręcznie', num: a.num };
         }
         return { stan: 'do', opis: 'płatność ' + f2(a.open) + ' na auftragu ' + a.num + ' + nota w tickecie ' + tick[0], num: a.num, rma: tick[0], kwota: a.open };
     }
@@ -51720,6 +52938,19 @@
             if (oc.stan === 'ok') kflSladUstaw(p.k, { tick: 'ok', tickBlad: null, uwaga: oc.uwaga || null, poz: oc.n > 1 ? oc.n : null, idsNowe: oc.ids });
             else if (oc.stan === 'niezg') kflSladUstaw(p.k, { tick: 'niezg', niezg: oc.opis });
             else if (s2.tick === 'wysl') kflSladUstaw(p.k, { tick: null, idsPrzed: null });
+        } else if (sNota && s2.rma && p.typ === 'S'){
+            // Platnosc anulacji stoi, a noga ticketowa nie zdjela jeszcze numerow not (nie doszla do wysylki): noty zespolu z ta data we
+            // wszystkich ticketach zamowienia, bez not innych pozycji HUB-a — jak w nodze (piaty przeglad: dotad dowolne noty z ta data
+            // dawaly „zaksięgowane przez HUB”, bez strazy zwrotu tego dnia).
+            const kw = Number(s2.kwota) || 0, dt = String(s2.data || '');
+            const Wall = await kflNotyZamowienia(p.ff);
+            const ob = kflObceNoty(p.k, Wall, p.ff);
+            const zDt = Wall.filter(function (n){ return n.data === dt && !ob[String(n.id)]; });
+            if (!zDt.length){ if (s2.tick === 'wysl') kflSladUstaw(p.k, { tick: null }); return; }
+            const gdzie = zDt.map(function (n){ return n.rma; }).filter(function (r, i, x){ return x.indexOf(r) === i; }).join(', ');
+            if (Math.abs(kflSumaNot(zDt) - kw) < 0.01) kflJuzNoty(p, zDt, gdzie, dt, acct);
+            else kflSladUstaw(p.k, { tick: 'niezg', niezg: 'w tickecie ' + gdzie + ' są noty z ' + dt + ': ' + kflOpisNot(zDt) + ' — razem ' + f2(kflSumaNot(zDt))
+                                                          + ', a anulacja to ' + f2(kw) });
         } else if (sNota && s2.rma){
             const noty = await kflNotyTicketu(s2.rma);
             const kw = Number(s2.kwota) || 0, dt = String(s2.data || '');
@@ -51821,6 +53052,7 @@
     // w zdjeciu kazdej pozniejszej proby B, a nota spoza zdjecia B nie moze byc zapisem A. '' — nota starsza od wszystkich zdjec.
     // (Czwarty przeglad, a87a18a: klucz „ticket|data" innej pozycji chowal noty zespolu z ta data i wlasna note HUB-a z cudza data.)
     function kflKtoZapisal(sl, n){
+        if (!n || !n.id) return '';                // nota bez numeru: nie wiadomo, czyja — zawsze widoczna (piaty przeglad)
         let kto = '', t0 = -1, d0 = -1;
         Object.keys(sl).forEach(function (x){
             const s = sl[x];
@@ -51835,25 +53067,57 @@
     // ktore mogl zapisac tylko on, daja razem jego kwote z jego data — czyli to, co jego „🔍 Sprawdź” uzna za zrobione. Noty, ktore sie
     // z tamtym zapisem nie zgadzaja (np. zespol dal zwrotowi Y date niepotwierdzonego zwrotu X), zostaja widoczne — straz „inna data"
     // tej pozycji dalej je widzi.
-    function kflObceNoty(k, noty){
+    // ffS (pozycja anulacji): slady anulacji TEGO SAMEGO zamowienia pod innym kluczem nie sa cudze — klucz anulacji zalezy od sztuk w oknie,
+    // a po zmianie miesiaca sztuka z wczesniejszego okna wypada i ta sama anulacja dostaje nowy klucz (piaty przeglad: HUB chowal jej
+    // wlasna note i kazal „dokończ ręcznie”). Noty bez numeru nigdy nie sa chowane.
+    function kflObceNoty(k, noty, ffS){
         const sl = kflSladLoad(), out = {};
-        Object.keys(sl).forEach(function (x){ if (x !== k) ((sl[x] || {}).idsNowe || []).forEach(function (i){ out[String(i)] = 1; }); });
-        const dod = kflNotyDodatnie(noty), grupy = {};
-        dod.forEach(function (n){ const x = kflKtoZapisal(sl, n); if (x && x !== k) (grupy[x] = grupy[x] || []).push(n); });
+        const swoj = function (z){ return !!ffS && !!z && z.typ === 'S' && String(z.ff || '') === String(ffS); };
+        Object.keys(sl).forEach(function (x){
+            const z = sl[x] || {};
+            if (x !== k && !swoj(z)) (z.idsNowe || []).forEach(function (i){ if (i) out[String(i)] = 1; });
+        });
+        const dod = kflNotyDodatnie(noty).filter(function (n){ return !!n.id; }), grupy = {};
+        dod.forEach(function (n){ const x = kflKtoZapisal(sl, n); if (x && x !== k && !swoj(sl[x])) (grupy[x] = grupy[x] || []).push(n); });
         Object.keys(grupy).forEach(function (x){
             const z = sl[x], g = grupy[x];
             if ((z.tick === 'wysl' || z.tick === 'blad') && !z.bezNoty && Math.abs(kflSumaNot(g) - (Number(z.kwota) || 0)) < 0.01
                 && g.every(function (n){ return n.data === z.data; })) g.forEach(function (n){ out[String(n.id)] = 1; });
         });
-        // Slady sprzed numerow not (kopia be2e56b, bez idsPrzed): noty tamtego ticketu z tamta data o sumie tamtej kwoty.
+        // Slady bez numerow wlasnych not: kopia be2e56b (bez idsPrzed), kopia 2b6f41c (tick 'ok' z idsPrzed, bez idsNowe), noga anulacji
+        // zamknieta nota zespolu bez numeru — noty tamtego ticketu (albo ticketu noty zespolu) z tamta data o sumie tamtej kwoty.
         Object.keys(sl).forEach(function (x){
             const z = sl[x] || {};
-            if (x === k || Array.isArray(z.idsPrzed) || (z.idsNowe || []).length || !z.rma || !z.data) return;
-            if (!(z.tick === 'ok' || z.tick === 'wysl' || z.tick === 'blad')) return;
-            const g = dod.filter(function (n){ return String(n.rma) === String(z.rma) && n.data === z.data; });
+            if (x === k || swoj(z) || (z.idsNowe || []).length || !z.rma || !z.data) return;
+            if (!(z.tick === 'ok' || (!Array.isArray(z.idsPrzed) && (z.tick === 'wysl' || z.tick === 'blad')))) return;
+            const tik = String(z.rmaNoty || z.rma).split(/,\s*/);
+            const g = dod.filter(function (n){ return tik.indexOf(String(n.rma)) >= 0 && n.data === z.data; });
             if (g.length && Math.abs(kflSumaNot(g) - (Number(z.kwota) || 0)) < 0.01) g.forEach(function (n){ out[String(n.id)] = 1; });
         });
         return out;
+    }
+    // Zwroty (E/SF) tego samego zamowienia z data dt, ktorych notom HUB nie przypisal numerow (bez potwierdzenia albo robione recznie).
+    // Nota z ta data i kwota anulacji moze byc ich — anulacja nie moze sie nia zamknac.
+    function kflZwrotyDnia(p, dt){
+        const sl = kflSladLoad();
+        return ((kflPozLoad() || {}).poz || []).filter(function (q){
+            const z = sl[q.k] || {};
+            return (q.typ === 'E' || q.typ === 'SF') && q.k !== p.k && q.ff === p.ff && q.data === dt && !(z.tick === 'ok' && (z.idsNowe || []).length);
+        });
+    }
+    // Noty zespolu, ktore zamykaja noge ticketowa anulacji: slad dostaje ich numery i ticket; konto inne niz 1307 → „ręcznie” (uwaga).
+    // Gdy tego dnia jest zwrot tego zamowienia bez potwierdzenia — nie wiadomo, czyja to nota: 'niezg'. Zwraca '' albo opis niezgodnosci.
+    function kflJuzNoty(p, noty, gdzie, dt, acct){
+        const zw = kflZwrotyDnia(p, dt)[0];
+        if (zw){
+            const opis = 'w tickecie ' + gdzie + ' są noty z ' + dt + ' na kwotę anulacji (' + kflOpisNot(noty) + '), ale tego dnia jest też zwrot tego zamówienia ('
+                       + f2(zw.kwota) + ') — nie wiem, czyja to nota';
+            kflSladUstaw(p.k, { tick: 'niezg', niezg: opis });
+            return opis;
+        }
+        kflSladUstaw(p.k, { tick: 'ok', tickBlad: null, juz: 1, niezg: null, rmaNoty: gdzie,
+                            idsNowe: noty.map(function (n){ return String(n.id || ''); }).filter(Boolean), uwaga: kflUwagaKonta(noty, acct) || null });
+        return '';
     }
     function kflUwagaKonta(noty, acct){
         const zle = (noty || []).filter(function (n){ return n.konto !== acct; });
@@ -51884,7 +53148,8 @@
         }
         if (oc.stan !== 'ok'){
             kflSladUstaw(k, { tick: 'blad', bezNoty: 1, tickBlad: 'moduł ticketa zgłosił ' + (t.ksieg.alreadyBooked ? '„już zaksięgowane”' : 'zapis') + ', a nowej noty w tickecie nie ma' });
-            throw new Error('ticket ' + rma + ': moduł ticketa zgłosił ' + (t.ksieg.alreadyBooked ? '„już zaksięgowane”' : 'zapis') + ', a nowej noty nie widzę — nic nie zapisano');
+            throw new Error('ticket ' + rma + ': moduł ticketa zgłosił ' + (t.ksieg.alreadyBooked ? '„już zaksięgowane”' : 'zapis') + ', a nowej noty nie widzę — '
+                            + 'bez potwierdzenia; nie dopisuj jej ręcznie, „🔍 Sprawdź” rozstrzygnie z ticketu');
         }
         const f = t.fill || {};
         const bezCn = (f.fallbackUsed && f.powod === 'no_credit_note_items') ? 'cn' : ((f.fallbackUsed && f.powod === 'no_solution_for_credit_note') ? 'sol' : '');
@@ -51898,7 +53163,7 @@
     // Ticket tuz przed wysylka. Noty z ta data, ktore przybyly przy poprzedniej probie HUB-a (slad z numerami) → zapis HUB-a; inne noty
     // z ta data → nic nie wysylamy (ktos zaksiegowal od sprawdzenia; most z sumami uznalby czesc za „już była", a bez sum — zapisal druga).
     // Zwraca { przed } albo { gotowe: napis }; rzuca, gdy trzeba czlowieka.
-    async function kflPrzedZapisem(k, rma, kw, data, acct, s0, co){
+    async function kflPrzedZapisem(k, rma, kw, data, acct, s0, co, ffS){
         let przed;
         try { przed = await kflNotyTicketu(rma); }
         catch (e){ throw new Error('nie odczytałem ticketu ' + rma + ' przed zapisem ' + co + ' (' + ((e && e.message) || e) + ') — nic nie wysłałem'); }
@@ -51915,7 +53180,7 @@
         }
         // Bez not innych pozycji HUB-a (np. zwrot tego zamowienia z data 1. dnia, zapisany przez HUB w tym samym tickecie) — ta sama regula
         // co kontrola przed platnoscia anulacji i sprawdzenie; inaczej platnosc szla, a noga stawala dopiero po niej (czwarty przeglad).
-        const obce = kflObceNoty(k, przed);
+        const obce = kflObceNoty(k, przed, ffS);
         const zDnia = kflNotyDodatnie(przed).filter(function (n){ return n.data === data && !obce[String(n.id)]; });
         if (zDnia.length){
             const rowna = Math.abs(kflSumaNot(zDnia) - kw) < 0.01;
@@ -52020,13 +53285,25 @@
             let W0;
             try { W0 = await kflNotyZamowienia(p.ff); }
             catch (e){ throw new Error('nie odczytałem ticketów zamówienia ' + p.ff + ' przed zapisem płatności (' + ((e && e.message) || e) + ') — nic nie wysłałem'); }
-            const ob0 = kflObceNoty(p.k, W0);
+            const ob0 = kflObceNoty(p.k, W0, p.ff);
             const zD = W0.filter(function (n){ return n.data === data && !ob0[String(n.id)]; });
             if (zD.length){
                 const gdzie = zD.map(function (n){ return n.rma; }).filter(function (r, i, x){ return x.indexOf(r) === i; }).join(', ');
                 kflPozUstaw(p.k, { spr: { stan: 'reka', kiedy: kflTeraz(), num: a.num,
                                           opis: 'w tickecie ' + gdzie + ' są już noty z ' + data + ': ' + kflOpisNot(zD) + ', a płatności na auftragu ' + a.num + ' nie ma — dokończ ręcznie' } });
                 throw new Error('w tickecie ' + gdzie + ' są już noty z ' + data + ' (' + kflOpisNot(zD) + ') — płatności nie wysłałem; dokończ ręcznie');
+            }
+            // Most zapisuje note anulacji jedna nota i uznaje ja za zrobiona, gdy w tickecie zapisu stoi JEDNA nota tej kwoty z ta data — takze
+            // nota innej pozycji HUB-a, ktorej kontrola wyzej nie liczy. Platnosc weszlaby wtedy bez noty (piaty przeglad). To samo przy zwrocie
+            // tego zamowienia z ta data, ktorego HUB nie potwierdzil — jego nota moze byc schowana.
+            const tejKw = W0.filter(function (n){ return String(n.rma) === String(sp.rma) && n.data === data && Math.abs((n.kwota || 0) - sp.kwota) < 0.01; });
+            const zwD = kflZwrotyDnia(p, data).filter(function (q){ const z = kflSladLoad()[q.k] || {}; return z.tick === 'wysl' || z.tick === 'blad'; })[0];
+            if (tejKw.length || zwD){
+                const opis = tejKw.length
+                    ? ('w tickecie ' + sp.rma + ' stoi już nota ' + kflOpisNot(tejKw) + ' innej pozycji tego zamówienia — moduł ticketa uznałby notę anulacji za zrobioną')
+                    : ('tego dnia jest też zwrot tego zamówienia (' + f2(zwD.kwota) + ') bez potwierdzenia zapisu noty — najpierw „🔍 Sprawdź”');
+                kflPozUstaw(p.k, { spr: { stan: 'reka', kiedy: kflTeraz(), num: a.num, opis: opis + '; płatności na auftragu ' + a.num + ' nie wysłałem' } });
+                throw new Error(opis + ' — płatności nie wysłałem; zrób ręcznie');
             }
             // Pelne sprawdzenie TUZ przed platnoscia (wszystkie tickety zamowienia, noty zespolu od poprzedniego miesiaca — takze rozbite,
             // takze z inna data): wysylamy tylko przy „do" z tym samym auftragiem, ticketem i kwota.
@@ -52066,29 +53343,16 @@
         if (!rma) throw new Error('płatność jest, ale nie znam ticketu — dokończ notę ręcznie');
         const kw = Number(s.kwota || sp.kwota), dt = String(s.data || data);
         let pz;
-        try { pz = await kflPrzedZapisem(p.k, rma, kw, dt, acct, s, 'noty anulacji'); }
+        try { pz = await kflPrzedZapisem(p.k, rma, kw, dt, acct, s, 'noty anulacji', p.ff); }
         catch (e){
             // Noty z ta data, ktore nie sa zapisem HUB-a: noga ticketowa czeka na czlowieka (slad 'niezg' — „▶" jej nie ponawia).
             if (/są już noty/.test(String(e && e.message))) kflSladUstaw(p.k, { tick: 'niezg', niezg: String(e.message).replace(/ — nic nie wysłałem; sprawdź ręcznie$/, '') });
             throw e;
         }
-        // Zwrot tego zamowienia z ta sama data, ktorego HUB nie potwierdzil po numerach not: nota z ta data i kwota anulacji moze byc
-        // jego (zespol, albo zapis HUB-a bez potwierdzenia) — wtedy nie wiadomo, czy nota anulacji istnieje (czwarty przeglad).
-        const slN = kflSladLoad();
-        const zwrotDnia = ((kflPozLoad() || {}).poz || []).filter(function (q){
-            const z = slN[q.k] || {};
-            return (q.typ === 'E' || q.typ === 'SF') && q.ff === p.ff && q.data === dt && !q.reka && !(z.tick === 'ok' && (z.idsNowe || []).length);
-        })[0];
-        // Noty zespolu, ktore zamykaja noge: slad dostaje ich numery (inne pozycje juz ich nie wezma) i konto (inne niz 1307 → recznie).
+        // Noty zespolu, ktore zamykaja noge (kflJuzNoty): zwrot tego zamowienia z ta data bez potwierdzenia — 'niezg' („nie wiem, czyja”).
         const juzNoty = function (noty, gdzie){
-            if (zwrotDnia){
-                const opis = 'w tickecie ' + gdzie + ' są noty z ' + dt + ' na kwotę anulacji (' + kflOpisNot(noty) + '), ale tego dnia jest też zwrot tego zamówienia ('
-                           + f2(zwrotDnia.kwota) + ') — nie wiem, czyja to nota';
-                kflSladUstaw(p.k, { tick: 'niezg', niezg: opis });
-                throw new Error(opis + ' — sprawdź ręcznie');
-            }
-            kflSladUstaw(p.k, { tick: 'ok', tickBlad: null, juz: 1, niezg: null, rmaNoty: gdzie, idsNowe: noty.map(function (n){ return String(n.id); }),
-                                uwaga: kflUwagaKonta(noty, acct) || null });
+            const nz = kflJuzNoty(p, noty, gdzie, dt, acct);
+            if (nz) throw new Error(nz + ' — sprawdź ręcznie');
         };
         if (pz.gotowe){
             if (!/poprzedniej próbie/.test(pz.gotowe)) juzNoty(pz.noty || [], rma);
@@ -52097,7 +53361,7 @@
         // Pozostale tickety zamowienia: nota anulacji zespolu z ta data gdzie indziej albo z inna data (od poprzedniego miesiaca) na kwote
         // anulacji — nie dokladamy drugiej.
         const Wall = await kflNotyZamowienia(p.ff);
-        const obce = kflObceNoty(p.k, Wall);
+        const obce = kflObceNoty(p.k, Wall, p.ff);
         const W = Wall.filter(function (n){ return !obce[String(n.id)]; });
         const gdzieIndziej = W.filter(function (n){ return String(n.rma) !== String(rma) && n.data === dt; });
         // Zespol dokonczyl note anulacji w innym tickecie (np. CS), z ta data i ta suma — anulacja jest kompletna.
@@ -52304,7 +53568,12 @@
                 const q = ((kflPozLoad() || {}).poz || []).filter(function (x){ return x.k === kk; })[0];
                 const opisQ = q ? ((q.mix ? 'zwrot + storno po wypłacie' : (KFL_TYP_NAZWA[q.typ] || q.typ)) + ' · zamówienie ' + q.ff + ' · '
                                    + (q.typ === 'S' ? ('netto ' + q.netto.map(f2).join(' + ')) : f2(q.kwota)) + ' · ' + kflDn(q.data)) : kk;
-                if (!confirm('Oznaczyć jako zrobione poza HUB-em?\n\n' + opisQ + '\n\nPozycja przestanie czekać (HUB nic nie księguje).')) return;
+                // Zapis HUB-a bez potwierdzenia: nota mogla wejsc — ostrzezenie przed recznym dublem (piaty przeglad).
+                const sQ = kflSladLoad()[kk] || {};
+                const niepewnaNota = (sQ.tick === 'wysl' || sQ.tick === 'blad') && sQ.rma;
+                if (!confirm('Oznaczyć jako zrobione poza HUB-em?\n\n' + opisQ + '\n\nPozycja przestanie czekać (HUB nic nie księguje).'
+                             + (niepewnaNota ? ('\n\n⚠ HUB wysłał notę do ticketu ' + sQ.rma + ' i nie dostał potwierdzenia — mogła wejść. Zanim dopiszesz notę '
+                                                + 'ręcznie, zajrzyj do ticketu albo kliknij „🔍 Sprawdź”.') : ''))) return;
                 kflPozUstaw(b.getAttribute('data-k'), { recznie: { kiedy: kflTeraz() } });
                 render();
             };
@@ -55676,6 +56945,16 @@
                 }
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
+                // Reczne pozycje operatora (One-off debit = reczny zwrot dla klienta, Manual credit = uznanie): kwoty sa w wyplacie,
+                // a ich ksiegowanie idzie lista zwrotow — nota na zamowieniu (zwrot) albo nota ze znakiem minus (uznanie).
+                const rcz = j.data.reczne || [];
+                if (rcz.length) det += '<div style="color:#0369a1;font-size:11px">pozycje ręczne operatora: '
+                    + esc(rcz.map(function (x){
+                          return x.rodzaj + ' ' + x.id + ' ' + f2(x.amt) + (x.dok ? (' · ' + x.dok) : '')
+                               + (x.kl === 'oplata' ? ' → opłata operatora, nie księgujemy'
+                                  : (x.rodzaj === 'Manual credit' ? ((x.amt > 0 ? ' → nota −' : ' → nota ') + f2(Math.abs(x.amt)))
+                                                                  : (' → zwrot ' + f2(Math.abs(x.amt)))));
+                      }).join(' · ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
                 const sh = mkSheet[mkJobId(j)];
                 const tf = shTrafienie(j, sh);
@@ -58583,6 +59862,7 @@
         // Bufor obcinamy od POCZATKU — przy dlugim przebiegu wazniejsze jest to, co dzieje
         // sie teraz, niz to, co bylo cztery tysiace wpisow temu.
         if (mkLogi.length > MK_LOG_MAX) mkLogi.splice(0, mkLogi.length - MK_LOG_MAX);
+        hubDz('Marketplace', faza, tekst);
     }
     function mkLogSek(t0){ return ((Date.now() - t0) / 1000).toFixed(1) + ' s'; }
     function mkLogCzas(ms){
@@ -64112,6 +65392,8 @@
                             + (list.length ? Object.keys(list[0]).join(', ') : 'cykl nie zwrócił pozycji'));
                         list = only;
                     }
+                    // One-off debit: zwrot czy oplata — z PDF-a dokumentu (mkOneOffKlasy). Tylko cykl, ktory ma takie pozycje.
+                    await mkOneOffKlasy(list, host);
                     const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     const wynik = mkZlozZlecenie(j, tx, {
                         manor: manor, bezKwoty: bezKwoty, byRef: byRef, byKwote: byKwote,
@@ -93022,6 +94304,7 @@
             return String(v);
         }).join(' ');
         ZW_LOG.push(cz + '  ' + t);
+        hubDz('Zwroty', '', t);
         if (ZW_LOG.length > 4000) ZW_LOG.splice(0, 1000);   // zabezpieczenie przed puchnieciem
     }
     function zapiszLog(){
@@ -101004,7 +102287,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'lokalna 5.60.10 · 20.10.2026 · Przelewy24';
+    const HUB_BUDOWA = 'a5250da · 21.10.2026 14:41';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -101045,6 +102328,8 @@
             if (isOn(m.id) && m.test()) m.init();
         } catch (e) {
             console.error('[Beliani hub] modul ' + m.id + ':', e);
+            // Modul, ktory sie nie podniosl (np. cichy ReferenceError), nie ma wlasnego logu — to jedyny slad dla zespolu.
+            HUBDZ.blad('HUB', '✖ moduł „' + m.name + '" nie wystartował: ' + String((e && (e.stack || e.message)) || e).split('\n').slice(0, 4).join(' | '));
         }
     });
 
@@ -101069,6 +102354,7 @@
             #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
             #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
             #beliani-launcher .bl-build{padding:6px 14px;font-size:11px;color:#888;background:#fff;border-top:1px solid #eee;user-select:text;cursor:default;}
+            #beliani-launcher .bl-build a{color:#750000;text-decoration:underline;cursor:pointer;}
             /* Krzyzyk wstrzykiwany do paneli, ktore nie mialy wlasnego zamkniecia.
                sticky + height:0 => nie zajmuje miejsca w ukladzie i nie odjezdza przy
                przewijaniu dlugiego panelu. */
@@ -101431,7 +102717,19 @@
             html += '<div class="bl-build" title="Ma się zgadzać z: git log -1 --oneline -- Beliani_prologistics_hub.user.js">HUB '
                 + String(wer).replace(/[<>&"]/g, '') + ' · ' + opis + '</div>';
         }
+        // Dziennik centralny (logi modulow -> arkusz „HUB Log"): wynik ostatniej wysylki, kto i z jakiego komputera.
+        html += '<div class="bl-build" id="bl-dz" title="Logi modułów wysyłają się do arkusza „HUB Log” — po godzinie, osobie i komputerze da się ustalić, kto kiedy zrobił co.">'
+            + HUBDZ.stopka() + '</div>';
         panel.innerHTML = html;
+        {
+            const dzBox = panel.querySelector('#bl-dz');
+            if (dzBox) dzBox.addEventListener('click', function (e) {
+                const a = e.target && e.target.closest ? e.target.closest('[data-dz]') : null;
+                if (!a) return;
+                e.preventDefault(); e.stopPropagation();
+                HUBDZ.klik(a.getAttribute('data-dz'), function () { dzBox.innerHTML = HUBDZ.stopka(); });
+            });
+        }
 
         wrap.appendChild(btn); wrap.appendChild(panel);
         document.body.appendChild(wrap);
