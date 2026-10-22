@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.11
+// @version      5.60.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11382,7 +11382,7 @@
         if (!refs.length) { c.notes.push(['i', 'brak numeru auftragu/ticketu w E2E i tytule - nie sprawdzam w prologistics']); return c; }
         c.checked = true;
         const reqs = [], seenQ = {};
-        let A = null, aufNr = '', pend = false;
+        let A = null, aufNr = '', aufA = '', pend = false;
         const add = (e, z) => e.reqs.forEach(x => { if (!seenQ[x.id]) { seenQ[x.id] = 1; reqs.push(Object.assign({ z: z }, x)); } });
         const get = key => {
             const e = chkCache[key];
@@ -11395,7 +11395,7 @@
             if (f.k === 'A') {
                 aufNr = aufNr || f.n;
                 const e = get('A:' + f.n);
-                if (e) { A = A || e; add(e, 'auftrag ' + f.n); }
+                if (e) { if (!A) aufA = f.n; A = A || e; add(e, 'auftrag ' + f.n); }
             } else {
                 const e = get('T:' + f.n);
                 if (e) {
@@ -11403,11 +11403,14 @@
                     if (e.auf) {
                         aufNr = aufNr || e.auf;
                         const ea = get('A:' + e.auf);
-                        if (ea) { A = A || ea; add(ea, 'auftrag ' + e.auf); }
+                        if (ea) { if (!A) aufA = e.auf; A = A || ea; add(ea, 'auftrag ' + e.auf); }
                     }
                 }
             }
         });
+        // Numer auftragu w komunikatach i w kluczu dopuszczenia ma byc tym, z ktorego naprawde pochodza dane (A),
+        // a nie pierwszym numerem z pola, ktorego odczyt mogl sie nie udac.
+        if (aufA) aufNr = aufA;
         const nr = cleanupIban(r.iban), kw = centsOf(r.amt);
         const exact = () => reqs.filter(x => nr && !isNaN(kw) && cleanupIban(x.iban) === nr && Math.round(x.kwota * 100) === kw);
         // Request z ticketu auftrag nie pokazuje: bez pasujacego na auftragu czytamy jego tickety.
@@ -11496,6 +11499,11 @@
 
         // Zwrot VAT: slowo „VAT" w E2E, tytule albo requescie.
         if (!c.vatNeed && CHK_VAT.test(String(c.reqMsg || ''))) c.vatNeed = true;
+        // „VAT" widziane raz w requescie tego wiersza zostaje, dopoki E2E i tytul sie nie zmienia: edycja kwoty/IBAN-u
+        // albo chwilowy blad odczytu odbierały requestowi trafienie, a wiersz — blokadę i pytanie.
+        const vatTekst = String(r.e2e || '') + '|' + String(r.ustrd || '');
+        if (c.vatNeed) r.vatHint = vatTekst;
+        else if (r.vatHint === vatTekst) c.vatNeed = true;
         if (c.vatNeed) {
             if (!A) { c.fail = true; c.notes.push(['w', 'zwrot VAT: nie mam auftragu, wiec nie sprawdzilem korekty (storno + zmiana stawki)']); }
             else {
@@ -11504,9 +11512,10 @@
                 // (15208528). Sama zmiana stawki z systemu nie wystarcza (15848550).
                 const kor = chkKorektaDok(A);
                 if (k && k.poz === 'faktury' && !kor && !A.docsBrak) {
-                    c.vatOk = false;
-                    c.notes.push(['e', 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty wystawionej recznie przez dzial finansow (np. "Korekta_<numer faktury>.pdf"). '
-                        + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach. Zaczekaj na korekte i usun pozycje z listy']);
+                    c.vatOk = false; c.vatKod = 'dok';
+                    c.vatBaza = 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty wystawionej recznie przez dzial finansow (np. "Korekta_<numer faktury>.pdf"). '
+                        + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach.';
+                    c.vatRada = ' Zaczekaj na korekte i usun pozycje z listy (albo dopusc ja swiadomie przyciskiem obok)';
                 } else if (k && k.poz === 'faktury' && !kor) {
                     c.fail = true; c.notes.push(['w', 'zwrot VAT: nie odczytalem tabeli Attached documents auftragu ' + aufNr + ' - sprawdz recznie, czy finanse dodaly korekte']);
                 } else if (k) {
@@ -11521,9 +11530,23 @@
                 } else if (A.invBrak && A.payBrak) {
                     c.fail = true; c.notes.push(['w', 'zwrot VAT: nie odczytalem tabel faktur ani platnosci auftragu ' + aufNr + ' - sprawdz korekte recznie']);
                 } else {
-                    c.vatOk = false;
+                    c.vatOk = false; c.vatKod = 'sys';
                     const neg = A.inv.filter(x => x.amt < 0);
-                    c.notes.push(['e', 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': ' + (neg.length ? 'jest storno ' + neg[0].id + ', ale brak nowej faktury na zmienionej stawce' : 'brak storna faktury i faktury na zmienionej stawce') + ' (faktury: ' + chkFakturyOpis(A.inv) + ')' + (kor ? ', jest dokument korekty "' + kor.name + '", ale w systemie brak storna i zmiany stawki' : '') + ' - nie zlecaj, usun pozycje z listy']);
+                    c.vatBaza = 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': ' + (neg.length ? 'jest storno ' + neg[0].id + ', ale brak nowej faktury na zmienionej stawce' : 'brak storna faktury i faktury na zmienionej stawce') + ' (faktury: ' + chkFakturyOpis(A.inv) + ')' + (kor ? ', jest dokument korekty "' + kor.name + '", ale w systemie brak storna i zmiany stawki' : '');
+                    c.vatRada = ' - nie zlecaj, usun pozycje z listy (albo dopusc ja swiadomie przyciskiem obok)';
+                }
+                if (c.vatOk === false) {
+                    // Blokade da sie zdjac swiadoma decyzja czlowieka (r.vatDop), ale tylko dla TEGO samego auftragu,
+                    // kwoty i rodzaju braku — zmiana numeru, kwoty albo sytuacji w prologistics ja uniewaznia.
+                    c.vatKlucz = aufNr + '|' + kw + '|' + nr + '|' + c.vatKod;
+                    if (r.vatDop && r.vatDop.klucz === c.vatKlucz) {
+                        c.vatDop = r.vatDop;
+                        c.notes.push(['w', 'DOPUSZCZONE MIMO BRAKU KOREKTY (decyzja uzytkownika, ' + r.vatDop.kiedy + '). ' + c.vatBaza]);
+                    } else {
+                        // Zgoda dotyczyla innych danych — wygasa (powrot do wczesniejszej wartosci jej nie wskrzesza).
+                        if (r.vatDop) r.vatDop = null;
+                        c.notes.push(['e', c.vatBaza + c.vatRada]);
+                    }
                 }
             }
         } else if (A && A.inv.length && A.pay.length && okCcy && !isNaN(kw)) {
@@ -11542,15 +11565,42 @@
         const needs = [];
         model.forEach(r => {
             try { r.chk = chkRow(r, needs); }
-            catch (e) { r.chk = { notes: [['w', 'blad sprawdzania: ' + ((e && e.message) || e)]], pend: false, checked: true, vatNeed: false, vatOk: null, fail: true }; }
+            catch (e) { r.chk = { notes: [['w', 'blad sprawdzania: ' + ((e && e.message) || e)]], pend: false, checked: true, vatNeed: CHK_VAT.test(String(r.e2e || '') + ' ' + String(r.ustrd || '')) || r.vatHint === String(r.e2e || '') + '|' + String(r.ustrd || ''), vatOk: null, fail: true }; }
         });
         needs.forEach(chkEnqueue);
         if (chkQueue.length && !chkTimer) chkTimer = setTimeout(() => { chkTimer = null; chkPump(); }, 400);
     }
+    // Brak korekty VAT, ktory dalej blokuje pobranie (dopuszczone swiadoma decyzja — c.vatDop — juz nie).
     function vatBrakIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.vatNeed && r.chk.vatOk === false) out.push(i); });
+        model.forEach((r, i) => { if (r.chk && r.chk.vatNeed && r.chk.vatOk === false && !r.chk.vatDop) out.push(i); });
         return out;
+    }
+    // Zdejmuje blokade „zwrot VAT bez korekty" z wybranych pozycji — po jednym potwierdzeniu, ktore
+    // wymienia kazda z nich i to, czego brakuje. Decyzja dotyczy tego auftragu, tej kwoty i tego rodzaju
+    // braku (klucz); sprawdzenie w prologistics dalej pokazuje brak, tylko na bursztynowo.
+    function vatDopusc(idx) {
+        const lista = idx.filter(i => model[i] && model[i].chk && model[i].chk.vatNeed && model[i].chk.vatOk === false && !model[i].chk.vatDop);
+        if (!lista.length) return;
+        // Powod bierzemy z tego samego tekstu, ktory stoi w kolumnie Status (c.vatBaza), z numerem auftragu i fakturami —
+        // zgoda ma dotyczyc tego, co czlowiek widzi, a nie zdania zgadywanego z rodzaju braku.
+        const opis = lista.map(i => {
+            const m = model[i], c = m.chk;
+            return 'poz. ' + (i + 1) + ' (' + (m.e2e || '?') + ', ' + m.amt + ' ' + (m.ccy || '') + '):\n   ' + c.vatBaza
+                + ((c.euBlok || c.stanBlok) ? '\n   UWAGA: ta pozycja ma tez INNA blokade (wplata eupago albo request nieaktywny/wykonany) - dopuszczenie VAT jej nie zdejmuje, plik nie wyjdzie, dopoki jej nie usuniesz.' : '');
+        }).join('\n\n');
+        if (!confirm('Dopuscic zwrot VAT MIMO BRAKU KOREKTY (' + lista.length + ' poz.)?\n\n' + opis + '\n\n'
+            + 'Bez korekty klient dostaje ten sam numer faktury na dwoch stawkach, a zwrot idzie do banku bez dokumentu od finansow. '
+            + 'Dopuszczasz to na wlasna odpowiedzialnosc - brak korekty VAT przestaje blokowac pobranie pliku (inne blokady zostaja).\n\nDopuscic?')) return;
+        const d = new Date(), kiedy = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        lista.forEach(i => { model[i].vatDop = { klucz: model[i].chk.vatKlucz, kiedy: kiedy }; });
+        chkEval(); refreshRows();
+        toast('Dopuszczono mimo braku korekty VAT: ' + lista.length + ' poz.');
+    }
+    function vatCofnijDop(i) {
+        if (!model[i] || !model[i].vatDop) return;
+        delete model[i].vatDop;
+        chkEval(); refreshRows();
     }
     // Zwrot przelewem przy wplacie przez eupago mlodszej niz 3 miesiace (c.euBlok).
     function euBrakIdx() {
@@ -11592,7 +11642,8 @@
                 + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lista(stn) + '\n\n' : '')
                 + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago (modul Zwroty), a nie przelewem z banku: ' + lista(eu) + '\n\n' : '')
                 + 'Usun te pozycje z listy (przycisk ✕ w ostatniej kolumnie albo przycisk w czerwonym pasku nad tabela) '
-                + 'i pobierz plik ponownie.');
+                + 'i pobierz plik ponownie.'
+                + (brak.length ? '\n\nZwrot VAT bez korekty mozna tez dopuscic swiadomie: przycisk "Dopusc mimo braku korekty" przy pozycji albo w czerwonym pasku.' : ''));
             return false;
         }
         if (trwa.length) { alert('Trwa sprawdzanie w prologistics: ' + lista(trwa) + '.\n\nPoczekaj chwile i pobierz plik ponownie.'); return false; }
@@ -11614,11 +11665,14 @@
             + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lst(stn) + '. ' : '')
             + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago, nie przelewem: ' + lst(eu) + '. ' : '')
             + 'Usun te pozycje z listy (✕) i pobierz plik ponownie. '
-            + '<button id="sepa-vatdel" style="margin-left:6px;padding:3px 9px;border:1px solid #b91c1c;background:#b91c1c;color:#fff;border-radius:5px;cursor:pointer;font:600 12px system-ui">Usun te pozycje (' + idx.length + ')</button>';
+            + '<button id="sepa-vatdel" style="margin-left:6px;padding:3px 9px;border:1px solid #b91c1c;background:#b91c1c;color:#fff;border-radius:5px;cursor:pointer;font:600 12px system-ui">Usun te pozycje (' + idx.length + ')</button>'
+            + (vat.length ? ' <button id="sepa-vatdop" title="Zwrot VAT bez dokumentu korekty od finansow — swiadoma decyzja; jedno okno wymienia kazda pozycje i to, czego brakuje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Dopusc zwroty VAT mimo braku korekty (' + vat.length + ')</button>' : '');
         el.querySelector('#sepa-vatdel').onclick = () => {
             if (!confirm('Usunac z listy ' + idx.length + ' poz. (zwrot VAT bez korekty albo wplata przez eupago)?')) return;
             idx.slice().reverse().forEach(i => deleteRow(i));
         };
+        const bd = el.querySelector('#sepa-vatdop');
+        if (bd) bd.onclick = () => vatDopusc(vat.slice());
     }
 
     // ---------- Zapis do XML + pobranie ----------
@@ -11666,6 +11720,9 @@
     }
     function download() {
         if (!vatGate()) return;   // zwrot VAT bez korekty (storno + zmiana stawki) nie wychodzi do banku
+        // Dopuszczone swiadomie pozycje nie blokuja, ale plik ma o nich przypominac (decyzja zyje tylko na ekranie).
+        const nDop = model.filter(r => r.chk && r.chk.vatDop).length;
+        if (nDop) toast('Plik zawiera ' + nDop + ' poz. dopuszczonych mimo braku korekty VAT');
         const st = writeModelToDoc() || { zle: 0 };
         // Kwota nie do odczytania trafia do pliku doslownie, a do CtrlSum juz nie —
         // NbOfTxs liczy taka transakcje, suma jej nie obejmuje. Taki plik bank odrzuci.
@@ -11749,6 +11806,8 @@
         td.st .ok{color:#15803d}
         td.st .ok,td.st .i{display:block}
         td.st .i{color:#64748b}
+        td.st button.sepa-dop{margin:3px 0 1px;padding:2px 8px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 11px system-ui}
+        td.st button.sepa-dop.cof{border-color:#94a3b8;color:#475569}
         #sepa-vatban{display:none;margin:8px 0;padding:8px 10px;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:6px;font-size:12px;line-height:1.5}
         .sepa-num{width:150px}
         #sepa-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483041;font:13px system-ui;display:none}
@@ -11821,7 +11880,7 @@
             selectErrors();
             updateSummary();
         } catch (e) {
-            document.getElementById('sepa-content').innerHTML = `<div style="color:#b91c1c;padding:10px;border:1px solid #fecaca;background:#fef2f2;border-radius:6px">${e.message}</div>`;
+            document.getElementById('sepa-content').innerHTML = `<div style="color:#b91c1c;padding:10px;border:1px solid #fecaca;background:#fef2f2;border-radius:6px">${esc(e.message)}</div>`;
         }
     }
 
@@ -11857,6 +11916,13 @@
             </table>
           </div>`;
         tbody = c.querySelector('#sepa-tbody');
+        tbody.addEventListener('click', e => {
+            const b = e.target && e.target.closest ? e.target.closest('button.sepa-dop') : null;
+            if (!b) return;
+            const tr = b.closest('tr'), i = tr ? Array.prototype.indexOf.call(tbody.children, tr) : -1;
+            if (i < 0 || !model[i]) return;
+            if (b.getAttribute('data-a') === 'cof') vatCofnijDop(i); else vatDopusc([i]);
+        });
         summaryEl = c.querySelector('#sepa-summary');
         c.querySelector('#sepa-fix').onclick = applyFixSelected;
         c.querySelector('#sepa-tr').onclick = applyTranslit;
@@ -11875,12 +11941,20 @@
         const c = r.chk;
         if (!c || !c.notes.length) return '';
         const ik = { e: '✗', w: '▲', ok: '✓', i: 'ℹ' };
-        return c.notes.map(n => `<span class="${n[0]}">${ik[n[0]]} ${esc(n[1])}</span>`).join('');
+        // Przyciski w komorce Status nie maja wlasnych uchwytow (komorka jest przepisywana innerHTML) —
+        // klik lapie jeden nasluch na tbody (renderContent), pozycje wskazuje wiersz tabeli.
+        const przyc = c.vatNeed && c.vatOk === false
+            ? (c.vatDop
+                ? '<button type="button" class="sepa-dop cof" data-a="cof" title="Przywroc blokade pobrania dla tej pozycji">↶ cofnij dopuszczenie</button>'
+                : '<button type="button" class="sepa-dop" data-a="dop" title="Zdejmuje blokade pobrania dla tej pozycji — po potwierdzeniu">✓ Dopusc mimo braku korekty</button>')
+            : '';
+        return c.notes.map(n => `<span class="${n[0]}">${ik[n[0]]} ${esc(n[1])}</span>`).join('') + przyc;
     }
     function statusHtml(r) {
         const c = r.chk;
         if (r.errs.length === 0 && r.warns.length === 0) return '<span class="ok">✓ ' + (c && c.checked ? 'format ok' : 'ok') + '</span>' + chkHtml(r);
-        return r.errs.map(e => `<span class="e">✗ ${e}</span>`).join('') + r.warns.map(w => `<span class="w">▲ ${w}</span>`).join('') + chkHtml(r);
+        // errs/warns niosa surowe pola z pliku (kwota, waluta) — ucieczka HTML, jak przy uwagach z prologistics
+        return r.errs.map(e => `<span class="e">✗ ${esc(e)}</span>`).join('') + r.warns.map(w => `<span class="w">▲ ${esc(w)}</span>`).join('') + chkHtml(r);
     }
     function rowCls(r) {
         const c = r.chk, has = n => !!c && c.notes.some(x => x[0] === n);
@@ -21148,7 +21222,7 @@
         async function fetchPen(o){ var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o)); return pcStronaOrderu(h) ? parsePenalties(h, PENALTY_DAYS) : null; }
         async function runPool(items, worker, workers){ var idx = 0, N = items.length, WORKERS = workers || 10; async function one(){ while (idx < N){ var i = idx++; await worker(items[i], i); } } var pool = []; for (var w = 0; w < Math.min(WORKERS, N); w++) pool.push(one()); await Promise.all(pool); }
 
-        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {}, depoSrc: '', diag: { bal: {}, dep: {}, raw: { bal: '', dep: '', depSrc: '' }, started: '', log: [] } };
+        var state = { bal: { order: [], groups: {} }, dep: { order: [], groups: {} }, depoNames: [], matched: {}, sup2cid: {}, depCid: {}, resolved: false, lastOutput: '', pcAmt: {}, pcAccEdit: {}, pcAccWar: {}, depoSrc: '', diag: { bal: {}, dep: {}, raw: { bal: '', dep: '', depSrc: '' }, started: '', log: [] } };
         // Slad przebiegu do pliku log — zapisujemy wszystko, co pozwala odtworzyc decyzje skryptu.
         function dlog(msg){ try { state.diag.log.push(pcNow() + '  ' + String(msg)); } catch(e){} hubDz('Chińskie (Depozyty)', '', msg, { ostro: true }); }
         function groupRows(rows){
@@ -22396,7 +22470,7 @@
                 + '>' + painEsc(painAccSrcTxt(r)) + '</div>';
         }
         function painAccNote(r){
-            return painAccSrcHtml(r) + painAccNoteBez(r);
+            return painAccSrcHtml(r) + painAccNoteBez(r) + painAccWarHtml(r);
         }
         function painAccNoteBez(r){
             if (r.accNieczyt) return '<div style="font-size:10px;color:#c47f00;font-weight:700">⚠ dopisek w numerze'
@@ -22674,6 +22748,95 @@
             if (p.acc) return { acc: p.acc, src: 'pi', why: '', karta: d.karta, regula: 'dep', czescPI: p.czesc || [] };
             return { acc: d.acc, src: d.skad, why: p.why, karta: d.karta, regula: 'dep', rozne: !!p.rozne };
         }
+        /* ===== Ten sam rachunek, inny zapis: wybor wariantu numeru (22.10.2026) =====
+           P/I i karta dostawcy niosa czasem TEN SAM numer zapisany inaczej: „1-234-5" i
+           „12345". accTenSam liczy same cyfry, wiec dla Wprowadzania to jeden rachunek i nic
+           sie nie zapalalo — ale do banku szedl ten zapis, ktory akurat wygrala regula zrodla
+           (depozyt: P/I, sam balance: karta), bo painAcctOthr zostawia myslniki, ukosniki
+           i kropki. Modul Sprawdzanie nazywa to wprost: bcKontoEq oddaje „ten sam numer, ale
+           jeden zapisany z myslnikiem" i NIE uznaje tego za zgodnosc.
+           Zamiast wybierac za czlowieka pokazujemy WYBOR przy wierszu w oknie przelewow;
+           wybrany zapis idzie do pliku pain.001 i do Excela do banku.
+           RACHUNEK sie przy tym nie zmienia: warianty musza miec te same znaki po zdjeciu
+           separatorow (painNorm). Dwa rozne numery rozstrzyga regula zrodla, nie ten wybor.
+           IBAN-u to nie dotyczy — painNorm i tak zdejmuje z niego wszystkie separatory. */
+        // Klucz wyboru to SAM RACHUNEK, nie klucz platnosci: ✂ / 🗑 / ↻ przenosza wiersze
+        // miedzy kluczami, a wybrany zapis numeru ma z tego wyjsc caly. Schodzi przy
+        // „Przetworz", razem z poprawka konta w naglowku.
+        function painAccWarKlucz(acc){ return painNorm(acc); }
+        // Czytelny numer konta z P/I jednego wiersza — ta sama droga co w painKontoZPI.
+        // Depozyt trzyma blok pod „piBank", balance pod „bank".
+        function painAccZPiWiersza(p, pole){
+            if (!p) return '';
+            var blok = p[pole] || p[pole + 'Raw'], a = '';
+            if (blok){ var z = painZKontem(blok, p.piAcc); a = String(z.acc || '').trim(); }
+            if (!a && normAcc(p.piAcc || '').length >= 8) a = String(p.piAcc);
+            if (!a) return '';
+            var cz = accBezDopiskow(a);
+            return cz.czytelne ? cz.acc : '';
+        }
+        // -> [] gdy nie ma czego wybierac, inaczej lista { acc, zapis, src }; pierwszy jest ten
+        //    z reguly zrodla, czyli dotychczasowy.
+        function painAccWarianty(G, zr, kz){
+            var baza = painNorm(kz && kz.acc);
+            if (!baza || painIbanOk(kz && kz.acc)) return [];
+            var out = [], seen = {};
+            function add(acc, src){
+                var a = String(acc == null ? '' : acc).trim();
+                if (!a || painNorm(a) !== baza) return;
+                var z = painAcctOthr(a);
+                if (!z || seen[z]) return;
+                seen[z] = 1; out.push({ acc: a, zapis: z, src: src });
+            }
+            add(kz.acc, kz.src);
+            var d = painKontoDostawcy(G);
+            add(d.acc, d.skad);
+            if (d.skad === 'naglowek') add(d.karta, 'karta');
+            // Zapisy z P/I: kazde zamowienie osobno — jedno bywa z myslnikami, drugie bez.
+            // Takze P/I balance: skoro to te same znaki, regula „sam balance idzie z karty"
+            // zostaje nienaruszona — chodzi wylacznie o zapis numeru.
+            (G.dep || []).forEach(function (r){ add(painAccZPiWiersza(r && r.pi, 'piBank'), 'pi'); });
+            (G.bal || []).forEach(function (r){ add(painAccZPiWiersza(r && r.bpi, 'bank'), 'pi'); });
+            return out.length > 1 ? out : [];
+        }
+        function painAccWarWybrany(war){
+            if (!war || war.length < 2) return null;
+            var w = state.pcAccWar ? state.pcAccWar[painAccWarKlucz(war[0].acc)] : null;
+            if (!w) return null;
+            for (var i = 0; i < war.length; i++) if (war[i].zapis === w) return war[i];
+            return null;   // tego zapisu juz nie ma (zmiana w P/I albo na karcie) — wraca regula
+        }
+        var PAIN_WAR_SRC = { pi: 'P/I', karta: 'karta dostawcy', naglowek: 'poprawka w nagłówku', reczne: 'ręcznie' };
+        function painAccWarHtml(r){
+            var w = r.accWar || [];
+            if (w.length < 2) return '';
+            var tyt = 'Ten sam rachunek stoi w P/I i na karcie dostawcy w RÓŻNYM ZAPISIE — te same znaki, inne'
+                + ' myślniki/spacje. Do pliku pain.001 (i do Excela do banku) idzie zapis zaznaczony tutaj;'
+                + ' numer rachunku się nie zmienia, bo warianty mają te same znaki.'
+                + '\nWybór trzyma się rachunku, nie płatności — przeżywa ✂, 🗑 i ↻, schodzi przy „Przetwórz".';
+            return '<div class="pain-war" style="font-size:10px;color:#0a58ca;margin-top:2px" title="' + pcAttr(tyt) + '">'
+                + '↹ zapis numeru: '
+                + w.map(function (x){
+                    return '<label style="cursor:pointer;white-space:nowrap;margin-right:7px">'
+                        + '<input type="radio" class="pain-acc-war" name="pain-war-' + pcAttr(r.key) + '"'
+                        + ' data-k="' + pcAttr(painAccWarKlucz(x.acc)) + '" data-val="' + pcAttr(x.zapis) + '"'
+                        + (x.zapis === r.accWarWyb ? ' checked' : '') + '> ' + painEsc(x.acc)
+                        + ' <span style="color:#888">(' + painEsc(PAIN_WAR_SRC[x.src] || x.src) + ')</span></label>';
+                  }).join('')
+                + '</div>';
+        }
+        // Plakietka w naglowku grupy — zeby bylo widac bez otwierania okna przelewow, ze jest
+        // co wybrac. Sam wybor stoi w oknie przelewow: tam widac numer, ktory pojdzie do pliku.
+        function pcAccWarHtml(G, hasDep, hasBal){
+            var zr = hasDep ? (hasBal ? 'combined' : 'depo') : 'bal', w = [];
+            try { w = painAccWarianty(G, zr, painKontoPlatnosci(G, zr)); } catch (e){ return ''; }
+            if (w.length < 2) return '';
+            var wyb = painAccWarWybrany(w) || w[0];
+            return '<span style="margin-left:8px;background:#0a58ca;color:#fff;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;cursor:help" title="'
+                + pcAttr('Ten sam rachunek jest zapisany na dwa sposoby:\n' + w.map(function (x){ return '  ' + x.acc + '   (' + (PAIN_WAR_SRC[x.src] || x.src) + ')'; }).join('\n')
+                    + '\n\nDo pliku pain.001 idzie: ' + wyb.acc + '\nZapis wybierzesz w oknie przelewów („🏦 Przelewy / pain.001"), przy tym dostawcy.')
+                + '">↹ zapis numeru: ' + esc(wyb.acc) + '</span>';
+        }
         // Blok do nazwy, adresu i SWIFT-u: ten, ktory mowi o koncie przelewu. SWIFT jednego banku nie
         // moze isc z numerem drugiego. Przeglad 15.10: platnosc laczona z „P/I dla balance" — depozyt ma
         // blok NIEPELNY (bez SWIFT-u) na koncie A, balance pelny na koncie B. painBankOfG wybieral B,
@@ -22736,6 +22899,14 @@
                 // Konto, ktore FAKTYCZNIE pojdzie do pliku — z nim porownujemy numer z komentarza.
                 var kz = painKontoPlatnosci(G, W.zr);
                 var accRecznie = ed.acc != null && String(ed.acc) !== '';
+                // Wybor zapisu numeru (ten sam rachunek, inne separatory). Wyboru nie ma tylko
+                // przy koncie wpisanym recznie w oknie przelewow — tam czlowiek podal doslowny
+                // napis, ktory ma pojsc do banku. Poprawka konta w naglowku grupy wyboru NIE
+                // wylacza: przy regule depozytu do pliku i tak idzie numer z P/I, wiec sama
+                // poprawka jest tylko jednym z wariantow zapisu (zrodlo „poprawka w naglowku").
+                var accWar = accRecznie ? [] : painAccWarianty(G, W.zr, kz);
+                var accWarW = painAccWarWybrany(accWar);
+                if (accWarW) kz.acc = accWarW.acc;
                 var accV = String(V('acc', kz.acc || ''));
                 // Waluta przy numerze („(USD)") nie idzie do banku; dopisek nieczytelny
                 // zostaje w polu i blokuje plik, dopoki ktos nie przyjmie propozycji.
@@ -22797,6 +22968,8 @@
                     name: String(V('name', b.name || '')),
                     acc: accV,
                     accZdjete: accCz.zdjete, accNieczyt: !accCz.czytelne, accProp: accCz.prop, accPropWiele: accCz.propWiele,
+                    // Zapisy tego samego rachunku do wyboru i ten, ktory idzie do pliku.
+                    accWar: accWar, accWarWyb: painAcctOthr(accV), accWarSrc: accWarW ? accWarW.src : '',
                     // Skad numer: 'pi' | 'karta' | 'naglowek' | 'reczne'; accSrcWhy — czemu nie z P/I depozytu.
                     accSrc: accSrc, accSrcWhy: accRecznie ? '' : (kz.why || ''), accRozne: !accRecznie && !!kz.rozne,
                     accKarta: kz.karta || '', accBlokInne: blokInne, blokPasuje: !!wb.pasuje,
@@ -23760,20 +23933,226 @@
                 return out.replace(/\s+$/, '');
             }).join('\n');
         }
+        /* ===== Potwierdzenie Credit Suisse (starsze zamowienia) =====
+           Do 2025 przelewy skladalo sie w e-bankingu Credit Suisse i taki PDF wisi dalej
+           w sekcji „Payment conformation" starszych zamowien — a najczesciej siegamy po
+           niego wlasnie jako po POPRZEDNI przelew. bcParsePdfText zna etykiety UBS
+           („Recipient's account") i na CS oddawal null, czyli „to nie wyglada na
+           potwierdzenie": caly plik byl odrzucany (zmierzone 22.10.2026 na „Order 15000,
+           deposit 15%, Moen Furniture Tianjin Co., ltd.pdf").
+           CS ma uklad DWUKOLUMNOWY: pod etykieta stoi jej wartosc, a obok, w drugiej
+           kolumnie, zupelnie inne pole. W tekscie sklejonym z pdf.js wartosci obu kolumn
+           laduja w jednej linii, czasem rozdzielone JEDNA spacja („1100000011420100151216
+           Order 15000, deposit 15%"), wiec po samym tekscie nie da sie ich rozciac bez
+           zgadywania — a numer konta zgadywany „na oko" to ostatnia rzecz, jakiej tu chcemy.
+           Czytamy wiec z POZYCJI: pdf.js podaje x kazdego fragmentu. Wartosc etykiety to
+           fragmenty z jej PASA (od jej x do x nastepnej etykiety w tym samym wierszu),
+           z wierszy ponizej, az do nastepnej etykiety w tym samym pasie.                  */
+        // „International Payment WITH IBAN" ma zamiast „Beneficiary's Account No." etykiete
+        // „Beneficiary's IBAN" (zamowienie 14638: przelew do Brazylii, USD 48 954,24).
+        var BC_CS_LBL = ["Beneficiary's Account No.", "Beneficiary's IBAN", 'Reason for Payment', 'Beneficiary/List',
+            'BIC Address', 'Bank of the Beneficiary', 'Fees to Be Paid by', 'Paid in by',
+            'Amount', 'Payable in', 'Account to be Debited', 'Debit Advice', 'Booking Text',
+            'Execution Date', 'Update Template', 'Charges Account', 'Reference',
+            // Stopka: bez niej pas „Execution Date" siegal do konca strony i zgarnial
+            // numer z sasiedniej kolumny (zamowienie 14405: data „25.10.2024 51621314551").
+            'Transaction Key', 'Transaction Customer End to End ID', 'Transaction no.',
+            'Transaction Reference', 'Order Status', 'Status'];
+        function bcCsZItems(items, fname){
+            var rows = [];
+            (items || []).forEach(function (it){
+                var s0 = it && it.str;
+                if (s0 == null || !String(s0).trim()) return;
+                var tr = it.transform || [], x = +tr[4] || 0, y = +tr[5] || 0, r = null;
+                for (var i = 0; i < rows.length; i++) if (Math.abs(rows[i].y - y) <= 3){ r = rows[i]; break; }
+                if (!r){ r = { y: y, it: [] }; rows.push(r); }
+                // Apostrof typograficzny jak w bcParsePdfText — „Beneficiary’s" to ta sama etykieta.
+                r.it.push({ x: x, s: String(s0).replace(/[‘’ʼ]/g, "'").trim() });
+            });
+            if (!rows.length) return null;
+            rows.sort(function (a, b){ return b.y - a.y; });
+            rows.forEach(function (r){ r.it.sort(function (a, b){ return a.x - b.x; }); });
+            // Etykiety z ich pasem. Pas konczy sie na x NASTEPNEJ etykiety w tym samym wierszu
+            // („Amount" ma obok „Payable in", wiec jego pas konczy sie przed nia).
+            var lbl = [];
+            rows.forEach(function (r, ri){
+                var w = [];
+                r.it.forEach(function (it, ii){
+                    if (BC_CS_LBL.indexOf(it.s) >= 0) w.push({ ri: ri, x: it.x, lb: it.s, ii: ii });
+                });
+                w.forEach(function (l, i){ l.do = (i + 1 < w.length) ? w[i + 1].x : Infinity; });
+                lbl = lbl.concat(w);
+            });
+            if (!lbl.some(function (l){ return l.lb === "Beneficiary's Account No." || l.lb === "Beneficiary's IBAN"; })) return null;
+            function wPasie(it, l){ return it.x >= l.x - 5 && it.x < l.do - 5; }
+            function wart(lb){
+                for (var i = 0; i < lbl.length; i++){
+                    if (lbl[i].lb !== lb) continue;
+                    var l = lbl[i], koniec = rows.length;
+                    for (var j = 0; j < lbl.length; j++){
+                        var o = lbl[j];
+                        if (o.ri > l.ri && o.ri < koniec && wPasie({ x: o.x }, l)) koniec = o.ri;
+                    }
+                    var out = [];
+                    for (var r = l.ri + 1; r < koniec; r++){
+                        var t = rows[r].it.filter(function (it){ return wPasie(it, l); })
+                                          .map(function (it){ return it.s; }).join(' ').replace(/\s+/g, ' ').trim();
+                        if (t) out.push(t);
+                    }
+                    return out;
+                }
+                return [];
+            }
+            // Pole jednowartosciowe bierze PIERWSZA linie swojego pasa. Pas domyka dopiero
+            // ZNANA etykieta, wiec bez tego kazde nieznane pole ponizej (inny wariant
+            // formularza) doklejaloby sie do numeru konta, kwoty albo daty.
+            function wart1(lb){ var a = wart(lb); return a.length ? a[0] : ''; }
+            var nm = wart('Beneficiary/List'), bank = wart('Bank of the Beneficiary');
+            // Czesc potwierdzen CS (przelew ekspresowy — „Booking Text Express") NIE MA pola
+            // „Execution Date": data stoi wtedy wylacznie w zdaniu wstepnym. Zmierzone na
+            // zamowieniu 14450 (dokument 265514): „received today for processing on 02.12.2024".
+            // Bez tego data przelewu wychodzila pusta, a od niej zalezy i granica partii kwot,
+            // i to, ktore potwierdzenie jest „poprzednie".
+            var exec = wart1('Execution Date');
+            if (!exec){
+                var wstep = rows.slice(0, 12).map(function (r){
+                    return r.it.map(function (it){ return it.s; }).join(' ');
+                }).join(' ');
+                var mD = wstep.match(/processing on\s+(\d{2}\.\d{2}\.\d{4})/i);
+                if (mD) exec = mD[1];
+            }
+            var amt = wart1('Amount');
+            var mAmt = amt.match(/^([A-Z]{3})\s+([\d.,'’ ]+)$/);
+            // Numer transakcji stoi w jednej linii z etykieta („Transaction no. DNWR-…").
+            // E2E: CS podaje go jako „Transaction Customer End to End ID" (SP-71082915-0).
+            // Gdy go nie ma — numer zlecenia („Transaction no."), raz pod etykieta, raz w tej
+            // samej linii co ona.
+            var tr = wart1('Transaction Customer End to End ID') || wart1('Transaction no.');
+            if (!tr) rows.forEach(function (r){
+                if (tr) return;
+                var m = r.it.map(function (it){ return it.s; }).join(' ').match(/Transaction no\.\s*(\S+)/i);
+                if (m) tr = m[1];
+            });
+            return {
+                file: fname || '', cs: true,
+                acct: wart1("Beneficiary's Account No.") || wart1("Beneficiary's IBAN"),
+                bic: wart1('BIC Address'),
+                bankLines: bank.slice(),
+                name: nm.length ? nm[0] : '',
+                addr: nm.slice(1),
+                ccy: mAmt ? mAmt[1] : (amt.split(/\s+/)[0] || ''),
+                amt: amt,
+                debit: wart1('Account to be Debited'),
+                exec: exec,
+                status: '',
+                msg: wart('Reason for Payment').join(' '),
+                e2e: tr,
+                opt: ''
+            };
+        }
+        /* ===== Potwierdzenie UniCredit DE (UC eBanking global) =====
+           Trzeci uklad, ktory wisi w sekcji „Payment conformation" (zamowienie 14403,
+           „20112024 herma 200872764.pdf"): platnosc SEPA w EUR z konta DE, nie przelew
+           chinski — ale lezy w tej samej sekcji, wiec sprawdzanie ma go przeczytac,
+           zamiast mowic „to nie wyglada na potwierdzenie".
+           Uklad jest prosty: etykieta w lewej kolumnie (x~71), wartosc w prawej (x~328),
+           wartosc bywa wielolinijkowa. Etykiety „IBAN", „BIC" i „Name in payment"
+           wystepuja DWA RAZY — raz dla zleceniodawcy, raz dla beneficjenta; rozroznia je
+           miejsce: wszystko PO wierszu „Beneficiary" nalezy do beneficjenta.
+           Dokument ma dwie strony („Payment reference" stoi na drugiej), wiec czytamy
+           wiersze wszystkich stron po kolei.
+           UWAGA: „Status: Entered" znaczy „wprowadzony", nie „wykonany" — zostaje w polu
+           status, ktore sprawdzanie z bankiem pokazuje przy platnosci. */
+        function bcUcWiersze(strony){
+            var out = [];
+            (strony || []).forEach(function (items){
+                var rows = [];
+                (items || []).forEach(function (it){
+                    var s0 = it && it.str;
+                    if (s0 == null || !String(s0).trim()) return;
+                    var tr = it.transform || [], x = +tr[4] || 0, y = +tr[5] || 0, r = null;
+                    for (var i = 0; i < rows.length; i++) if (Math.abs(rows[i].y - y) <= 3){ r = rows[i]; break; }
+                    if (!r){ r = { y: y, it: [] }; rows.push(r); }
+                    r.it.push({ x: x, s: String(s0).replace(/[‘’ʼ]/g, "'").trim() });
+                });
+                rows.sort(function (a, b){ return b.y - a.y; });
+                rows.forEach(function (r){ r.it.sort(function (a, b){ return a.x - b.x; }); });
+                out = out.concat(rows);
+            });
+            return out;
+        }
+        // „20/11/24" i „20/11/2024" -> „20.11.2024" (bcDzien zna tylko czterocyfrowy rok).
+        function bcUcData(v){
+            var m = String(v == null ? '' : v).match(/(\d{2})[.\/](\d{2})[.\/](\d{2}(?:\d{2})?)/);
+            if (!m) return '';
+            var rok = m[3].length === 2 ? ('20' + m[3]) : m[3];
+            return m[1] + '.' + m[2] + '.' + rok;
+        }
+        function bcUcZItems(strony, fname){
+            var wiersze = bcUcWiersze(strony);
+            if (!wiersze.length) return null;
+            var GR = 300, pola = [], ost = null, naglowek = false;
+            wiersze.forEach(function (r){
+                var lewa  = r.it.filter(function (it){ return it.x <  GR; }).map(function (it){ return it.s; }).join(' ').trim();
+                var prawa = r.it.filter(function (it){ return it.x >= GR; }).map(function (it){ return it.s; }).join(' ').trim();
+                if (/^Credit Transfer Details$/i.test(lewa)) naglowek = true;
+                if (lewa){ ost = { lb: lewa, v: prawa ? [prawa] : [] }; pola.push(ost); }
+                else if (prawa && ost) ost.v.push(prawa);
+            });
+            if (!naglowek) return null;
+            function idx(lb, od){
+                for (var i = od || 0; i < pola.length; i++) if (pola[i].lb === lb) return i;
+                return -1;
+            }
+            function val(lb, od){ var i = idx(lb, od); return i < 0 ? [] : pola[i].v; }
+            var iBen = idx('Beneficiary');
+            // Pole z bloku BENEFICJENTA — czyli pierwsze wystapienie ZA wierszem „Beneficiary".
+            function valBen(lb){ return iBen < 0 ? [] : val(lb, iBen + 1); }
+            var ben = val('Beneficiary');
+            var acct = valBen('IBAN')[0] || '';
+            if (!acct) for (var i = 1; i < ben.length; i++){
+                // W bloku „Beneficiary" numer stoi pod nazwa, raz zwarty, raz grupami.
+                if (/^[A-Z]{2}\d{2}[A-Z0-9 ]{10,}$/i.test(ben[i])){ acct = ben[i]; break; }
+            }
+            var ca = val('Currency / Amount')[0] || '';
+            var mA = ca.match(/^([A-Z]{3})\s*(?:\([^)]*\))?\s*([\d.,'’ ]+)$/);
+            var adr = [].concat(valBen('Street / House number'), valBen('Postcode / Town'), valBen('Country'));
+            return {
+                file: fname || '', uc: true,
+                acct: acct,
+                bic: valBen('BIC')[0] || '',
+                bankLines: [],
+                name: valBen('Name in payment')[0] || (ben.length ? ben[0] : ''),
+                addr: adr,
+                ccy: mA ? mA[1] : (ca.split(/\s+/)[0] || ''),
+                amt: mA ? (mA[1] + ' ' + mA[2].trim()) : ca,
+                debit: val('IBAN')[0] || '',
+                exec: bcUcData(val('Requested execution date')[0] || val('Execution date')[0] || ''),
+                status: val('Status')[0] || '',
+                msg: val('Remittance information').join(' '),
+                e2e: val('Payment reference')[0] || '',
+                opt: val('Payment type')[0] || ''
+            };
+        }
         async function bcParsePdf(u8, fname){
             var lib = await getPdfjs();
             if (!lib) return { err: 'brak pdf.js — nie mogę odczytać PDF', file: fname };
-            var txt = '';
+            var txt = '', strony = [];
             try {
                 var doc = await lib.getDocument({ data: u8 }).promise;
                 for (var pg = 1; pg <= doc.numPages; pg++){
                     var page = await doc.getPage(pg);
                     var tc = await page.getTextContent();
                     txt += bcPdfLayoutLines(tc.items) + '\n';
+                    // Credit Suisse i UniCredit czytamy z POZYCJI, wiec trzymamy fragmenty
+                    // kazdej strony osobno (CS jest jednostronicowy, UniCredit ma dwie strony).
+                    strony.push(tc.items || []);
                 }
             } catch(e){ return { err: 'nie udało się otworzyć PDF (' + e + ')', file: fname }; }
             var r = bcParsePdfText(txt, fname);
-            if (!r) return { err: 'to nie wygląda na potwierdzenie z e-finance (brak „Recipient’s account”)', file: fname };
+            if (!r) r = bcCsZItems(strony[0] || [], fname);
+            if (!r) r = bcUcZItems(strony, fname);
+            if (!r) return { err: 'to nie wygląda na potwierdzenie przelewu (nie ma ani „Recipient’s account” z UBS, ani „Beneficiary’s Account No.” z Credit Suisse, ani „Credit Transfer Details” z UniCredit)', file: fname };
             return r;
         }
 
@@ -24414,6 +24793,26 @@
                 return d && (!d.kom || !d.kom.length);
             });
 
+            // Dla ktorych zamowien warto przeczytac POPRZEDNI przelew. Przy czystym depozycie,
+            // ktorego konto zgadza sie z P/I co do znaku, nie ma czego wyjasniac — i nie
+            // pobieramy nic. Zostaje to, co zglasza uzytkownik: balance (tam P/I bywa stare),
+            // rozjazd zapisu numeru i brak konta w P/I.
+            var potrzebne = {};
+            (g.pdfs || []).forEach(function (q){
+                var wTyt0 = bcOrderyZTytulu(q.msg || '');
+                podszywacze.forEach(function (nr){ delete wTyt0[nr]; });
+                var czystyDepo = bcRodzajPrzelewu(q.msg || '') === 'depozyt';
+                wszystkie.forEach(function (o){
+                    if (!wTyt0[o]) return;
+                    var dd = out.dane[o] || {}, pib = (dd.pi && (dd.pi.piBank || dd.pi.piBankRaw)) || {};
+                    var pa = pib.acc || (dd.pi && dd.pi.piAcc) || '';
+                    if (bcTrzebaPoprzedni(czystyDepo ? 'depozyt' : '', pa, q.acct)) potrzebne[o] = 1;
+                });
+            });
+            var poprz = {};
+            try { poprz = await bcPoprzednieKonta(g.prev || {}, Object.keys(potrzebne), dataPl, io || null, say) || {}; }
+            catch (e){ poprz = {}; }
+
             (g.pdfs || []).forEach(function (q){
                 // Zamowienia TEGO przelewu bierzemy z jego tytulu — tak dziala tez
                 // dopasowanie przy Excelu i tylko tak da sie obsluzyc przelew laczony.
@@ -24426,7 +24825,14 @@
                           orders: moje, obce: obce, bledy: [], uwagi: [], suma: null, laczony: moje.length > 1,
                           cent: bcCents(q.amt), rozjazd: false };
                 if (!moje.length){
-                    w.bledy.push('w tytule nie ma żadnego zamówienia z wklejki');
+                    // Potwierdzenie UniCredit to zwykle platnosc SEPA za usluge (transport, palety):
+                    // w tytule stoi numer FAKTURY, nie numer zamowienia. Do 22.10.2026 taki plik byl
+                    // odrzucany przy odczycie, wiec w ogole nie dochodzil do tego miejsca — teraz
+                    // dochodzi i ma sie tlumaczyc sam, zeby nie wygladal na zgubione dopasowanie.
+                    w.bledy.push('w tytule nie ma żadnego zamówienia z wklejki'
+                        + (q.uc ? ' — to przelew ' + (q.opt || 'SEPA') + ' w ' + (q.ccy || '?')
+                                  + ' z tytułem „' + String(q.msg || '').slice(0, 40)
+                                  + '”, czyli zapłata za fakturę, nie za zamówienie' : ''));
                     out.wiersze.push(w); return;
                 }
                 var suma = 0, brakKwot = [], pcts = [], zrodla = {};
@@ -24609,6 +25015,16 @@
                         k2.ok ? 'ok' : 'zle');
                     if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
                         + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
+                    }
+                    // Na jakie konto poszedl POPRZEDNI przelew tego zamowienia. To jedyne zrodlo,
+                    // ktore mowi o ZAPISIE numeru z praktyki: skoro tamten przelew przeszedl,
+                    // bank przyjal numer w tej postaci. Sprawdzajacy nie musi wiedziec, kto i co
+                    // wybral w Wprowadzaniu — widzi, co bylo poprzednio.
+                    if (potrzebne[o]){
+                        var pw = bcPoprzWynik(poprz[o], q.acct);
+                        kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, pw.prawo, pw.lv);
+                        if (pw.uwaga) w.uwagi.push(o + ': ' + pw.uwaga);
+                        if (pw.blad) w.bledy.push(o + ': ' + pw.blad);
                     }
                     // SWIFT o zlym ksztalcie (np. dziesiecioznakowy „BKCHCNBJ72") nie jest
                     // rozjazdem z bankiem, tylko literowka w P/I. Mowimy to wprost i nie
@@ -25429,12 +25845,115 @@
         // NIC nie ląduje na dysku: strona zamowienia -> tekst, plik -> ArrayBuffer w pamieci
         // -> pdf.js czyta tekst -> bajty od razu porzucone. Zadnego okna "Zapisz jako",
         // zadnego folderu Pobrane, zadnego wyjscia poza przegladarke.
+        /* ===== Na jakie konto szedl POPRZEDNI przelew tego zamowienia (22.10.2026) =====
+           Przy BALANSIE P/I bywa starym dokumentem, a karta dostawcy niesie numer w innym
+           zapisie — i sprawdzajacy (inna osoba, inny modul niz Wprowadzanie) nie ma jak
+           odroznic swiadomego zapisu od literowki. Praktycznym dowodem jest to, ze POPRZEDNI
+           przelew tego samego zamowienia (zwykle depozyt) na ten numer PRZESZEDL.
+           Czytamy go z sekcji „Payment conformation" tego samego zamowienia: lista zalacznikow
+           jest juz w pobranej stronie, dochodzi wylacznie pobranie jednego PDF-a — i tylko tam,
+           gdzie to ma znaczenie (patrz „potrzebne" w bcZWklejki).
+           -> { <order>: { acct, bic, nazwa, kwota, ccy, dzien, plik, tytul, rodzaj } }          */
+        async function bcPoprzednieKonta(prev, ordery, dataPl, io, say){
+            var IO = io || bcIO(), out = {}, lista = (ordery || []).slice();
+            if (!lista.length) return out;
+            var plan = {};
+            lista.forEach(function (o){
+                // Data z potwierdzenia jest w postaci dd.mm.rrrr, a daty zalacznikow w RRRR-MM-DD
+                // (bcDocsIn) — bez bcDzien porownanie bylo porownaniem dwoch roznych zapisow.
+                var dzienP = bcDzien(dataPl);
+                var docs = ((prev && prev[o]) || []).filter(function (d){
+                    return d && d.date && (!dzienP || d.date < dzienP);
+                });
+                if (!docs.length) return;
+                // Najswiezszy z WCZESNIEJSZYCH. Czas bywa pusty — wtedy rozstrzyga sama data.
+                docs.sort(function (a, b){
+                    var x = a.date + ' ' + (a.time || ''), y = b.date + ' ' + (b.time || '');
+                    return x < y ? 1 : (x > y ? -1 : 0);
+                });
+                plan[o] = docs[0];
+            });
+            // Ten sam plik bywa wgrany do kilku zamowien jednej platnosci — pobieramy go RAZ
+            // (ten sam klucz co w bcGrabConfs: nazwa pliku).
+            var kdo = {}, klucze = [];
+            Object.keys(plan).forEach(function (o){
+                var k = bcDocKey(plan[o]);
+                if (!kdo[k]){ kdo[k] = []; klucze.push(k); }
+                kdo[k].push(o);
+            });
+            if (!klucze.length) return out;
+            var cache = {}, done = 0;
+            if (say) say('Czytam poprzednie potwierdzenia: 0/' + klucze.length + '…', '#666');
+            await bcPool(klucze, 5, async function (k){
+                var d = plan[kdo[k][0]], ab = null, q = null;
+                // Plik, ktorego NIE DALO SIE odczytac, to nie to samo, co brak wczesniejszego
+                // przelewu: w raporcie ma stac, ze potwierdzenie jest, tylko nie wiem co w nim.
+                function nieUdane(why){ cache[k] = { blad: why, dzien: d.date || '', plik: d.name || '' }; return null; }
+                try { ab = await IO.docBin(d.href); } catch (e){ ab = null; }
+                done++;
+                if (say) say('Czytam poprzednie potwierdzenia: ' + done + '/' + klucze.length + '…', '#666');
+                if (!ab) return nieUdane('nie udało się pobrać pliku');
+                var u8 = (ab && ab.byteLength !== undefined && !(ab instanceof Uint8Array)) ? new Uint8Array(ab) : ab;
+                ab = null;
+                if (!u8 || !u8.length) return nieUdane('pusty plik');
+                if (!bcIsPdf(u8)) return nieUdane('to nie jest PDF');
+                try { q = await IO.parsePdf(u8, d.name || ('dokument ' + d.id)); } catch (e){ q = null; }
+                u8 = null;
+                if (!q || q.err) return nieUdane('nie udało się odczytać treści');
+                cache[k] = { acct: q.acct || '', bic: q.bic || '', nazwa: q.name || '',
+                             kwota: q.amt, ccy: q.ccy || '', tytul: q.msg || '',
+                             dzien: d.date || '', plik: d.name || '',
+                             rodzaj: bcRodzajPrzelewu(q.msg || '') };
+                return true;
+            });
+            Object.keys(kdo).forEach(function (k){
+                if (!cache[k]) return;
+                kdo[k].forEach(function (o){ out[o] = cache[k]; });
+            });
+            return out;
+        }
+        // Czy dla tego zamowienia warto siegnac po poprzedni przelew. Czysty depozyt,
+        // ktorego konto zgadza sie z P/I co do znaku, niczego nie wyjasnia — i nic nie
+        // pobieramy. Zostaje to, co zglosil uzytkownik: balance (tam P/I bywa starym
+        // dokumentem), rozjazd zapisu numeru, konto „to samo, inaczej zapisane" i brak P/I.
+        function bcTrzebaPoprzedni(rodzaj, piAcc, qAcct){
+            if (String(rodzaj || '') !== 'depozyt') return true;
+            if (!piAcc) return true;
+            var e = bcKontoEq(piAcc, qAcct);
+            return !e.ok || !!e.opis;
+        }
+        // Co wynika z poprzedniego przelewu. -> { lewo, prawo, lv, uwaga, blad }
+        function bcPoprzWynik(pp, qAcct){
+            if (!pp) return { lewo: '—', lv: 'uwaga',
+                prawo: 'nie ma wcześniejszego potwierdzenia w sekcji „Payment conformation” — to pierwszy przelew do tego zamówienia?',
+                uwaga: '', blad: '' };
+            if (pp.blad) return { lewo: '? ' + (pp.plik || 'potwierdzenie') + (pp.dzien ? ('   (z ' + pp.dzien + ')') : ''),
+                lv: 'uwaga', prawo: 'wcześniejsze potwierdzenie JEST, ale ' + pp.blad + ' — konta z niego nie porównałem',
+                uwaga: 'wcześniejszego potwierdzenia (' + (pp.plik || '?') + ') nie dało się odczytać: ' + pp.blad, blad: '' };
+            var op = bcPoprzOpis(pp), e = bcKontoEq(pp.acct, qAcct);
+            var o = { lewo: (pp.acct || '—') + '   (' + op + ')',
+                      prawo: (qAcct || '—') + (e.msg ? (' — ' + e.msg) : ' — to samo konto, ten sam zapis'),
+                      lv: e.ok ? 'ok' : (e.myslnik ? 'uwaga' : 'zle'), uwaga: '', blad: '' };
+            if (e.myslnik)
+                o.uwaga = 'poprzedni przelew (' + op + ') poszedł na ten sam numer zapisany inaczej („'
+                        + pp.acct + '”) — sprawdź, w jakiej postaci przyjmuje go bank';
+            else if (!e.ok && !e.brak)
+                o.blad = 'poprzedni przelew (' + op + ') poszedł na konto „' + pp.acct
+                       + '”, a ten idzie na „' + (qAcct || '—') + '”';
+            return o;
+        }
+        // Opis poprzedniego przelewu do jednej linii raportu.
+        function bcPoprzOpis(pp){
+            if (!pp) return '';
+            return (pp.rodzaj || 'przelew') + ' z ' + (pp.dzien || '—')
+                 + (pp.plik ? ('  ·  ' + String(pp.plik).slice(0, 60)) : '');
+        }
         async function bcGrabConfs(orders, day, io, say, workers){
             var IO = io || bcIO(), ord = (orders || []).slice(), errs = [];
             var stat = { orders: ord.length, pages: 0, pageErr: 0, docs: 0, sameDay: 0, noDate: 0,
                 files: 0, got: 0, fail: 0, notPdf: 0, parseErr: 0, pdfs: 0, day: day || '',
                 noConf: 0, noConfList: [] };
-            if (!ord.length) return { pdfs: [], stat: stat, errs: errs };
+            if (!ord.length) return { pdfs: [], stat: stat, errs: errs, prev: {} };
             var W = workers || 5, seen = 0;
             if (say) say('Czytam zamówienia: 0/' + ord.length + '…', '#666');
             var pages = await bcPool(ord, W, async function(o){
@@ -25444,6 +25963,10 @@
                 if (say) say('Czytam zamówienia: ' + seen + '/' + ord.length + '…', '#666');
                 return { o: o, html: html || '' };
             });
+            // Wszystkie potwierdzenia zamowienia z czytelna data — takze te spoza wybranego
+            // dnia. Z nich bierzemy POPRZEDNI przelew (bcPoprzednieKonta); strona zamowienia
+            // jest juz pobrana, wiec sama lista nie kosztuje ani jednego zapytania wiecej.
+            var prev = {};
             var uniq = {}, from = {}, none = [];
             pages.forEach(function(p){
                 if (!p || p.err || !p.html){
@@ -25459,6 +25982,8 @@
                 if (sec) bcDocsIn(sec).forEach(function(d){
                     stat.docs++;
                     if (!d.date){ stat.noDate++; return; }
+                    if (!prev[p.o]) prev[p.o] = [];
+                    prev[p.o].push(d);
                     if (day && d.date !== day) return;
                     stat.sameDay++;
                     hit++;
@@ -25477,7 +26002,7 @@
             stat.noConf = none.length;
             var keys = Object.keys(uniq);
             stat.files = keys.length;
-            if (!keys.length) return { pdfs: [], stat: stat, errs: errs };
+            if (!keys.length) return { pdfs: [], stat: stat, errs: errs, prev: prev };
             var done = 0;
             if (say) say('Pobieram potwierdzenia: 0/' + keys.length + '…', '#666');
             var got = await bcPool(keys, W, async function(k){
@@ -25518,7 +26043,7 @@
                 pdfs.push(q);
             });
             stat.pdfs = pdfs.length;
-            return { pdfs: pdfs, stat: stat, errs: errs };
+            return { pdfs: pdfs, stat: stat, errs: errs, prev: prev };
         }
         // Komentarz w zamowieniach, po 5 naraz, z weryfikacja NA STRONIE.
         // Sprawdzamy PRZYROST liczby wystapien tresci (przed -> po), nie sam fakt jej
@@ -26870,7 +27395,7 @@
                     : '')
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + pcAttr(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(accShown || '—') + '</span></span>'
-                + pcAccDopiskiHtml(G)
+                + pcAccDopiskiHtml(G) + pcAccWarHtml(G, hasDep, hasBal)
                 + pcConfBadge(pcConfG(G)) + pcHintBadge(pcConfG(G), accShown)
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
@@ -30074,7 +30599,7 @@
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
             // painSel i painEdit tez. Bez tego klucz grupy, ktory przezyl nowa wklejke,
             // wracal ZAZNACZONY do pliku pain.001 razem ze stara reczna kwota.
-            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {};
+            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {}; state.pcAccWar = {};
             state.painSel = {}; state.painEdit = {};
             state.pcKontoZm = {}; state._odswLog = []; state._painSchowek = []; state._odswKartaBlad = {}; state._penBlad = {};
             // ✂ tez (decyzja uzytkownika 15.10.2026, zgodnie z napisem przy ✂ i z zalozeniem
@@ -30180,6 +30705,13 @@
                 if (t.classList.contains('pain-chk')) { state.painSel[t.getAttribute('data-key')] = t.checked; renderPain(); return; }
                 if (t.classList.contains('pain-cfgb')) { painCfg()[t.getAttribute('data-k')] = t.checked; painCfgSave(); renderPain(); return; }
                 if (t.classList.contains('pain-cfg')) { painCfg()[t.getAttribute('data-k')] = t.value.trim(); painCfgSave(); renderPain(); return; }
+                // Zapis numeru konta (ten sam rachunek, inne separatory) — wybor trzyma sie
+                // rachunku, wiec data-k to numer bez separatorow, nie klucz platnosci.
+                if (t.classList.contains('pain-acc-war')) {
+                    if (!state.pcAccWar) state.pcAccWar = {};
+                    state.pcAccWar[t.getAttribute('data-k')] = t.getAttribute('data-val') || '';
+                    renderPain(); return;
+                }
                 if (t.classList.contains('pain-ed')) {
                     var k = t.getAttribute('data-k'), key = t.getAttribute('data-key'), val = t.value.trim();
                     if (k === 'amount') { var n = parseMoney(val); setEd(key, 'amount', (val === '' || !isFinite(n)) ? '' : n); }
@@ -39363,15 +39895,83 @@
                 if (amt == null && /[A-Z]{3}\s*-?[\d'’.,]+/.test(t)) amt = mkNum(t.replace(/[A-Z]{3}/, ''));
             });
             const nm = String(a.textContent || '').trim();
+            // Dzien wyplaty (kolumna „Payout date", w nazwie pliku tez: ..._07-10-2026.xlsx) —
+            // po nim portal filtruje okna dat, a wplyw na konto jest dzien pozniej.
+            const dm = nm.match(/_(\d{2})-(\d{2})-(\d{4})\.xlsx$/i) || String(tds[tds.length - 1] || '').match(/^(\d{2})\.(\d{2})\.(\d{4})/);
             out.push({
                 url: href.indexOf('http') === 0 ? href : ('https://' + MK_GALX_HOST + (href.charAt(0) === '/' ? '' : '/') + href),
                 name: nm,
                 id: (nm.match(/_(\d+)_/) || [])[1] || '',
                 amount: amt,
+                day: dm ? (dm[3] + '-' + dm[2] + '-' + dm[1]) : '',
                 cells: tds
             });
         });
         return out;
+    }
+    // Strona „Show" oddaje tylko 10 NAJNOWSZYCH wyplat („Latest 10 payouts"). Starsze portal pokazuje
+    // dopiero po wyszukaniu w formularzu „Search criteria": POST na ten sam adres z polami
+    // __RequestVerificationToken (ukryte pole formularza), StartDate i EndDate (rrrr-mm-dd).
+    // Zmierzone w panelu 22.10.2026: filtr dziala po DACIE WYPLATY, obie krawedzie wlacznie, wyniki
+    // od najnowszej i tez co najwyzej 10 (okno 01.01–22.10 oddalo te sama dziesiatke co strona bez
+    // filtra); okno 06–07.10 oddalo dokladnie dwie wyplaty, ktorych nie bylo wsrod ostatnich 10.
+    // Dlatego pytamy oknami po 8 dni — wyplata jest raz dziennie, wiec okno nie obetnie dziesiatki.
+    function galxToken(html){
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const el = doc.querySelector('input[name="__RequestVerificationToken"]');
+        return el ? String(el.value || el.getAttribute('value') || '') : '';
+    }
+    async function galxSzukaj(token, od, doo){
+        const url = 'https://' + MK_GALX_HOST + '/en/ui/Receivables/PayoutOverviewCmi/Show';
+        const hdrs = { 'content-type': 'application/x-www-form-urlencoded', 'accept': 'text/html,application/xhtml+xml',
+                       'origin': 'https://' + MK_GALX_HOST, 'referer': url };
+        if (location.hostname !== MK_GALX_HOST){
+            // Ciasteczka czytamy tuz przed zapytaniem — GET moglo dopiero co ustawic ciasteczko antyfalszerskie.
+            const ck = await gmCookies('https://' + MK_GALX_HOST + '/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        const r = await gmPost(url, '__RequestVerificationToken=' + encodeURIComponent(token)
+                                  + '&StartDate=' + od + '&EndDate=' + doo, hdrs);
+        if (r.status !== 200) throw new Error('szukanie wypłat ' + od + ' – ' + doo + ': HTTP ' + r.status);
+        const html = String(r.responseText || '');
+        if (!galxToken(html)) throw new Error('szukanie wypłat ' + od + ' – ' + doo + ': portal nie oddał strony z formularzem — zaloguj się na ' + MK_GALX_HOST);
+        return galxParseList(html);
+    }
+    // Wyplata pasuje dniem, gdy wyszla do 30 dni przed wplywem albo najwyzej 3 dni po nim
+    // (zwykle jest to dzien przed). Bez daty zlecenia albo wyplaty dzien nie rozstrzyga.
+    function galxWOknie(p, date){
+        if (!date || !p.day) return true;
+        return p.day >= mkShift(date, -30) && p.day <= mkShift(date, 3);
+    }
+    // Szuka wyplaty zlecenia: najpierw wsrod 10 ze strony, potem oknami dat wstecz od dnia wplywu
+    // (3 okna po 8 dni, od wplywu+1 do ~22 dni przed). Zwraca { hit, widziane, okno, pelne, blad }.
+    async function galxZnajdz(j, lista, token, cache){
+        const widziane = {};
+        const dodaj = function (l){
+            // Po NAZWIE pliku: pole `id` to pierwszy numer z nazwy, czyli numer sprzedawcy, wspolny dla wszystkich wyplat.
+            l.forEach(function (p){ widziane[p.name || p.url] = p; });
+        };
+        const pasuje = function (p){ return p.amount != null && eq(p.amount, j.amount) && galxWOknie(p, j.date); };
+        dodaj(lista);
+        const wynik = { hit: [], widziane: widziane, okno: '', pelne: false, blad: '' };
+        wynik.hit = Object.keys(widziane).map(function (k){ return widziane[k]; }).filter(pasuje);
+        if (wynik.hit.length || !token) return wynik;
+        const baza = j.date || new Date().toISOString().slice(0, 10);
+        let min = '', max = '';
+        for (let i = 0; i < 3 && !wynik.hit.length; i++){
+            const doo = mkShift(baza, 1 - 8 * i), od = mkShift(doo, -7);
+            const k = od + '|' + doo;
+            try {
+                if (!cache[k]) cache[k] = await galxSzukaj(token, od, doo);
+            } catch (e){ wynik.blad = (e && e.message) || String(e); break; }
+            if (!min || od < min) min = od;
+            if (!max || doo > max) max = doo;
+            if (cache[k].length >= 10) wynik.pelne = true;
+            dodaj(cache[k]);
+            wynik.hit = Object.keys(widziane).map(function (x){ return widziane[x]; }).filter(pasuje);
+        }
+        wynik.okno = min ? (min + ' – ' + max) : '';
+        return wynik;
     }
     async function galxDownload(url){
         const hdrs = {};
@@ -45152,6 +45752,10 @@
     const TM_DOBOR_MAX_KOREKT = 4;             // …i tyle korekt (przypadkowe trafienia co do grosza — tmKombinacje)
     const TM_DOBOR_LICZ = 500;                 // tyle trafien liczymy dokladnie, dalej „ponad"
     const TM_MAX_PROPOZYCJI = 5;
+    const TM_DAT_MAX_KOREKT = 30;              // dobor wg dat: podzbior sposrod najwyzej tylu najnowszych korekt (2^15 na polowe)
+    const TM_DAT_PRZERWA_DNI = 3;              // dobor wg dat: okno faktur musi lezec najwyzej tyle dni od faktur z tytulu
+    const TM_WYCIAGI_KEY = 'mkt_tm_wyciagi';   // rozliczenia Trademax (lista dokumentow wplaty) wgrane przez „📎 Dodaj pliki"
+    const TM_WYCIAGI_DNI = 120;
     const TM_MAX_PACZEK = 80;                  // zapora i dobor: szczegoly najwyzej tylu najnowszych paczek 117 w oknie
     const TM_UZYTE_KEY = 'mkt_tm_uzyte';       // numery z tytulow wszystkich wplat Trademax z wgranych wyciagow
     const TM_UZYTE_DNI = 400;
@@ -45274,8 +45878,11 @@
             t.faktury.forEach(dodaj);
             t.korekty.forEach(function (n){ dodaj('CN ' + n); });
         }
-        return { faktury: faktury, korekty: korekty, uciety: t.uciety, niepewny: t.niepewny, reszta: t.reszta, tekst: t.tekst,
-                 pelny: faktury.length > 0 && !t.uciety && !t.reszta };
+        // Rozliczenie Trademax (j.tmWyciag) to KOMPLETNA lista dokumentow wplaty — ucieta czesc tytulu przelewu nie ma wtedy znaczenia.
+        const pelnyW = !!(j && j.tmWyciag);
+        return { faktury: faktury, korekty: korekty, uciety: pelnyW ? false : t.uciety, niepewny: pelnyW ? '' : t.niepewny,
+                 reszta: pelnyW ? '' : t.reszta, tekst: t.tekst,
+                 pelny: faktury.length > 0 && (pelnyW || (!t.uciety && !t.reszta)) };
     }
     function tmTx(j){
         return (j && j.txId) ? ('tx:' + String(j.txId)) : ('d:' + String((j && j.date) || '') + '|' + f2(j && j.amount));
@@ -45325,6 +45932,15 @@
     }
     function tmTytulZWyciagu(k, o, r){
         o.ref = r.ref;
+        // Wplata ma rozliczenie Trademax (pelna lista dokumentow): tytul z wyciagu UBS, ktorego numery sa w tym rozliczeniu, niczego
+        // nie zmienia (ucieta lista z tytulu nadpisalaby pelna). Tytul z numerami SPOZA rozliczenia znaczy, ze to nie to rozliczenie.
+        if (o.tmWyciag){
+            const maja = {};
+            (o.docs || []).forEach(function (d){ const kl = tmKlZDocs(d); if (kl) maja[kl] = 1; });
+            const obce = (r.docs || []).map(tmKlZDocs).filter(function (kl){ return kl && !maja[kl]; });
+            if (!obce.length) return false;
+            delete o.tmWyciag;
+        }
         if (!tmTytulInny(o, r)) return false;
         o.docs = r.docs;
         if ((o.status || 'new') === 'new' && !o.tmPotw && !o.data) return true;
@@ -45698,6 +46314,121 @@
         } catch (e){ return false; }
     }
 
+    // ---------- rozliczenie Trademax (wyciag z ksiegi dostawcy „Lev.reskontratransaktioner") ----------
+    // Trademax przysyla przy wplacie arkusz z LISTA dokumentow, ktore ta wplata zaplacila (22.10.2026: „261015 Beliani.xlsx"):
+    // kolumny Bokföringsdatum | Dokumenttyp (Faktura / Kreditnota) | Verifikationsnr | Externt verifikationsnr (numer faktury
+    // „55331_55331_07102026" albo korekty „CN/IO2855959") | … | Belopp; faktury ze znakiem MINUS, korekty z PLUSEM, a pod spodem
+    // komorka bez etykiety z suma = przelew ze znakiem minus. Zmierzone: 16 faktur (3 305 111,90) − 15 korekt (8 767,82) =
+    // 3 296 344,08 SEK, czyli dokladnie wplata UBS. To zrodlo prawdy o skladzie wplaty: bez zgadywania po kwocie i bez limitow
+    // doboru (3 faktury + 4 korekty nie obejmowaly takiej wplaty nigdy). Tytul UBS niesie tylko poczatek tej listy (ucina po ~140 znakach).
+    function tmKlasyfikujWyciag(wiersze){
+        const W = wiersze || [];
+        for (let i = 0; i < W.length && i < 15; i++){
+            const n = tmNaglowek(W[i]).map(function (t){ return t.toLowerCase(); });
+            if (n.some(function (t){ return t === 'dokumenttyp'; }) && n.some(function (t){ return /^externt\s*verifikationsnr/.test(t); })
+                && n.some(function (t){ return t === 'belopp'; })) return 'wyciag';
+        }
+        return '';
+    }
+    // -> { ok, faktury: [{ numer (klucz), grosze }], korekty: [{ numer: 'IO…', grosze }], docs: ['klucz', 'CN IO…'], kwoty: { klucz: grosze },
+    //      przelewGr, razemGr, bledy }. Kwoty dokumentow w groszach BEZWZGLEDNYCH; przelew = −Σ Belopp. ok = suma wierszy rowna
+    // komorce z suma pod tabela (co do grosza), znaki zgodne z typem, kazdy numer rozpoznany, zadnego dokumentu dwa razy.
+    function tmCzytajWyciag(wiersze){
+        const W = wiersze || [];
+        const w = { ok: false, faktury: [], korekty: [], docs: [], kwoty: {}, przelewGr: 0, razemGr: null, bledy: [] };
+        let h = -1, kT = -1, kN = -1, kB = -1, kU = -1;
+        for (let i = 0; i < W.length && h < 0; i++){
+            const n = tmNaglowek(W[i]).map(function (t){ return t.toLowerCase(); });
+            const t = n.indexOf('dokumenttyp'), b = n.indexOf('belopp');
+            const nr = n.findIndex(function (x){ return /^externt\s*verifikationsnr/.test(x); });
+            if (t >= 0 && b >= 0 && nr >= 0){ h = i; kT = t; kN = nr; kB = b; kU = n.findIndex(function (x){ return /^ursprungligt\s*belopp/.test(x); }); }
+        }
+        if (h < 0){ w.bledy.push('nie znalazłem nagłówka (Dokumenttyp / Externt verifikationsnr / Belopp)'); return w; }
+        let suma = 0;
+        const widziane = {};
+        for (let i = h + 1; i < W.length; i++){
+            const r = W[i] || [];
+            const typ = f1Tekst(r[kT]).trim().toLowerCase();
+            if (!typ){
+                // komorka z suma pod tabela (kolumna „Belopp" albo „Ursprungligt belopp", bez etykiety w wierszu)
+                const g = f1Grosze(r[kB] != null && f1Tekst(r[kB]) !== '' ? r[kB] : (kU >= 0 ? r[kU] : null));
+                if (g != null && w.razemGr == null && !f1Tekst(r[kN]).trim()) w.razemGr = g;
+                continue;
+            }
+            const wiersz = 'wiersz ' + (i + 1);
+            const kor = /^kreditnota$/.test(typ), fak = /^faktura$/.test(typ);
+            if (!kor && !fak){ w.bledy.push(wiersz + ': nieznany typ dokumentu „' + f1Tekst(r[kT]).trim() + '”'); continue; }
+            const numer = f1Tekst(r[kN]).trim();
+            const kl = tmKlZDocs(numer);
+            const g = f1Grosze(r[kB]);
+            if (!kl){ w.bledy.push(wiersz + ': numer dokumentu nieczytelny („' + numer + '”)'); continue; }
+            if (g == null){ w.bledy.push(wiersz + ': brak kwoty (' + numer + ')'); continue; }
+            if (widziane[kl]){ w.bledy.push(wiersz + ': ' + kl + ' występuje drugi raz'); continue; }
+            widziane[kl] = 1;
+            // faktura = zobowiazanie (minus), korekta = naleznosc (plus)
+            if ((fak && g > 0) || (kor && g < 0)){ w.bledy.push(wiersz + ': znak kwoty niezgodny z typem (' + numer + ')'); continue; }
+            suma += g;
+            w.kwoty[kl] = Math.abs(g);
+            if (fak) w.faktury.push({ numer: kl, grosze: Math.abs(g) });
+            else w.korekty.push({ numer: kl.slice(3), grosze: Math.abs(g) });
+            w.docs.push(kl);
+        }
+        w.przelewGr = -suma;
+        if (!w.docs.length) w.bledy.push('brak dokumentów w tabeli');
+        if (w.razemGr == null) w.bledy.push('nie znalazłem sumy pod tabelą — nie mam jak sprawdzić kompletu');
+        else if (w.razemGr !== suma) w.bledy.push('suma wierszy ' + f1KwotaPl(suma) + ' ≠ suma pod tabelą ' + f1KwotaPl(w.razemGr));
+        w.ok = !w.bledy.length;
+        return w;
+    }
+    function tmWyciagZBajtow(u8){
+        try {
+            const p = f1Odczytaj({ bajty: u8 }, null, { klasyfikuj: tmKlasyfikujWyciag, faktura: function (){ return null; }, korekta: function (){ return null; } });
+            if (p.blad || p.rodzaj !== 'wyciag') return null;
+            return tmCzytajWyciag(p.wiersze);
+        } catch (e){ return null; }
+    }
+    function tmCzyWyciag(u8){ return !!tmWyciagZBajtow(u8); }
+    // Pamiec rozliczen: wgrane PRZED wplata (albo przed wyciagiem UBS) dopinaja sie same, gdy w arkuszu / z wyciagu pojawia sie
+    // wplata o tej kwocie (co do grosza). GM, ten komputer; 120 dni.
+    function tmWyciagiLoad(){
+        try { const a = JSON.parse(GM_getValue(TM_WYCIAGI_KEY, '[]')); return Array.isArray(a) ? a : []; }
+        catch (e){ return []; }
+    }
+    function tmWyciagiDodaj(S){
+        const teraz = Date.now();
+        const l = tmWyciagiLoad().filter(function (x){
+            return x && x.przelewGr !== S.przelewGr && (teraz - Number(x.kiedy) < TM_WYCIAGI_DNI * 86400000);
+        });
+        l.push({ przelewGr: S.przelewGr, docs: S.docs.slice(), kwoty: S.kwoty, nazwa: String(S.nazwa || ''), kiedy: teraz,
+                 faktur: S.faktury.length, korekt: S.korekty.length });
+        try { GM_setValue(TM_WYCIAGI_KEY, JSON.stringify(l.slice(-20))); } catch (e){}
+    }
+    function tmWyciagDla(j){
+        const kw = f1Grosze(j && j.amount);
+        if (kw == null) return null;
+        const l = tmWyciagiLoad().filter(function (x){ return x && x.przelewGr === kw; });
+        return l.length ? l[l.length - 1] : null;
+    }
+    // Dopina rozliczenie do zlecenia Trademax o tej samej kwocie: j.docs = pelna lista, j.tmWyciag = ślad (kwoty dokumentow do kontroli).
+    // Tytul przelewu, jesli niesie numery, musi sie w rozliczeniu zawierac — inaczej to nie to rozliczenie (kwota moze sie powtorzyc).
+    // Zwraca 'ok' | 'obce' | ''.
+    function tmDopnijWyciag(k){
+        const jobs = jobsLoad(), j = jobs[k];
+        if (!j || j.kind !== 'tm' || ['new', 'err', 'partial'].indexOf(j.status || 'new') < 0 || j.tmWyciag || !(j.amount > 0) || !tmAutomat(j)) return '';
+        const S = tmWyciagDla(j);
+        if (!S) return '';
+        const t = tmTytul(j.ref);
+        const maja = {};
+        S.docs.forEach(function (d){ maja[d] = 1; });
+        const obce = t.faktury.filter(function (f){ return !maja[f]; }).concat(t.korekty.filter(function (n){ return !maja['CN ' + n]; }).map(function (n){ return 'CN/' + n; }));
+        if (obce.length) return 'obce';
+        j.docs = S.docs.slice();
+        j.tmWyciag = { nazwa: S.nazwa, przelewGr: S.przelewGr, n: S.docs.length, faktur: S.faktur, korekt: S.korekt, kwoty: S.kwoty, kiedy: new Date().toISOString() };
+        delete j.tmPotw;
+        jobsSave(jobs);
+        return 'ok';
+    }
+
     // ---------- dopasowanie plikow do numerow z tytulu ----------
 
     // Faktury po PELNYM kluczu (numery + data z tresci pliku), korekty po numerze IO. Rozna tresc pod tym samym numerem =
@@ -45798,6 +46529,125 @@
         }
         return { wyniki: wyniki, ile: ile };
     }
+    // ---------- dobor wg dat: faktury z kolejnych dni + podzbior korekt ----------
+    // Wplata Trademax placi WSZYSTKIE faktury z kilku kolejnych dni i kompensuje je korektami (22.10.2026: 16 faktur z 07 i 08.10
+    // na 3 305 111,90 i 15 korekt na 8 767,82 = 3 296 344,08; tytul UBS niosl 5 faktur i 2 korekty). tmKombinacje (do 3 faktur i 4
+    // korekt) takiej wplaty nie znajdzie, a pelne przeszukanie jest niewykonalne (2^60). Tu: faktury biora sie OKNAMI DAT (wszystkie
+    // faktury kandydatow z dni [a, b], okno blisko faktur z tytulu), a korekty dopelniaja sume — podzbior korekt o sumie dokladnie
+    // „suma faktur − brakujaca kwota” szukamy spotkaniem w srodku (2^15 na polowe). Wynik to PROPOZYCJA do potwierdzenia: faktury
+    // wynikaja z dni (mocna przeslanka), korekty tylko z sumy (moze pasowac kilka zestawow).
+    // Zwraca funkcje (cel, limit) -> { ile (do 5000), wyn: [[indeksy w K]] (najwyzej limit+1) } dla K = kwoty w groszach.
+    function tmPodzbioryKorekt(K){
+        const zbuduj = function (arr){
+            const N = 1 << arr.length, s = new Float64Array(N);
+            for (let m = 1; m < N; m++){ const low = m & -m; s[m] = s[m ^ low] + arr[31 - Math.clz32(low)]; }
+            const idx = new Uint32Array(N);
+            for (let i = 0; i < N; i++) idx[i] = i;
+            idx.sort(function (a, b){ return s[a] - s[b]; });
+            const sorted = new Float64Array(N);
+            for (let i = 0; i < N; i++) sorted[i] = s[idx[i]];
+            return { s: sorted, idx: idx };
+        };
+        const n1 = K.length >> 1;
+        const A = zbuduj(K.slice(0, n1)), B = zbuduj(K.slice(n1));
+        const maski = function (ma, mb){
+            const o = [];
+            for (let i = 0; i < n1; i++) if (ma & (1 << i)) o.push(i);
+            for (let i = 0; i < K.length - n1; i++) if (mb & (1 << i)) o.push(n1 + i);
+            return o;
+        };
+        return function (cel, limit){
+            const wyn = [];
+            let ile = 0, i = 0, j = B.s.length - 1;
+            while (i < A.s.length && j >= 0 && ile < 5000){
+                const x = A.s[i] + B.s[j];
+                if (x < cel) i++;
+                else if (x > cel) j--;
+                else {
+                    let i2 = i, j2 = j;
+                    while (i2 < A.s.length && A.s[i2] === A.s[i]) i2++;
+                    while (j2 >= 0 && B.s[j2] === B.s[j]) j2--;
+                    for (let a = i; a < i2 && ile < 5000; a++)
+                        for (let b = j; b > j2 && ile < 5000; b--){ ile++; if (wyn.length <= limit) wyn.push(maski(A.idx[a], B.idx[b])); }
+                    i = i2; j = j2;
+                }
+            }
+            return { ile: ile, wyn: wyn };
+        };
+    }
+    // lista: kandydaci jak w tmKombinacje (indeksy w wynikach odnosza sie do niej), R: brakujaca kwota w groszach, stale: dokumenty
+    // z tytulu (ich daty ustalaja, gdzie lezy okno faktur). Najpierw okna BEZ pominiec; dopiero gdy nic nie pasuje — okna bez jednej
+    // faktury (wstrzymana/zaplacona osobno). Wynik: { wyniki: [[indeksy]], meta: [{ od, doo, pomin, kor }], ile, przeszukane, kor, korWszystkich }.
+    function tmDoborWgDat(lista, R, stale, limit){
+        const wynik = { wyniki: [], meta: [], ile: 0, przeszukane: 0, kor: 0, korWszystkich: 0 };
+        const F = [], Kall = [];
+        (lista || []).forEach(function (c, i){ (c.rodzaj === 'korekta' ? Kall : F).push(i); });
+        const K = Kall.slice(0, TM_DAT_MAX_KOREKT);
+        wynik.kor = K.length; wynik.korWszystkich = Kall.length;
+        if (!F.length) return wynik;
+        const Kg = K.map(function (i){ return lista[i].grosze; });
+        const sumaK = Kg.reduce(function (a, b){ return a + b; }, 0);
+        const podz = tmPodzbioryKorekt(Kg);
+        const daty = [];
+        F.forEach(function (i){ const d = lista[i].data; if (d && daty.indexOf(d) < 0) daty.push(d); });
+        daty.sort();
+        const dA = ((stale && stale.faktury) || []).map(function (f){ return String((f.dok && (f.dok.data || f.dok.dataNr)) || ''); }).filter(Boolean).sort();
+        const mn = dA[0] || '', mx = dA[dA.length - 1] || '';
+        const okna = [{ od: '', doo: '', idx: [] }];
+        for (let a = 0; a < daty.length; a++)
+            for (let b = a; b < daty.length; b++){
+                // Z fakturami w tytule: okno zaczyna sie najwyzej TM_DAT_PRZERWA_DNI przed najwczesniejsza z nich (tytul wylicza dokumenty
+                // od poczatku listy) i najwyzej tyle dni po najpozniejszej, a konczy sie nie wczesniej niz najwczesniejsza.
+                if (mn && (daty[a] < mkShift(mn, -TM_DAT_PRZERWA_DNI) || daty[a] > mkShift(mx, TM_DAT_PRZERWA_DNI) || daty[b] < mn)) continue;
+                okna.push({ od: daty[a], doo: daty[b], idx: F.filter(function (i){ return lista[i].data >= daty[a] && lista[i].data <= daty[b]; }) });
+            }
+        // Jedna faktura = jedna para numerow (dwie wersje tej samej faktury z roznymi datami to nie dwie faktury) — bierzemy nowsza.
+        const bezWersji = function (idx){
+            const pary = {};
+            return idx.filter(function (i){ const p = tmBezDaty(lista[i].numer); if (pary[p]) return false; pary[p] = 1; return true; });
+        };
+        const zebrane = [], widz = {};
+        // Oba przebiegi (bez pominiec i z jedna pominieta faktura) zawsze — przypadkowe trafienie okna bez pominiec nie moze
+        // zaslonic wlasciwego okna z pominieta faktura; kolejnosc ustala ranking nizej.
+        for (let pomin = 0; pomin <= 1; pomin++){
+            okna.forEach(function (o){
+                const baza = bezWersji(o.idx);
+                const warianty = pomin === 0 ? [{ X: baza, bez: -1 }]
+                    : ((baza.length >= 2 && baza.length <= 30) ? baza.map(function (i){ return { X: baza.filter(function (x){ return x !== i; }), bez: i }; }) : []);
+                warianty.forEach(function (w){
+                    let sX = 0;
+                    w.X.forEach(function (i){ sX += lista[i].grosze; });
+                    const T = sX - R;
+                    if (T < 0 || T > sumaK || (!w.X.length && T === 0)) return;
+                    wynik.przeszukane++;
+                    // Zbieramy WIECEJ niz limit przed rankingiem (do 300 na okno) — ucinamy dopiero po posortowaniu.
+                    const r = podz(T, Math.max(limit, 300));
+                    wynik.ile += r.ile;
+                    r.wyn.forEach(function (m){
+                        const idx = w.X.concat(m.map(function (q){ return K[q]; }));
+                        const pod = idx.map(function (i){ return lista[i].klucz + ':' + lista[i].grosze; }).sort().join('|');
+                        if (widz[pod]) { wynik.ile--; return; }
+                        widz[pod] = 1;
+                        // Ranking: tytul UBS wylicza dokumenty od POCZATKU listy (wg numerow ksiegowych ~ chronologicznie), wiec okno ma
+                        // zaczynac sie tam, gdzie faktury z tytulu, i sie z nimi pokrywac; krotsze okno to prostsze wyjasnienie.
+                        // kara = odleglosc poczatku okna od najwczesniejszej faktury z tytulu + dni, o ile okno konczy sie przed najpozniejsza.
+                        const dl = o.od ? Math.max(0, tmDni(o.doo, o.od)) : 0;
+                        const kara = (mn && o.od) ? (Math.abs(tmDni(o.od, mn)) + (o.doo < mx ? Math.max(0, tmDni(mx, o.doo)) : 0)) : 0;
+                        // Korekty wynikaja tylko z SUMY — ich podzbiorow o tej samej sumie bywa wiele (zmierzone: 54 zestawy po 14 z 23).
+                        // Kolejnosc wsrod nich: nowsze korekty najpierw (starsze czesciej zaplacila wczesniejsza wplata, ktorej tytul byl ucięty).
+                        const nowosc = m.reduce(function (s, q){ return s + q; }, 0);
+                        zebrane.push({ idx: idx, kara: kara, dl: dl, nowosc: nowosc,
+                                       meta: { od: o.od, doo: o.doo, pomin: pomin, kor: m.length, bez: w.bez >= 0 ? lista[w.bez].klucz : '' } });
+                    });
+                });
+            });
+        }
+        zebrane.sort(function (a, b){
+            return (a.meta.pomin - b.meta.pomin) || (a.kara - b.kara) || (a.dl - b.dl) || (a.nowosc - b.nowosc);
+        });
+        zebrane.slice(0, limit + 1).forEach(function (z){ wynik.wyniki.push(z.idx); wynik.meta.push(z.meta); });
+        return wynik;
+    }
     function tmDataDok(p){ return String((p.dok && (p.dok.data || p.dok.dataNr)) || ''); }
     // Kandydaci: faktury i korekty spoza tytulu, niezajete przez inna wplate (tmZajete — takze inne wersje zajetej faktury),
     // z data dokumentu w oknie [wplyw − TM_OKNO_KANDYDATOW_DNI, wplyw], z suma zgodna ze stopka; faktury, ktorych pozycje juz
@@ -45861,7 +46711,13 @@
         stale.faktury.forEach(function (f){ wTytule[tmKlDok('faktura', f.numer)] = 1; wersje[tmBezDaty(f.numer)] = 1; });
         stale.korekty.forEach(function (x){ wTytule[tmKlDok('korekta', x.numer)] = 1; });
         const kd = tmKandydaci(k, j, pliki, wTytule, jobs, wersje, opcje);
-        const komb = tmKombinacje(kd.lista, R, TM_MAX_PROPOZYCJI);
+        let komb = tmKombinacje(kd.lista, R, TM_MAX_PROPOZYCJI);
+        // Nic do 3 faktur i 4 korekt: wplata moze placic cala serie faktur z kilku dni (tytul ucięty) — dobor wg dat i podzbioru korekt.
+        let wgDat = null;
+        if (!komb.wyniki.length){
+            const dd = tmDoborWgDat(kd.lista, R, stale, TM_MAX_PROPOZYCJI);
+            if (dd.wyniki.length){ wgDat = dd; komb = { wyniki: dd.wyniki, ile: dd.ile }; }
+        }
         // Propozycja „bez kotwicy": nic z tytulu nie jest pewne (stale puste — tytul bez numerow albo wszystkie jego faktury tylko
         // w innej wersji), a ona sama nie ma zadnego dokumentu z tytulu (takze innej wersji faktury z tytulu) — caly przelew dobrany
         // po samej kwocie. Wtedy ostrzezenie i drugie potwierdzenie (przeglad 3).
@@ -45869,10 +46725,10 @@
         (t.faktury || []).forEach(function (f){ tPary[tmBezDaty(f)] = 1; });
         (t.korekty || []).forEach(function (n){ tKor[n] = 1; });
         const bezPewnych = !stale.faktury.length && !stale.korekty.length;
-        const propozycje = komb.wyniki.slice(0, TM_MAX_PROPOZYCJI).map(function (idx){
+        const propozycje = komb.wyniki.slice(0, TM_MAX_PROPOZYCJI).map(function (idx, q){
             const doks = idx.map(function (i){ return kd.lista[i]; });
             const kotwica = doks.some(function (x){ return x.rodzaj === 'korekta' ? !!tKor[x.numer] : !!tPary[tmBezDaty(x.numer)]; });
-            return { dok: doks, podpis: tmPodpis(doks), slaba: bezPewnych && !kotwica };
+            return { dok: doks, podpis: tmPodpis(doks), slaba: bezPewnych && !kotwica, okno: wgDat ? wgDat.meta[q] : null };
         });
         const wiecej = komb.ile > propozycje.length;
         // Z TYTULU (numerow wplaty), nie ze zbioru pewnych dokumentow — druga proba doboru zdejmuje z niego faktury, ktore
@@ -45894,25 +46750,32 @@
         // Dluga najkrotsza kombinacja: przy kilkudziesieciu kandydatach sumy 4+ dokumentow gesto pokrywaja zakres kwot,
         // wiec trafienie co do grosza bywa przypadkiem (przeglad 14.10.2026) — mowimy to wprost.
         const dlugosc = propozycje.length ? propozycje[0].dok.length : 0;
-        const dluga = dlugosc >= 4;
+        const dluga = !wgDat && dlugosc >= 4;
+        // Dobor wg dat: faktury wynikaja z dni (mocna przeslanka), korekty tylko z sumy — mowimy to wprost i odsylamy do rozliczenia.
+        const ostrDat = wgDat ? (' ⚠ Dobór wg dat: faktury wynikają z dni, korekty tylko z sumy — inny zestaw korekt może dać tę samą kwotę. '
+                               + 'Potwierdź po sprawdzeniu z rozliczeniem Trademax (najlepiej wgraj jego plik „Lev.reskontratransaktioner” przez „📎 Dodaj pliki” — wtedy lista dokumentów jest pewna).') : '';
+        const zakresDat = wgDat ? (' Nic do ' + TM_DOBOR_MAX_FAKTUR + ' faktur i ' + TM_DOBOR_MAX_KOREKT + ' korekt nie pasuje, więc szukałem wg dat: wszystkie faktury kandydatów z kolejnych dni (blisko faktur z tytułu) i podzbiór korekt ('
+                                  + wgDat.kor + (wgDat.korWszystkich > wgDat.kor ? (' najnowszych z ' + wgDat.korWszystkich) : '') + ') o sumie dopełniającej przelew.') : '';
         let opis = powod + '; z tytułu ' + (stale.faktury.length + stale.korekty.length) + ' dok. na ' + f1KwotaPl(gS)
                  + ', brakuje ' + f1KwotaPl(R) + ' SEK. ';
         if (!propozycje.length)
             opis += 'Nie znalazłem kombinacji dokumentów z Drive na tę kwotę — wgraj brakujące pliki albo wyjaśnij z Trademax. ' + zakres;
         else
             opis += (wiecej ? ('Pasuje ' + (komb.ile > TM_DOBOR_LICZ ? ('ponad ' + TM_DOBOR_LICZ) : komb.ile) + ' kombinacji — pokazuję '
-                               + propozycje.length + ' najkrótszych; wybierz właściwą tylko, jeśli jesteś pewien.')
+                               + propozycje.length + (wgDat ? ' najbardziej prawdopodobnych' : ' najkrótszych') + '; wybierz właściwą tylko, jeśli jesteś pewien.')
                      : (propozycje.length === 1 ? 'Wśród kandydatów pasuje jedna kombinacja' : ('Pasuje ' + propozycje.length + ' kombinacji'))
                        + ' — potwierdź przy zleceniu, zanim cokolwiek pójdzie do importu.')
-                  + ' ' + zakres
+                  + ' ' + zakres + zakresDat
                   + (dluga ? (' ⚠ Najkrótsza pasująca kombinacja ma ' + dlugosc + ' dokumentów — przy tylu łatwo o przypadkowe trafienie co do grosza; potwierdź tylko po sprawdzeniu z rozliczeniem Trademax.') : '')
+                  + ostrDat
                   + (bezTytulu ? ' ⚠ Bez żadnego numeru z tytułu cały przelew jest dobrany po samej kwocie — pewność mała, sprawdź z rozliczeniem Trademax.'
                      : (propozycje.some(function (p){ return p.slaba; }) ? ' ⚠ Propozycje bez żadnego dokumentu z tytułu dobierają cały przelew po samej kwocie — pewność mała, sprawdź z rozliczeniem Trademax.' : ''));
         return { R: R / 100, Rgr: R, stale: { gr: gS, faktury: stale.faktury.map(function (f){ return { numer: f.numer, grosze: f.dok.sumaGrosze }; }),
                                               korekty: stale.korekty.map(function (x){ return { numer: x.numer, grosze: x.dok.sumaGrosze }; }) },
                  propozycje: propozycje, wiecej: wiecej, ile: komb.ile, kandydatow: kd.lista.length, wszystkich: kd.wszystkich,
-                 pominiete: kd.pominiete.slice(0, 10), od: kd.od, doo: kd.doo, powod: powod, opis: opis, zakres: zakres,
-                 bezTytulu: bezTytulu, dluga: dluga, dlugosc: dlugosc, zaimportowanych: kd.zaimportowanych, tekst: t.tekst || '' };
+                 pominiete: kd.pominiete.slice(0, 10), od: kd.od, doo: kd.doo, powod: powod, opis: opis, zakres: zakres + zakresDat,
+                 bezTytulu: bezTytulu, dluga: dluga, dlugosc: dlugosc, zaimportowanych: kd.zaimportowanych, tekst: t.tekst || '',
+                 wgDat: !!wgDat };
     }
     // Potwierdzony dobor: te same dokumenty, ta sama tresc (podpis z kwotami). Zwraca { ok, faktury, korekty } albo
     // { ok: false, blad } — wtedy dobor liczy sie od nowa, a czlowiek potwierdza jeszcze raz.
@@ -46100,6 +46963,21 @@
         const zleSumy = [];
         F.forEach(function (f){ if (!f.dok.sumaOk) zleSumy.push('faktura ' + f.numer + ': ' + (f.dok.bledy.join('; ') || 'suma pozycji ≠ stopka')); });
         K.forEach(function (x){ if (!x.dok.sumaOk) zleSumy.push('korekta CN/' + x.numer + ': ' + (x.dok.bledy.join('; ') || 'suma pozycji ≠ Total')); });
+        // Rozliczenie Trademax zna kwote KAZDEGO dokumentu — niezgodnosc z plikiem z Drive (inna wersja, inna tresc) widac od razu,
+        // zanim bilans calej wplaty powie tylko „nie zgadza sie".
+        const zlaRozl = [];
+        if (j.tmWyciag && j.tmWyciag.kwoty){
+            F.forEach(function (f){
+                const g = j.tmWyciag.kwoty[tmKlDok('faktura', f.numer)];
+                if (g != null && f.dok.sumaGrosze != null && g !== Math.abs(f.dok.sumaGrosze))
+                    zlaRozl.push('faktura ' + f.numer + ': w pliku ' + f1KwotaPl(f.dok.sumaGrosze) + ', w rozliczeniu ' + f1KwotaPl(g));
+            });
+            K.forEach(function (x){
+                const g = j.tmWyciag.kwoty[tmKlDok('korekta', x.numer)];
+                if (g != null && x.dok.sumaGrosze != null && g !== Math.abs(x.dok.sumaGrosze))
+                    zlaRozl.push('korekta CN/' + x.numer + ': w pliku ' + f1KwotaPl(Math.abs(x.dok.sumaGrosze)) + ', w rozliczeniu ' + f1KwotaPl(g));
+            });
+        }
         const bilans = f1Bilans(j.amount, F, K);
         const wszystkie = [];
         F.forEach(function (f){ f.dok.pozycje.forEach(function (p){ wszystkie.push(p); }); });
@@ -46134,6 +47012,7 @@
                          plik: f.plik.nazwa, folder: f.plik.folder, zrodlo: meta(f).zrodlo };
             }),
             tmDobrane: dobrane ? dobrane.faktury.map(function (f){ return f.numer; }).concat(dobrane.korekty.map(function (x){ return 'CN/' + x.numer; })) : null,
+            tmWyciag: j.tmWyciag ? { nazwa: j.tmWyciag.nazwa, n: j.tmWyciag.n } : null,
             bilans: bilans, zapora: null, zrodla: zrodla, ostrzezenia: ostrz,
             powtorzone: scal.filter(function (p){ return p.powtorzonaLinia; }).map(function (p){ return p.ref; }),
             unknown: {}, skipped: {}, both: [], full: true, split: false, pays: 1, pages: 1,
@@ -46141,6 +47020,10 @@
         };
         if (zleSumy.length)
             return { stan: 'niezgodne', dane: dane, tekst: 'Trademax: suma dokumentu nie zgadza się z jego stopką — ' + zleSumy.join(' · ') };
+        if (zlaRozl.length)
+            return { stan: 'niezgodne', dane: dane, tekst: 'Trademax: kwoty dokumentów nie zgadzają się z rozliczeniem Trademax („' + ((j.tmWyciag && j.tmWyciag.nazwa) || '')
+                                                          + '”) — ' + zlaRozl.slice(0, 6).join(' · ') + (zlaRozl.length > 6 ? (' … +' + (zlaRozl.length - 6)) : '')
+                                                          + '. Nie importuję — sprawdź, czy na Drive leżą właściwe wersje plików.' };
         if (!bilans.ok)
             return { stan: 'niezgodne', dane: dane, tekst: 'Trademax: bilans się nie zgadza — ' + bilans.opis + '. Nie importuję.' };
         if (!doImp.length)
@@ -46282,18 +47165,63 @@
     async function tmPrzetworz(k, pliki, ctx){
         ctx = ctx || {};
         const dozw = ctx.dozwolone || ['new', 'err'];
+        // Rozliczenie Trademax wgrane wczesniej (albo przed wplata) dopina sie do zlecenia o tej samej kwocie, zanim cokolwiek liczymy.
+        try { tmDopnijWyciag(k); } catch (e){}
         const j0 = jobsLoad()[k];
         if (!j0 || j0.kind !== 'tm' || dozw.indexOf(j0.status || 'new') < 0) return '';
         const czemu = tmCzemuNie(j0);
         if (czemu) return tmZastosuj(k, { status: 'new', tekst: czemu, zrodlo: ctx.zrodlo }, dozw) ? 'new' : '';
         const bank = String((setLoad()[setKey(j0.mp, TM_SKLEP)] || {}).bank || TM_BANK);
         let o = tmOblicz(k, j0, pliki || [], ctx.gdzie, ctx.zrodlo, ctx.zastapione, { jobs: jobsLoad() });
+        // Przeczytalismy tylko pliki potrzebne wplacie, a wyszedl DOBOR (np. potwierdzenie przestalo obowiazywac, bo tresc
+        // dokumentu sie zmienila): kandydatami musi byc caly folder — dociagamy reszte i liczymy jeszcze raz.
+        if (o.stan === 'dobor' && ctx.dociagnij && !ctx.szeroko){
+            pliki = await ctx.dociagnij();
+            o = tmOblicz(k, j0, pliki || [], ctx.gdzie, ctx.zrodlo, ctx.zastapione, { jobs: jobsLoad() });
+        }
         // Dobor: faktury-kandydaci, ktore juz leza w paczkach importu 117 (zaplacone innym przelewem, zaimportowane recznie albo
-        // przed ta wersja HUB-a — pamiec uzytych ich nie zna), odpadaja PRZED propozycjami. Paczki z calego okna kandydatow.
+        // przed ta wersja HUB-a — pamiec uzytych ich nie zna), nie moga wejsc do propozycji.
+        // 22.10.2026: paczek NIE czytamy z gory dla calego okna kandydatow (do 80 paczek, kilkadziesiat zapytan na kazda wplate).
+        // Propozycje liczymy najpierw BEZ paczek; potem czytamy tylko paczki od najstarszej faktury z propozycji (zwykle kilka dni)
+        // i odrzucamy propozycje z fakturami, ktore juz tam leza. Dopiero gdy zadna propozycja nie zostanie (albo nie bylo zadnej),
+        // idziemy stara droga: paczki z calego okna jako wykluczenie kandydatow przed propozycjami.
         if (o.stan === 'dobor' && o.dane && o.dane.tmDobor){
-            const zp = tmZaimportowane(await ctx.paczki(bank, o.dane.tmDobor.od, mkShift(j0.date, -F1_OKNO_PACZEK_DNI)), pliki || []);
-            o = tmOblicz(k, j0, pliki || [], ctx.gdzie, ctx.zrodlo, ctx.zastapione,
-                         { jobs: jobsLoad(), zaimportowane: zp.ok ? zp.mapa : null, paczkiUwaga: zp.opis || '' });
+            const d0 = o.dane.tmDobor;
+            let zostaly = false;
+            if (d0.propozycje.length){
+                let od = '';
+                d0.propozycje.forEach(function (p){
+                    p.dok.forEach(function (x){
+                        if (x.rodzaj !== 'faktura' || !/^\d{4}-\d{2}-\d{2}$/.test(String(x.data || ''))) return;
+                        const d = mkShift(x.data, -3);
+                        if (!od || d < od) od = d;
+                    });
+                });
+                const odW = od || mkShift(j0.date, -F1_OKNO_PACZEK_DNI);
+                const zp = tmZaimportowane(await ctx.paczki(bank, odW, mkShift(j0.date, -F1_OKNO_PACZEK_DNI)), pliki || []);
+                if (!zp.ok || !zp.mapa || !Object.keys(zp.mapa).length) zostaly = true;
+                else {
+                    const dobre = d0.propozycje.filter(function (p){
+                        return !p.dok.some(function (x){ return x.rodzaj === 'faktura' && zp.mapa[x.klucz]; });
+                    });
+                    if (dobre.length){
+                        const odrzucone = d0.propozycje.length - dobre.length;
+                        if (odrzucone){
+                            const stary = d0.opis;
+                            d0.propozycje = dobre;
+                            d0.opis = stary + ' Odrzuciłem ' + odrzucone + (odrzucone === 1 ? ' propozycję' : ' propozycje')
+                                    + ' z fakturami już zaimportowanymi do paczek 117 (sprawdziłem paczki od ' + odW + ').';
+                            o.tekst = o.tekst.replace(stary, d0.opis);
+                        }
+                        zostaly = true;
+                    }
+                }
+            }
+            if (!zostaly){
+                const zp = tmZaimportowane(await ctx.paczki(bank, d0.od, mkShift(j0.date, -F1_OKNO_PACZEK_DNI)), pliki || []);
+                o = tmOblicz(k, j0, pliki || [], ctx.gdzie, ctx.zrodlo, ctx.zastapione,
+                             { jobs: jobsLoad(), zaimportowane: zp.ok ? zp.mapa : null, paczkiUwaga: zp.opis || '' });
+            }
         }
         if (o.stan === 'brak' && ctx.bezObnizania) return 'bez zmian';
         let w;
@@ -46309,6 +47237,7 @@
             const uw = [];
             if (z.tekst) uw.push(z.tekst);
             if (o.dane.tmDobrane) uw.push('Trademax: dokumenty dobrane po kwocie i potwierdzone: ' + o.dane.tmDobrane.join(', ') + '.');
+            if (o.dane.tmWyciag) uw.push('Trademax: skład wpłaty z rozliczenia Trademax „' + o.dane.tmWyciag.nazwa + '” (' + o.dane.tmWyciag.n + ' dokumentów).');
             if (o.dane.powtorzone.length)
                 uw.push('Uwaga: ten sam fulfilment ma kwotę w dwóch fakturach tego przelewu — w imporcie jedna pozycja z sumą obu: '
                         + o.dane.powtorzone.slice(0, 5).join(', ') + '.');
@@ -46334,8 +47263,12 @@
             const t = tmTytulZlecenia(j);
             t.faktury.forEach(function (f){ kl[f] = 1; });
             t.korekty.forEach(function (n){ kl['CN ' + n] = 1; });
-            ((j.tmPotw && j.tmPotw.dok) || []).forEach(function (x){ kl[x] = 1; });
-            if (!t.pelny) wszystko = true;
+            const potw = (j.tmPotw && Array.isArray(j.tmPotw.dok)) ? j.tmPotw.dok : [];
+            potw.forEach(function (x){ kl[x] = 1; });
+            // Potwierdzony dobor (i rozliczenie Trademax — t.pelny) to JUZ znana lista dokumentow: czytamy tylko je. Reszta folderu
+            // dociaga sie dopiero, gdy potwierdzenie sie nie utrzyma (tmPrzetworz: ctx.dociagnij) — 22.10.2026: po „✓ To te
+            // dokumenty” HUB ciagal 181 plikow, choc wiedzial, ktore dwa dokumenty sprawdzic.
+            if (!t.pelny && !potw.length) wszystko = true;
         });
         return { klucze: kl, wszystko: wszystko };
     }
@@ -46390,17 +47323,29 @@
             const k = tmKluczZNazwy(f.name);
             return !k || kl[k] || (!/^CN /.test(k) && pary[tmBezDaty(k)]);
         });
-        await pobierz(potrz && potrz.wszystko ? czytelne : poNazwie);
+        let wszystkoPobrane = !!(potrz && potrz.wszystko);
+        await pobierz(wszystkoPobrane ? czytelne : poNazwie);
         const jest = {};
         pliki.concat(reczne).forEach(function (p){ if (p.dok && p.dok.numer) jest[tmKlDok(p.rodzaj, p.dok.numer)] = 1; });
-        if (!(potrz && potrz.wszystko) && Object.keys(kl).some(function (k){ return !jest[k]; })) await pobierz(czytelne);
-        if (czytelne.length > Object.keys(pobrane).length && Object.keys(pobrane).length >= F1_MAX_PLIKOW)
-            uwagi.push('pobrałem ' + F1_MAX_PLIKOW + ' najnowszych z ' + czytelne.length + ' plików xlsx/csv (limit HUB-a)');
-        if (nieodczytane) uwagi.push('nie pobrałem ' + nieodczytane + ' plików z Drive (szczegóły niżej)');
-        const nz = f1NowszyZDwoch(pliki, reczne);
-        return { pliki: nz.pliki, zastapione: nz.zastapione,
-                 gdzie: { opis: tmOpisFolderow(f1OpisGdzieSzukano(lista)) + (reczne.length ? ('; pliki wgrane ręcznie: ' + reczne.length) : ''),
-                          kompletna: lista.kompletna && !nieodczytane, uwagi: uwagi, nieczytelne: nieczytelne } };
+        if (!wszystkoPobrane && Object.keys(kl).some(function (k){ return !jest[k]; })){ await pobierz(czytelne); wszystkoPobrane = true; }
+        const zloz = function (){
+            const uw = uwagi.slice();
+            if (czytelne.length > Object.keys(pobrane).length && Object.keys(pobrane).length >= F1_MAX_PLIKOW)
+                uw.push('pobrałem ' + F1_MAX_PLIKOW + ' najnowszych z ' + czytelne.length + ' plików xlsx/csv (limit HUB-a)');
+            if (nieodczytane) uw.push('nie pobrałem ' + nieodczytane + ' plików z Drive (szczegóły niżej)');
+            const nz = f1NowszyZDwoch(pliki, reczne);
+            return { pliki: nz.pliki, zastapione: nz.zastapione,
+                     gdzie: { opis: tmOpisFolderow(f1OpisGdzieSzukano(lista)) + (reczne.length ? ('; pliki wgrane ręcznie: ' + reczne.length) : ''),
+                              kompletna: lista.kompletna && !nieodczytane, uwagi: uw, nieczytelne: nieczytelne } };
+        };
+        const wynik = zloz();
+        wynik.szeroko = wszystkoPobrane;
+        // Dociagniecie reszty folderu na zadanie (potwierdzenie doboru sie nie utrzymalo — dobor liczy sie od nowa na wszystkich plikach).
+        wynik.dociagnij = async function (){
+            if (!wszystkoPobrane){ await pobierz(czytelne); wszystkoPobrane = true; }
+            return zloz();
+        };
+        return wynik;
     }
     // Przelot „⬇ Pobierz zestawienia" (i ponowne sprawdzenie jednej wplaty po potwierdzeniu doboru: opcje.tylko).
     async function tmPass(jobs, opcje){
@@ -46432,10 +47377,22 @@
                           uwagi: ['Google Drive nie jest ustawiony — wpisz adres i klucz w ⚙ Konta → Drive Furniture 1 (ten sam skrypt czyta folder Trademax)'] };
             pliki = reczne;
         } else {
-            const zb = await tmPlikiZDrive(najstarsza, reczne, tmPotrzebne(jobs, doRoboty));
+            // Rozliczenia Trademax dopinamy PRZED ustaleniem, co pobrac z Drive: wplata z pelna lista dokumentow potrzebuje tylko
+            // tych plikow, a bez niej „dobor" oznacza pobranie calego folderu.
+            doRoboty.forEach(function (k){ try { tmDopnijWyciag(k); } catch (e){} });
+            const zb = await tmPlikiZDrive(najstarsza, reczne, tmPotrzebne(jobsLoad(), doRoboty));
             pliki = zb.pliki;
             ctx.gdzie = zb.gdzie;
             ctx.zastapione = zb.zastapione;
+            ctx.szeroko = !!zb.szeroko;
+            ctx.dociagnij = async function (){
+                const z = await zb.dociagnij();
+                pliki = z.pliki;
+                ctx.gdzie = z.gdzie;
+                ctx.zastapione = z.zastapione;
+                ctx.szeroko = true;
+                return pliki;
+            };
         }
         let ok = 0;
         for (let i = 0; i < doRoboty.length; i++){
@@ -46457,11 +47414,19 @@
         const lista = Array.prototype.slice.call(fs || []);
         if (!lista.length) return;
         say('Trademax — czytam ' + lista.length + ' plików…', '#666');
-        const odczytane = [], zle = [];
+        const odczytane = [], zle = [], wyciagi = [];
         for (let i = 0; i < lista.length; i++){
             const f = lista[i];
             try {
-                const p = tmOdczytaj({ bajty: new Uint8Array(await readBuf(f)), nazwa: f.name, folder: 'wgrane ręcznie', id: '',
+                const bajty = new Uint8Array(await readBuf(f));
+                // Rozliczenie Trademax (lista dokumentow wplaty) — nie faktura ani korekta, tylko SKLAD wplaty.
+                const S = tmWyciagZBajtow(bajty);
+                if (S){
+                    if (S.ok) wyciagi.push(Object.assign({ nazwa: f.name }, S));
+                    else zle.push(f.name + ' (rozliczenie Trademax: ' + S.bledy.slice(0, 3).join('; ') + ')');
+                    continue;
+                }
+                const p = tmOdczytaj({ bajty: bajty, nazwa: f.name, folder: 'wgrane ręcznie', id: '',
                                        zmiana: new Date().toISOString() });
                 if (p.blad) zle.push(f.name + ' (' + p.blad + ')');
                 else if (!p.dok || !p.rodzaj) zle.push(f.name + ' (to nie faktura ani korekta Trademax)');
@@ -46470,14 +47435,39 @@
             } catch (e){ zle.push(f.name + ' (' + ((e && e.message) || e) + ')'); }
         }
         const zleTxt = zle.length ? (' Nie odczytałem: ' + zle.join('; ') + '.') : '';
-        if (!odczytane.length){ say('Trademax: nie odczytałem żadnego dokumentu.' + zleTxt, '#c00'); return; }
-        try { f1ReczneDodaj(odczytane, TM_RECZNE_KEY); }
-        catch (e){ say('Trademax: nie zapamiętałem plików (' + ((e && e.message) || e) + ').' + zleTxt, '#c00'); return; }
+        if (!odczytane.length && !wyciagi.length){ say('Trademax: nie odczytałem żadnego dokumentu.' + zleTxt, '#c00'); return; }
+        if (odczytane.length){
+            try { f1ReczneDodaj(odczytane, TM_RECZNE_KEY); }
+            catch (e){ say('Trademax: nie zapamiętałem plików (' + ((e && e.message) || e) + ').' + zleTxt, '#c00'); return; }
+        }
+        // Rozliczenia Trademax: pamiec (dopasuja sie tez do wplaty, ktora pojawi sie pozniej) i dopiecie do czekajacych wplat
+        // o tej samej kwocie — od tej chwili wplata ma PELNA liste dokumentow i nie trzeba jej zgadywac po kwocie.
+        const dopiete = [], bezWplaty = [], inneTytuly = [];
+        wyciagi.forEach(function (S){
+            tmWyciagiDodaj(S);
+            let ktos = false;
+            const jobsW = jobsLoad();
+            Object.keys(jobsW).forEach(function (k){
+                const j = jobsW[k];
+                if (!j || j.kind !== 'tm' || ['new', 'err', 'partial'].indexOf(j.status || 'new') < 0 || !(j.amount > 0) || !tmAutomat(j) || f1Grosze(j.amount) !== S.przelewGr) return;
+                ktos = true;
+                const r = tmDopnijWyciag(k);
+                if (r === 'ok') dopiete.push((j.date || '') + ' ' + f2(j.amount) + ' SEK');
+                else if (r === 'obce') inneTytuly.push((j.date || '') + ' ' + f2(j.amount) + ' SEK');
+            });
+            if (!ktos) bezWplaty.push(f1KwotaPl(S.przelewGr) + ' SEK');
+        });
+        const opisW = wyciagi.map(function (S){
+            return 'rozliczenie Trademax „' + S.nazwa + '”: ' + S.faktury.length + ' faktur, ' + S.korekty.length + ' korekt, przelew ' + f1KwotaPl(S.przelewGr) + ' SEK';
+        });
         const opis = odczytane.map(function (p){
             const d = p.dok;
             return (p.rodzaj === 'faktura' ? ('faktura ' + d.numer) : ('korekta CN/' + d.numer)) + ' ' + f1KwotaPl(d.sumaGrosze)
                  + (d.sumaOk ? '' : ' ✗ suma≠stopka');
-        }).join(', ');
+        }).concat(opisW).join(', ')
+          + (dopiete.length ? (' — dopięte do wpłaty: ' + dopiete.join(', ')) : '')
+          + (bezWplaty.length ? (' — zapamiętałem rozliczenie, dopnie się do wpłaty na ' + bezWplaty.join(', ') + ', gdy pojawi się w arkuszu albo wyciągu') : '')
+          + (inneTytuly.length ? (' — NIE dopiąłem do wpłaty ' + inneTytuly.join(', ') + ': numery z jej tytułu nie występują w tym rozliczeniu') : '');
         const dozw = ['new', 'err', 'partial'];
         const jobs = jobsLoad();
         const kand = Object.keys(jobs).filter(function (k){
@@ -46764,17 +47754,35 @@
             h += '<div style="color:#c2410c;font-weight:700">⚠ Tytuł bez żadnego numeru — cały przelew dobrany po samej kwocie, pewność mała. Sprawdź z rozliczeniem Trademax.</div>';
         if (d.dluga && d.propozycje.length)
             h += '<div style="color:#c2410c;font-weight:700">⚠ Najkrótsza pasująca kombinacja ma ' + d.dlugosc + ' dokumentów — przy tylu łatwo o przypadkowe trafienie co do grosza. Potwierdź tylko po sprawdzeniu z rozliczeniem Trademax.</div>';
+        if (d.wgDat && d.propozycje.length)
+            h += '<div style="color:#c2410c;font-weight:700">⚠ Dobór wg dat: faktury wynikają z dni, korekty tylko z sumy — inny zestaw korekt może dać tę samą kwotę. '
+               + 'Potwierdź po sprawdzeniu z rozliczeniem Trademax. Najlepiej wgraj jego plik „Lev.reskontratransaktioner” przez „📎 Dodaj pliki” — wtedy lista dokumentów jest pewna.</div>';
         if (d.zPaczek && d.propozycje.length)
             h += '<div style="color:#c2410c;font-weight:700">⚠ Bez faktur już zaimportowanych do paczek 117 nic nie pasuje. Gdy tę wpłatę już zaimportowano, po potwierdzeniu zapora oznaczy ją jako zaimportowaną; gdy te faktury zapłacił inny przelew — nie potwierdzaj.</div>';
         d.propozycje.forEach(function (p, i){
+            const opisDok = function (x){
+                return (x.rodzaj === 'korekta' ? ('korekta CN/' + esc(x.numer) + ' −') : ('faktura ' + esc(x.numer) + ' '))
+                     + kwG(x.grosze) + ' <span style="color:#94a3b8">(' + esc(x.data || '') + ', ' + esc((x.plik && x.plik.nazwa) || '') + ')</span>'
+                     + (x.paczka ? (' <span style="color:#c2410c">już w paczce: ' + esc(x.paczka) + '</span>') : '');
+            };
+            // Dlugie zestawy (dobor wg dat: kilkanascie faktur i korekt) — streszczenie, a pelna lista pod „rozwiń".
+            let tresc;
+            if (!p.dok.length) tresc = 'bez dodatkowych dokumentów — te z tytułu pokrywają cały przelew';
+            else if (p.dok.length > 8){
+                const fk = p.dok.filter(function (x){ return x.rodzaj !== 'korekta'; }), kr = p.dok.filter(function (x){ return x.rodzaj === 'korekta'; });
+                const sm = function (L){ return L.reduce(function (a, x){ return a + (Number(x.grosze) || 0); }, 0); };
+                const o = p.okno || null;
+                tresc = (fk.length ? (fk.length + ' faktur na ' + kwG(sm(fk)) + (o && o.od ? (' z dni ' + esc(o.od) + (o.doo !== o.od ? (' – ' + esc(o.doo)) : '')) : '')) : '')
+                      + (fk.length && kr.length ? ' − ' : '') + (kr.length ? (kr.length + ' korekt na ' + kwG(sm(kr))) : '')
+                      + (o && o.pomin ? (' <span style="color:#c2410c">(bez faktury ' + esc(o.bez) + ')</span>') : '')
+                      + ' <details style="display:inline"><summary style="display:inline;cursor:pointer;color:#5b21b6">rozwiń listę</summary>'
+                      + p.dok.map(opisDok).join('; ') + '</details>';
+            }
+            else tresc = p.dok.map(opisDok).join('; ');
             h += '<div style="margin-top:4px;padding:4px 6px;background:#fff;border:1px solid #ddd6fe;border-radius:6px">'
                + '<b>' + (d.propozycje.length > 1 ? ('Propozycja ' + (i + 1)) : 'Propozycja') + '</b>'
                + (p.slaba && !d.bezTytulu ? ' <span style="color:#c2410c;font-weight:700">⚠ bez dokumentu z tytułu — tylko kwota</span>' : '') + ': '
-               + (p.dok.length ? p.dok.map(function (x){
-                     return (x.rodzaj === 'korekta' ? ('korekta CN/' + esc(x.numer) + ' −') : ('faktura ' + esc(x.numer) + ' '))
-                          + kwG(x.grosze) + ' <span style="color:#94a3b8">(' + esc(x.data || '') + ', ' + esc((x.plik && x.plik.nazwa) || '') + ')</span>'
-                          + (x.paczka ? (' <span style="color:#c2410c">już w paczce: ' + esc(x.paczka) + '</span>') : '');
-                 }).join('; ') : 'bez dodatkowych dokumentów — te z tytułu pokrywają cały przelew')
+               + tresc
                + ' = ' + kwG(d.Rgr) + ' <span style="color:#0a7a2f;font-weight:700">✓</span> '
                + '<button class="mk-tm-potw" data-k="' + esc(k) + '" data-i="' + i + '" data-p="' + esc(p.podpis) + '" style="margin-left:6px;padding:2px 9px;border:none;border-radius:6px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">✓ To te dokumenty — potwierdzam</button>'
                + '</div>';
@@ -55646,6 +56654,31 @@
         const m = String(rep.payoutReportFileName || '').match(/PODE-(\d{4})(\d{2})(\d{2})/);
         return m ? (m[1] + '-' + m[2] + '-' + m[3]) : '';
     }
+    // Ktory z raportow (o tym samym netto) jest NAJBLIZEJ dnia wplaty. Odleglosc w dniach z nazwy raportu; ze znakiem:
+    // dodatnia = raport z dnia pozniejszego niz wplata. Wygrywa najmniejsza odleglosc bezwzgledna, przy remisie raport
+    // nie pozniejszy niz wplata. Zwraca { rep, dni, inne: [{ rep, dni }] } albo null, gdy brak daty wplaty / raportu
+    // albo remis, ktorego nie da sie rozstrzygnac (dwa raporty z tego samego dnia — raport ma wtedy inny numer, nie date).
+    function vtexNajblizszyRaport(reps, date){
+        const t0 = mkDay(date);
+        if (t0 == null) return null;
+        const lista = [];
+        for (let i = 0; i < reps.length; i++){
+            const d = repDay(reps[i]), t = d ? mkDay(d) : null;
+            if (t == null) return null;
+            lista.push({ rep: reps[i], dni: Math.round((t - t0) / 86400000) });
+        }
+        lista.sort(function (a, b){
+            return (Math.abs(a.dni) - Math.abs(b.dni)) || ((a.dni > 0 ? 1 : 0) - (b.dni > 0 ? 1 : 0));
+        });
+        const a = lista[0], b = lista[1];
+        if (Math.abs(a.dni) === Math.abs(b.dni) && (a.dni > 0) === (b.dni > 0)) return null;
+        return { rep: a.rep, dni: a.dni, inne: lista.slice(1) };
+    }
+    function vtexOpisOdleglosci(dni){
+        if (!dni) return 'raport z dnia wpłaty';
+        const n = Math.abs(dni);
+        return n + ' ' + (n === 1 ? 'dzień' : 'dni') + (dni < 0 ? ' przed wpłatą' : ' po wpłacie');
+    }
     function saldaRows(reps, mm, yyyy){
         const out = [];
         const num = function (v){
@@ -56385,6 +57418,7 @@
         if (refOtw[mkKlucz(j)]) return true;                       // zwroty do zaksiegowania
         if (crZostalo(j)) return true;                             // oddane potracenia Wayfaira
         if (mkProblemJob(j).length) return true;                   // zapisany problem (np. CHECK / NOT FOUND zostaly w paczce)
+        if (Object.keys(mkProbSlad(j)).length) return true;        // wiersz z listy „Do wyjasnienia": status OK ustawiony, ksiegowanie nie potwierdzone
         if (j.hdRozjazd && ((j.hdRozjazd.brak || []).length || (j.hdRozjazd.nadmiar || []).length)) return true;
         if (j.data && j.data.amz && (j.data.amz.doWyj || []).length) return true;
         if (j.kind === 'obich' && obiChRefBox(j)) return true;     // pola fulfilmentu i ostrzezenia przy zwrotach OBI CH
@@ -56542,6 +57576,7 @@
         // wlasnie ida. W trakcie operacji napis BEZ liczby — sciezka nie przerysowuje sie co pozycje, liczba by zamarzla.
         k.konc = mkKoncPaczki(jobs).length;          // zaksiegowane paczki, w ktorych zostaly wiersze CHECK
         k.nfa = mkNfaPaczki(jobs).length;            // zaksiegowane paczki, w ktorych zostaly wiersze NOT FOUND
+        k.prob = mkProbPaczki(jobs).length;          // zaksiegowane paczki z NOT FOUND albo CHECK — zbiorcza lista „do wyjasnienia"
         k.typG = null;
         const wagaT = function (x){ return (x.bieg ? 2 : 0) + (x.pusto ? 1 : 0); };
         bookList().forEach(function (j){
@@ -56606,7 +57641,7 @@
                ? ('<button id="mk-book-all"' + (mBook ? '' : ' disabled')
                   + ' title="Księguje pozycje OK ze wszystkich wgranych, jeszcze niezaksięgowanych paczek. CHECK i NOT FOUND zostają nietknięte.'
                   + (k.typ ? (' Paczki czekające na typy klientów (' + k.typ + ') pomija.') : '') + '"'
-                  + ' style="' + duzy(mBook, '#7c3aed') + '">' + (mkWid.book ? '⏳ Księguję paczki…' : ('▶ Zaksięguj paczki (' + nBook + ')')) + '</button>')
+                  + ' style="' + duzy(mBook, '#7c3aed') + '">' + (mkWid.book ? mkKsEtykietaZbiorcza() : ('▶ Zaksięguj paczki (' + nBook + ')')) + '</button>')
                : '')
             // Paczki na typach klientow: ten sam guzik co w widoku paczki (otwiera paczke i robi to samo).
             + (typG ? ('<button id="mk-typ-all" data-k="' + esc(typG.k) + '"' + (mTyp ? '' : ' disabled')
@@ -56625,6 +57660,15 @@
                   + ' title="Sprawdza auftragi wierszy NOT FOUND z zaksięgowanych paczek. Te z dokładnie jednym aktywnym auftragiem o tym numerze i open amount pokrywającym wpłatę księguje hurtem wprost na auftragach (jedno potwierdzenie)."'
                   + ' style="padding:4px 10px;border:1px solid #b91c1c;border-radius:6px;background:#fff;color:#b91c1c;font-weight:700;cursor:pointer;font-size:11px">'
                   + '🔎 NOT FOUND na auftragach (' + k.nfa + (k.nfa === 1 ? ' paczka' : ' paczek') + ')</button>') : '')
+            // Jedna lista NOT FOUND i CHECK ze wszystkich zaksiegowanych paczek, podzielona na marketplace'y (bez wchodzenia w paczki).
+            + (k.prob ? ('<button id="mk-prob-all"' + (mkWid.book ? ' disabled' : '')
+                  + ' title="Czyta zaksięgowane paczki i pokazuje w jednej liście wszystkie NOT FOUND i CHECK (poza końcówkami w tolerancji), podzielone na marketplace\'y."'
+                  + ' style="padding:4px 10px;border:1px solid #991b1b;border-radius:6px;background:#fff;color:#991b1b;font-weight:700;cursor:pointer;font-size:11px">'
+                  + '📋 Do wyjaśnienia — lista (' + k.prob + (k.prob === 1 ? ' paczka' : ' paczek') + ')</button>') : '')
+            // Ustawienia koncowek zawsze pod reka (22.10.2026: „nie widze gdzie jest sekcja koncowki"): sekcja „💰 Koncowki" rysuje
+            // sie dopiero, gdy sa koncowki do ksiegowania, wiec tolerancji i samoczynnego ksiegowania nie bylo gdzie zmienic.
+            + '<button id="mk-konc-ust" class="mk-lnk" style="font-size:11px;color:#6b7280" title="Końcówki to wiersze CHECK z open amount do tolerancji (±) — po „▶ Zaksięguj paczki” HUB księguje je na subkonto sam, gdy to włączone. Kliknij, żeby zmienić tolerancję albo wyłączyć samoczynne księgowanie.">'
+              + '💰 końcówki ±' + f2(tolGet()) + ' → subkonto · ' + (mkKoncAuto() ? 'same po ▶ ✔' : 'ręcznie') + '</button>'
             + '<span class="mk-strz">›</span>' + kn(5, n5)
             + skok('mk-k-ref', 'Zwroty', mkLicz.ref, mkLicz.refJest)
             + (mkLicz.crJest ? skok('mk-k-cr', 'Potrącenia', mkLicz.cr, true) : '')
@@ -56645,8 +57689,8 @@
         const bk = slot.querySelector('#mk-book-all');
         if (bk) bk.onclick = async function(){
             if (mkWid.book) return;
-            mkWid.book = true; krokiMaluj();
-            try { await bookAllPackages(bk); } finally { mkWid.book = false; krokiRysuj(); }
+            mkWid.book = true; mkKsPostep.zbiorcza = { t0: Date.now(), faza: 'czytam', i: 0, n: 0, impId: '' }; mkKsTikSprawdz(); krokiMaluj();
+            try { await bookAllPackages(bk); } finally { mkWid.book = false; mkKsPostep.zbiorcza = null; mkKsTikSprawdz(); krokiRysuj(); }
         };
         // Typy klientow z kroku 4: otwieramy paczke (swiezy odczyt) i klikamy JEJ guzik typow — jedna droga, jeden napis.
         const bt = slot.querySelector('#mk-typ-all');
@@ -56681,6 +57725,27 @@
                 if (kb) kb.scrollIntoView({ block: 'nearest' });
             } catch (e){ say('Końcówki na subkonto: ' + ((e && e.message) || e), '#c00'); }
             finally { bko.disabled = false; }
+        };
+        const bku = slot.querySelector('#mk-konc-ust');
+        if (bku) bku.onclick = function(){
+            mkKoncRysuj();
+            const kb = document.getElementById('mk-konc-box');
+            if (kb){ try { kb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
+        };
+        const bpr = slot.querySelector('#mk-prob-all');
+        if (bpr) bpr.onclick = async function(){
+            if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — listę zrobisz po jego zakończeniu.', '#c47f00'); return; }
+            if (mkWid.book || mkKsiegBieg){ say('Trwa księgowanie — listę zrobisz po jego zakończeniu.', '#c47f00'); return; }
+            bpr.disabled = true;
+            say('Czytam zaksięgowane paczki z NOT FOUND i CHECK…');
+            try {
+                const ile = await mkProbSkanuj(null, false);
+                say('Do wyjaśnienia: ' + ile.n + ' poz. (NOT FOUND ' + ile.nf + ', CHECK ' + ile.chk + ') w ' + ile.m + ' paczkach, ' + ile.rynki + ' marketplace\'ach.',
+                    ile.n ? '#c47f00' : '#0a7a2f');
+                const pb = document.getElementById('mk-prob-box');
+                if (pb) pb.scrollIntoView({ block: 'nearest' });
+            } catch (e){ say('Lista do wyjaśnienia: ' + ((e && e.message) || e), '#c00'); }
+            finally { bpr.disabled = false; }
         };
         const bnf = slot.querySelector('#mk-nfa-all');
         if (bnf) bnf.onclick = async function(){
@@ -60286,7 +61351,8 @@
         });
     }
     // Ile wierszy NOT FOUND paczki zostaje naprawde do wyjasnienia — bez tych, ktore znosza sie ze zwrotem.
-    function impNfZostaje(j, rows){
+    function impNfZostaje(j, rows){ return impNfZostajeRows(j, rows).length; }
+    function impNfZostajeRows(j, rows){
         const zn = mkZnosiIds(j), sl = mkNfaSlad(j), zuzyte = {};
         return (rows || []).filter(function (x){
             if (String(x.state) !== 'NOT FOUND') return false;
@@ -60299,7 +61365,7 @@
                 return false;
             }
             return !(id && zn.indexOf(id) >= 0);
-        }).length;
+        });
     }
     // Zapisuje potwierdzenia „znosi się" dla wierszy NOT FOUND paczki: zwrot calej kwoty w tym samym rozliczeniu
     // i auftrag Deleted (sprawdzony przy paczce albo pominiety przez modul ticketa). Oddaje potwierdzone numery.
@@ -61132,7 +62198,51 @@
                      err: usun ? ('auftrag ' + num + ' jest SKASOWANY (bez formularza płatności)')
                                : ('na stronie auftragu ' + num + ' nie ma formularza płatności') };
         return { ok: true, open: crOpen(d), nPay: d.querySelectorAll('a[href*="delpay="]').length,
-                 deleted: usun, ffy: ffy, tickety: auftTickety(d) };
+                 deleted: usun, ffy: ffy, tickety: auftTickety(d), platnosci: auftPlatnosciOpis(d), platKw: auftPlatnosciKwoty(d) };
+    }
+    // Kwoty platnosci stojacych na auftragu — do kontroli „jest juz platnosc o tej kwocie" przy ksiegowaniu z listy „Do wyjasnienia"
+    // (przeglad 22.10.2026). Najpierw tabela Payments (allePlatnosci); gdy jej uklad sie nie zgadza — kazda komorka liczbowa wiersza
+    // z linkiem delpay, ktora wyglada na kwote z groszami (moze zawyzyc, wiec bramka co najwyzej pyta o jedno potwierdzenie za duzo).
+    function auftPlatnosciKwoty(d){
+        let out = [];
+        try { out = allePlatnosci(d).map(function (x){ return x.kwota; }).filter(function (a){ return a != null; }); } catch (e){ out = []; }
+        if (out.length || !d) return out;
+        d.querySelectorAll('a[href*="delpay="]').forEach(function (a){
+            const tr = a.closest ? a.closest('tr') : null;
+            if (!tr) return;
+            Array.prototype.forEach.call(tr.querySelectorAll('td'), function (td){
+                const t = String(td.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/^-?[\d\s.,']+$/.test(t) || !/[.,]\d{2}$/.test(t)) return;       // kwota ma grosze; numer konta (1034) nie
+                const v = mkNum(t);
+                if (v != null) out.push(r2(v));
+            });
+        });
+        return out;
+    }
+    // Na auftragu stoi juz platnosc o kwocie rownej wplacie (moze byc zaksiegowana recznie) — mozliwy duplikat.
+    function nfPlatnoscRowna(rr, kwota){
+        if (!rr || kwota == null) return false;
+        const k = Math.abs(kwota);
+        return (rr.platKw || []).some(function (a){ return a != null && Math.abs(Math.abs(a) - k) < 0.005; });
+    }
+    // Wiersze platnosci auftragu jako krotkie napisy (data, konto, kwota…) — do okna potwierdzenia przy ksiegowaniu „mimo"
+    // (22.10.2026): czlowiek ma zobaczyc, co juz stoi na auftragu, zanim zgodzi sie na nadplate. Tylko do pokazania — nic
+    // z tego nie jest liczone (liczy sie nPay).
+    function auftPlatnosciOpis(d){
+        const out = [];
+        if (!d) return out;
+        let reszta = 0;
+        d.querySelectorAll('a[href*="delpay="]').forEach(function (a){
+            if (out.length >= 8){ reszta++; return; }
+            const tr = a.closest ? a.closest('tr') : null;
+            if (!tr) return;
+            const t = Array.prototype.slice.call(tr.querySelectorAll('td')).filter(function (td){ return !td.querySelector('a[href*="delpay="]'); })
+                .map(function (td){ return String(td.textContent || '').replace(/\s+/g, ' ').trim(); }).filter(Boolean).join(' · ');
+            if (t) out.push(t.length > 140 ? (t.slice(0, 140) + '…') : t);
+        });
+        // Okno potwierdzenia ma pokazac, ze wierszy jest wiecej niz widac (wiecej niz 8 platnosci to auftrag do przemyslenia).
+        if (reszta) out.push('… i ' + reszta + ' więcej (pełna lista na stronie auftragu)');
+        return out;
     }
     // Formularz #book nie ma tokenu CSRF ani onsubmit, wiec POST z osmioma polami
     // odtwarza dokladnie to, co wysyla przegladarka po kliknieciu „Make payment".
@@ -62617,7 +63727,7 @@
             c24: 'CHECK24 Details', c24pdf: 'CHECK24 Abrechnung', cnov: 'zestawienie Cnova',
             alleops: 'operacje Allegro', allemap: 'raport zamówień Allegro', allebil: 'billing Allegro',
             hd: 'rozliczenie Homedeco', brico: 'rozliczenie Brico Bravo',
-            f1: 'faktura/korekta Furniture 1', tm: 'faktura/korekta Trademax', vtex: 'raport OBI DE (panel)' };
+            f1: 'faktura/korekta Furniture 1', tm: 'faktura/korekta/rozliczenie Trademax', vtex: 'raport OBI DE (panel)' };
         const MK_TYPY_NAZWY = Object.keys(MK_TYPY_ETYK);
         function mkTypPliku(txt){
             // OBI DE (raport z panelu VTEX): komplet 17 kolumn MK_OBI_HDR co do nazwy i kolejnosci, na przecinku.
@@ -62706,6 +63816,8 @@
                     // Trademax (faktura zbiorcza „Colective Invoice number: 56144_56145_13102026" albo korekta „Statement
                     // number : CN/IO…") PRZED Furniture 1: obie faktury maja „Colective Invoice number".
                     if (!typ && tmCzyDokument(u8)) typ = 'tm';
+                    // Rozliczenie Trademax (lista dokumentow wplaty z ksiegi dostawcy) — tez do Trademaxa; czyta je tmWczytajPliki.
+                    if (!typ && tmCzyWyciag(u8)) typ = 'tm';
                     if (!typ && f1CzyDokument(u8)) typ = 'f1';
                 } catch (e){ typ = ''; }
                 if (typ) kubelki[typ].push(f); else nieznane.push(f);
@@ -64630,6 +65742,8 @@
             const ksieg = Object.keys(jobs).filter(function (k){ return jobs[k] && mkEtap(jobs[k], {}) === 'ksieg'; }).length;
             // Wplaty NOT FOUND wyslane na auftrag bez potwierdzenia — slad siedzi w zleceniu i zniknie razem z nim.
             const wisiNf = Object.keys(jobs).reduce(function (sum, k){ return sum + mkNfaWisi(jobs[k]).length; }, 0);
+            // Wiersze, ktorym lista „Do wyjasnienia" ustawila status OK, a ksiegowanie nie weszlo albo nie wiadomo, czy weszlo.
+            const wisiProb = Object.keys(jobs).reduce(function (sum, k){ return sum + Object.keys(mkProbSlad(jobs[k])).length; }, 0);
             const zwr = mkLicz.refJest ? mkLicz.ref : 0;
             // Notatki HUB-a w arkuszu schodza same, gdy ich zlecenia juz nie ma (mkProblemySync) — mowimy o tym PRZED.
             const prob = mkProbWczytaj();
@@ -64637,7 +65751,8 @@
             if ((ile || mkLicz.kflJest) && !confirm('Wyczyścić wszystko w Księgowaniu Marketplace?\n\n'
                 + '• zlecenia z listy: ' + ile
                 + (ksieg ? ('\n   ⚠ w tym zaimportowane, a jeszcze niezaksięgowane: ' + ksieg + ' — paczki zostają w prologistics, HUB przestanie o nich przypominać') : '')
-                + (wisiNf ? ('\n   ⚠ wpłaty NOT FOUND wysłane na auftragi bez potwierdzenia: ' + wisiNf + ' — rozstrzygnij je w „🔎 NOT FOUND na auftragach” przed czyszczeniem; po nim HUB o nich nie przypomni') : '') + '\n'
+                + (wisiNf ? ('\n   ⚠ wpłaty NOT FOUND wysłane na auftragi bez potwierdzenia: ' + wisiNf + ' — rozstrzygnij je w „🔎 NOT FOUND na auftragach” przed czyszczeniem; po nim HUB o nich nie przypomni') : '')
+                + (wisiProb ? ('\n   ⚠ wiersze z listy „Do wyjaśnienia”, którym HUB ustawił status OK, a księgowanie nie weszło albo nie wiadomo, czy weszło: ' + wisiProb + ' — sprawdź je w prologistics przed czyszczeniem; po nim HUB o nich nie przypomni') : '') + '\n'
                 + '• lista zwrotów' + (zwr ? (' (grup z czymś do zaksięgowania: ' + zwr + ')') : '') + ', oddane potrącenia i Joybuy — liczą się ze zleceń\n'
                 + (mkLicz.kflJest ? ('• Kaufland DE — zwroty i storna z ostatniego pobrania (do zrobienia: ' + mkLicz.kfl + '); ślad zapisów HUB-a zostaje\n') : '')
                 + '• otwarte okna: paczka importu, typy klientów, końcówki, postęp zwrotów, lista „Z arkusza” i braki\n\n'
@@ -64651,10 +65766,10 @@
             kflPozZapisz(null);                  // Kaufland: lista pozycji z ostatniego pobrania (slad zapisow mkt_kfl_slad zostaje)
             // Pamiec strony o zleceniach: zaznaczenia do importu, typy, „Sprawdź auftragi" potracen i Joybuy.
             [mkSel, mkTyp, mkTypPusto, mkCrState, mkJoyState].forEach(function (o){ Object.keys(o).forEach(function (k){ delete o[k]; }); });
-            mkKonc = null; mkNfa = null; mkImpWidok = '';
+            mkKonc = null; mkNfa = null; mkProb = null; mkImpWidok = '';
             ksMirror(null);                      // podglad postepu z poprzedniego przebiegu zwrotow przestaje sie odswiezac
             shZamknij(); brZamknij();
-            ['#mk-imp-box', '#mk-typ-box', '#mk-prog', '#mk-konc-box', '#mk-nfa-box'].forEach(function (q){ const e = $(q); if (e){ e.style.display = 'none'; e.innerHTML = ''; } });
+            ['#mk-imp-box', '#mk-typ-box', '#mk-prog', '#mk-konc-box', '#mk-nfa-box', '#mk-prob-box'].forEach(function (q){ const e = $(q); if (e){ e.style.display = 'none'; e.innerHTML = ''; } });
             render();
             say(ile ? ('Wyczyszczone: zlecenia (' + ile + '), lista zwrotów i otwarte okna. Ustawienia i ślad zaksięgowanych zwrotów zostały.')
                     : 'Lista zleceń była pusta — zamknąłem otwarte okna.', '#0a7a2f');
@@ -65500,7 +66615,7 @@
             let ok = 0;
             for (let i = 0; i < todo.length; i++){
                 const j = jobs[todo[i]];
-                let rep;
+                let rep, wskaz = '';
                 if (String(j.ref || '').trim()){
                     // Porownujemy takze po sklejeniu spacji i bez wielkosci liter — nazwa
                     // raportu bywa zapisana inaczej niz referencja w wyciagu.
@@ -65515,7 +66630,10 @@
                     // sa juz pobrane z okna dat wokol wplaty, wiec nic wiecej nie sciagamy.
                     // „Netto" to kwota przelewu: netto zamowien albo netto po potraceniu z wiersza „Internal Transfer"
                     // (vtexKwotaPasuje) — wiersz wyplaty nie jest juz doliczany do netto (16.10.2026, 446,43).
-                    // Musi pasowac DOKLADNIE JEDEN: przy dwoch nie ma czego rozstrzygnac.
+                    // Przy dwoch raportach o tym samym netto bierzemy ten, ktorego dzien (z nazwy PODE-RRRRMMDD-NNNN) jest
+                    // NAJBLIZSZY dacie wplaty (decyzja uzytkownika 22.10.2026, OBI DE 83,78: PODE-20261019-0289 i
+                    // PODE-20261011-0285, wplata 19.10). Przy remisie wygrywa raport z dnia nie pozniejszego niz wplata
+                    // (wplata nie moze wyprzedzic raportu); dalszy remis albo brak daty w nazwie — nadal nie zgadujemy.
                     const traf = reps.filter(function (r){
                         try { return vtexKwotaPasuje(vtexAgg(vtexRows(r)), j.amount); } catch (e){ return false; }
                     });
@@ -65526,13 +66644,20 @@
                         jobsSave(jobs); continue;
                     }
                     if (traf.length > 1){
-                        j.msg = 'zlecenie bez referencji — netto ' + f2(j.amount) + ' pasuje do '
-                              + traf.length + ' raportów: '
-                              + traf.map(function (r){ return String(r.payoutReportFileName || r.id); }).join(', ')
-                              + ' — nie zgaduję, który wziąć; dopisz referencję.';
-                        jobsSave(jobs); continue;
-                    }
-                    rep = traf[0];
+                        const naj = vtexNajblizszyRaport(traf, j.date);
+                        if (!naj){
+                            j.msg = 'zlecenie bez referencji — netto ' + f2(j.amount) + ' pasuje do '
+                                  + traf.length + ' raportów: '
+                                  + traf.map(function (r){ return String(r.payoutReportFileName || r.id); }).join(', ')
+                                  + ' — nie umiem wskazać, który z nich jest bliżej daty wpłaty ' + (j.date || '(brak daty)')
+                                  + '; dopisz referencję.';
+                            jobsSave(jobs); continue;
+                        }
+                        wskaz = 'kilka raportów miało to samo netto — wzięty ten z najbliższą datą wpłaty ('
+                              + vtexOpisOdleglosci(naj.dni) + '; pozostałe: '
+                              + naj.inne.map(function (o){ return String(o.rep.payoutReportFileName || o.rep.id) + ', ' + vtexOpisOdleglosci(o.dni); }).join(' · ') + ')';
+                        rep = naj.rep;
+                    } else rep = traf[0];
                 }
                 try {
                     const rows = vtexRows(rep);
@@ -65556,7 +66681,7 @@
                     // swiadectwem jest kwota, wiec musi to byc widoczne, a nie domyslne.
                     if (!String(j.ref || '').trim()){
                         const skad = 'raport „' + String(rep.payoutReportFileName || rep.id)
-                                   + '" dopasowany po kwocie (zlecenie bez referencji)';
+                                   + '" dopasowany po kwocie (zlecenie bez referencji)' + (wskaz ? ('; ' + wskaz) : '');
                         j.note = j.note ? (j.note + '; ' + skad) : skad;
                     }
                     const pot = vtexOpisPotracenia(a, j.amount);
@@ -65637,20 +66762,41 @@
             });
             if (!left.length) return 0;
             say('Galaxus — pobieram listę wypłat…');
-            let list;
-            try { list = galxParseList(await galxHtml()); }
+            let list, html;
+            try { html = await galxHtml(); list = galxParseList(html); }
             catch (e){ say('Galaxus: ' + withLogin({ brand: 'Galaxus', shop: 'Galaxus CH' }, e), '#c47f00'); return 0; }
             if (!list.length){ say('Galaxus: nie widzę żadnego linku do raportu na „Payout overview".', '#c47f00'); return 0; }
+            // Strona pokazuje tylko 10 najnowszych wyplat — starsze szukamy oknami dat przez formularz portalu.
+            let token = '';
+            try { token = galxToken(html); } catch (e){ token = ''; }
+            const cache = {};
             let ok = 0;
             for (let i = 0; i < left.length; i++){
                 const j = jobs[left[i]];
-                const hit = list.filter(function (p){ return p.amount != null && eq(p.amount, j.amount); });
+                say('Galaxus — szukam wypłaty na ' + f2(j.amount) + '…');
+                const zn = await galxZnajdz(j, list, token, cache);
+                let hit = zn.hit;
+                if (hit.length > 1 && j.date){
+                    // Ta sama kwota potrafi sie powtorzyc — rozstrzyga dzien: wyplata jest dzien przed wplywem.
+                    const bl = hit.filter(function (p){ return p.day && p.day >= mkShift(j.date, -4) && p.day <= j.date; });
+                    if (bl.length === 1) hit = bl;
+                }
                 if (!hit.length){
-                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' wśród ' + list.length + ' widocznych w portalu';
+                    const wsz = Object.keys(zn.widziane).map(function (k){ return zn.widziane[k]; });
+                    const bliskie = wsz.filter(function (p){ return p.amount != null; })
+                        .sort(function (a, b){ return Math.abs(a.amount - j.amount) - Math.abs(b.amount - j.amount); })
+                        .slice(0, 3)
+                        .map(function (p){ return f2(p.amount) + ' z ' + (p.day || '?'); });
+                    j.msg = 'nie ma wypłaty na ' + f2(j.amount) + ' w portalu — sprawdziłem ' + wsz.length + ' wypłat: '
+                          + 'ostatnie 10 ze strony' + (zn.okno ? (' oraz okno dat wypłaty ' + zn.okno) : '')
+                          + (bliskie.length ? ('. Najbliższe: ' + bliskie.join(' · ')) : '')
+                          + (zn.pelne ? '. Któreś okno zwróciło 10 wypłat — mogło się nie zmieścić' : '')
+                          + (zn.blad ? ('. Wyszukiwanie po datach nie powiodło się: ' + zn.blad) : '')
+                          + (!token ? '. Nie widzę formularza wyszukiwania na stronie portalu' : '');
                     jobsSave(jobs); continue;
                 }
                 if (hit.length > 1){
-                    j.msg = 'kilka wypłat na tę samą kwotę (' + hit.map(function (p){ return p.id; }).join(', ') + ') — wgraj raport ręcznie';
+                    j.msg = 'kilka wypłat na tę samą kwotę (' + hit.map(function (p){ return p.name; }).join(', ') + ') — wgraj raport ręcznie';
                     jobsSave(jobs); continue;
                 }
                 try {
@@ -68033,12 +69179,258 @@
         const alt = L.lista.filter(function (x){ return bank && String(x.bank_id || '') === String(bank); });
         return alt.length ? String(alt[0].file_id || '') : '';
     }
+    // ---------- ochrona przed podwojnym ksiegowaniem tej samej paczki (22.10.2026) ----------
+    // Paczka 2259365 (Trademax SE, 1831 wierszy): ksiegowanie to JEDEN dlugi zapis (po stronie serwera kilka minut), a ok. 45 s
+    // po jego starcie ruszyl drugi na tych samych wierszach. Serwer sprawdza „czy wiersz juz zaksiegowany" osobno dla kazdego
+    // wiersza, wiec te, do ktorych oba doszly w tym samym czasie, dostaly po DWIE platnosci (1375 wierszy, nadwyzka
+    // 2 633 320,90 SEK). Straze mkWid.book / mkKsiegBieg dzialaja tylko w obrebie jednej karty, a „zaksiegowane" w zleceniu
+    // stoi dopiero po powrocie zapisu. Trzy warstwy, wszystkie w impBook / impBookSub (obejmuja kazda droge ksiegowania):
+    //  1. blokada paczki w GM, wspolna dla kart (odnawiana co 5 s; bez znaku zycia dluzej niz MK_KSL_WAZNA przestaje obowiazywac);
+    //  2. trwaly slad „zapis wyslany, odpowiedzi nie znamy" (GM): serwer mogl dalej ksiegowac mimo bledu HTTP albo zamknietej
+    //     karty. Dopoki slad stoi, nowy zapis wymaga SPOKOJU paczki: dwa odczyty w odstepie MK_KS_SPOKOJ — liczba zaksiegowanych
+    //     wierszy bez zmian. Ten sam test robimy, gdy od ostatniego odczytu w tej karcie przybylo zaksiegowanych wierszy
+    //     (ktos ksiegowal np. przyciskiem w prologistics);
+    //  3. swiezy odczyt tuz przed zapisem: do zapisu ida tylko wiersze o statusie OK, ktore NIE maja jeszcze platnosci
+    //     (payment_id = 0 albo platnosc usunieta: payment_deleted = 1; wiersz zaksiegowany ma payment_id i amount_booked). Bez odczytu
+    //     nic nie wysylamy.
+    const MK_KSL_PREF = 'mkt_ksieg_lock_';     // + numer paczki: { token, karta, od, bij, opis }
+    const MK_KSW_PREF = 'mkt_ksieg_wisi_';     // + numer paczki: { od, n, karta, opis } — zapis wyslany, wyniku nie znamy
+    const MK_KSL_WAZNA = 90000;
+    const MK_KS_SPOKOJ = 15000;
+    const mkKsKarta = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    let mkKsLicznik = 0;
+    const mkKsTrzymane = {};          // token -> { timer, impId }: odnawianie blokady trzymanej przez TE karte
+    const mkImpOstatni = {};          // numer paczki -> { t, zaks } z ostatniego odczytu w tej karcie
+    const mkKsRaport = {};            // numer paczki -> { pominiete: [...], wyslane: n } ostatniego zapisu (do komunikatow)
+    // Postep ksiegowania na guzikach (22.10.2026): „▶ Zaksięguj paczki" w pasku kroków pokazuje paczke i wiersze oraz sekundy,
+    // „▶ Zaksięguj OK" w widoku paczki — tylko „Księguję… N s". Jeden zegar na sekunde, dopoki cos sie ksieguje; napisy
+    // czyta tez krokiMaluj / impRender, bo przerysowanie wymienia wezel guzika.
+    //   trwa[numer paczki] = { t0, n } — zapis tej paczki w toku (n = ile naraz: widok + zbiorczy);
+    //   zbiorcza = { t0, faza: 'czytam' | 'ksieguje' | 'po', i, n, impId } — przebieg „Zaksięguj paczki";
+    //   wiersze[numer paczki] = { z, n } — ile z wierszy zapisu juz ma platnosc (odczyt co 8 s, tylko duze paczki).
+    const mkKsPostep = { trwa: {}, zbiorcza: null, wiersze: {}, timer: null };
+    function mkKsSek(t0){ return Math.max(0, Math.round((Date.now() - t0) / 1000)); }
+    function mkKsEtykietaZbiorcza(){
+        const z = mkKsPostep.zbiorcza;
+        if (!z) return '⏳ Księguję paczki…';
+        const sek = ' · ' + mkKsSek(z.t0) + ' s';
+        if (z.faza === 'czytam') return '⏳ Czytam paczki…' + sek;
+        if (z.faza === 'po') return '⏳ Po księgowaniu: czytam paczki…' + sek;
+        const w = z.impId ? mkKsPostep.wiersze[String(z.impId)] : null;
+        return '⏳ Księguję paczkę ' + Math.max(1, z.i) + ' z ' + z.n + (w ? (' · ' + w.z + ' z ' + w.n + ' wierszy') : '') + sek;
+    }
+    function mkKsEtykietaPaczki(impId){
+        const x = mkKsPostep.trwa[String(impId)];
+        return x ? ('⏳ Księguję… ' + mkKsSek(x.t0) + ' s') : '';
+    }
+    function mkKsOdswiezEtykiety(){
+        try {
+            const b = document.getElementById('mk-book-all');
+            if (b && mkWid.book && mkKsPostep.zbiorcza) b.textContent = mkKsEtykietaZbiorcza();
+            const e = mkImpWidok ? mkKsEtykietaPaczki(mkImpWidok) : '';
+            const v = document.getElementById('mk-book');
+            if (v && e){
+                if (!v.hasAttribute('data-ks-orig')){ v.setAttribute('data-ks-orig', v.textContent); v.setAttribute('data-ks-dis', v.disabled ? '1' : '0'); }
+                v.textContent = e; v.disabled = true;
+            } else if (v && v.hasAttribute('data-ks-orig')){
+                v.textContent = v.getAttribute('data-ks-orig'); v.disabled = v.getAttribute('data-ks-dis') === '1';
+                v.removeAttribute('data-ks-orig'); v.removeAttribute('data-ks-dis');
+            }
+        } catch (err){}
+    }
+    function mkKsTikSprawdz(){
+        const trwa = Object.keys(mkKsPostep.trwa).length > 0 || !!mkKsPostep.zbiorcza;
+        if (trwa && !mkKsPostep.timer){ mkKsPostep.timer = setInterval(mkKsOdswiezEtykiety, 1000); mkKsOdswiezEtykiety(); }
+        else if (!trwa && mkKsPostep.timer){ clearInterval(mkKsPostep.timer); mkKsPostep.timer = null; mkKsOdswiezEtykiety(); }
+    }
+    function mkKsTrwaStart(impId){
+        const k = String(impId), x = mkKsPostep.trwa[k] || (mkKsPostep.trwa[k] = { t0: Date.now(), n: 0 });
+        x.n++;
+        mkKsTikSprawdz();
+    }
+    function mkKsTrwaKoniec(impId){
+        const k = String(impId), x = mkKsPostep.trwa[k];
+        if (x && --x.n <= 0) delete mkKsPostep.trwa[k];
+        mkKsTikSprawdz();
+    }
+    // Ile z wierszy `set` ma juz platnosc — czysty odczyt, bez ruszania „ostatniego odczytu" paczki (mkImpOstatni).
+    async function mkKsLicz(impId, set){
+        const r = await fetch('/api/importPayments/index/' + encodeURIComponent(impId) + '/?', {
+            credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        return (Array.isArray(j.hash_result) ? j.hash_result : []).filter(function (x){ return set[String(x.id)] && mkKsWierszZaks(x); }).length;
+    }
+    function mkKsGM(klucz){ try { const s = GM_getValue(klucz, ''); return s ? JSON.parse(s) : null; } catch (e){ return null; } }
+    function mkKsGMUstaw(klucz, o){ try { GM_setValue(klucz, o ? JSON.stringify(o) : ''); } catch (e){} }
+    function mkKsCzekaj(ms){ return new Promise(function (r){ setTimeout(r, ms); }); }
+    function mkKsGodz(t){ const d = new Date(Number(t) || Date.now()); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
+    // Wiersz zaksiegowany = ma platnosc (payment_id) i ta platnosc nie zostala usunieta. Po „Unbook" wiersz zachowuje stary
+    // payment_id, ale dostaje payment_deleted = 1 (paczka 2259365 po cofnieciu: 1830 wierszy z payment_deleted = 1) — taki
+    // wiersz jest znowu do ksiegowania i nie wolno go pomijac jako „juz zaksiegowanego".
+    function mkKsWierszZaks(x){ return Number(x && x.payment_id) > 0 && String(x && x.payment_deleted) !== '1'; }
+    function mkKsZaks(rows){ return (rows || []).filter(mkKsWierszZaks).length; }
     async function impRows(id){
         const r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
         if (!r.ok) throw new Error('HTTP ' + r.status + ' przy odczycie paczki ' + id);
         const j = await r.json();
-        return { rows: Array.isArray(j.hash_result) ? j.hash_result : [], colours: j.colours || {} };
+        const rows = Array.isArray(j.hash_result) ? j.hash_result : [];
+        mkImpOstatni[String(id)] = { t: Date.now(), zaks: mkKsZaks(rows) };
+        return { rows: rows, colours: j.colours || {} };
+    }
+    async function mkKsBlokada(impId, opis){
+        const teraz = Date.now();
+        const x = mkKsGM(MK_KSL_PREF + impId);
+        if (x && teraz - Number(x.bij || 0) < MK_KSL_WAZNA)
+            throw new Error('paczka ' + impId + ' jest teraz księgowana (' + (x.opis || 'zapis') + ', od ' + mkKsGodz(x.od)
+                + ') — drugi przebieg albo druga karta. Nie księguję jej drugi raz; poczekaj, aż tamto się skończy, i kliknij „↻ Odśwież".');
+        const token = mkKsKarta + '-' + (++mkKsLicznik);
+        mkKsGMUstaw(MK_KSL_PREF + impId, { token: token, karta: mkKsKarta, od: teraz, bij: teraz, opis: opis || '' });
+        // Zapis do GM nie jest atomowy miedzy kartami: po chwili sprawdzamy, czy blokada dalej jest nasza.
+        await mkKsCzekaj(400);
+        const y = mkKsGM(MK_KSL_PREF + impId);
+        if (!y || y.token !== token)
+            throw new Error('paczkę ' + impId + ' zajął w tej samej chwili inny przebieg księgowania — nie księguję jej drugi raz; poczekaj i kliknij „↻ Odśwież".');
+        mkKsTrzymane[token] = { impId: impId, timer: setInterval(function (){
+            const z = mkKsGM(MK_KSL_PREF + impId);
+            if (z && z.token === token){ z.bij = Date.now(); mkKsGMUstaw(MK_KSL_PREF + impId, z); }
+            else { try { clearInterval(mkKsTrzymane[token].timer); } catch (e){} delete mkKsTrzymane[token]; }
+        }, 5000) };
+        return token;
+    }
+    function mkKsZwolnij(impId, token){
+        try { clearInterval(mkKsTrzymane[token].timer); } catch (e){}
+        delete mkKsTrzymane[token];
+        const z = mkKsGM(MK_KSL_PREF + impId);
+        if (z && z.token === token) mkKsGMUstaw(MK_KSL_PREF + impId, null);
+    }
+    // Zamykana karta oddaje swoje blokady. Slad „wyslane, wyniku nie znamy" zostaje — serwer moze dalej ksiegowac.
+    try {
+        window.addEventListener('pagehide', function (){
+            Object.keys(mkKsTrzymane).forEach(function (t){ const x = mkKsTrzymane[t]; if (x) mkKsZwolnij(x.impId, t); });
+        });
+    } catch (e){}
+    // Blokada + swiezy odczyt + (gdy trzeba) test spokoju paczki. Zwraca { token, ids, pominiete } — wiersze do zapisu.
+    // Rzuca, gdy zapisu robic nie wolno; blokada jest wtedy zwolniona.
+    async function mkKsPrzygotuj(impId, ids, opis){
+        const bazowy = mkImpOstatni[impId] ? Object.assign({}, mkImpOstatni[impId]) : null;
+        const token = await mkKsBlokada(impId, opis);
+        try {
+            let d = await impRows(impId);
+            const wisi = mkKsGM(MK_KSW_PREF + impId);
+            const zaks0 = mkKsZaks(d.rows);
+            let powod = '';
+            if (wisi) powod = 'poprzedni zapis tej paczki (' + mkKsGodz(wisi.od) + ') nie zwrócił odpowiedzi — serwer mógł dalej księgować';
+            else if (bazowy && Date.now() - bazowy.t >= 2000 && zaks0 > bazowy.zaks)
+                powod = 'od ostatniego odczytu (' + mkKsGodz(bazowy.t) + ') przybyło ' + (zaks0 - bazowy.zaks) + ' zaksięgowanych wierszy — ktoś księguje tę paczkę';
+            if (powod){
+                say('Paczka ' + impId + ': ' + powod + '. Sprawdzam, czy prologistics skończył (' + Math.round(MK_KS_SPOKOJ / 1000) + ' s)…', '#c47f00');
+                mkLog('book', '⚠ paczka ' + impId + ': ' + powod + ' — test spokoju');
+                await mkKsCzekaj(MK_KS_SPOKOJ);
+                const d1 = await impRows(impId);
+                const zaks1 = mkKsZaks(d1.rows);
+                if (zaks1 !== zaks0){
+                    mkLog('book', '✖ paczka ' + impId + ': prologistics dalej księguje (' + zaks0 + ' → ' + zaks1 + ') — nie piszę');
+                    throw new Error('prologistics dalej księguje paczkę ' + impId + ': w ciągu ' + Math.round(MK_KS_SPOKOJ / 1000) + ' s przybyło '
+                        + Math.abs(zaks1 - zaks0) + ' zaksięgowanych wierszy (razem ' + zaks1 + '). Nie dokładam drugiego zapisu — poczekaj kilka minut i kliknij „↻ Odśwież".');
+                }
+                if (wisi) mkKsGMUstaw(MK_KSW_PREF + impId, null);
+                d = d1;
+            }
+            const poId = {};
+            d.rows.forEach(function (x){ poId[String(x.id)] = x; });
+            const idsOk = [], pominiete = [];
+            (ids || []).forEach(function (id){
+                const x = poId[String(id)];
+                if (!x) pominiete.push({ id: String(id), powod: 'nie ma już w paczce' });
+                else if (mkKsWierszZaks(x)) pominiete.push({ id: String(id), powod: 'już zaksięgowany (płatność ' + x.payment_id + ')' });
+                else if (String(x.state) !== 'OK') pominiete.push({ id: String(id), powod: 'status ' + x.state + ', nie OK' });
+                else idsOk.push(id);
+            });
+            return { token: token, ids: idsOk, pominiete: pominiete };
+        } catch (e){ mkKsZwolnij(impId, token); throw e; }
+    }
+    async function mkKsZapis(id, ids, block, opis){
+        const impId = String(id);
+        mkKsTrwaStart(impId);
+        let p;
+        try { p = await mkKsPrzygotuj(impId, ids, opis); }
+        catch (e){ mkKsTrwaKoniec(impId); throw e; }
+        mkKsRaport[impId] = { pominiete: p.pominiete, wyslane: p.ids.length };
+        let tik = null, poll = null;
+        try {
+            if (p.pominiete.length)
+                mkLog('book', '· paczka ' + impId + ' (' + opis + '): pomijam ' + p.pominiete.length + ' z ' + (ids || []).length + ' wierszy — '
+                    + p.pominiete.slice(0, 3).map(function (x){ return x.id + ' ' + x.powod; }).join('; ') + (p.pominiete.length > 3 ? ' …' : ''));
+            if (!p.ids.length){
+                mkLog('book', '· paczka ' + impId + ' (' + opis + '): nie ma czego zapisywać — nic nie wysyłam');
+                return '';
+            }
+            const body = 'file_id=' + encodeURIComponent(impId) + '&block=' + block
+                       + p.ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
+            // Slad „wyslane, wyniku nie znamy" stoi do powrotu odpowiedzi — blad HTTP i urwane polaczenie go zostawiaja.
+            mkKsGMUstaw(MK_KSW_PREF + impId, { od: Date.now(), n: p.ids.length, karta: mkKsKarta, opis: opis });
+            mkLog('book', '▶ paczka ' + impId + ' (' + opis + '): wysyłam ' + p.ids.length + ' wierszy');
+            const t0 = Date.now();
+            // Duza paczka ksieguje sie kilka minut bez zadnego sygnalu — w paczce 2259365 po ok. 46 s ruszyl drugi zapis
+            // (najpewniej reka). Licznik na pasku mowi, ze to normalne i zeby nie klikac drugi raz.
+            if (p.ids.length >= 200)
+                tik = setInterval(function (){
+                    say('Księguję paczkę ' + impId + ' (' + p.ids.length + ' wierszy) — trwa ' + Math.round((Date.now() - t0) / 1000)
+                        + ' s; przy dużej paczce to zwykle kilka minut. Nie klikaj ponownie i nie księguj tej paczki drugi raz w prologistics.', '#666');
+                }, 1000);
+            if (p.ids.length >= 200){
+                const set = {};
+                p.ids.forEach(function (x){ set[String(x)] = 1; });
+                mkKsPostep.wiersze[impId] = { z: 0, n: p.ids.length };
+                let wLocie = false;
+                poll = setInterval(async function (){
+                    if (wLocie) return;
+                    wLocie = true;
+                    try {
+                        const z = await mkKsLicz(impId, set);
+                        if (mkKsPostep.wiersze[impId]) mkKsPostep.wiersze[impId].z = z;
+                        mkKsOdswiezEtykiety();
+                    } catch (e){}
+                    wLocie = false;
+                }, 8000);
+            }
+            let r;
+            try {
+                r = await fetch('/api/importPayments/save/', {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+                    body: body });
+            } catch (e){
+                mkLog('book', '✖ paczka ' + impId + ': zapis bez odpowiedzi (' + ((e && e.message) || e) + ') po ' + Math.round((Date.now() - t0) / 1000) + ' s — wynik nieznany');
+                throw new Error('zapis paczki ' + impId + ' bez odpowiedzi (' + ((e && e.message) || e) + ') — wynik nieznany: prologistics mógł dokończyć księgowanie. '
+                    + 'Nie ponawiaj od razu — po kilku minutach kliknij „↻ Odśwież" i sprawdź paczkę.');
+            }
+            if (!r.ok){
+                mkLog('book', '✖ paczka ' + impId + ': HTTP ' + r.status + ' po ' + Math.round((Date.now() - t0) / 1000) + ' s — wynik nieznany');
+                throw new Error('HTTP ' + r.status + ' przy księgowaniu paczki ' + impId + ' — wynik nieznany: prologistics mógł dokończyć księgowanie. '
+                    + 'Nie ponawiaj od razu — po kilku minutach kliknij „↻ Odśwież" i sprawdź paczkę.');
+            }
+            const txt = await r.text();
+            if (mkKsPostep.wiersze[impId]) mkKsPostep.wiersze[impId].z = mkKsPostep.wiersze[impId].n;
+            mkLog('book', '✔ paczka ' + impId + ' (' + opis + '): odpowiedź po ' + Math.round((Date.now() - t0) / 1000) + ' s, wierszy ' + p.ids.length);
+            mkKsGMUstaw(MK_KSW_PREF + impId, null);
+            delete mkImpOstatni[impId];           // wlasny zapis zmienil liczbe zaksiegowanych — nie bierzemy go za cudzy
+            return txt;
+        } finally {
+            if (tik) clearInterval(tik);
+            if (poll) clearInterval(poll);
+            delete mkKsPostep.wiersze[impId];
+            mkKsZwolnij(impId, p.token);
+            mkKsTrwaKoniec(impId);
+        }
+    }
+    // Komunikat o wierszach pominietych przy ostatnim zapisie paczki (puste, gdy nic nie pominieto).
+    function mkKsPominieteOpis(impId){
+        const x = mkKsRaport[String(impId)];
+        return (x && x.pominiete && x.pominiete.length)
+            ? ('paczka ' + impId + ': ' + x.pominiete.length + ' poz. pominięte (' + x.pominiete.slice(0, 2).map(function (q){ return q.powod; }).join('; ') + (x.pominiete.length > 2 ? ' …' : '') + ')') : '';
     }
     // ---------- wyplata zaimportowana recznie (kontrola po tresci) ----------
     // Pozostale zapory nie widza paczki zalozonej RECZNIE: impSameFile szuka nazwy „data + sklep", a reczna
@@ -68152,16 +69544,9 @@
         }
         return { dalej: (sel || []).filter(function (j){ return !zatrz[mkKlucz(j)]; }), stop: stop, uwaga: uwaga };
     }
+    // „Book on main account" — ochrona przed podwojnym zapisem: mkKsZapis (blokada, swiezy odczyt, slad „wyslane").
     async function impBook(id, ids){
-        const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK
-                   + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
-        const r = await fetch('/api/importPayments/save/', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
-            body: body
-        });
-        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu');
-        return r.text();
+        return mkKsZapis(id, ids, MK_BLOCK, 'na koncie głównym');
     }
     // Open amount przychodzi raz jako „0.00", a raz jako „CHF 0.01" — z waluta w srodku
     // Number() zwracalo NaN i kolumna pokazywala kreske zamiast kwoty. Odsiewamy wiec
@@ -68247,14 +69632,7 @@
     }
     // „Book on sub-account" — bez przypisania, inny przycisk niz ksiegowanie na koncie glownym.
     async function impBookSub(id, ids){
-        const body = 'file_id=' + encodeURIComponent(id) + '&block=' + MK_BLOCK_SUB
-                   + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
-        const r = await fetch('/api/importPayments/save/', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
-            body: body });
-        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy księgowaniu na subkoncie');
-        return r.text();
+        return mkKsZapis(id, ids, MK_BLOCK_SUB, 'na subkoncie');
     }
 
     // ---------- NOT FOUND: sprawdzenie auftragu po numerze fulfilmentu ----------
@@ -68353,7 +69731,15 @@
     // Ksiegowanie wplaty na skasowanym auftragu. Konto bierzemy z ustawien sklepu,
     // date z rozliczenia, kwote z wiersza NOT FOUND — komplet pokazujemy w pytaniu,
     // zeby decyzja zapadala na widocznych liczbach, a nie na zaufaniu do tabeli.
-    async function nfKsieguj(job, ff, num, kwota, btn, rysuj){
+    // opcje.mimo (22.10.2026, lista „Do wyjasnienia"): ksieguje takze przy open amount mniejszym od wplaty (w tym 0) i przy
+    // auftragu z platnosciami — okno pokazuje te platnosci i ostrzega o nadplacie. Skasowany auftrag i tak szedl „mimo delete".
+    // Straze zbiegow, swiezy odczyt przed i po oknie, zgodnosc statusu i numeru fulfilmentu oraz slad zapisu zostaja bez zmian.
+    async function nfKsieguj(job, ff, num, kwota, btn, rysuj, opcje){
+        const mimo = !!(opcje && opcje.mimo);
+        // Wywolanie z listy „Do wyjasnienia" (opcje podane): lista bywa sprzed godzin, a zapis wprost na auftragu to kolejna
+        // platnosc — dochodza kontrole stanu od sprawdzenia, kwoty i twarda bramka przed nadplata (przeglad 22.10.2026).
+        const zListy = !!opcje, znana = !!(opcje && opcje.znana);
+        if (zListy && !(kwota > 0.005)){ say('Auftrag ' + ff + ': kwota wpłaty ' + String(kwota) + ' nie jest dodatnia — księguj ręcznie.', '#c47f00'); return; }
         // Zbieg (przeglad 14.10.2026): przelot zapisuje cala migawke zlecen z chwili startu (zgubilby slad zapisu), a skan
         // „NOT FOUND na auftragach" rozstrzyga slady. Zapis zbiorczy i inne zapisy ksiegujace wyklucza straz w obsludze guzika.
         if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
@@ -68401,7 +69787,22 @@
             say('Auftrag ' + num + ' ma inny numer fulfilmentu (' + (rr.ffy || []).join(', ') + ') — nic nie księguję.', '#c47f00');
             return;
         }
-        if (!rr.deleted && (rr.open == null || rr.open + 0.005 < kwota)){
+        if (zListy){
+            // Przycisk zostal narysowany ze stanu sprzed godzin: inny auftrag w sprawdzeniu niz w guziku albo zmiana open/platnosci
+            // od sprawdzenia = decyzja na nieaktualnych danych. Odswiezamy i prosimy o ponowna decyzje.
+            if (String(kand.num) !== String(num)){
+                popraw();
+                say('Auftrag ' + ff + ': sprawdzenie wskazuje teraz auftrag ' + kand.num + ', a przycisk dotyczył ' + num + ' — nic nie księguję; lista odświeżona.', '#c47f00');
+                return;
+            }
+            if (rr.ok && kand.ok && (rr.nPay !== kand.nPay || rr.open !== kand.open)){
+                const was = 'płatności ' + (kand.nPay == null ? '?' : kand.nPay) + ' → ' + (rr.nPay == null ? '?' : rr.nPay) + ', open ' + (kand.open == null ? '?' : f2(kand.open)) + ' → ' + (rr.open == null ? '?' : f2(rr.open));
+                popraw();
+                say('Auftrag ' + num + ' zmienił się od sprawdzenia (' + was + ') — nic nie księguję; lista odświeżona, zdecyduj jeszcze raz.', '#c47f00');
+                return;
+            }
+        }
+        if (!rr.deleted && !mimo && (rr.open == null || rr.open + 0.005 < kwota)){
             popraw();
             say('Auftrag ' + num + ': open amount to teraz ' + (rr.open == null ? '?' : f2(rr.open)) + ' — nie pokrywa wpłaty (ktoś zaksięgował?). Nic nie księguję.', '#c47f00');
             return;
@@ -68415,6 +69816,9 @@
         // od 5.09 guzik stoi takze przy auftragu zywym, a pytanie o pieniadze nie moze
         // twierdzic „DELETED", gdy auftrag jest ACTIVE.
         const usun = !!rr.deleted;
+        // Nadplata = zapis wprost na auftrag, ktorego open amount nie pokrywa wplaty (tylko „mimo" z listy). Przy open < 0
+        // auftrag jest juz nadplacony — doklada sie kolejna wplata, wiec mowimy o obu.
+        const nadp = mimo && !usun && (rr.open == null || rr.open + 0.005 < kwota);
         if (!confirm('Zaksięgować wpłatę na ' + (usun ? 'SKASOWANYM auftragu' : 'auftragu') + '?\n\n'
             + 'fulfilment : ' + ff + '\n'
             + 'auftrag    : ' + num + '   (status ' + (usun ? 'DELETED' : 'ACTIVE') + ')\n'
@@ -68423,19 +69827,52 @@
             + 'konto      : ' + c.acct + '\n'
             + 'data       : ' + mkDataNf(job, ff) + '\n\n'
             + (juz ? ('UWAGA: na auftragu stoją już płatności (' + juz + ') — sprawdź, czy tej wpłaty nie zaksięgowano ręcznie.\n\n') : '')
+            + ((rr.platnosci && rr.platnosci.length) ? ('Płatności na auftragu:\n' + rr.platnosci.map(function (s){ return '  • ' + s; }).join('\n') + '\n\n') : '')
+            + (nadp
+                ? ('UWAGA: open amount ' + (rr.open == null ? 'nieznany' : f2(rr.open)) + ' nie pokrywa wpłaty ' + f2(kwota)
+                   + ' — zapis da NADPŁATĘ' + (rr.open == null ? '' : (' ' + f2(r2(kwota - Math.max(0, rr.open)))))
+                   + (rr.open != null && rr.open < -0.005 ? (' (auftrag jest już nadpłacony o ' + f2(r2(-rr.open)) + ', razem będzie ' + f2(r2(-rr.open + kwota)) + ')') : '')
+                   + ' na tym auftragu.\n\n') : '')
             + (usun ? ('W tym cyklu nie ma zwrotu dla tej pozycji. Jeśli zwrot przyjdzie w kolejnym '
                        + 'rozliczeniu, zaksięgujesz go osobno.\n\n')
-                    : ('Import nie dopasował tego auftragu po numerze fulfilmentu, ale auftrag '
-                       + 'istnieje i ma na to miejsce.\n\n'))
+                    : (nadp ? ('Import nie dopasował tego auftragu po numerze fulfilmentu. Auftrag istnieje, ale zapis wprost to DODATKOWA płatność '
+                               + '(nadpłata), a nie rozliczenie zamówienia.\n\n')
+                            : ('Import nie dopasował tego auftragu po numerze fulfilmentu, ale auftrag '
+                               + 'istnieje i ma na to miejsce.\n\n')))
             + 'Tej operacji nie da się cofnąć ze skryptu.')) return;
+        // Twarda bramka z listy „Do wyjasnienia" (przeglad 22.10.2026): przy ryzyku DUBLA samo „OK" w oknie nie wystarcza —
+        // trzeba wpisac slowo. Ryzyko: auftrag juz nadplacony (open < 0), na nim stoi platnosc o tej samej kwocie, prologistics
+        // zna te platnosc z wczesniejszego importu (already_imported) albo na stronie auftragu nie ma numeru fulfilmentu, wiec
+        // nic nie potwierdza, ze to TEN auftrag (poza OBI CH, gdzie szukamy po numerze faktury).
+        if (zListy){
+            const ryz = [];
+            if (rr.ok && rr.open != null && rr.open < -0.005) ryz.push('auftrag jest już NADPŁACONY (open ' + f2(rr.open) + ')');
+            if (rr.ok && nfPlatnoscRowna(rr, kwota)) ryz.push('na auftragu stoi już płatność o kwocie ' + f2(kwota) + ' — możliwy DUPLIKAT');
+            if (znana) ryz.push('prologistics zna już tę płatność (była wczytana wcześniej)');
+            if (nfPoCzym(job) === 'fulfilment' && !(rr.ffy || []).length) ryz.push('na stronie auftragu nie ma numeru fulfilmentu — nic nie potwierdza, że to ten auftrag');
+            if (ryz.length){
+                const odp = prompt('RYZYKO PODWÓJNEGO ZAKSIĘGOWANIA — wpłata ' + f2(kwota) + ' na auftrag ' + num + ':\n\n'
+                    + ryz.map(function (s){ return '  ⚠ ' + s; }).join('\n')
+                    + '\n\nAby zaksięgować mimo to, wpisz słowo ZAKSIEGUJ (inaczej nic się nie stanie):', '');
+                if (String(odp == null ? '' : odp).trim().toUpperCase() !== 'ZAKSIEGUJ'){
+                    say('Auftrag ' + ff + ': nie wpisano potwierdzenia — nic nie księguję.', '#c47f00');
+                    return;
+                }
+                mkLog('notfound', '⚠ ' + ff + ' → auftrag ' + num + ': księgowanie mimo ryzyka dubla (' + ryz.join('; ') + ') — potwierdzone wpisaniem słowa');
+            }
+        }
         // Drugi odczyt PO oknie (drugi przeglad 14.10.2026): okno moglo stac otwarte, a w tym czasie ktos zaksiegowal recznie —
         // stary nPay jako punkt odniesienia uznalby wtedy cudza platnosc za nasza.
         btn.disabled = true;
         say('Czytam auftrag ' + num + ' jeszcze raz…');
         const rr2 = await crRead(num);
         btn.disabled = false;
+        // „Open amount pokrywa wplate" dotyczy TYLKO auftragu zywego — pierwszy odczyt wyzej tez ma ten warunek za !rr.deleted.
+        // Skasowany auftrag ma open 0 (wartosc 0), wiec bez tego warunku KAZDE „Zaksięguj mimo delete" na skasowanym auftragu
+        // z formularzem platnosci konczylo sie „zmienil sie, gdy okno bylo otwarte (platnosci 0 → 0, open 0.00)" i nic nie
+        // szlo do zapisu (zgloszenie 22.10.2026, Galaxus CH, paczka 2259248, fulfilment 205445032, auftrag 15856037).
         const zmiana = (!!rr2.deleted !== !!rr.deleted) || (!!rr2.ok !== !!rr.ok) || mkNfFfInny(job, ff, rr2)
-            || (rr.ok && (rr2.nPay !== rr.nPay || rr2.open == null || rr2.open + 0.005 < kwota));
+            || (rr.ok && (rr2.nPay !== rr.nPay || (!rr.deleted && (mimo ? rr2.open !== rr.open : (rr2.open == null || rr2.open + 0.005 < kwota)))));
         if (zmiana){
             Object.assign(kand, { ok: !!rr2.ok, deleted: !!rr2.deleted, open: rr2.open, nPay: rr2.nPay, ffy: rr2.ffy || kand.ffy, err: rr2.err || '' });
             try { rysuj(); } catch (e){}
@@ -68450,10 +69887,16 @@
         const wpis = { num: String(num), kwota: r2(kwota), konto: String(c.acct), data: mkDataNf(job, ff), f: przed == null ? 'reka' : 'wysl',
                        nPrzed: przed, kiedy: mkNfaTeraz(), paczka: String(job.impId || '') };
         // Slad PRZED zapisem — przerwany zapis nie moze zostawic auftragu bez sladu (rozstrzyga mkNfaSkanuj po nPay albo czlowiek).
-        mkNfaZapisz(job, ff, wpis);
+        // Zlecenia nie ma w pamieci (np. „Wyczysc wszystko" w drugiej karcie) = slad nie powstanie, wiec i zapisu nie ma.
+        if (!mkNfaZapisz(job, ff, wpis)){
+            btn.disabled = false;
+            say('Nie odnalazłem zlecenia w pamięci (wyczyszczone w innej karcie?) — nic nie księguję; odśwież stronę.', '#c00');
+            return;
+        }
         mkLog('notfound', '▶ księguję ' + ff + ' → auftrag ' + num + ' (' + (usun ? 'DELETED' : 'ACTIVE') + ') · '
               + f2(kwota) + ' · konto ' + c.acct + ' · data ' + mkDataNf(job, ff)
-              + ' · open ' + (rr.open == null ? '?' : f2(rr.open)) + (juz ? (' · płatności na auftragu: ' + juz) : ''));
+              + ' · open ' + (rr.open == null ? '?' : f2(rr.open)) + (juz ? (' · płatności na auftragu: ' + juz) : '')
+              + (mimo ? ' · z listy „Do wyjaśnienia" (mimo open/płatności/delete, po potwierdzeniu)' : ''));
         say('Księguję ' + ff + ' na auftragu ' + num + '…');
         const r = await crBook(num, mkDataNf(job, ff), c.acct, kwota,
                                String(job.short || job.mp || '') + ' ' + ff);
@@ -68947,7 +70390,11 @@
             // Numer fulfilmentu, wplata i zwrot z tego samego cyklu OBOK SIEBIE. Wczesniej
             // byla to sama lista numerow i zeby sprawdzic, czy pozycja faktycznie sie znosi,
             // trzeba bylo porownywac ja recznie z wierszem „rozliczone i zwrócone".
-            h += '<div style="margin:6px 0"><b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
+            // Paczka zaksiegowana: pozycje NOT FOUND sa w zbiorczej liscie „📋 Do wyjasnienia" (22.10.2026, prosba uzytkownika) —
+            // tu zostaje jedna linia, a tabela jest zwinieta (rozwijana klikiem; nic z jej dzialania nie znika).
+            const nfZwin = !!(jobsK0[kluczJob] || job).booked;
+            h += '<div style="margin:6px 0">' + (nfZwin ? '<details><summary style="cursor:pointer">' : '')
+              +  '<b style="font-size:11px;color:#c00">NOT FOUND (' + nf.length + ')</b>'
               // 5.59.1: bez guzika — auftragi sprawdzaja sie same, ta sama droga co modul „Księgowanie w auftragu".
               +  (mkNfAuto[mkImpWidok]
                     ? ' <span id="mk-nf-stan" style="font-size:11px;color:#5b21b6;font-weight:700">' + esc(mkNfPostepTekst(job, mkImpWidok)) + '</span>'
@@ -68960,6 +70407,7 @@
                             : ' class="mk-lnk"')
                        + ' title="Sprawdza auftragi wierszy NOT FOUND (po ' + MK_NF_NARAZ + ' naraz) — także te, przy których wynik już jest (status auftragu mógł się zmienić). Nie rusza wierszy, na które poszedł zapis.">'
                        + (nfCzeka > 0 ? ('🔍 sprawdź pozostałe (' + nfCzeka + ')') : '↻ sprawdź ponownie') + '</button>'))
+              +  (nfZwin ? (' <span style="font-size:11px;color:#6b7280">— pozycje są w liście „📋 Do wyjaśnienia” (<button id="mk-nf-lista" class="mk-lnk">pokaż listę</button>); kliknij tu, żeby rozwinąć tabelę</span></summary>') : '')
               +  '<div style="font-size:10px;color:#888;margin-top:2px">Prologistics nie znalazł auftragu dla tych numerów. '
               +  'HUB sam sprawdza każdy z nich i mówi obok, co znalazł. Gdy auftrag jest DELETED, a zwrot całej kwoty stoi w tym samym rozliczeniu, wpłata i zwrot znoszą się i nie ma czego księgować. '
               +  'Bywa też, że auftrag ŻYJE, tylko import nie dopasował go po numerze fulfilmentu — wtedy księgujemy wprost, o ile open amount pokrywa wpłatę. '
@@ -69071,7 +70519,7 @@
                   +  '<td style="padding:2px 6px;color:' + colr + '">' + msg + '</td>'
                   +  '<td class="mk-nf-a" data-ff="' + esc(id) + '" style="padding:2px 6px">' + nfKom(job, id, a, rv, (nfIle[id] || 0) > 1) + nfF1Nota(id) + '</td></tr>';
             });
-            h += '</table></div>';
+            h += '</table>' + (nfZwin ? '</details>' : '') + '</div>';
         }
         // Stan guzika bierzemy z ZAPISANEJ flagi, nie z samego licznika: prologistics
         // po zaksiegowaniu nadal oddaje te wiersze jako OK, wiec licznik nie odroznia
@@ -69126,9 +70574,11 @@
                   +  'a po zaksięgowaniu jego poprawienie to już grzebanie w zaksięgowanych pozycjach.">'
                   +  'Zaksięguj mimo to</button>';
         } else {
-            h += '<button id="mk-book"' + (canBook ? '' : ' disabled')
-              +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (canBook ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (canBook ? 'pointer' : 'default') + ';font-size:11px">'
-              +  (jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')')
+            const kTrwa = mkKsEtykietaPaczki(job.impId);          // zapis tej paczki w toku (z widoku albo z „Zaksięguj paczki")
+            const mozeB = canBook && !kTrwa;
+            h += '<button id="mk-book"' + (mozeB ? '' : ' disabled')
+              +  ' style="padding:5px 12px;border:none;border-radius:6px;background:' + (mozeB ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (mozeB ? 'pointer' : 'default') + ';font-size:11px">'
+              +  (kTrwa ? kTrwa : jbNow.booked ? ('✔ Zaksięgowane (' + ok.length + ')')
                   : ('▶ Zaksięguj OK (' + ok.length + ')' + (kup.length ? ((job.kind === 'kfl' ? ' + wielosztukowe (' : ' + kupony (') + kup.length + ')') : ''))) + '</button>';
             if (f1Widok.stop && !jbNow.booked) h += '<span style="font-size:11px;color:#c47f00">' + esc(f1Widok.stop) + '</span>';
             const biegN = jestAmz ? mkTypBieg[jbNow.ref] : null;
@@ -69171,6 +70621,19 @@
         if (nfStart) nfAutoStart(job, d, nfDoSpr).catch(function (e){
             say('Sprawdzanie auftragów NOT FOUND: ' + ((e && e.message) || e), '#c00');
         });
+        const nl = box.querySelector('#mk-nf-lista');
+        if (nl) nl.onclick = async function(){
+            if (mkPrzelotTrwa() || mkWid.book || mkKsiegBieg){ say('Trwa pobieranie albo księgowanie — pokaż listę po jego zakończeniu.', '#c47f00'); return; }
+            nl.disabled = true;
+            try {
+                const gotowe = {}; gotowe[String(job.impId)] = rows;          // tę paczkę już mamy — bez drugiego odczytu
+                const ile = await mkProbSkanuj(gotowe, false);
+                say('Do wyjaśnienia: ' + ile.n + ' poz. (NOT FOUND ' + ile.nf + ', CHECK ' + ile.chk + ') w ' + ile.m + ' paczkach.', ile.n ? '#c47f00' : '#0a7a2f');
+                const pb = document.getElementById('mk-prob-box');
+                if (pb) pb.scrollIntoView({ block: 'nearest' });
+            } catch (e){ say('Lista do wyjaśnienia: ' + ((e && e.message) || e), '#c00'); }
+            finally { nl.disabled = false; }
+        };
         box.querySelectorAll('.mk-nf-hdtick').forEach(function (b){
             b.onclick = function(){
                 doHdNaTicket(b.getAttribute('data-k'), b.getAttribute('data-ff'), b.getAttribute('data-num'),
@@ -69333,6 +70796,7 @@
                     return;
                 }
                 await impBook(job.impId, idsB);
+                const pomW = mkKsPominieteOpis(job.impId);
                 const jobs = jobsLoad();
                 const kj = kluczJob;
                 if (jobs[kj]){
@@ -69359,6 +70823,7 @@
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
                 render();
                 await impCheck(kj);                      // stan po ksiegowaniu, prosto z systemu
+                if (pomW) say('⚠ ' + pomW + ' — świeży odczyt tuż przed zapisem; nie księgowałem tych wierszy drugi raz.', '#c47f00');
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
                 bb.disabled = false;
@@ -69764,6 +71229,11 @@
             return !(j.koncSpr && j.koncSpr.n === 0 && j.koncSpr.tol === tol && j.koncSpr.notka === p.tekst);
         });
     }
+    // Samoczynne ksiegowanie koncowek po „▶ Zaksięguj paczki" (22.10.2026) — domyslnie WLACZONE (prosba uzytkownika),
+    // wylaczane checkboxem w zestawieniu; ustawienie jest na komputerze (GM).
+    const MK_KONC_AUTO_KEY = 'mkt_konc_auto';
+    function mkKoncAuto(){ try { return String(GM_getValue(MK_KONC_AUTO_KEY, '1')) !== '0'; } catch (e){ return true; } }
+    function mkKoncAutoSet(v){ try { GM_setValue(MK_KONC_AUTO_KEY, v ? '1' : '0'); } catch (e){} }
     let mkKonc = null;                     // ostatnie zestawienie: { pakiety: [{ k, j, rows, err, stop }], tol }
     // gotowe: numer paczki -> wiersze odczytane chwile wczesniej (guzik zbiorczy), zeby nie czytac drugi raz.
     // tylkoGdyJest: sekcji nie pokazujemy, gdy nie ma czego ksiegowac ani dokonczyc (wolanie po ksiegowaniu zbiorczym).
@@ -69862,10 +71332,14 @@
               + (ile.dok ? (' · do dokończenia ' + ile.dok) : '') + '</span>'
               + '<span style="font-size:11px;color:#666">tolerancja do <input id="mk-konc-tol" value="' + esc(String(tol)) + '" style="width:56px;font-size:11px">'
               + ' <button id="mk-konc-tol-ok" class="mk-lnk">zastosuj</button> (ta sama, co w widoku paczki)</span>'
+              + '<label style="font-size:11px;color:#374151;cursor:pointer" title="Po „▶ Zaksięguj paczki" HUB sam czyta paczki od nowa i księguje końcówki w tolerancji na subkonto, bez pytania. Wyłącz, żeby wracało okno potwierdzenia.">'
+              + '<input type="checkbox" id="mk-konc-auto"' + (mkKoncAuto() ? ' checked' : '') + '> księguj same po „▶ Zaksięguj paczki"</label>'
               + '<button id="mk-konc-x" class="mk-lnk">✕ zamknij</button></div>'
-              + '<div style="font-size:10px;color:#6b7280;margin-bottom:4px">Wiersze CHECK z zaksięgowanych paczek, których open amount mieści się w tolerancji — '
-              + 'tak samo jak „Ustaw OK i zaksięguj na subkoncie" w widoku paczki, tylko ze wszystkich paczek naraz (Book on sub-account, bez przypisania).</div>';
-        if (!pak.length) h += '<div style="font-size:11px;color:#0a7a2f">Żadna zaksięgowana paczka nie ma zostawionych wierszy CHECK.</div>';
+              + '<div style="font-size:10px;color:#6b7280;margin-bottom:4px">Wiersze CHECK z zaksięgowanych paczek, których open amount mieści się w tolerancji (±) — '
+              + 'tak samo jak „Ustaw OK i zaksięguj na subkoncie" w widoku paczki, tylko ze wszystkich paczek naraz (Book on sub-account, bez przypisania — '
+              + 'subkonto z ustawienia importu, zwykle 8100).</div>';
+        if (!mkKonc) h += '<div style="font-size:11px;color:#6b7280">Tu ustawiasz tolerancję i samoczynne księgowanie końcówek. Zestawienie wierszy rysuje się po „▶ Zaksięguj paczki” (gdy są końcówki) albo guzikiem „💰 Końcówki na subkonto” przy krokach — ten guzik pojawia się, gdy zaksięgowane paczki mają wiersze CHECK.</div>';
+        else if (!pak.length) h += '<div style="font-size:11px;color:#0a7a2f">Żadna zaksięgowana paczka nie ma zostawionych wierszy CHECK.</div>';
         if (wiersze.length){
             h += '<table style="border-collapse:collapse;font-size:11px;margin-bottom:6px"><tr style="color:#6b7280">'
                + '<td style="' + td + '">paczka</td><td style="' + td + '">sklep</td><td style="' + td + '">data</td>'
@@ -69897,7 +71371,7 @@
                           + ' <button class="mk-konc-jeszcze mk-lnk" data-k="' + esc(kk) + '">↻ nie weszło — dołącz do zapisu</button></div>';
                  }).join('');
         }
-        if (poza > 0) h += '<div style="font-size:10px;color:#6b7280;margin-top:4px">poza tolerancją zostaje CHECK: ' + poza + ' — te do wyjaśnienia w widoku paczki („🔍 Otwórz paczkę")</div>';
+        if (poza > 0) h += '<div style="font-size:10px;color:#6b7280;margin-top:4px">poza tolerancją zostaje CHECK: ' + poza + ' — wszystkie takie pozycje są w liście „📋 Do wyjaśnienia” (podział na marketplace’y) albo w widoku paczki („🔍 Otwórz paczkę")</div>';
         if (pomin.length) h += '<div style="font-size:10px;color:#b45309;margin-top:4px">pominięte: ' + esc(pomin.join(' · ')) + '</div>';
         b.innerHTML = h;
         b.style.display = 'block';
@@ -69908,6 +71382,14 @@
             const v = Number(String(b.querySelector('#mk-konc-tol').value || '').replace(',', '.'));
             if (!isFinite(v) || v < 0){ say('Podaj liczbę, np. 0.05.', '#c47f00'); return; }
             tolSet(v); mkKoncRysuj();
+            try { krokiMaluj(); } catch (e){}                  // napis przy krokach („💰 końcówki ±…") ma pokazywac te sama wartosc
+        };
+        const aut = b.querySelector('#mk-konc-auto');
+        if (aut) aut.onchange = function(){
+            mkKoncAutoSet(aut.checked);
+            try { krokiMaluj(); } catch (e){}
+            say(aut.checked ? 'Końcówki w tolerancji będą księgowane same po „▶ Zaksięguj paczki".'
+                            : 'Końcówki po „▶ Zaksięguj paczki" zostają w zestawieniu — zaksięgujesz je tym guzikiem, z potwierdzeniem.', '#0a7a2f');
         };
         const go = b.querySelector('#mk-konc-go');
         if (go) go.onclick = function(){
@@ -69927,24 +71409,29 @@
             };
         });
     }
-    async function mkKoncKsieguj(btn){
-        if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
-        if (mkWid.book || mkKsiegBieg){ say('Trwa księgowanie — końcówki zaksięgujesz po jego zakończeniu.', '#c47f00'); return; }
+    // Ksiegowanie koncowek (CHECK w tolerancji) na subkonto. auto = true: wolane z „▶ Zaksięguj paczki" (mkPoKsiegowaniu) bez
+    // pytania — wlasna zgoda uzytkownika z 22.10.2026 („automatycznie ksiegowalo na konto 8100 koncowki do 0.05 +/-"); w tym
+    // trybie nie ma okna potwierdzenia ani guzika (btn = null), a wynik wraca do wolajacego. Reszta zabezpieczen bez zmian:
+    // swiezy odczyt kazdej paczki tuz przed zapisem, bramki typow i Furniture 1, slad zapisu, open 0 nigdy.
+    async function mkKoncKsieguj(btn, auto){
+        const pusty = function (powod){ return { paczek: 0, wierszy: 0, bad: powod ? [powod] : [], plan: 0 }; };
+        if (mkPrzelotTrwa()){ if (!auto) say('Trwa pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return pusty(auto ? 'trwa pobieranie zestawień' : ''); }
+        if ((mkWid.book && !auto) || mkKsiegBieg){ if (!auto) say('Trwa księgowanie — końcówki zaksięgujesz po jego zakończeniu.', '#c47f00'); return pusty(auto ? 'trwa inne księgowanie' : ''); }
         const tol = tolGet();
         // Tolerancja zmieniona gdzie indziej (widok paczki) — tabela pokazuje inny zbior niz ten, ktory by poszedl.
         if (!mkKonc || mkKonc.tol !== tol){
             mkKoncRysuj();
-            say('Tolerancja zmieniła się (teraz do ' + f2(tol) + ') — przeliczyłem zestawienie, sprawdź je i kliknij jeszcze raz.', '#c47f00');
-            return;
+            if (!auto) say('Tolerancja zmieniła się (teraz do ' + f2(tol) + ') — przeliczyłem zestawienie, sprawdź je i kliknij jeszcze raz.', '#c47f00');
+            return pusty(auto ? 'tolerancja zmieniła się w trakcie' : '');
         }
         const jobs0 = jobsLoad();
         const plan = ((mkKonc && mkKonc.pakiety) || []).filter(function (p){ return !p.err && !p.stop; })
             .map(function (p){ return { p: p, w: mkKoncWiersze(p.rows, tol), d: mkKoncDokoncz(p, jobs0) }; })
             .filter(function (x){ return x.w.length || x.d.length; });
-        if (!plan.length){ mkKoncRysuj(); say('W tolerancji do ' + f2(tol) + ' nie ma nic do zaksięgowania — zestawienie odświeżone.', '#c47f00'); return; }
+        if (!plan.length){ mkKoncRysuj(); if (!auto) say('W tolerancji do ' + f2(tol) + ' nie ma nic do zaksięgowania — zestawienie odświeżone.', '#c47f00'); return pusty(''); }
         let n = 0, suma = 0;
         plan.forEach(function (x){ n += x.w.length + x.d.length; x.w.forEach(function (y){ suma = r2(suma + (impNum(y.open_amount) || 0)); }); });
-        if (!confirm('Zaksięgować ' + n + ' końcówek z ' + plan.length + ' paczek na subkoncie (open amount razem ' + f2(suma) + ')?\n\n'
+        if (!auto && !confirm('Zaksięgować ' + n + ' końcówek z ' + plan.length + ' paczek na subkoncie (open amount razem ' + f2(suma) + ')?\n\n'
             + plan.map(function (x){
                   return '  • paczka ' + x.p.j.impId + '  ' + (mkShort(x.p.j) || x.p.j.mp || '') + ' ' + (x.p.j.date || '') + ': '
                        + x.w.map(function (y){ return String(y.payment_descr == null ? '' : y.payment_descr) + ' wpłata ' + f2(impNum(y.amount)) + ', open ' + f2(impNum(y.open_amount)); })
@@ -69952,8 +71439,8 @@
               }).join('\n')
             + '\n\nOdpowiada to ręcznej zmianie statusu na OK i przyciskowi „Book on sub-account" w każdej paczce. '
             + 'Każdą paczkę czytam jeszcze raz tuż przed zapisem — idą tylko wiersze, które dalej są CHECK w tolerancji.'
-            + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-        btn.disabled = true;
+            + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return pusty('');
+        if (btn) btn.disabled = true;
         const msg = document.getElementById('mk-konc-msg');
         let paczek = 0, wierszy = 0;
         const bad = [], zapisane = {};
@@ -69993,7 +71480,9 @@
                     faza = 'sub';
                     await impBookSub(imp, ids);
                     faza = 'po';
-                    paczek++; wierszy += ids.length; zapisane[String(imp)] = x.p.j;
+                    const pomK = mkKsPominieteOpis(imp), nPomK = (mkKsRaport[String(imp)] || { pominiete: [] }).pominiete.length;
+                    if (pomK) bad.push(pomK + ' — nie wysłałem ich drugi raz');
+                    paczek++; wierszy += Math.max(0, ids.length - nPomK); zapisane[String(imp)] = x.p.j;
                     // Otwarty widok tej paczki ma jeszcze czynne „Ustaw OK i zaksięguj na subkoncie" z migawki — gasimy od razu.
                     if (mkImpWidok === String(imp)){
                         const bx = document.getElementById('mk-imp-box'), g = bx ? bx.querySelector('#mk-fix') : null;
@@ -70036,7 +71525,7 @@
             }
         } finally {
             mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1);
-            btn.disabled = false;
+            if (btn) btn.disabled = false;
         }
         // Otwarty widok paczki, na ktora poszedl zapis — od nowa, ze swiezego odczytu (nie ze starej migawki).
         const bxW = document.getElementById('mk-imp-box');
@@ -70046,8 +71535,638 @@
         }
         render();
         mkKoncRysuj();
-        say('Końcówki na subkoncie: zaksięgowane ' + wierszy + ' poz. w ' + paczek + ' z ' + plan.length + ' paczek'
+        // Samoczynnie wolany (auto) oddaje wynik wolajacemu, ktory sklada jeden komunikat z calego przebiegu.
+        if (!auto) say('Końcówki na subkoncie: zaksięgowane ' + wierszy + ' poz. w ' + paczek + ' z ' + plan.length + ' paczek'
             + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.'), bad.length ? '#c47f00' : '#0a7a2f');
+        return { paczek: paczek, wierszy: wierszy, bad: bad, plan: plan.length };
+    }
+    // ===== Po ksiegowaniu paczek: odczyt od nowa, koncowki same, NOT FOUND i zbiorcza lista reszty (22.10.2026) =====
+    // Zgloszenie: po „▶ Zaksięguj paczki" w kazdej paczce (Galaxus CH 2259248 i 2259249) trzeba bylo wchodzic i recznie
+    // ksiegowac koncowki, a NOT FOUND i CHECK ogladac osobno w kazdej paczce. Przyczyna: stan wierszy zmienia sie DOPIERO po
+    // zapisie — wiersz OK (wplata 59.97 wobec auftragu na 59.98) po ksiegowaniu robi sie CHECK z open amount 0.01, a notatka
+    // „zostaly w paczce" liczyla sie z planu sprzed zapisu, wiec zbiorcze „Koncowki" takiej paczki nie widzialy. Teraz kazda
+    // zaksiegowana paczka jest czytana od nowa; z tego odczytu liczy sie notatka, koncowki w tolerancji ida same na subkonto
+    // (mkKoncAuto, domyslnie wlaczone), auftragi NOT FOUND sprawdzaja sie jak dotad, a cala reszta (CHECK poza tolerancja i
+    // NOT FOUND) laduje w jednej liscie podzielonej na marketplace'y (mkProb*).
+    async function mkPoKsiegowaniu(zaks){
+        const wynik = { po: {}, konc: null, koncAuto: null, nfa: null, prob: null };
+        const tol = tolGet();
+        for (let i = 0; i < zaks.length; i++){
+            const p = zaks[i], id = String(p.j.impId);
+            say('Sprawdzam paczkę po księgowaniu ' + (i + 1) + ' z ' + zaks.length + ' — ' + id + '…');
+            try { wynik.po[id] = (await impRows(id)).rows; }
+            catch (e){ wynik.po[id] = p.rows || []; mkLog('notfound', '✖ odczyt paczki ' + id + ' po księgowaniu: ' + ((e && e.message) || e) + ' — zostaje stan sprzed księgowania'); }
+        }
+        // Notatka „zostały w paczce" z tego, co JEST w paczce po zapisie (nie z planu sprzed zapisu). Wiersze CHECK ksiegowane
+        // razem z OK (kupony Shöpping, sztuki Kauflanda) nie licza sie. Pusty odczyt nie zdejmuje notatki.
+        const jobs = jobsLoad(); let zm = false;
+        zaks.forEach(function (p){
+            const jj = jobs[mkKlucz(p.j)];
+            if (!jj || !jj.booked) return;
+            const rows = wynik.po[String(p.j.impId)] || [];
+            if (!rows.length) return;
+            const kz = {};
+            (jj.kupZaks || []).forEach(function (id){ kz[String(id)] = 1; });
+            const nChk = rows.filter(function (x){ return String(x.state) === 'CHECK' && !kz[String(x.id)]; }).length;
+            const nNf = impNfZostaje(jj, rows);
+            if (nChk || nNf)
+                mkProblemUstawW(jj, 'ksiegowanie', 'księgowanie paczki ' + p.j.impId,
+                    'zaksięgowane ' + p.nZaks + ' poz., ale zostały w paczce: '
+                    + [nChk ? ('CHECK ' + nChk) : '', nNf ? ('NOT FOUND ' + nNf) : ''].filter(Boolean).join(', ')
+                    + ' — te pozycje nie weszły');
+            else mkProblemZdejmijZ(jj, 'ksiegowanie');
+            zm = true;
+        });
+        if (zm){ jobsSave(jobs); try { render(); } catch (e){} }       // lista zlecen pokazuje notatki — od razu ze stanu po zapisie
+        // Koncowki w tolerancji (±): zestawienie i — gdy wlaczone — samoczynny zapis na subkonto.
+        if (zaks.some(function (p){ return mkKoncWiersze(wynik.po[String(p.j.impId)], tol).length; })){
+            try { wynik.konc = await mkKoncSkanuj(wynik.po, true); } catch (e){ wynik.konc = null; }
+            if (wynik.konc && wynik.konc.n && mkKoncAuto()){
+                try { wynik.koncAuto = await mkKoncKsieguj(null, true); }
+                catch (e){ wynik.koncAuto = { paczek: 0, wierszy: 0, bad: [(e && e.message) || String(e)], plan: 0 }; }
+            }
+            // Wiersze po zapisie koncowek (zestawienie je odswiezylo) — lista reszty ma byc ze stanu PO nim.
+            ((mkKonc && mkKonc.pakiety) || []).forEach(function (pk){ if (!pk.err && pk.rows) wynik.po[String(pk.j.impId)] = pk.rows; });
+        }
+        // NOT FOUND z auftragiem (14.10.2026): wlasnie zaksiegowane paczki z pozycjami NOT FOUND, ktore „zostaja" — auftragi
+        // sprawdzaja sie od razu (wszystkie, nie tylko ze zwrotem), a te do zaksiegowania wprost ida do zestawienia.
+        const nfTylko = {}, nfGot = {};
+        zaks.forEach(function (p){
+            const jj = jobsLoad()[mkKlucz(p.j)], id = String(p.j.impId), rows = wynik.po[id] || [];
+            if (jj && jj.booked && impNfZostaje(jj, rows)){ nfTylko[id] = 1; nfGot[id] = rows; }
+        });
+        if (Object.keys(nfTylko).length){
+            try { wynik.nfa = await mkNfaSkanuj(nfGot, nfTylko, true); }
+            catch (e){ wynik.nfa = null; mkLog('notfound', '✖ NOT FOUND na auftragach po księgowaniu: ' + ((e && e.message) || e)); }
+        }
+        try { wynik.prob = await mkProbSkanuj(wynik.po, true); }
+        catch (e){ wynik.prob = null; mkLog('notfound', '✖ lista do wyjaśnienia: ' + ((e && e.message) || e)); }
+        return wynik;
+    }
+    // ----- Zbiorcza lista „do wyjasnienia": NOT FOUND i CHECK ze WSZYSTKICH zaksiegowanych paczek, wg marketplace'ow -----
+    // Bez wchodzenia w kazda paczke. NIE zawiera: koncowek w tolerancji (maja swoja sekcje i ida na subkonto), wierszy CHECK
+    // z open amount 0 (druga wplata do oplaconego auftragu — nie ma czego wyjasniac; tylko licznik), wierszy CHECK
+    // zaksiegowanych razem z OK (kupZaks) i NOT FOUND, ktore sie znosza ze zwrotem albo zostaly zaksiegowane wprost na auftragu.
+    let mkProb = null;                     // { pakiety: [{ k, j, rows, err }], tol }
+    let mkProbNfSprBieg = false;           // trwa zbiorcze „🔍 sprawdź auftragi NOT FOUND" z listy (przerysowanie listy nie wlacza guzika)
+    // Slad ksiegowania wiersza z listy (j.probWisi): id wiersza -> { d: numer, f: 'stan' | 'book', t }. Zapisywany PRZED
+    // pierwszym zapytaniem („Zmien na OK i zaksieguj"): 'stan' — status OK ustawiany, zapis na konto glowne jeszcze nie wyslany;
+    // 'book' — zapis wyslany albo mogl wyjsc, wynik nieznany. Wiersz ze sladem, ktory jest OK i bez platnosci, wraca na liste
+    // jako „do dokonczenia" (bez tego przerwany zapis zostawialby wiersz OK bez ksiegowania i bez sladu — jak kiedys koncowki).
+    function mkProbSlad(j){ return (j && j.probWisi && typeof j.probWisi === 'object') ? j.probWisi : {}; }
+    function mkProbPaczki(jobs){
+        return (jobs || jobList()).filter(function (j){
+            if (!j || !j.impId || !j.booked) return false;
+            if (Object.keys(mkProbSlad(j)).length) return true;
+            const p = mkProblemyZ(j).ksiegowanie;
+            return !!(p && /(CHECK|NOT FOUND) \d/.test(String(p.tekst)));
+        });
+    }
+    function mkProbRynek(j){ return mkShort(j) || (j.data && j.data.shop) || j.mp || '?'; }
+    function mkProbWiersze(j, rows, tol){
+        const kz = {}, sl = mkProbSlad(j);
+        ((j && j.kupZaks) || []).forEach(function (id){ kz[String(id)] = 1; });
+        const chk = [], zeraL = [], dok = [];
+        let konc = 0;
+        (rows || []).forEach(function (x){
+            const id = String(x.id);
+            if (sl[id] && String(x.state) === 'OK' && !mkKsWierszZaks(x)){ dok.push({ x: x, s: sl[id] }); return; }
+            // Wiersz CHECK z platnoscia (zaksiegowany recznie albo przez kogos innego po zmianie statusu) nie jest do wyjasnienia.
+            if (String(x.state) !== 'CHECK' || kz[id] || mkKsWierszZaks(x)) return;
+            const o = impNum(x.open_amount);
+            if (o != null && Math.abs(o) < 0.005){ zeraL.push(x); return; }
+            if (o != null && Math.abs(o) <= tol && String(x.auction_number || '').trim()){ konc++; return; }
+            chk.push(x);
+        });
+        return { chk: chk, nf: impNfZostajeRows(j, rows), konc: konc, zera: zeraL.length, zeraL: zeraL, dok: dok };
+    }
+    // Slady z listy, ktore nic juz nie znacza: wiersza nie ma, jest zaksiegowany albo jego status wrocil z OK (zmiana nie weszla).
+    function mkProbPorzadek(pakiety){
+        const jobs = jobsLoad(); let zm = false;
+        (pakiety || []).forEach(function (p){
+            // Pusty odczyt (blad, pusta paczka) nie jest dowodem, ze wierszy nie ma — bez tego zdjelibysmy slady „do dokonczenia".
+            if (!p || p.err || !p.rows || !p.rows.length) return;
+            const jj = mkKoncJob(jobs, p).j, sl = mkProbSlad(jj);
+            const ids = Object.keys(sl);
+            if (!ids.length) return;
+            const by = {};
+            (p.rows || []).forEach(function (x){ by[String(x.id)] = x; });
+            ids.forEach(function (id){
+                const x = by[id];
+                if (!x || mkKsWierszZaks(x) || String(x.state) !== 'OK'){ delete sl[id]; zm = true; }
+            });
+            if (Object.keys(sl).length) jj.probWisi = sl; else delete jj.probWisi;
+        });
+        if (zm) jobsSave(jobs);
+    }
+    // Notatka „zostaly w paczce" przeliczona z odczytu PO zapisie z listy (tak samo jak w mkPoKsiegowaniu).
+    function mkProbNotatka(p, rows){
+        if (!rows || !rows.length) return;
+        const jobs = jobsLoad(), z = mkKoncJob(jobs, p), jj = z.j;
+        if (!jj || !jj.booked) return;
+        const kz = {}, sl = mkProbSlad(jj);
+        (jj.kupZaks || []).forEach(function (id){ kz[String(id)] = 1; });
+        const nChk = rows.filter(function (x){ return String(x.state) === 'CHECK' && !kz[String(x.id)] && !mkKsWierszZaks(x); }).length;
+        // Wiersz, ktoremu HUB ustawil OK, a ksiegowanie nie weszlo (slad z listy) tez „nie wszedl" — bez niego notatka by schodzila.
+        const nDok = rows.filter(function (x){ return sl[String(x.id)] && String(x.state) === 'OK' && !mkKsWierszZaks(x); }).length;
+        const nNf = impNfZostaje(jj, rows);
+        const stary = mkProblemyZ(jj).ksiegowanie;
+        const m = stary ? /^(zaksięgowane \d+ poz\., ale )/.exec(String(stary.tekst)) : null;
+        if (nChk || nNf || nDok){
+            const tekst = (m ? m[1] : 'zaksięgowane, ale ') + 'zostały w paczce: '
+                + [nChk ? ('CHECK ' + nChk) : '', nNf ? ('NOT FOUND ' + nNf) : '', nDok ? ('do dokończenia ' + nDok) : ''].filter(Boolean).join(', ')
+                + ' — te pozycje nie weszły';
+            if (stary && String(stary.tekst) === tekst) return;          // bez zmiany — bez zapisu (zapis rusza synchronizacje notatek z arkuszem)
+            mkProblemUstawW(jj, 'ksiegowanie', 'księgowanie paczki ' + p.j.impId, tekst);
+        } else if (stary) mkProblemZdejmijZ(jj, 'ksiegowanie');
+        else return;
+        jobsSave(jobs);
+    }
+    async function mkProbSkanuj(gotowe, tylkoGdyJest){
+        const lista = mkProbPaczki();
+        const tol = tolGet();
+        const pakiety = [];
+        for (let i = 0; i < lista.length; i++){
+            const j = lista[i];
+            let rows = (gotowe && gotowe[String(j.impId)]) || null, err = '';
+            if (!rows){
+                say('Lista do wyjaśnienia: czytam paczkę ' + (i + 1) + ' z ' + lista.length + ' — ' + j.impId + '…');
+                try { rows = (await impRows(j.impId)).rows; }
+                catch (e){ err = (e && e.message) || String(e); rows = []; }
+            }
+            pakiety.push({ k: mkKlucz(j), j: j, rows: rows, err: err });
+        }
+        mkProbPorzadek(pakiety);
+        // Zlecenia po porzadkowaniu sladow (probWisi) — lista rysuje sie ze swiezych obiektow.
+        const jb = jobsLoad();
+        pakiety.forEach(function (p){ const z = mkKoncJob(jb, p).j; if (z) p.j = z; });
+        mkProb = { pakiety: pakiety, tol: tol };
+        const ile = mkProbIle();
+        if (!tylkoGdyJest || ile.n || ile.zera || ile.konc) mkProbRysuj();
+        return ile;
+    }
+    function mkProbIle(){
+        const tol = (mkProb && mkProb.tol != null) ? mkProb.tol : tolGet();
+        let n = 0, chk = 0, nf = 0, m = 0, zera = 0, konc = 0, dok = 0;
+        const rynki = {};
+        ((mkProb && mkProb.pakiety) || []).forEach(function (p){
+            if (p.err) return;
+            const w = mkProbWiersze(p.j, p.rows, tol);
+            zera += w.zera; konc += w.konc;
+            if (!w.chk.length && !w.nf.length && !w.dok.length) return;
+            m++; chk += w.chk.length; nf += w.nf.length; dok += w.dok.length; n += w.chk.length + w.nf.length + w.dok.length;
+            rynki[mkProbRynek(p.j)] = 1;
+        });
+        return { n: n, chk: chk, nf: nf, dok: dok, m: m, rynki: Object.keys(rynki).length, zera: zera, konc: konc };
+    }
+    function mkProbBox(){
+        let b = document.getElementById('mk-prob-box');
+        if (!b){
+            const za = $('#mk-nfa-box') || $('#mk-konc-box') || $('#mk-imp-box');
+            if (!za) return null;
+            b = document.createElement('div');
+            b.id = 'mk-prob-box';
+            b.style.cssText = 'display:none;margin:10px 0;padding:10px 12px;border:1px solid #fca5a5;border-radius:8px;background:#fff7f7';
+            za.insertAdjacentElement('afterend', b);
+        }
+        return b;
+    }
+    // Opis wiersza NOT FOUND tekstem (bez guzikow — te sa w widoku paczki i w „🔎 NOT FOUND na auftragach"). Wynik sprawdzenia
+    // auftragu (mkNfState) zyje w pamieci strony: po przeladowaniu wiersz jest „niesprawdzony", dopoki nie ruszy sprawdzanie.
+    function mkProbNfTekst(j, x){
+        const ff = nfNumer(x), kw = impNum(x.amount);
+        const lnk = function (n){ return '<a href="/auction.php?number=' + esc(n) + '&txnid=3" target="_blank">' + esc(n) + '</a>'; };
+        const sl = ff ? mkNfaSlad(j)[ff] : null;
+        if (sl && sl.f !== 'ok') return '⚠ wysłane na auftrag ' + lnk(sl.num) + ' bez potwierdzenia — rozstrzyga „🔎 NOT FOUND na auftragach"';
+        const st = ff ? mkNfState[ff] : null;
+        if (!st) return '<span style="color:#6b7280">niesprawdzony — „🔍 sprawdź auftrag" (przycisk obok) szuka go po numerze</span>';
+        if (st.zaks) return '✔ zaksięgowane ' + esc(mkCzasLok(st.zaks));
+        if (st.err) return esc(st.err);
+        if (st.stan === 'brak') return 'nie ma auftragu o tym numerze fulfilmentu';
+        if (st.f1Blokuj) return esc(st.f1Blokuj);
+        const k = st.kand || [];
+        if (st.stan !== 'sprawdzone' || !k.length) return '<span style="color:#6b7280">sprawdzam…</span>';
+        if (k.length > 1) return 'kilka auftragów: ' + k.map(function (c){ return lnk(c.num) + (c.deleted ? ' <b>DELETED</b>' : ''); }).join(', ') + ' — ręcznie';
+        const c = k[0];
+        if (mkNfFfInny(j, ff, c)) return 'auftrag ' + lnk(c.num) + (c.deleted ? ' <b>DELETED</b>' : '') + ' ma inny numer fulfilmentu — sprawdź ręcznie';
+        if (c.deleted){
+            const rv = (j.data && j.data.ref && j.data.ref[ff] != null) ? Math.abs(j.data.ref[ff]) : null;
+            return 'auftrag ' + lnk(c.num) + ' <b>DELETED</b>' + (rv != null ? (' · zwrot w tym cyklu ' + f2(rv))
+                 : ' · brak zwrotu w tym cyklu — wpłatę można zaksięgować mimo delete (przycisk obok)');
+        }
+        if (!c.ok) return esc(c.err || 'nie odczytałem auftragu');
+        let t = 'auftrag ' + lnk(c.num) + ' istnieje (open ' + (c.open == null ? '?' : f2(c.open)) + ')';
+        if (j.kind === 'hd' && c.open != null && Math.abs(c.open) <= 0.005 && (c.tickety || []).length) t += ' — Homedeco: wpłata idzie do ticketu na minus („↓ Wpłata na minus w tickecie” w widoku paczki)';
+        else if ((c.nPay || 0) > 0) t += ' · są już płatności (' + c.nPay + ') — sprawdź, czy wpłaty nie zaksięgowano ręcznie';
+        else if (c.open != null && kw != null && c.open + 0.005 >= kw) t += ' — do zaksięgowania w „🔎 NOT FOUND na auftragach"';
+        else t += ' — open amount nie pokrywa wpłaty: księguj mimo (przycisk obok) albo ręcznie';
+        return t;
+    }
+    function mkProbCheckTekst(x){
+        const a = impNum(x.amount), o = impNum(x.open_amount);
+        const znany = String(x.already_imported) === '1' || String(x.already_imported_flag) === '1';
+        let t = '';
+        if (o == null) t = 'brak open amount w odczycie paczki';
+        else if (a != null && o > a + 0.005) t = 'open amount większy od wpłaty o ' + f2(r2(o - a)) + ' — auftrag ma więcej do zapłaty niż ta wpłata';
+        else if (a != null) t = 'open amount mniejszy od wpłaty o ' + f2(r2(a - o)) + ' — auftrag mógł być już opłacony';
+        return esc(t) + (znany ? ' · ⚠ prologistics zna już tę płatność' : '');
+    }
+    // ----- Akcje z listy „Do wyjasnienia" (22.10.2026) -----
+    // Prosba: „opcja ksiegowania, ksieguj mimo open amount = 0 i mimo delete w do wyjasnienia, to samo z check — zmien na OK
+    // i ksieguj". NOT FOUND: guzik przy wierszu (po sprawdzeniu auftragu) idzie ta sama droga co w widoku paczki (nfKsieguj),
+    // tylko z opcja mimo — okno pokazuje platnosci na auftragu i ostrzega o nadplacie. CHECK: zmiana statusu na OK i „Book on
+    // main account" (impState + impBook, czyli z blokada paczki, swiezym odczytem i testem spokoju), pojedynczo, po oknie z
+    // open amount z paczki i z auftragu. Wiersze z open amount 0 siedza w osobnej, zwinietej sekcji i tez ida tylko pojedynczo.
+    // Zbiorczego „ksieguj wszystko" nie ma celowo — kazda nadplata to decyzja czlowieka przy konkretnym wierszu.
+    function mkProbNfAkcja(p, x, dubel){
+        const j = p.j, ff = nfNumer(x), kw = impNum(x.amount);
+        if (!ff || kw == null || !(kw > 0.005) || dubel) return '';     // wplata zerowa albo ujemna to nie wplata do zaksiegowania na auftrag
+        if (mkNfaSlad(j)[ff]) return '';                         // slad zapisu (zaksiegowane albo bez potwierdzenia) — opis w kolumnie obok
+        const st = mkNfState[ff];
+        const przycisk = function (cls, kol, txt, tytul, dane){
+            return ' <button class="' + cls + ' mk-lnk" data-k="' + esc(p.k) + '" data-ff="' + esc(ff) + '"' + (dane || '')
+                 + ' title="' + esc(tytul) + '" style="color:' + kol + ';font-weight:700">' + txt + '</button>';
+        };
+        if (!st || mkNfNieudane(st) || (!st.stan && !st.err && !(st.kand || []).length))
+            return przycisk('mk-prob-nfspr', '#5b21b6', '🔍 sprawdź auftrag', 'Szuka auftragu po numerze fulfilmentu i czyta jego stan (open amount, płatności, DELETED).');
+        if (st.stan !== 'sprawdzone' || (st.kand || []).length !== 1 || st.zaks || st.wyslane || st.f1Blokuj) return '';
+        const c = st.kand[0];
+        if (mkNfFfInny(j, ff, c) || (!c.ok && !c.deleted)) return '';
+        if (j.kind === 'hd' && !c.deleted && c.open != null && Math.abs(c.open) <= 0.005 && (c.tickety || []).length) return '';   // Homedeco: wpłata na minus w tickecie (widok paczki)
+        const pow = [];
+        if (c.deleted){
+            // Zwrot tego zamowienia w tym cyklu, ale NIE na cala wplate (zwrot czesciowy): nie wiadomo, czy wplata ma wejsc
+            // na skasowany auftrag — decyzja reczna. Zwrot rowny wplacie, ktory juz wszedl, zostaje na guziku z widoku paczki.
+            const rv = (j.data && j.data.ref && j.data.ref[ff] != null) ? Math.abs(j.data.ref[ff]) : null;
+            if (rv != null && rv > 0.005 && Math.abs(rv - kw) > 0.005) return '';
+            pow.push('DELETED');
+        } else {
+            if (c.open == null) pow.push('open nieznany');
+            else if (c.open + 0.005 < kw) pow.push(Math.abs(c.open) < 0.005 ? 'open 0' : ('open ' + f2(c.open) + ' < wpłata'));
+            if ((c.nPay || 0) > 0) pow.push('są płatności (' + c.nPay + ')');
+        }
+        // data-mimo tylko na czerwonym guziku: zielony (open pokrywa wplate, auftrag bez platnosci) idzie bez „mimo", wiec
+        // nfKsieguj sam odmowi, gdy open okaze sie za maly po swiezym odczycie.
+        const dane = ' data-num="' + esc(c.num) + '" data-amt="' + esc(String(kw)) + '"' + (pow.length ? ' data-mimo="1"' : '');
+        return pow.length
+            ? przycisk('mk-prob-nfbook', '#b91c1c', '⚠ księguj mimo: ' + esc(pow.join(', ')),
+                       'Księguje wpłatę na tym auftragu mimo wymienionych powodów. Okno pokaże płatności na auftragu i ostrzeże o nadpłacie.', dane)
+            : przycisk('mk-prob-nfbook', '#0a7a2f', '💾 księguj na auftragu', 'Księguje wpłatę na tym auftragu (open amount ją pokrywa, auftrag nie ma płatności).', dane);
+    }
+    function mkProbChkAkcja(p, x, dok){
+        const j = p.j;
+        const stop = mkTypBlokada(j) || f1BlokadaKsiegowania(j, p.rows);
+        if (stop) return '<span style="color:#9ca3af" title="' + esc(stop) + '">zablokowane</span>';
+        if (!dok && !impAuction(x)) return '<span style="color:#9ca3af" title="Wiersz CHECK bez numeru auftragu — nie ma na co księgować.">brak auftragu</span>';
+        const o = impNum(x.open_amount), a = impNum(x.amount);
+        const zero = o != null && Math.abs(o) < 0.005;
+        const mniej = o != null && a != null && o + 0.005 < a;
+        const txt = dok ? '▶ dokończ księgowanie' : (zero ? '⚠ zmień na OK i zaksięguj (open 0)' : (mniej ? '⚠ zmień na OK i zaksięguj' : '✔ zmień na OK i zaksięguj'));
+        return '<button class="mk-prob-chk mk-lnk" data-k="' + esc(p.k) + '" data-id="' + esc(String(x.id)) + '" data-tryb="' + (dok ? 'dok' : 'chk') + '"'
+             + ' title="Ustawia status OK i księguje na koncie głównym (Book on main account) — jak ręcznie w paczce. Okno pokaże open amount z paczki i z auftragu."'
+             + ' style="color:' + ((zero || mniej) ? '#b91c1c' : '#0a7a2f') + ';font-weight:700">' + txt + '</button>';
+    }
+    // Po zapisie z listy: wiersze tej paczki od nowa, porzadki, przerysowanie listy, notatki przy zleceniach i kroki.
+    async function mkProbPoZapisie(p){
+        // Notatka i porzadkowanie sladow tylko ze SWIEZEGO odczytu: stare wiersze (blad odczytu) mowilyby, ze nic sie nie zmienilo
+        // albo — przy zapisie, ktory wlasnie wszedl — kazalyby zdjac slad „do dokonczenia" albo zostawic notatke.
+        let odczytOk = false;
+        try { p.rows = (await impRows(p.j.impId)).rows; odczytOk = true; } catch (e){ mkLog('book', '✖ odczyt paczki ' + p.j.impId + ' po zapisie z listy: ' + ((e && e.message) || e)); }
+        if (odczytOk){
+            try { mkProbNotatka(p, p.rows); } catch (e){}
+            mkProbPorzadek([p]);
+        }
+        const z = mkKoncJob(jobsLoad(), p).j; if (z) p.j = z;
+        mkProbRysuj();
+        try { render(); } catch (e){}
+        try { krokiRysuj(); } catch (e){}
+    }
+    async function mkProbCheckKsieguj(btn, kk, rowId, tryb){
+        if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
+        if (mkWid.book || mkKsiegBieg || mkNfaSkanBieg){ say('Trwa księgowanie albo sprawdzanie NOT FOUND — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
+        const p = ((mkProb && mkProb.pakiety) || []).filter(function (q){ return q.k === kk; })[0];
+        if (!p){ say('Tej paczki nie ma na liście — kliknij „↻ odśwież”.', '#c47f00'); return; }
+        const imp = String(p.j.impId), dok = tryb === 'dok', id = String(rowId);
+        mkImpBieg++; mkKsiegBieg++;
+        if (btn) btn.disabled = true;
+        let faza = '';
+        const wiersz = function (rows){ return (rows || []).filter(function (r){ return String(r.id) === id; })[0]; };
+        try {
+            say('Paczka ' + imp + ': czytam wiersz przed zapisem…');
+            const sw = (await impRows(imp)).rows;
+            p.rows = sw;
+            const x = wiersz(sw);
+            if (!x){ say('Wiersza nie ma już w paczce — lista odświeżona.', '#c47f00'); return; }
+            if (mkKsWierszZaks(x)){ say('Wiersz ' + nfNumer(x) + ' jest już zaksięgowany (płatność ' + x.payment_id + ') — nic nie wysyłam.', '#c47f00'); return; }
+            const dobry = dok ? 'OK' : 'CHECK';
+            if (String(x.state) !== dobry){ say('Wiersz ' + nfNumer(x) + ' ma status ' + x.state + ' (oczekiwałem ' + dobry + ') — nic nie wysyłam; lista odświeżona.', '#c47f00'); return; }
+            const js0 = jobsLoad(), jb = mkKoncJob(js0, p).j || p.j;
+            const stop = mkTypBlokada(jb) || f1BlokadaKsiegowania(jb, sw);
+            if (stop){ say('Nie księguję: ' + stop + '.', '#c47f00'); return; }
+            const au = impAuction(x), kw = impNum(x.amount), opP = impNum(x.open_amount);
+            let rr = null;
+            if (au){
+                say('Czytam auftrag ' + au.label + '…');
+                rr = await crRead(au.num);
+                if (!rr.ok && !rr.deleted){ say('Auftrag ' + au.label + ': ' + (rr.err || 'nie odczytałem') + ' — nic nie księguję.', '#c00'); return; }
+            }
+            // Homedeco: wplata na auftrag z open 0 i ticketem idzie do ticketu na minus (widok paczki: „↓ Wpłata na minus w tickecie”),
+            // a nie jako druga platnosc na auftragu — z listy tego nie robimy.
+            if (rr && rr.ok && !rr.deleted && p.j.kind === 'hd' && rr.open != null && Math.abs(rr.open) <= 0.005 && (rr.tickety || []).length){
+                say('Homedeco: auftrag ' + au.label + ' ma open 0 i ticket — wpłata idzie do ticketu na minus („↓ Wpłata na minus w tickecie” w widoku paczki), nie na auftrag. Nic nie księguję.', '#c47f00');
+                return;
+            }
+            const opA = (rr && rr.ok) ? rr.open : null, op = opA != null ? opA : opP;
+            const ostrz = [];
+            if (rr && rr.deleted) ostrz.push('auftrag jest SKASOWANY (DELETED) — prologistics może odmówić zapisu; sprawdzę wynik po zapisie');
+            else if (op != null && kw != null){
+                if (op <= 0.005) ostrz.push('open amount ' + f2(op) + ' — auftrag NIE MA już nic do zapłaty, zapis da NADPŁATĘ ' + f2(kw));
+                else if (op + 0.005 < kw) ostrz.push('open amount ' + f2(op) + ' jest mniejszy niż wpłata ' + f2(kw) + ' — nadpłata ' + f2(r2(kw - op)));
+            }
+            if (rr && (rr.nPay || 0) > 0) ostrz.push('na auftragu stoją już płatności (' + rr.nPay + ') — sprawdź, czy tej wpłaty nie zaksięgowano ręcznie');
+            const znanaPl = String(x.already_imported) === '1' || String(x.already_imported_flag) === '1';
+            if (znanaPl) ostrz.push('prologistics zna już tę płatność (była wczytana wcześniej)');
+            if (String(x.payment_deleted) === '1') ostrz.push('ten wiersz miał już płatność, którą ktoś cofnął (Unbook) — sprawdź, czy cofnięcie było zamierzone');
+            if (!confirm((dok ? 'Zaksięgować ten wiersz (status OK już ustawiony) na koncie głównym?' : 'Zmienić status wiersza CHECK na OK i zaksięgować go na koncie głównym?') + '\n\n'
+                + 'paczka     : ' + imp + ' · ' + (mkShort(p.j) || p.j.mp || '') + (p.j.date ? (' · ' + p.j.date) : '') + '\n'
+                + 'zamówienie : ' + nfNumer(x) + '\n'
+                + 'auftrag    : ' + (au ? au.label : '—') + (rr ? ('   (status ' + (rr.deleted ? 'DELETED' : 'ACTIVE') + ')') : '') + '\n'
+                + 'wpłata     : ' + (kw == null ? '?' : f2(kw)) + '\n'
+                + 'open amount: ' + (opP == null ? '?' : f2(opP)) + ' (z paczki)' + (opA != null ? (' · ' + f2(opA) + ' (auftrag, odczyt sprzed chwili)') : '') + '\n\n'
+                + ((rr && rr.platnosci && rr.platnosci.length) ? ('Płatności na auftragu:\n' + rr.platnosci.map(function (s){ return '  • ' + s; }).join('\n') + '\n\n') : '')
+                + (ostrz.length ? ('UWAGA:\n' + ostrz.map(function (s){ return '  ⚠ ' + s; }).join('\n') + '\n\n') : '')
+                + 'Odpowiada to ręcznej zmianie statusu na OK i przyciskowi „Book on main account”.\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            // Twarda bramka przy ryzyku DUBLA (przeglad 22.10.2026) — jak przy NOT FOUND: samo „OK” w oknie nie wystarcza, trzeba wpisac
+            // slowo. Ryzyko: auftrag juz nadplacony, platnosc o tej samej kwocie juz na nim stoi (takze po przerwanym zapisie z listy),
+            // prologistics zna te platnosc, wiersz mial platnosc cofnieta przez kogos (Unbook).
+            {
+                const ryz = [];
+                if (rr && rr.ok && rr.open != null && rr.open < -0.005) ryz.push('auftrag jest już NADPŁACONY (open ' + f2(rr.open) + ')');
+                if (rr && rr.ok && kw != null && nfPlatnoscRowna(rr, kw)) ryz.push('na auftragu stoi już płatność o kwocie ' + f2(kw) + ' — możliwy DUPLIKAT' + (dok ? ' (zapis z listy mógł jednak wejść)' : ''));
+                if (znanaPl) ryz.push('prologistics zna już tę płatność (była wczytana wcześniej)');
+                if (String(x.payment_deleted) === '1') ryz.push('płatność tego wiersza została wcześniej cofnięta (Unbook)');
+                if (ryz.length){
+                    const odp = prompt('RYZYKO PODWÓJNEGO ZAKSIĘGOWANIA — wiersz ' + nfNumer(x) + ', wpłata ' + (kw == null ? '?' : f2(kw)) + ':\n\n'
+                        + ryz.map(function (s){ return '  ⚠ ' + s; }).join('\n')
+                        + '\n\nAby zaksięgować mimo to, wpisz słowo ZAKSIEGUJ (inaczej nic się nie stanie):', '');
+                    if (String(odp == null ? '' : odp).trim().toUpperCase() !== 'ZAKSIEGUJ'){ say('Wiersz ' + nfNumer(x) + ': nie wpisano potwierdzenia — nic nie księguję.', '#c47f00'); return; }
+                    mkLog('book', '⚠ lista „do wyjaśnienia": paczka ' + imp + ' ' + nfNumer(x) + ' — księgowanie mimo ryzyka dubla (' + ryz.join('; ') + '), potwierdzone wpisaniem słowa');
+                }
+            }
+            // Okno moglo stac otwarte — wiersz i auftrag jeszcze raz, przed zapisem.
+            say('Czytam wiersz i auftrag jeszcze raz…');
+            const sw2 = (await impRows(imp)).rows, x2 = wiersz(sw2);
+            if (!x2 || mkKsWierszZaks(x2) || String(x2.state) !== dobry){ p.rows = sw2; say('Wiersz zmienił się, gdy okno było otwarte — nic nie księguję; lista odświeżona.', '#c47f00'); return; }
+            if (au){
+                const rr2 = await crRead(au.num);
+                // Nieczytelny drugi odczyt to nie „bez zmian" — bez niego nie wiemy, czy ktos nie zaksiegowal w miedzyczasie.
+                if (!rr2.ok && !rr2.deleted){ say('Auftrag ' + au.label + ': ' + (rr2.err || 'nie odczytałem') + ' — nic nie księguję.', '#c00'); return; }
+                if (!!rr2.deleted !== !!(rr && rr.deleted) || (rr2.ok && rr && rr2.nPay !== rr.nPay) || (rr2.ok && rr && rr2.open !== rr.open)){
+                    say('Auftrag ' + au.label + ' zmienił się, gdy okno było otwarte (płatności ' + (rr && rr.nPay != null ? rr.nPay : '?') + ' → ' + (rr2.nPay == null ? '?' : rr2.nPay)
+                        + ', open ' + (rr2.open == null ? '?' : f2(rr2.open)) + ') — nic nie księguję; sprawdź i kliknij jeszcze raz.', '#c47f00');
+                    return;
+                }
+            }
+            if (mkPrzelotTrwa()){ say('W międzyczasie ruszyło pobieranie zestawień — zaksięguj po jego zakończeniu.', '#c47f00'); return; }
+            // Slad PRZED pierwszym zapytaniem — przerwany zapis nie zostawi wiersza OK bez ksiegowania i bez sladu.
+            const stempel = function (){ return new Date().toISOString().slice(0, 16).replace('T', ' '); };
+            const js1 = jobsLoad(), z1 = mkKoncJob(js1, p);
+            if (!z1.j){ say('Nie odnalazłem zlecenia w pamięci — odśwież stronę.', '#c00'); return; }
+            const sl1 = mkProbSlad(z1.j);
+            sl1[id] = { d: nfNumer(x), f: 'stan', t: stempel() };
+            z1.j.probWisi = sl1; jobsSave(js1);
+            mkLog('book', '▶ lista „do wyjaśnienia": paczka ' + imp + ' ' + nfNumer(x) + ' (auftrag ' + (au ? au.label : '?') + ', wpłata ' + (kw == null ? '?' : f2(kw))
+                + ', open ' + (op == null ? '?' : f2(op)) + (ostrz.length ? (', ostrzeżenia: ' + ostrz.length) : '') + ') — ' + (dok ? 'dokończenie' : 'CHECK → OK + konto główne'));
+            if (!dok){ faza = 'stan'; await impState(imp, x.id, 'OK'); }
+            const js2 = jobsLoad(), z2 = mkKoncJob(js2, p);
+            if (z2.j){ const sl2 = mkProbSlad(z2.j); sl2[id] = { d: nfNumer(x), f: 'book', t: stempel() }; z2.j.probWisi = sl2; jobsSave(js2); }
+            faza = 'book';
+            await impBook(imp, [x.id]);
+            faza = 'po';
+            const pom = mkKsPominieteOpis(imp);
+            const po = (await impRows(imp)).rows;
+            p.rows = po;
+            const x3 = wiersz(po);
+            if (x3 && mkKsWierszZaks(x3)){
+                mkLog('book', '✔ lista „do wyjaśnienia": paczka ' + imp + ' ' + nfNumer(x) + ' zaksięgowana (płatność ' + x3.payment_id + ')');
+                say('✔ Zaksięgowane: ' + nfNumer(x) + ' (paczka ' + imp + ', płatność ' + x3.payment_id + ').', '#0a7a2f');
+            } else {
+                mkLog('book', '⚠ lista „do wyjaśnienia": paczka ' + imp + ' ' + nfNumer(x) + ' — zapis wysłany, ale wiersz nie ma płatności' + (pom ? (' (' + pom + ')') : ''));
+                say('⚠ Wysłane, ale wiersz ' + nfNumer(x) + ' nie ma płatności po odczycie paczki' + (pom ? (' — ' + pom) : '') + '. Zostaje w sekcji „do dokończenia” — sprawdź paczkę w prologistics, zanim kliknisz ponownie.', '#c47f00');
+            }
+        } catch (e){
+            const opis = (e && e.message) || String(e);
+            mkLog('book', '✖ lista „do wyjaśnienia": paczka ' + imp + ' wiersz ' + id + ': ' + opis);
+            say('Księgowanie z listy nie poszło: ' + opis
+                + (faza === 'book' ? ' — NIE WIEM, czy weszło; wiersz zostaje w sekcji „do dokończenia”, sprawdź paczkę w prologistics.'
+                   : faza === 'stan' ? ' — status mógł zostać zmieniony na OK; wiersz zostaje w sekcji „do dokończenia”, jeśli tak.' : ''), '#c00');
+        } finally {
+            mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1);
+            if (btn) btn.disabled = false;
+            try { await mkProbPoZapisie(p); } catch (e2){}
+        }
+    }
+    function mkProbRysuj(){
+        const b = mkProbBox();
+        if (!b) return;
+        if (mkProb) mkProb.tol = tolGet();
+        const tol = tolGet(), ile = mkProbIle();
+        const pak = (mkProb && mkProb.pakiety) || [];
+        const grupy = {}, bledy = [], dokL = [], zeroL = [], bezSpr = {};
+        pak.forEach(function (p){
+            if (p.err){ bledy.push('paczka ' + p.j.impId + ': nie odczytałem (' + p.err + ')'); return; }
+            const w = mkProbWiersze(p.j, p.rows, tol);
+            w.dok.forEach(function (q){ dokL.push({ p: p, x: q.x, s: q.s }); });
+            w.zeraL.forEach(function (x){ zeroL.push({ p: p, x: x }); });
+            if (!w.chk.length && !w.nf.length) return;
+            const r = mkProbRynek(p.j);
+            const g = grupy[r] = grupy[r] || { l: [], chk: 0, nf: 0, paczki: {} };
+            // Numer, ktory stoi w paczce kilka razy jako NOT FOUND, nie ma guzika zapisu (slad zapisu jest po numerze).
+            const ileNf = {};
+            (p.rows || []).forEach(function (x){ if (String(x.state) === 'NOT FOUND'){ const i0 = nfNumer(x); if (i0) ileNf[i0] = (ileNf[i0] || 0) + 1; } });
+            w.chk.forEach(function (x){ g.l.push({ p: p, x: x, t: 'CHECK' }); });
+            w.nf.forEach(function (x){
+                g.l.push({ p: p, x: x, t: 'NOT FOUND', dubel: (ileNf[nfNumer(x)] || 0) > 1 });
+                const st = mkNfState[nfNumer(x)];
+                if (nfNumer(x) && !mkNfaSlad(p.j)[nfNumer(x)] && (!st || mkNfNieudane(st))) bezSpr[p.k + '|' + nfNumer(x)] = 1;
+            });
+            g.chk += w.chk.length; g.nf += w.nf.length; g.paczki[String(p.j.impId)] = 1;
+        });
+        const nfBezSpr = Object.keys(bezSpr).length;           // numery (nie wiersze) bez wyniku sprawdzenia auftragu
+        const rynki = Object.keys(grupy).sort(function (a, c){ return a.localeCompare(c); });
+        const td = 'padding:2px 6px';
+        let h = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
+              + '<b style="font-size:12px;color:#991b1b">📋 Do wyjaśnienia — NOT FOUND i CHECK ze wszystkich zaksięgowanych paczek</b>'
+              + '<span style="font-size:11px;color:#374151;font-weight:700">' + ile.n + ' poz. (NOT FOUND ' + ile.nf + ', CHECK ' + ile.chk
+              + (ile.dok ? (', do dokończenia ' + ile.dok) : '') + ') w ' + ile.m
+              + ' paczkach · ' + ile.rynki + ' marketplace\'ów</span>'
+              + '<button id="mk-prob-odsw" class="mk-lnk" title="Czyta wszystkie te paczki od nowa">↻ odśwież</button>'
+              + (nfBezSpr ? ('<button id="mk-prob-nfspr-all" class="mk-lnk"' + (mkProbNfSprBieg ? ' disabled' : '') + ' style="color:#5b21b6;font-weight:700" title="Szuka auftragów po numerze fulfilmentu dla NOT FOUND, których jeszcze nie sprawdzono — po sprawdzeniu przy wierszu pojawia się guzik księgowania.">🔍 sprawdź auftragi NOT FOUND (' + nfBezSpr + ')</button>') : '')
+              + '<button id="mk-prob-x" class="mk-lnk">✕ zamknij</button></div>'
+              + '<div style="font-size:10px;color:#6b7280;margin-bottom:4px">Podział na marketplace\'y; przy każdej pozycji link do paczki i auftragu. '
+              + 'Księgować można stąd pojedynczo: NOT FOUND — „księguj na auftragu” (także mimo open amount 0, płatności albo DELETED, po oknie z płatnościami auftragu), '
+              + 'CHECK — „zmień na OK i zaksięguj” (konto główne). „🔍 otwórz” prowadzi do widoku paczki. Końcówki w tolerancji (do ' + f2(tol) + ') idą na subkonto '
+              + 'same albo z sekcji „💰 Końcówki" i nie ma ich na tej liście.</div>';
+        // Wiersze, ktorym HUB zmienil status na OK, a ksiegowanie nie weszlo albo nie wiadomo, czy weszlo — na samej gorze.
+        if (dokL.length){
+            h += '<div style="margin:6px 0;padding:6px 8px;border:1px solid #fca5a5;border-radius:6px;background:#fef2f2"><b style="font-size:11px;color:#991b1b">⚠ Do dokończenia (' + dokL.length
+               + ') — status OK ustawiony, ale wiersz nie ma płatności</b>'
+               + '<div style="font-size:10px;color:#6b7280;margin:2px 0">Przerwany albo niepotwierdzony zapis z tej listy. Zanim klikniesz „dokończ”, sprawdź paczkę w prologistics (czy płatność nie weszła chwilę później) — '
+               + 'zapis ma własną blokadę i test spokoju paczki, więc drugi raz nie pójdzie równolegle z pierwszym.</div>'
+               + '<table style="border-collapse:collapse;font-size:11px">'
+               + dokL.map(function (w){
+                     return '<tr><td style="' + td + '"><a href="/react/settings_page/import_payments/' + esc(w.p.j.impId) + '/" target="_blank">' + esc(w.p.j.impId) + '</a> ' + esc(mkProbRynek(w.p.j)) + '</td>'
+                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + esc(nfNumer(w.x)) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + f2(impNum(w.x.amount)) + '</td>'
+                          + '<td style="' + td + ';color:#92400e">' + (w.s && w.s.f === 'book' ? 'zapis wysłany bez potwierdzenia' : 'status OK, zapis nie wysłany') + (w.s && w.s.t ? (' · ' + esc(mkCzasLok(w.s.t))) : '') + '</td>'
+                          + '<td style="' + td + '">' + mkProbChkAkcja(w.p, w.x, true) + '</td></tr>';
+                 }).join('') + '</table></div>';
+        }
+        if (!rynki.length && !dokL.length) h += '<div style="font-size:11px;color:#0a7a2f">✔ W zaksięgowanych paczkach nie zostało nic do wyjaśnienia.</div>';
+        rynki.forEach(function (r){
+            const g = grupy[r];
+            g.l.sort(function (a, c){
+                return String(a.p.j.date || '').localeCompare(String(c.p.j.date || '')) || String(a.p.j.impId).localeCompare(String(c.p.j.impId))
+                    || (a.t === c.t ? 0 : (a.t === 'CHECK' ? -1 : 1));
+            });
+            const nPacz = Object.keys(g.paczki).length;
+            // Rozwiniecie przezywa przerysowanie (po kazdym zapisie lista rysuje sie od nowa): wybor czlowieka wygrywa z domyslnym.
+            const kOtw = 'prob|' + r, otw = (kOtw in mkWid.det) ? !!mkWid.det[kOtw] : (g.l.length <= 40 || rynki.length === 1);
+            h += '<details data-o="' + esc(kOtw) + '"' + (otw ? ' open' : '') + ' style="margin:6px 0">'
+               + '<summary style="cursor:pointer;font-size:12px;font-weight:700;color:#7f1d1d">' + esc(r)
+               + ' <span style="font-weight:400;color:#374151">— ' + g.l.length + ' poz. (NOT FOUND ' + g.nf + ', CHECK ' + g.chk + ') w '
+               + nPacz + (nPacz === 1 ? ' paczce' : ' paczkach') + '</span></summary>'
+               + '<table style="border-collapse:collapse;font-size:11px;margin:3px 0 0 10px"><tr style="color:#6b7280">'
+               + '<td style="' + td + '">paczka</td><td style="' + td + '">data wpływu</td><td style="' + td + '"></td><td style="' + td + '">zamówienie</td>'
+               + '<td style="' + td + ';text-align:right">wpłata</td><td style="' + td + ';text-align:right">open amount</td>'
+               + '<td style="' + td + '">auftrag</td><td style="' + td + '">co to znaczy</td></tr>'
+               + g.l.map(function (w){
+                     const au = impAuction(w.x);
+                     const nf = w.t === 'NOT FOUND';
+                     return '<tr style="border-top:1px solid #f1f5f9"><td style="' + td + '"><a href="/react/settings_page/import_payments/' + esc(w.p.j.impId) + '/" target="_blank">'
+                          + esc(w.p.j.impId) + '</a> <button class="mk-prob-otw mk-lnk" data-k="' + esc(w.p.k) + '">🔍 otwórz</button></td>'
+                          + '<td style="' + td + '">' + esc(w.p.j.date || '') + '</td>'
+                          + '<td style="' + td + ';font-weight:700;color:' + (nf ? '#b91c1c' : '#c47f00') + '">' + esc(w.t) + '</td>'
+                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + esc(nfNumer(w.x)) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + f2(impNum(w.x.amount)) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + (nf ? '—' : f2(impNum(w.x.open_amount))) + '</td>'
+                          + '<td style="' + td + '">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
+                          + '<td style="' + td + '">' + (nf ? (mkProbNfTekst(w.p.j, w.x) + mkProbNfAkcja(w.p, w.x, w.dubel))
+                                                           : (mkProbCheckTekst(w.x) + '<div style="margin-top:2px">' + mkProbChkAkcja(w.p, w.x, false) + '</div>')) + '</td></tr>';
+                 }).join('') + '</table></details>';
+        });
+        // CHECK z open amount 0 — druga wplata do oplaconego auftragu. Zwinieta sekcja, kazdy wiersz osobno, czerwony przycisk.
+        if (zeroL.length){
+            zeroL.sort(function (a, c){ return String(a.p.j.date || '').localeCompare(String(c.p.j.date || '')) || String(a.p.j.impId).localeCompare(String(c.p.j.impId)); });
+            h += '<details' + mkOtw('prob|zera') + ' style="margin:6px 0"><summary style="cursor:pointer;font-size:11px;font-weight:700;color:#6b7280">Open amount 0 — druga wpłata do opłaconego auftragu (' + zeroL.length
+               + ') · księgowanie tylko świadomie, pojedynczo</summary>'
+               + '<div style="font-size:10px;color:#6b7280;margin:2px 0 2px 10px">Zwykle nie ma tu czego wyjaśniać. Jeśli jednak wpłata ma wejść na ten auftrag mimo to (nadpłata do późniejszego rozliczenia), '
+               + 'użyj przycisku przy wierszu — okno pokaże płatności już stojące na auftragu.</div>'
+               + '<table style="border-collapse:collapse;font-size:11px;margin:3px 0 0 10px"><tr style="color:#6b7280"><td style="' + td + '">paczka</td><td style="' + td + '">marketplace</td>'
+               + '<td style="' + td + '">data wpływu</td><td style="' + td + '">zamówienie</td><td style="' + td + ';text-align:right">wpłata</td><td style="' + td + '">auftrag</td><td style="' + td + '"></td></tr>'
+               + zeroL.map(function (w){
+                     const au = impAuction(w.x);
+                     return '<tr style="border-top:1px solid #f1f5f9"><td style="' + td + '"><a href="/react/settings_page/import_payments/' + esc(w.p.j.impId) + '/" target="_blank">' + esc(w.p.j.impId) + '</a></td>'
+                          + '<td style="' + td + '">' + esc(mkProbRynek(w.p.j)) + '</td><td style="' + td + '">' + esc(w.p.j.date || '') + '</td>'
+                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + esc(nfNumer(w.x)) + '</td>'
+                          + '<td style="' + td + ';text-align:right">' + f2(impNum(w.x.amount)) + '</td>'
+                          + '<td style="' + td + '">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
+                          + '<td style="' + td + '">' + mkProbChkAkcja(w.p, w.x, false) + '</td></tr>';
+                 }).join('') + '</table></details>';
+        }
+        const przypisy = [];
+        if (ile.konc) przypisy.push('końcówki w tolerancji: ' + ile.konc + ' poz. — sekcja „💰 Końcówki na subkonto”');
+        if (przypisy.length) h += '<div style="font-size:10px;color:#6b7280;margin-top:4px">' + esc(przypisy.join(' · ')) + '</div>';
+        if (bledy.length) h += '<div style="font-size:10px;color:#b45309;margin-top:4px">pominięte: ' + esc(bledy.join(' · ')) + '</div>';
+        b.innerHTML = h;
+        b.style.display = 'block';
+        const x = b.querySelector('#mk-prob-x');
+        if (x) x.onclick = function(){ b.style.display = 'none'; };
+        const od = b.querySelector('#mk-prob-odsw');
+        if (od) od.onclick = function(){
+            if (mkPrzelotTrwa() || mkWid.book || mkKsiegBieg){ say('Trwa pobieranie albo księgowanie — odśwież listę po jego zakończeniu.', '#c47f00'); return; }
+            od.disabled = true;
+            Promise.resolve(mkProbSkanuj(null, false)).catch(function (e){ say('Lista do wyjaśnienia: ' + ((e && e.message) || e), '#c00'); });
+        };
+        b.querySelectorAll('.mk-prob-otw').forEach(function (g){
+            g.onclick = async function(){
+                const kk = g.getAttribute('data-k');
+                try { await impCheck(kk); } catch (e){ say('Nie udało się otworzyć paczki: ' + ((e && e.message) || e), '#c00'); return; }
+                const box = $('#mk-imp-box');
+                if (box){ try { box.scrollIntoView({ block: 'nearest' }); } catch (e2){} }
+            };
+        });
+        // --- akcje z listy (22.10.2026) ---
+        const paczkaK = function (kk){ return pak.filter(function (q){ return q.k === kk; })[0] || null; };
+        const zajeteMsg = function (){
+            if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — zrób to po jego zakończeniu.', '#c47f00'); return true; }
+            if (mkWid.book || mkKsiegBieg || mkNfaSkanBieg){ say('Trwa księgowanie albo sprawdzanie NOT FOUND — zrób to po jego zakończeniu.', '#c47f00'); return true; }
+            return false;
+        };
+        b.querySelectorAll('.mk-prob-chk').forEach(function (g){
+            g.onclick = function(){
+                Promise.resolve(mkProbCheckKsieguj(g, g.getAttribute('data-k'), g.getAttribute('data-id'), g.getAttribute('data-tryb')))
+                    .catch(function (e){ say('Księgowanie z listy: ' + ((e && e.message) || e), '#c00'); });
+            };
+        });
+        b.querySelectorAll('.mk-prob-nfbook').forEach(function (g){
+            g.onclick = async function(){
+                const p = paczkaK(g.getAttribute('data-k'));
+                if (!p){ say('Tej paczki nie ma na liście — kliknij „↻ odśwież”.', '#c47f00'); return; }
+                if (zajeteMsg()) return;
+                const ff = g.getAttribute('data-ff'), amt = Number(g.getAttribute('data-amt'));
+                // Lista bywa sprzed godzin: wiersz mogl zostac w paczce przestawiony albo zaksiegowany (np. po ponownym imporcie),
+                // a zapis wprost na auftragu to druga platnosc. Wiersz czytamy na swiezo, zanim cokolwiek ruszy.
+                g.disabled = true;
+                let swieze;
+                try { swieze = (await impRows(p.j.impId)).rows; }
+                catch (e){ g.disabled = false; say('Nie odczytałem paczki ' + p.j.impId + ' przed zapisem: ' + ((e && e.message) || e) + ' — nic nie księguję.', '#c00'); return; }
+                p.rows = swieze;
+                const wNf = swieze.filter(function (r){ return String(r.state) === 'NOT FOUND' && nfNumer(r) === ff && Math.abs((impNum(r.amount) || 0) - amt) < 0.005; })[0];
+                if (!wNf || mkKsWierszZaks(wNf)){ g.disabled = false; say('Wiersz ' + ff + ' nie jest już NOT FOUND w paczce ' + p.j.impId + ' — nic nie księguję, lista odświeżona.', '#c47f00'); mkProbRysuj(); return; }
+                if (zajeteMsg()){ g.disabled = false; return; }
+                mkImpBieg++; mkKsiegBieg++;
+                // mimo tylko z czerwonego guzika; znana = prologistics zna te platnosc z wczesniejszego importu (twarda bramka w nfKsieguj).
+                const znanaPl = String(wNf.already_imported) === '1' || String(wNf.already_imported_flag) === '1';
+                Promise.resolve(nfKsieguj(p.j, ff, g.getAttribute('data-num'), amt, g, function (){ mkProbRysuj(); }, { mimo: g.getAttribute('data-mimo') === '1', znana: znanaPl }))
+                    .catch(function (e){ say('Księgowanie na auftragu: ' + ((e && e.message) || e), '#c00'); })
+                    .then(function (){ mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1); return mkProbPoZapisie(p); })
+                    .catch(function (){});
+            };
+        });
+        b.querySelectorAll('.mk-prob-nfspr').forEach(function (g){
+            g.onclick = async function(){
+                const p = paczkaK(g.getAttribute('data-k')), ff = g.getAttribute('data-ff');
+                if (!p || !ff) return;
+                if (zajeteMsg()) return;
+                if (mkNfChroniony(mkNfState[ff])){ mkProbRysuj(); return; }
+                g.disabled = true;
+                try { await nfSprawdz(p.j, [ff], null, null); }
+                catch (e){ say('Sprawdzanie auftragu: ' + ((e && e.message) || e), '#c00'); }
+                mkProbRysuj();
+            };
+        });
+        const nsa = b.querySelector('#mk-prob-nfspr-all');
+        if (nsa) nsa.onclick = async function(){
+            if (zajeteMsg()) return;
+            // Przerysowania listy (z innych akcji) wymieniaja guzik na czynny — trwajace sprawdzanie ma wlasna flage.
+            if (mkProbNfSprBieg){ say('Sprawdzanie auftragów NOT FOUND już trwa — poczekaj na koniec.', '#c47f00'); return; }
+            mkProbNfSprBieg = true;
+            nsa.disabled = true;
+            try {
+                for (let i = 0; i < pak.length; i++){
+                    const p = pak[i];
+                    if (p.err) continue;
+                    const w = mkProbWiersze(p.j, p.rows, tol);
+                    const lista = w.nf.map(nfNumer).filter(function (id, n, a){
+                        return id && a.indexOf(id) === n && !mkNfaSlad(p.j)[id] && (!mkNfState[id] || mkNfNieudane(mkNfState[id])) && !mkNfChroniony(mkNfState[id]);
+                    });
+                    if (lista.length) await nfSprawdz(p.j, lista, nsa, null);
+                }
+            } catch (e){ say('Sprawdzanie auftragów NOT FOUND: ' + ((e && e.message) || e), '#c00'); }
+            mkProbNfSprBieg = false;
+            mkProbRysuj();
+        };
     }
     // ===== NOT FOUND na auftragach — zbiorczo (14.10.2026) =====
     // Zgloszenie: Maisons du Monde FR, paczka 2236456. Import oznaczyl 012592134-A (179.99) jako NOT FOUND, choc auftrag
@@ -70607,7 +72726,11 @@
             + '\nOdpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')){
             b.disabled = false; return;
         }
+        // Po potwierdzeniu licznik czasu liczy od zera (okno „confirm" zatrzymuje stronę, nie ma być w sekundach księgowania).
+        if (mkKsPostep.zbiorcza) Object.assign(mkKsPostep.zbiorcza, { t0: Date.now(), faza: 'ksieguje', i: 0, n: good.length, impId: '' });
         let done = 0; const bad = [];
+        const zaks = [];        // paczki zaksiegowane w tym przebiegu (do odczytu po ksiegowaniu)
+        const pomin = [];       // wiersze pominiete tuz przed zapisem (juz zaksiegowane / zmieniony status) — mkKsZapis
         for (let i = 0; i < good.length; i++){
             const p = good[i];
             // Bramka jeszcze raz, tuz przed zapisem: od planu moglo ruszyc sprawdzanie albo zmiana typow tej paczki
@@ -70615,6 +72738,7 @@
             const jTeraz = jobsLoad()[mkKlucz(p.j)] || p.j;
             const blokTeraz = jTeraz.booked ? 'już zaksięgowana' : mkTypBlokada(jTeraz);
             if (blokTeraz){ bad.push(p.j.impId + ': pominięta — ' + blokTeraz); render(); continue; }
+            if (mkKsPostep.zbiorcza){ mkKsPostep.zbiorcza.i = i + 1; mkKsPostep.zbiorcza.impId = String(p.j.impId); }
             say('Księguję paczkę ' + (i + 1) + '/' + good.length + ' — ' + p.j.impId + '…');
             try {
                 // Kupony Shöpping — na swiezym odczycie, jak w widoku paczki.
@@ -70630,12 +72754,17 @@
                 const idsB = p.ok.map(function (x){ return x.id; }).concat(kupNow.map(function (x){ return x.id; }));
                 if (!idsB.length){ bad.push(p.j.impId + ': nic do zaksięgowania — pozycje CHECK zostają (open auftragu ich nie pokrywa albo ktoś je zmienił)'); continue; }
                 await impBook(p.j.impId, idsB);
+                const pomOp = mkKsPominieteOpis(p.j.impId);
+                if (pomOp) pomin.push(pomOp);
                 const nZaks = p.ok.length + kupNow.length, chkZ = p.chk - kupNow.length;
                 const jobs = jobsLoad();
                 const kj = mkKlucz(p.j);
                 if (jobs[kj]){
                     jobs[kj].booked = true;
                     jobs[kj].checked = true;
+                    // Wiersze CHECK ksiegowane razem z OK (kupony Shöpping, sztuki Kauflanda): po ksiegowaniu prologistics moze je
+                    // znow pokazac jako CHECK (open amount dalej wiekszy od wplaty) — nie sa „do wyjasnienia" (mkProbWiersze).
+                    if (kupNow.length) jobs[kj].kupZaks = kupNow.map(function (x){ return String(x.id); });
                     if (jTeraz.typMimo) jobs[kj].typMimo = true;     // slad „mimo to" wchodzi do ksiag razem z paczka
                     jobs[kj].msg = impMsgPoKsieg(jobs[kj].msg) + ' · zaksięgowane ' + nZaks + ' poz.';
                     // Pozycje CHECK i NOT FOUND zostaja w paczce — to jest wlasnie „newralgiczna
@@ -70658,6 +72787,7 @@
                     await shAfterBook(jobs, kj);
                 }
                 done++;
+                p.nZaks = nZaks; zaks.push(p);
                 // Dopiero TERAZ, gdy flaga „zaksięgowane" jest zapisana: NOT FOUND ze zwrotem calej kwoty w tym samym
                 // rozliczeniu — sprawdzamy auftrag od razu. Deleted = wplata i zwrot znosza sie, notatka paczki schodzi.
                 // Blad tego kroku niczego nie cofa (wlasny try/catch) i nie liczy paczki jako nieudanej.
@@ -70676,30 +72806,17 @@
             render();
         }
         b.disabled = false;
-        // Koncowki w tolerancji z zaksiegowanych paczek — jedno zestawienie zamiast otwierania kazdej paczki (06.10.2026).
-        // Wiersze zaksiegowanych przed chwila paczek mamy z planu (ksiegowanie OK nie rusza wierszy CHECK).
-        let konc = null;
-        // Pelne zestawienie (z odczytem wczesniejszych paczek) tylko wtedy, gdy wlasnie zaksiegowane paczki maja koncowki —
-        // ich wiersze sa juz w planie, wiec samo sprawdzenie nic nie kosztuje (przeglad 06.10.2026).
-        const tolK = tolGet();
-        const jestKonc = good.some(function (p){ const jj = jobsLoad()[mkKlucz(p.j)]; return jj && jj.booked && mkKoncWiersze(p.rows, tolK).length; });
-        if (done && jestKonc){
-            const got = {};
-            good.forEach(function (p){ got[String(p.j.impId)] = p.rows; });
-            try { konc = await mkKoncSkanuj(got, true); } catch (e){ konc = null; }
+        // Po ksiegowaniu paczki czytamy OD NOWA (22.10.2026): prologistics zmienia stan wierszy dopiero po zapisie — auftrag
+        // zostaje z koncowka (open 0.01), a wiersz robi sie CHECK, czego plan sprzed ksiegowania nie widzial (paczka
+        // Galaxus CH 2259248: 35 OK przed zapisem, po nim 4 wiersze CHECK z open 0.01/-0.01/0.04). Z tego odczytu:
+        // notatka „zostaly w paczce", koncowki (ksiegowane same na subkonto), NOT FOUND z auftragiem i zbiorcza lista reszty.
+        let po = { konc: null, koncAuto: null, nfa: null, prob: null };
+        if (zaks.length){
+            if (mkKsPostep.zbiorcza) mkKsPostep.zbiorcza.faza = 'po';
+            try { po = await mkPoKsiegowaniu(zaks); }
+            catch (e){ mkLog('notfound', '✖ czynności po księgowaniu paczek: ' + ((e && e.message) || e)); }
         }
-        // NOT FOUND z auftragiem (14.10.2026): wlasnie zaksiegowane paczki z pozycjami NOT FOUND, ktore „zostaja" — auftragi
-        // sprawdzaja sie od razu (wszystkie, nie tylko ze zwrotem), a te do zaksiegowania wprost ida do zestawienia.
-        let nfa = null;
-        const nfTylko = {}, nfGot = {};
-        good.forEach(function (p){
-            const jj = jobsLoad()[mkKlucz(p.j)];
-            if (jj && jj.booked && impNfZostaje(jj, p.rows)){ nfTylko[String(p.j.impId)] = 1; nfGot[String(p.j.impId)] = p.rows; }
-        });
-        if (done && Object.keys(nfTylko).length){
-            try { nfa = await mkNfaSkanuj(nfGot, nfTylko, true); }
-            catch (e){ nfa = null; mkLog('notfound', '✖ NOT FOUND na auftragach po księgowaniu: ' + ((e && e.message) || e)); }
-        }
+        const konc = po.konc, nfa = po.nfa, koncAuto = po.koncAuto, prob = po.prob;
         const zostaly = [];
         good.forEach(function (p){
             const jz = jobsLoad()[mkKlucz(p.j)];
@@ -70708,13 +72825,19 @@
             if (m) zostaly.push('paczka ' + p.j.impId + ' (' + ((jz.data && jz.data.shop) || jz.mp || '') + '): ' + m[1]);
         });
         say('Zaksięgowanych paczek ' + done + ' z ' + good.length + (bad.length ? ('. Nie poszło: ' + bad.join('; ')) : '.')
+            + (pomin.length ? (' ⚠ Pominięte tuż przed zapisem (świeży odczyt: już zaksięgowane w prologistics albo zmieniony status — nie księgowałem ich drugi raz): ' + pomin.join('; ') + '.') : '')
             + (zostaly.length ? (' ⚠ W paczkach zostało (nie weszło): ' + zostaly.join(' · ') + ' — opis przy zleceniach w grupie ⑤.') : '')
-            + ((konc && konc.n) ? (' Końcówki w tolerancji: ' + konc.n + ' poz. w ' + konc.m + ' paczkach (razem ' + f2(konc.suma)
+            + (koncAuto && koncAuto.wierszy ? (' Końcówki do ' + f2(tolGet()) + ' zaksięgowane same na subkoncie: ' + koncAuto.wierszy + ' poz. w ' + koncAuto.paczek + ' paczkach.') : '')
+            + (koncAuto && koncAuto.bad && koncAuto.bad.length ? (' ⚠ Końcówki, które nie poszły: ' + koncAuto.bad.join('; ') + '.') : '')
+            + ((konc && konc.n && !(koncAuto && koncAuto.wierszy >= konc.n)) ? (' Końcówki w tolerancji do zaksięgowania: ' + konc.n + ' poz. w ' + konc.m + ' paczkach (razem ' + f2(konc.suma)
                                    + ') — zestawienie „💰 Końcówki na subkonto" pod widokiem paczki.') : '')
             + ((nfa && (nfa.n || nfa.niep)) ? (' NOT FOUND z auftragiem do zaksięgowania: ' + nfa.n + ' poz. (razem ' + f2(nfa.suma)
-                                   + ') — zestawienie „🔎 NOT FOUND na auftragach" pod widokiem paczki.') : ''),
-            bad.length ? '#c00' : '#0a7a2f');
-        if (konc && konc.n){ try { const kb = document.getElementById('mk-konc-box'); if (kb) kb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
+                                   + ') — zestawienie „🔎 NOT FOUND na auftragach" pod widokiem paczki.') : '')
+            + ((prob && prob.n) ? (' Do wyjaśnienia: ' + prob.n + ' poz. (NOT FOUND ' + prob.nf + ', CHECK ' + prob.chk + ') w ' + prob.m + ' paczkach, '
+                                   + prob.rynki + ' marketplace\'ach — lista „📋 Do wyjaśnienia" pod widokiem paczki.') : ''),
+            (bad.length || (koncAuto && koncAuto.bad && koncAuto.bad.length)) ? '#c00' : '#0a7a2f');
+        if (prob && prob.n){ try { const pb = document.getElementById('mk-prob-box'); if (pb) pb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
+        else if (konc && konc.n){ try { const kb = document.getElementById('mk-konc-box'); if (kb) kb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
         else if (nfa && nfa.n){ try { const nb = document.getElementById('mk-nfa-box'); if (nb) nb.scrollIntoView({ block: 'nearest' }); } catch (e){} }
     }
 
@@ -102287,7 +104410,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'a5250da · 21.10.2026 14:41';
+    const HUB_BUDOWA = 'b5b3791 · 22.10.2026 12:14';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
