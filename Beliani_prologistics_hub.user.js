@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.12
+// @version      5.60.13
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -174,6 +174,8 @@
         const K_KOL   = HUB + 'dz_kolejka_v1';   // wiersze, ktore nie wyszly
         const K_STAN  = HUB + 'dz_stan_v1';      // wynik ostatniej wysylki
         const K_OSOBA = HUB + 'dz_osoba_v1';     // ostatnia osoba widziana w prologistics
+        const K_CHG   = HUB + 'dz_chg_v1';       // kopia dziennika zmian z zakladki „Changelog"
+        const CHG_WAZNA   = 6 * 3600 * 1000;     // po tylu godzinach pytamy arkusz od nowa
         const CISZA_MS    = 40000;    // tyle ciszy konczy przebieg
         const PO_KONCU_MS = 4000;     // tyle ciszy po wpisie „koniec" konczy przebieg
         const MAX_LINII   = 3000;     // dluzszy przebieg dzielimy na czesci
@@ -516,7 +518,31 @@
             odswiez();
         }
 
-        return { wpis: wpis, blad: blad, stopka: stopka, klik: klik, cfg: cfg };
+        // Dziennik zmian dla zakladki „Changelog" w ustawieniach: te same wiersze, ktore hook
+        // post-commit dopisuje do arkusza. CELOWO nie patrzy na przelacznik „on" — kto wylaczyl
+        // WYSYLANIE swoich logow, ma dalej widziec, co sie w HUB-ie zmienilo; potrzebny jest sam adres.
+        // Kopia siedzi w GM, bo inaczej kazde otwarcie zakladki to zapytanie do Apps Scriptu
+        // u kazdej osoby na kazdym komputerze.
+        function zmianyKopia() {
+            const k = wczytaj(K_CHG, null);
+            return (k && Array.isArray(k.rows)) ? k : null;
+        }
+        function zmiany(n, swiezo, cb) {
+            const ile = Math.max(1, Math.min(200, Number(n) || 50));
+            const k = zmianyKopia();
+            if (!swiezo && k && (Date.now() - (k.t || 0) < CHG_WAZNA) && (k.n || 0) >= ile) { cb(null, k.rows, k.t); return; }
+            const c = cfg();
+            if (!c.url) { cb('brak adresu wdrożenia', k && k.rows, k && k.t); return; }
+            zadanie(c.url, JSON.stringify({ secret: HUB_DZ_SECRET, action: 'changelog', n: ile }), function (err, j) {
+                if (err) { cb(err, k && k.rows, k && k.t); return; }
+                const rows = Array.isArray(j.rows) ? j.rows : [];
+                const t = Date.now();
+                zapisz(K_CHG, { t: t, n: ile, rows: rows });
+                cb(null, rows, t);
+            });
+        }
+
+        return { wpis: wpis, blad: blad, stopka: stopka, klik: klik, cfg: cfg, zmiany: zmiany, zmianyKopia: zmianyKopia };
     })();
     // Jedyne wejscie dla modulow: hubDz('Nazwa modulu', 'faza', 'tekst', { ostro: true dla modulow z numerami kont }).
     function hubDz(modul, faza, tekst, opcje) { HUBDZ.wpis(modul, faza, tekst, opcje); }
@@ -37720,12 +37746,22 @@
         // i o rozliczeniu nie mowi nic.
         // Sprawdzone na sierpniu: 22 151,22 (04.08), 11 558,25 (11.08) i 21 277,38 (21.08)
         // — ta ostatnia zgadza sie co do grosza z zestawieniem „Maison IT 21.08.2026".
+        // 22.10.2026, wyciag Postbank „Umsatzliste" (przelew 14 011,40): dwie rzeczy sie zmienily
+        // i regula przestala trafiac. (1) Zamiast numeru stoi UUID: „Mangopay 0e8c7599-4801-4e29-854b-
+        // MA ISONS DU MO" — bank ucina go po czterech grupach, wiec to POCZATEK identyfikatora; mkMatchIn
+        // szuka referencji tez w c.id cyklu, wiec dopasuje, jesli to jego id (czy tak jest — nie
+        // sprawdzone na panelu); gdy nie, cykl dobierze sie po kwocie jak dotad. (2) Bank lamie opis
+        // w srodku slowa: „MA ISONS".
+        // Dlatego spacje miedzy czlonami nazwy sa opcjonalne (mkDetect probuje tez tekstu sklejonego,
+        // gdzie spacji nie ma wcale), a UUID nie ma granicy slowa z przodu — po sklejeniu
+        // „Mangopay0e8c…" nie ma jej wcale. Wzorzec nadal wymaga PELNEGO „MA ISONS DU MO", wiec
+        // „MAISON JOUET" i inne sklepy Mangopaya do tej reguly nie wpadaja.
         { mp: 'Mirakl (Maisons du Monde)', ok: true, payer: /MANGOPAY/i,
-          ref: /\b(\d{4,})\s+MAISONS?\s+DU\s+MO/i,
+          ref: /(\b\d{4,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4})-?\s*MA\s*ISONS?\s*DU\s*MO/i,
           brand: 'Maisons du Monde', short: 'Maisons du Monde',
           host: 'maisonsdumonde-prod.mirakl.net' },
         // Gdyby referencji zabraklo albo miala inny ksztalt — wiersz ma zostac NAZWANY.
-        { mp: 'Maisons du Monde', ok: false, payer: /MANGOPAY/i, ref: /(MAISONS?\s+DU\s+MO)/i },
+        { mp: 'Maisons du Monde', ok: false, payer: /MANGOPAY/i, ref: /(MA\s*ISONS?\s*DU\s*MO)/i },
         // Gamm Vert — panel teractfr-prod.mirakl.net. Na przelewie stoi nazwa GRUPY
         // („TERACT (GROUP", tez ucieta), a nie sklepu; w arkuszu ten marketplace nazywa
         // sie Gamm Vert i tak go tu podpisujemy. Nawias w „TERACT (GROUPE)" jest czescia
@@ -39329,11 +39365,35 @@
     // Rozliczenie Galaxusa to plik z 24 kolumnami sciagany z „Payout overview". Kolumna N
     // nie ma naglowka i przychodzi pusta — to brutto z VAT, ktore Beliani dolicza samo.
     // Sprawdzone na dwoch wyplatach (4336.22 i 8801.72): N = Sales Price x 1.081 zgadza sie
-    // w 102 wierszach na 102. Ostatni wiersz to „Total" — nie jest pozycja i nie liczymy go.
+    // w 102 wierszach na 102 (przy ilosci 1 — dla wiekszej ilosci patrz galxBrutto: brutto liczy sie od JEDNOSTKI).
+    // Ostatni wiersz to „Total" — nie jest pozycja i nie liczymy go.
     const MK_GALX_VAT = { 'Galaxus CH': 0.081 };
     function galxVat(shop){
         const v = MK_GALX_VAT[shop];
         return (typeof v === 'number') ? v : 0.081;
+    }
+    // BRUTTO POZYCJI. „Sales Price" w pliku Galaxusa to cena netto CALEJ pozycji (ilosc x cena jednostkowa),
+    // a auftrag w prologistics ma brutto zaokraglone do groszy od JEDNOSTKI i dopiero pomnozone przez ilosc:
+    // Galaxus podaje 2 x 74.00 = 148.00, auftrag ma 2 x 79.99 = 159.98, a r2(148 x 1.081) to 159.99 — grosz za duzo.
+    // Zmierzone 22.10.2026 na 10 wyplatach (09–22.10, 504 zamowienia) i 12 paczkach banku 199: 24 zamowienia
+    // roznia sie przy liczeniu od pozycji i od jednostki, a wszystkie 16 CHECK z grosza w tych paczkach to
+    // dokladnie te zamowienia; kolejne osiem zespol poprawil recznie dopiska −0,01 / +0,01 / −0,03 (auftrag 15921004:
+    // wartosc 159.98, wplaty 159.99 i −0.01). Dla ilosci 1 nic sie nie zmienia — z wyjatkiem DOKLADNEJ polowki:
+    // 185.00 x 1.081 = 199.985, a auftrag ma 199.98 (5 na 5 sprawdzonych), wiec polowka idzie W DOL. Inne dokladne
+    // polowki (cena jednostkowa konczaca sie na 5.00 CHF) nie wystapily, regule przyjeto z tego jednego przypadku.
+    // Arytmetyka na calkowitych groszach, zeby 199.985 nie zalezalo od zmiennoprzecinkowej reprezentacji.
+    // Pozycja, ktorej nie da sie podzielic na jednostki co do grosza (w danych nie bylo), liczy sie jak dawniej.
+    function galxBrutto(price, qty, vat){
+        if (price == null || !isFinite(price)) return null;
+        const znak = price < 0 ? -1 : 1;
+        const L = Math.round(Math.abs(price) * 100);
+        const q = Math.abs(Math.round(Number(qty))) || 1;
+        if (L % q !== 0) return r2(price * (1 + vat));
+        const bp = Math.round(vat * 10000);
+        const licz = (L / q) * (10000 + bp), dol = Math.floor(licz / 10000);
+        const reszta = licz - dol * 10000;
+        const jedn = (2 * reszta > 10000) ? dol + 1 : dol;          // dokladna polowka w dol
+        return znak * (q * jedn) / 100;
     }
     // Kolumny szukamy po nazwach, a nie po numerach — gdyby Galaxus dolozyl pole,
     // uklad przesunalby sie i cicho psul kwoty.
@@ -39567,7 +39627,7 @@
             // Do zwrotow i do zamowien idzie BRUTTO z VAT, tak jak w pozostalych
             // marketplace'ach — w tickecie ksieguje sie to, co dostal klient, a nie
             // kwote po prowizji Galaxusa.
-            const g = (price == null) ? null : r2(price * (1 + vat));
+            const g = galxBrutto(price, c.qty >= 0 ? mkNum(r[c.qty]) : null, vat);
             if (g != null && g !== 0){
                 if (back){ ref[id] = r2((ref[id] || 0) + Math.abs(g)); refund = r2(refund + Math.abs(g)); }
                 else { ord[id] = r2((ord[id] || 0) + g); gross = r2(gross + g); }
@@ -39599,7 +39659,7 @@
             const isTot = /^total$/i.test(String(r[0] || '').trim());
             if (!isTot && !String(r[c.order] || '').trim()) continue;
             const price = mkNum(r[c.price]);
-            const g = (price == null) ? null : r2(price * (1 + vat));
+            const g = galxBrutto(price, c.qty >= 0 ? mkNum(r[c.qty]) : null, vat);
             if (c.vat >= 0){ if (!isTot) r[c.vat] = (g == null) ? '' : g.toFixed(2); }
             else r.splice(c.price, 0, (isTot || g == null) ? '' : g.toFixed(2));
             out.push(r);
@@ -104410,7 +104470,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'b5b3791 · 22.10.2026 12:14';
+    const HUB_BUDOWA = '2ae4841 · 22.10.2026 13:51';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -104464,18 +104524,19 @@
         if (document.getElementById('beliani-launcher')) return;
 
         GM_addStyle(`
-            #beliani-launcher{position:fixed;top:70px;right:12px;z-index:2147483647;font-family:Arial,Helvetica,sans-serif;}
+            /* --bl-w / --bl-py / --bl-fs ustawia uiZastosuj() z zapisanych ustawien widoku —
+               dzieki temu gestosc i szerokosc menu wchodza bez przerysowania i bez przeladowania. */
+            #beliani-launcher{position:fixed;top:70px;right:12px;z-index:2147483647;font-family:Arial,Helvetica,sans-serif;--bl-w:252px;--bl-py:11px;--bl-fs:14px;}
             #beliani-launch-btn{height:44px;padding:0 16px;border:none;border-radius:22px;background:#FF2F00;color:#fff;font-size:15px;font-weight:bold;cursor:grab;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;display:flex;align-items:center;gap:8px;touch-action:none;user-select:none;-webkit-user-select:none;}
             #beliani-launch-btn:hover{background:#cc2600;}
             #beliani-launch-btn:active{cursor:grabbing;}
-            #beliani-launch-panel{margin-top:8px;width:252px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:hidden;}
-            #beliani-launcher .bl-row{display:flex;align-items:center;gap:10px;width:100%;padding:11px 14px;border:none;background:#fff;font-size:14px;color:#1a1a1a;cursor:pointer;text-align:left;box-sizing:border-box;}
+            #beliani-launch-panel{margin-top:8px;width:var(--bl-w);background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);overflow:hidden;overscroll-behavior:contain;}
+            #beliani-launcher .bl-row{display:flex;align-items:center;gap:10px;width:100%;padding:var(--bl-py) 14px;border:none;background:#fff;font-size:var(--bl-fs);color:#1a1a1a;cursor:pointer;text-align:left;box-sizing:border-box;}
+            #beliani-launcher .bl-dot{color:#FF2F00;font-size:11px;margin-left:auto;}
             #beliani-launcher .bl-row:hover{background:#F6E7E6;}
             #beliani-launcher .bl-emoji{width:20px;flex:0 0 20px;display:flex;align-items:center;justify-content:center;}
             #beliani-launcher .bl-sep{height:1px;background:#eee;}
             #beliani-launcher .bl-gear{color:#750000;font-weight:bold;}
-            #beliani-launcher .bl-set-row{display:block;width:100%;padding:9px 14px 9px 34px;border:none;background:#faf7f6;font-size:13px;color:#333;cursor:pointer;text-align:left;box-sizing:border-box;}
-            #beliani-launcher .bl-set-row:hover{background:#F6E7E6;}
             #beliani-launcher .bl-build{padding:6px 14px;font-size:11px;color:#888;background:#fff;border-top:1px solid #eee;user-select:text;cursor:default;}
             #beliani-launcher .bl-build a{color:#750000;text-decoration:underline;cursor:pointer;}
             /* Krzyzyk wstrzykiwany do paneli, ktore nie mialy wlasnego zamkniecia.
@@ -104532,7 +104593,7 @@
         ];
         // Tylko te wlasnosci nadpisujemy i tylko te oddajemy przy zamknieciu.
         const BL_OWNED = ['position','left','right','top','transform','width',
-                          'max-width','max-height','overflow-y','box-sizing'];
+                          'max-width','max-height','overflow-y','box-sizing','zoom'];
         let blOrder = [], blKey = '';
 
         function blSnap(el){
@@ -104577,6 +104638,26 @@
                 const el = document.querySelector(d.sel);
                 if (el && blOrder.indexOf(d.sel) < 0) blRestore(el);
             });
+            const ui = uiGet();
+            // Pomniejszenie panelu robimy przez `zoom`, nie przez sama czcionke: moduly maja
+            // rozmiary wpisane na sztywno w wielu miejscach, wiec samo font-size zmniejszyloby
+            // tylko czesc napisow. `zoom` (inaczej niz `transform: scale`) naprawde zmienia
+            // uklad, wiec panel zajmuje mniej miejsca — ale wszystkie dlugosci, ktore dok podaje
+            // panelowi, trzeba podzielic przez ten czynnik, zeby na ekranie wyszlo to, co policzyl.
+            const z = (Number(ui.skala) || 100) / 100;
+            // „Nie układaj": oddajemy panelom ich wlasna geometrie i nie dotykamy jej wiecej.
+            // Stan sprzed doku — panele moga sie nakladac, ale zachowuja szerokosc z modulu.
+            if (ui.dok === 'bez'){
+                BL_DOCK.forEach(function (d){
+                    const el = document.querySelector(d.sel);
+                    if (!el) return;
+                    blRestore(el);
+                    // Pomniejszenie dziala takze bez ukladania — wtedy jest jedyna rzecza,
+                    // jaka narzucamy panelowi.
+                    if (z !== 1 && panelOpen(el)) { blSnap(el); blPut(el, 'zoom', String(z)); }
+                });
+                return;
+            }
             const n = blOrder.length;
             if (!n) return;
             const EDGE = 12, GAP = 10, MIN = 380;
@@ -104621,11 +104702,12 @@
                 blPut(el, 'position', 'fixed');
                 blPut(el, 'left', 'auto');
                 blPut(el, 'transform', 'none');
-                blPut(el, 'right', right + 'px');
-                blPut(el, 'top', top + 'px');
-                blPut(el, 'width', ws[i] + 'px');
+                blPut(el, 'zoom', z === 1 ? 'normal' : String(z));
+                blPut(el, 'right', (right / z) + 'px');
+                blPut(el, 'top', (top / z) + 'px');
+                blPut(el, 'width', (ws[i] / z) + 'px');
                 blPut(el, 'max-width', 'none');
-                blPut(el, 'max-height', Math.max(200, window.innerHeight - top - 12) + 'px');
+                blPut(el, 'max-height', (Math.max(200, window.innerHeight - top - 12) / z) + 'px');
                 blPut(el, 'overflow-y', 'auto');
                 el.classList.add('bl-panel');
                 el.setAttribute('data-bl-mod', defs[i].mod);
@@ -104646,8 +104728,20 @@
             });
             blOrder = blOrder.filter(function (sel){ return openNow.indexOf(sel) >= 0; });
             openNow.forEach(function (sel){ if (blOrder.indexOf(sel) < 0) blOrder.push(sel); });
+            const ui = uiGet();
+            // Limit otwartych paneli. Zamykamy NAJSTARSZE, bo nowo otwarty to ten, na ktory
+            // ktos wlasnie patrzy. Geometrie oddajemy przed zamknieciem — inaczej panel
+            // otwarty nastepnym razem wrocilby w szerokosci sprzed chwili.
+            const lim = ui.dok === 'jeden' ? 1 : (ui.dok === 'obok' ? ui.maks : 0);
+            if (lim > 0 && blOrder.length > lim){
+                blOrder.slice(0, blOrder.length - lim).forEach(function (sel){
+                    const el = document.querySelector(sel);
+                    if (el){ blRestore(el); blClose(el); }
+                });
+                blOrder = blOrder.slice(blOrder.length - lim);
+            }
             const key = blOrder.join('|') + '@' + window.innerWidth + 'x' + window.innerHeight
-                      + '@' + blTop();
+                      + '@' + blTop() + '@' + ui.dok + ui.maks + '@' + ui.skala;
             if (key === blKey) return;
             blKey = key;
             blApply();
@@ -104709,6 +104803,9 @@
             { sel: '#sal-panel',        needX: false },
             { sel: '#rcn-panel',        needX: false },
             { sel: '#tis-panel',        needX: true },
+            // Okno ustawien ma wlasny krzyzyk w naglowku, ale Escape ma je zamykac tak samo
+            // jak kazdy inny panel — stad wpis z needX:false.
+            { sel: '#bl-set-panel',     needX: false },
         ];
         function panelOpen(el) {
             if (!el) return false;
@@ -104765,7 +104862,7 @@
 
         const wrap = document.createElement('div'); wrap.id = 'beliani-launcher';
         const btn = document.createElement('button'); btn.id = 'beliani-launch-btn';
-        btn.innerHTML = '<span>\u2630</span><span>Narzędzia</span>';
+        btn.innerHTML = '<span>\u2630</span><span class="bl-btn-napis">Narzędzia</span>';
         const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
 
         function checkUpdate(){
@@ -104814,37 +104911,497 @@
             } catch(e){ window.open(RAW, '_blank'); }
         }
 
-        let html = '';
-        LAUNCH_TOOLS.forEach(function(t){
-            if (!isOn(t.id)) return;
-            html += '<button class="bl-row" data-sel="' + t.sel + '"><span class="bl-emoji">' + t.icon + '</span>' + t.label + '</button>';
-        });
-        html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">\ud83d\udd04</span>Uaktualnij (sprawd\u017a wersj\u0119)</button>';
-        html += '<div class="bl-sep"></div>';
-        html += '<button class="bl-row bl-gear" id="bl-gear"><span class="bl-emoji">\u2699</span>Moduly i ustawienia</button>';
-        html += '<div id="bl-settings" style="display:none">';
-        MODULES.forEach(function(m){
-            html += '<button class="bl-set-row" data-id="' + m.id + '">' + (isOn(m.id) ? '\u2705' : '\u2B1C') + ' ' + m.name + '</button>';
-        });
-        html += '<button class="bl-set-row" id="bl-pos-reset">\u21BA Przywr\u00F3\u0107 pozycj\u0119 guzika</button>';
-        html += '</div>';
-        // Stopka ze znacznikiem budowy. Znak zastepczy (plik wklejony prosto z repo, nie z kopii)
-        // poznajemy po podkresleniach na poczatku — sam znak nie moze tu stac drugi raz,
-        // bo kopia-wersji.sh podmienia go i sprawdza, ze wystepuje dokladnie raz.
-        {
+        // ===== Ustawienia: Widok · Moduły · Changelog ==============================
+        // Do 5.60.12 ustawienia były rozwijaną listą W MENU: 252 px szerokości, 19 narzędzi,
+        // a pod nimi 25 modułów — razem ok. 1850 px. Menu siedzi w position:fixed, więc tego,
+        // co wyszło poza ekran, nie dało się doścignąć przewijaniem strony (zgłoszenie
+        // „ustawienia pojawiają się za ekranem"). Teraz ustawienia to osobne okno, a menu ma
+        // wysokość liczoną z okna i własne przewijanie — niezależnie od tego, co kto ustawi.
+        function blEsc(s){ return String(s == null ? '' : s).replace(/[<>&"]/g, function(c){ return { '<':'&lt;', '>':'&gt;', '&':'&amp;', '"':'&quot;' }[c]; }); }
+        function blP2(n){ return n < 10 ? '0' + n : '' + n; }
+        function blJeden(k, v){ const o = {}; o[k] = v; return o; }
+
+        // ---------- widok (ustawienie tego komputera) ----------
+        const UI_KEY = HUB + 'ui_v1';
+        const UI_DOM = { gest: 'zwykla', szer: 252, napis: true, dok: 'obok', maks: 0, skala: 100, kropka: true, tab: 'widok' };
+        const UI_GEST = { zwykla: ['11px', '14px'], zwarta: ['6px', '13px'], mala: ['4px', '12px'] };
+        let uiCache = null;
+        function uiGet(){
+            if (uiCache) return uiCache;
+            let o = null;
+            try { const s = GM_getValue(UI_KEY, ''); o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+            const u = {};
+            Object.keys(UI_DOM).forEach(function(k){ u[k] = (o && o[k] !== undefined && o[k] !== null) ? o[k] : UI_DOM[k]; });
+            // Zapis z pamieci bywa starszy niz kod: kazda wartosc przechodzi przez wlasna regule,
+            // zeby nieznane „maks" albo szerokosc 9000 nie wywrocily menu.
+            u.szer = Math.max(220, Math.min(400, Number(u.szer) || UI_DOM.szer));
+            if (!UI_GEST[u.gest]) u.gest = UI_DOM.gest;
+            if (['obok', 'jeden', 'bez'].indexOf(u.dok) < 0) u.dok = UI_DOM.dok;
+            u.maks = [0, 2, 3, 4].indexOf(Number(u.maks)) >= 0 ? Number(u.maks) : 0;
+            u.skala = [100, 95, 90, 85, 80].indexOf(Number(u.skala)) >= 0 ? Number(u.skala) : 100;
+            if (['widok', 'moduly', 'changelog'].indexOf(u.tab) < 0) u.tab = UI_DOM.tab;
+            u.napis = !!u.napis; u.kropka = !!u.kropka;
+            uiCache = u;
+            return u;
+        }
+        function uiSet(p){
+            const u = uiGet(), n = {};
+            Object.keys(u).forEach(function(k){ n[k] = u[k]; });
+            Object.keys(p).forEach(function(k){ n[k] = p[k]; });
+            try { GM_setValue(UI_KEY, JSON.stringify(n)); } catch (e) {}
+            uiCache = null;
+            uiZastosuj();
+        }
+        // Gestosc i szerokosc ida zmiennymi CSS, nie przerysowaniem menu — zmiana wchodzi
+        // od razu, nawet przy otwartym menu i bez przeladowania strony.
+        function uiZastosuj(){
+            const u = uiGet();
+            const g = UI_GEST[u.gest] || UI_GEST.zwykla;
+            wrap.style.setProperty('--bl-w', u.szer + 'px');
+            wrap.style.setProperty('--bl-py', g[0]);
+            wrap.style.setProperty('--bl-fs', g[1]);
+            const nap = btn.querySelector('.bl-btn-napis');
+            if (nap) nap.style.display = u.napis ? '' : 'none';
+            btn.style.padding = u.napis ? '' : '0';
+            btn.style.width = u.napis ? '' : '44px';
+            btn.style.justifyContent = 'center';
+            if (panel.style.display !== 'none') placePanel();
+        }
+
+        // ---------- co widac w menu i w jakiej kolejnosci ----------
+        // Kluczem jest SELEKTOR guzika, nie id modulu: dwa wiersze potrafia wskazywac ten sam
+        // modul („Kurs walut" i „VIES/KRS/GUS" to oba „vies", „Issue / PAID" i „Issue — Szukaj"
+        // to oba „issuelog"), wiec po id nie dalo by sie schowac jednego, zostawiajac drugi.
+        const MENU_KEY = HUB + 'menu_v1';
+        function menuGet(){
+            let o = null;
+            try { const s = GM_getValue(MENU_KEY, ''); o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+            o = o || {};
+            return {
+                ukryte: Array.isArray(o.ukryte) ? o.ukryte : [],
+                kol:    Array.isArray(o.kol)    ? o.kol    : [],
+                ulub:   Array.isArray(o.ulub)   ? o.ulub   : []
+            };
+        }
+        function menuSet(m){
+            try { GM_setValue(MENU_KEY, JSON.stringify(m)); } catch (e) {}
+            menuMaluj();
+            if (setPanel && setPanel.style.display !== 'none' && setTab === 'moduly') setMaluj();
+        }
+        // Narzedzie, ktorego nie ma w zapisanej kolejnosci (bo doszlo w nowszej wersji HUB-a),
+        // ladzie na koncu i JEST widoczne. Bez tej zasady nowy modul bylby niewidzialny dla
+        // kazdego, kto raz poukladal sobie menu.
+        function menuWszystkie(m){
+            const kol = m.kol;
+            return LAUNCH_TOOLS.map(function(t, i){
+                const k = kol.indexOf(t.sel);
+                return { t: t, i: i, k: k < 0 ? 9999 : k, ukryty: m.ukryte.indexOf(t.sel) >= 0, ulub: m.ulub.indexOf(t.sel) >= 0 };
+            }).sort(function(a, b){ return (a.k - b.k) || (a.i - b.i); });
+        }
+        function menuZapiszKolejnosc(lista){
+            const m = menuGet();
+            m.kol = lista.map(function(p){ return p.t.sel; });
+            menuSet(m);
+        }
+        function menuPrzestaw(sel, o){
+            const lista = menuWszystkie(menuGet());
+            let i = -1;
+            lista.forEach(function(p, k){ if (p.t.sel === sel) i = k; });
+            const j = i + o;
+            if (i < 0 || j < 0 || j >= lista.length) return;
+            const x = lista[i]; lista[i] = lista[j]; lista[j] = x;
+            menuZapiszKolejnosc(lista);
+        }
+        function menuPoka(sel, poka){
+            const m = menuGet();
+            const i = m.ukryte.indexOf(sel);
+            if (poka && i >= 0) m.ukryte.splice(i, 1);
+            if (!poka && i < 0) m.ukryte.push(sel);
+            menuSet(m);
+        }
+        function menuUlub(sel){
+            const m = menuGet();
+            const i = m.ulub.indexOf(sel);
+            if (i >= 0) m.ulub.splice(i, 1); else m.ulub.push(sel);
+            menuSet(m);
+        }
+
+        // ---------- dziennik zmian z arkusza ----------
+        const CHG_WIDZ = HUB + 'chg_widziane_v1';
+        // Pastele te same, co pasek modulu na panelach — zeby swoj modul dalo sie wylapac wzrokiem.
+        const CHG_TINT = {
+            'Marketplace': '#DD7E6B', 'Chińskie (Depozyty)': '#F9CB9C', 'Księgowanie w tickecie': '#B6D7A8',
+            'Refund Checker': '#FFE599', 'Issue Log': '#A4C2F4', 'TEST Issue': '#A4C2F4',
+            'Księgowanie w auftragu': '#9FC5E8', 'Bank Import': '#D5A6BD', 'Reconciliation': '#8E7CC3',
+            'Export payments': '#A2C4C9', 'Salda': '#A2C4C9'
+        };
+        let chgRows = null, chgT = 0, chgBlad = '', chgQ = '', chgIle = 50, chgBieg = false;
+        function chgNajnowszy(){
+            const k = HUBDZ.zmianyKopia();
+            const r = k && k.rows && k.rows[0];
+            return r ? String(r.commit || r.t || '') : '';
+        }
+        function chgNowe(){
+            if (!uiGet().kropka) return false;
+            const n = chgNajnowszy();
+            if (!n) return false;
+            let w = '';
+            try { w = GM_getValue(CHG_WIDZ, ''); } catch (e) {}
+            return String(w) !== n;
+        }
+        function chgWidziane(){ try { GM_setValue(CHG_WIDZ, chgNajnowszy()); } catch (e) {} }
+        // Kropke poprawiamy przy otwarciu menu, bo „widziane" zmienia sie w oknie ustawien,
+        // a menu samo z siebie sie wtedy nie przerysowuje. Ruszamy jeden wezel, nie cale menu —
+        // przerysowanie gubiloby przewijanie i zaznaczenie w otwartym menu.
+        function chgKropka(){
+            const g = panel.querySelector('#bl-set-open');
+            if (!g) return;
+            const jest = g.querySelector('.bl-dot');
+            const ma = chgNowe();
+            if (ma && !jest) {
+                const s = document.createElement('span');
+                s.className = 'bl-dot';
+                s.title = 'Nowe wpisy w Changelogu';
+                s.textContent = '●';
+                g.appendChild(s);
+            } else if (!ma && jest) {
+                jest.parentNode.removeChild(jest);
+            }
+        }
+        function chgData(t, zRokiem){
+            const d = new Date(Number(t) || 0);
+            if (!t || isNaN(d.getTime())) return '';
+            return blP2(d.getDate()) + '.' + blP2(d.getMonth() + 1) + (zRokiem ? '.' + d.getFullYear() : '');
+        }
+        function chgGodz(t){
+            const d = new Date(Number(t) || 0);
+            return (!t || isNaN(d.getTime())) ? '' : blP2(d.getHours()) + ':' + blP2(d.getMinutes());
+        }
+        // Kazdy powod ma mowic, co z nim zrobic — inaczej zostaje puste okno i pytanie do mnie.
+        function chgPowod(err){
+            const e = String(err || '');
+            if (/adresu wdro/i.test(e)) return 'Changelog bierze się z tego samego arkusza, co Dziennik, a adres wdrożenia jest pusty.<br>Wpisz go na dole menu „Narzędzia" → <b>adres</b>.';
+            if (/nieznana akcja/i.test(e)) return 'Wdrożony Apps Script jest starszy niż HUB (' + blEsc(e) + ').<br>W projekcie arkusza: <b>Wdróż → Zarządzaj wdrożeniami → ołówek → Wersja: Nowa wersja</b>. Adres się nie zmieni.';
+            return 'Nie udało się pobrać listy zmian: ' + blEsc(e) + '.';
+        }
+        function chgZaladuj(swiezo){
+            if (chgBieg) return;
+            chgBieg = true;
+            const box = setPanel && setPanel.querySelector('#bls-chg-lista');
+            if (box && swiezo) box.innerHTML = '<div class="bls-pusto">Pytam arkusz…</div>';
+            HUBDZ.zmiany(chgIle, !!swiezo, function(err, rows, t){
+                chgBieg = false;
+                chgBlad = err || '';
+                if (rows) { chgRows = rows; chgT = t || 0; }
+                chgMaluj();
+                menuMaluj();
+            });
+        }
+        function chgMaluj(){
+            const box = setPanel && setPanel.querySelector('#bls-chg-lista');
+            if (!box) return;
+            if (!chgRows) { box.innerHTML = '<div class="bls-uwaga">' + (chgBlad ? chgPowod(chgBlad) : 'Wczytuję…') + '</div>'; return; }
+            const q = chgQ.trim().toLowerCase();
+            const rows = chgRows.filter(function(r){
+                if (!q) return true;
+                return ((r.opis || '') + ' ' + (r.modul || '') + ' ' + (r.wersja || '')).toLowerCase().indexOf(q) >= 0;
+            });
+            let h = chgBlad ? '<div class="bls-uwaga">' + chgPowod(chgBlad) + '<br><i>Poniżej ostatnia pobrana lista.</i></div>' : '';
+            if (!rows.length) {
+                h += '<div class="bls-pusto">' + (q ? 'Nic nie pasuje do „' + blEsc(chgQ) + '".' : 'Arkusz nie ma jeszcze żadnego wpisu.') + '</div>';
+            } else {
+                let ost = null;
+                rows.forEach(function(r){
+                    const w = r.wersja || '—';
+                    if (w !== ost) { ost = w; h += '<div class="bls-wer">' + blEsc(w) + '<span>' + chgData(r.t, true) + '</span></div>'; }
+                    const tint = CHG_TINT[r.modul] || '#DBD9D7';
+                    h += '<div class="bls-wpis"><span class="bls-d">' + chgData(r.t) + '</span>'
+                       + '<span class="bls-m" style="background:' + tint + '">' + blEsc(r.modul || '—') + '</span>'
+                       + '<span class="bls-o">' + blEsc(r.opis || '') + '</span>'
+                       + '<span class="bls-c">' + blEsc(r.commit || '') + '</span></div>';
+                });
+                if (chgRows.length >= chgIle) h += '<div class="bls-btns"><button type="button" data-act="chg-wiecej">pokaż starsze (50)</button></div>';
+            }
+            h += '<div class="bls-stopka">' + (chgT ? 'pobrane ' + chgData(chgT, true) + ' ' + chgGodz(chgT) : 'bez pobrania')
+               + ' · arkusz „Dawid\'s sprints", zakładka „Changelog" · wpisy robi hook po commicie</div>';
+            box.innerHTML = h;
+            chgWidziane();
+        }
+
+        // ---------- okno ustawien ----------
+        let setPanel = null, setTab = '', setMod = {};
+        function setOtworz(tab){
+            if (!setPanel) setBuduj();
+            setTab = tab || uiGet().tab || 'widok';
+            setPanel.style.display = 'block';
+            setMaluj();
+        }
+        function setZamknij(){ if (setPanel) setPanel.style.display = 'none'; }
+        function setBuduj(){
+            GM_addStyle(`
+                #bl-set-panel{position:fixed;top:70px;left:50%;transform:translateX(-50%);width:620px;max-width:calc(100vw - 24px);
+                    max-height:80vh;overflow:auto;z-index:2147483646;background:#fff;border:1px solid #DBD9D7;border-top:4px solid #750000;
+                    border-radius:12px;box-shadow:0 10px 30px rgba(51,37,36,.25);font-family:'Poppins','Segoe UI',Arial,Helvetica,sans-serif;
+                    font-size:13px;color:#332524;box-sizing:border-box;}
+                #bl-set-panel .bls-head{position:sticky;top:0;background:#fff;display:flex;align-items:center;gap:8px;padding:12px 14px 8px;border-bottom:1px solid #eee;z-index:2;}
+                #bl-set-panel .bls-head b{font-size:15px;color:#750000;flex:1;}
+                #bl-set-panel .bls-x{width:26px;height:26px;border:1px solid #e5d5d3;border-radius:13px;background:#fff;color:#750000;font-weight:bold;cursor:pointer;}
+                #bl-set-panel .bls-x:hover{background:#F6E7E6;}
+                #bl-set-panel .bls-tabs{position:sticky;top:46px;background:#fff;display:flex;gap:6px;padding:8px 14px;border-bottom:1px solid #eee;z-index:2;}
+                #bl-set-panel .bls-tab{padding:6px 14px;border:1px solid #DBD9D7;border-radius:16px;background:#fff;cursor:pointer;font-size:13px;color:#332524;}
+                #bl-set-panel .bls-tab:hover{background:#F6E7E6;}
+                #bl-set-panel .bls-tab.on{background:#750000;border-color:#750000;color:#fff;}
+                #bl-set-panel .bls-body{padding:12px 14px 16px;}
+                #bl-set-panel .bls-sek{margin-bottom:18px;}
+                #bl-set-panel .bls-sek h4{margin:0 0 6px;font-size:13px;color:#750000;}
+                #bl-set-panel .bls-p{margin:0 0 8px;color:#555;line-height:1.45;}
+                #bl-set-panel .bls-l{display:flex;align-items:flex-start;gap:8px;padding:5px 0;cursor:pointer;}
+                #bl-set-panel .bls-l i{display:block;color:#777;font-style:normal;font-size:11.5px;}
+                #bl-set-panel .bls-l.bls-zm span{color:#750000;font-weight:bold;}
+                #bl-set-panel .bls-row{display:flex;align-items:center;gap:10px;padding:6px 0;flex-wrap:wrap;}
+                #bl-set-panel .bls-row i{color:#777;font-style:normal;font-size:11.5px;flex:1 1 100%;}
+                #bl-set-panel .bls-btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
+                #bl-set-panel button:not(.bls-tab):not(.bls-x):not(.bls-star){padding:6px 12px;border:1px solid #DBD9D7;border-radius:6px;background:#faf7f6;cursor:pointer;font-size:12.5px;color:#332524;}
+                #bl-set-panel button:not(.bls-tab):not(.bls-x):not(.bls-star):hover{background:#F6E7E6;}
+                #bl-set-panel button[disabled]{opacity:.4;cursor:default;}
+                #bl-set-panel .bls-t{width:100%;border-collapse:collapse;}
+                #bl-set-panel .bls-t td{padding:3px 4px;border-bottom:1px solid #f2f2f2;vertical-align:middle;}
+                #bl-set-panel .bls-t td:last-child{text-align:right;white-space:nowrap;}
+                #bl-set-panel .bls-t i{color:#999;font-style:normal;font-size:11px;}
+                #bl-set-panel .bls-off td{color:#aaa;}
+                #bl-set-panel .bls-star{border:none;background:none;cursor:pointer;font-size:15px;color:#ccc;padding:0 2px;}
+                #bl-set-panel .bls-star.on{color:#FD9000;}
+                #bl-set-panel .bls-ar button{padding:2px 7px !important;}
+                #bl-set-panel .bls-apply{position:sticky;bottom:0;background:#FFF6F3;border:1px solid #FFCCB7;border-radius:8px;padding:8px 10px;margin-top:10px;}
+                #bl-set-panel .bls-uwaga{background:#FFF6F3;border:1px solid #FFCCB7;border-radius:8px;padding:8px 10px;margin-bottom:10px;line-height:1.45;}
+                #bl-set-panel .bls-pusto{color:#777;padding:10px 0;}
+                #bl-set-panel .bls-chg-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;}
+                #bl-set-panel .bls-chg-top span{flex:1;}
+                #bl-set-panel .bls-szuk{width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid #DBD9D7;border-radius:6px;font-size:13px;margin-bottom:8px;}
+                #bl-set-panel .bls-wer{margin:12px 0 4px;font-weight:bold;color:#750000;border-bottom:1px solid #eee;padding-bottom:3px;}
+                #bl-set-panel .bls-wer span{float:right;font-weight:normal;color:#888;font-size:11.5px;}
+                #bl-set-panel .bls-wpis{display:flex;gap:8px;padding:4px 0;border-bottom:1px solid #f6f6f6;line-height:1.4;}
+                #bl-set-panel .bls-d{flex:0 0 38px;color:#888;font-size:11.5px;padding-top:2px;}
+                #bl-set-panel .bls-m{flex:0 0 120px;align-self:flex-start;padding:1px 6px;border-radius:9px;font-size:11px;color:#332524;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+                #bl-set-panel .bls-o{flex:1;}
+                #bl-set-panel .bls-c{flex:0 0 56px;color:#aaa;font-size:11px;text-align:right;padding-top:2px;}
+                #bl-set-panel .bls-stopka{margin-top:12px;padding-top:8px;border-top:1px solid #eee;color:#888;font-size:11.5px;}
+            `);
+            setPanel = document.createElement('div');
+            setPanel.id = 'bl-set-panel';
+            setPanel.style.display = 'none';
+            document.body.appendChild(setPanel);
+            // Nasluchy na calym oknie, bo tresc zakladek przerysowuje sie po kazdej zmianie
+            // i nasluchy powieszone na pojedynczych guzikach odchodzilyby razem z wezlami.
+            setPanel.addEventListener('click', setKlik);
+            setPanel.addEventListener('change', setZmiana);
+            setPanel.addEventListener('input', setWpis);
+        }
+        function setMaluj(){
+            if (!setPanel) return;
+            const tabs = [['widok', 'Widok'], ['moduly', 'Moduły'], ['changelog', 'Changelog']];
+            let h = '<div class="bls-head"><b>Ustawienia HUB-a</b><button type="button" class="bls-x" data-act="zamknij" title="Zamknij (Esc)">✕</button></div>';
+            h += '<div class="bls-tabs">' + tabs.map(function(x){
+                return '<button type="button" class="bls-tab' + (setTab === x[0] ? ' on' : '') + '" data-tab="' + x[0] + '">' + x[1]
+                     + (x[0] === 'changelog' && chgNowe() ? ' <span class="bl-dot">●</span>' : '') + '</button>';
+            }).join('') + '</div>';
+            h += '<div class="bls-body">' + (setTab === 'widok' ? setWidokHtml() : (setTab === 'moduly' ? setModulyHtml() : setChgHtml())) + '</div>';
+            setPanel.innerHTML = h;
+            if (setTab === 'changelog') { chgMaluj(); chgZaladuj(false); }
+        }
+        function setWidokHtml(){
+            const u = uiGet();
+            const rd = function(id, val, txt, pod){
+                return '<label class="bls-l"><input type="radio" name="bls-' + id + '" data-ui="' + id + '" value="' + val + '"'
+                     + (u[id] === val ? ' checked' : '') + '> <span>' + txt + (pod ? '<i>' + pod + '</i>' : '') + '</span></label>';
+            };
+            const ck = function(id, txt, pod){
+                return '<label class="bls-l"><input type="checkbox" data-ui="' + id + '"' + (u[id] ? ' checked' : '')
+                     + '> <span>' + txt + (pod ? '<i>' + pod + '</i>' : '') + '</span></label>';
+            };
+            return '<div class="bls-sek"><h4>Menu „Narzędzia"</h4>'
+                 + rd('gest', 'zwykla', 'Zwykła czcionka i odstępy', '14 px, wiersz ok. 40 px — tak jest dotąd')
+                 + rd('gest', 'zwarta', 'Mniejsza czcionka', '13 px, wiersz ok. 30 px — przy 19 narzędziach menu jest krótsze o jedną trzecią')
+                 + rd('gest', 'mala', 'Najmniejsza czcionka', '12 px, wiersz ok. 24 px — najwięcej mieści się na raz')
+                 + '<div class="bls-row"><span>Szerokość menu</span><input type="range" data-ui="szer" min="220" max="400" step="4" value="' + u.szer + '"> <b id="bls-szer">' + u.szer + ' px</b></div>'
+                 + ck('napis', 'Napis „Narzędzia" przy guziku', 'bez napisu guzik jest kółkiem ☰ i mniej zasłania stronę')
+                 + ck('kropka', 'Kropka przy guziku, gdy w Changelogu są nowe wpisy')
+                 + '<div class="bls-btns"><button type="button" data-act="pos">↺ Przywróć pozycję guzika</button>'
+                 + '<button type="button" data-act="widok-dom">↺ Domyślny widok</button></div></div>'
+                 + '<div class="bls-sek"><h4>Panele modułów</h4>'
+                 + rd('dok', 'obok', 'Układaj obok siebie', 'tak jest dotąd: otwarte panele stają w rzędzie i zwężają się, gdy brakuje miejsca')
+                 + rd('dok', 'jeden', 'Jeden naraz', 'otwarcie panelu zamyka poprzedni — każdy dostaje pełną szerokość')
+                 + rd('dok', 'bez', 'Nie układaj', 'HUB nie dotyka geometrii paneli: zachowują szerokość z modułu, ale mogą się nakładać')
+                 + '<div class="bls-row"><span>Najwyżej naraz</span><select data-ui="maks"' + (u.dok === 'obok' ? '' : ' disabled') + '>'
+                 + [0, 2, 3, 4].map(function(v){ return '<option value="' + v + '"' + (u.maks === v ? ' selected' : '') + '>' + (v ? v + ' panele' : 'bez limitu') + '</option>'; }).join('')
+                 + '</select><i>przy układaniu obok siebie: kolejny panel zamyka najstarszy, zamiast ściskać wszystkie do podłogi</i></div>'
+                 + '<div class="bls-row"><span>Czcionka w panelach</span><select data-ui="skala">'
+                 + [100, 95, 90, 85, 80].map(function(v){ return '<option value="' + v + '"' + (u.skala === v ? ' selected' : '') + '>' + (v === 100 ? '100% (bez zmian)' : v + '%') + '</option>'; }).join('')
+                 + '</select><i>pomniejsza <b>cały panel modułu</b> — czcionkę, odstępy i guziki, więc mieści się więcej. '
+                 + 'Nie samą czcionkę: moduły mają rozmiary wpisane na sztywno w wielu miejscach, więc zmiana samej czcionki '
+                 + 'zmniejszyłaby tylko część napisów. Jeśli któryś moduł zacznie się przez to rysować dziwnie — wróć na 100%.</i></div></div>';
+        }
+        function setModulyHtml(){
+            const lista = menuWszystkie(menuGet());
+            let h = '<div class="bls-sek"><h4>Widoczne w menu</h4>'
+                  + '<p class="bls-p">Ptaszek chowa <b>wiersz w menu</b> — moduł działa dalej, a panel otworzysz stąd guzikiem „otwórz". '
+                  + 'Żeby moduł w ogóle się nie uruchamiał, odznacz go niżej.</p><table class="bls-t">';
+            lista.forEach(function(p, i){
+                const wyl = !isOn(p.t.id);
+                h += '<tr' + (wyl ? ' class="bls-off"' : '') + '>'
+                   + '<td><input type="checkbox" data-menu="poka" data-sel="' + p.t.sel + '"' + (p.ukryty ? '' : ' checked') + (wyl ? ' disabled' : '') + '></td>'
+                   + '<td><button type="button" class="bls-star' + (p.ulub ? ' on' : '') + '" data-menu="ulub" data-sel="' + p.t.sel + '" title="Na górę menu">' + (p.ulub ? '★' : '☆') + '</button></td>'
+                   + '<td>' + blEsc(p.t.label) + (wyl ? ' <i>moduł wyłączony</i>' : '') + '</td>'
+                   + '<td class="bls-ar"><button type="button" data-menu="gora" data-sel="' + p.t.sel + '"' + (i === 0 ? ' disabled' : '') + '>▲</button> '
+                   + '<button type="button" data-menu="dol" data-sel="' + p.t.sel + '"' + (i === lista.length - 1 ? ' disabled' : '') + '>▼</button> '
+                   + '<button type="button" data-menu="otworz" data-sel="' + p.t.sel + '"' + (wyl ? ' disabled' : '') + '>otwórz</button></td></tr>';
+            });
+            h += '</table><div class="bls-btns"><button type="button" data-act="menu-dom">↺ Domyślna kolejność, wszystko widoczne</button></div></div>';
+
+            const tu = [], tam = [];
+            MODULES.forEach(function(m){
+                let ok = false;
+                try { ok = !!m.test(); } catch (e) { ok = false; }
+                (ok ? tu : tam).push(m);
+            });
+            const wiersz = function(m){
+                const stan = (setMod[m.id] === undefined) ? isOn(m.id) : setMod[m.id];
+                const zm = stan !== isOn(m.id);
+                return '<label class="bls-l' + (zm ? ' bls-zm' : '') + '"><input type="checkbox" data-mod="' + m.id + '"' + (stan ? ' checked' : '') + '> <span>' + blEsc(m.name)
+                     + (MOD_OFF[m.id] ? '<i>domyślnie wyłączony — przechwytuje każde zapytanie panelu, więc startuje tylko na życzenie</i>' : '')
+                     + (zm ? '<i>zmienione — czeka na „Zastosuj"</i>' : '') + '</span></label>';
+            };
+            h += '<div class="bls-sek"><h4>Uruchamiane moduły</h4>'
+               + '<p class="bls-p">Odznaczony moduł nie uruchamia się wcale — nie ma jego panelu ani guzika. Zmiany wchodzą dopiero po przeładowaniu strony.</p>'
+               + tu.map(wiersz).join('');
+            if (tam.length) {
+                h += '<p class="bls-p" style="margin-top:10px">Na tej stronie i tak nie wystartują (działają na panelach marketplace\'ów, eupago, Saferpaya…):</p>'
+                   + '<div class="bls-off">' + tam.map(wiersz).join('') + '</div>';
+            }
+            const zm = Object.keys(setMod).filter(function(id){ return setMod[id] !== isOn(id); });
+            if (zm.length) {
+                h += '<div class="bls-apply"><b>Zmienione: ' + zm.length + '.</b> Żeby weszły, strona musi się przeładować.'
+                   + '<div class="bls-btns"><button type="button" data-act="mod-zastosuj">Zastosuj i odśwież</button>'
+                   + '<button type="button" data-act="mod-cofnij">↶ cofnij zmiany</button></div></div>';
+            }
+            return h + '</div>';
+        }
+        function setChgHtml(){
             let wer = '?';
             try { if (typeof GM_info !== 'undefined' && GM_info.script) wer = GM_info.script.version || '?'; } catch (e) {}
-            const opis = /^__/.test(HUB_BUDOWA)
-                ? 'bez znacznika — plik prosto z repozytorium'
-                : ('zmiana ' + String(HUB_BUDOWA).replace(/[<>&"]/g, ''));
-            html += '<div class="bl-build" title="Ma się zgadzać z: git log -1 --oneline -- Beliani_prologistics_hub.user.js">HUB '
-                + String(wer).replace(/[<>&"]/g, '') + ' · ' + opis + '</div>';
+            const opis = /^__/.test(HUB_BUDOWA) ? 'bez znacznika (plik prosto z repozytorium)' : ('zmiana ' + blEsc(HUB_BUDOWA));
+            return '<div class="bls-chg-top"><span>Masz <b>HUB ' + blEsc(wer) + '</b> · ' + opis + '</span>'
+                 + '<button type="button" data-act="chg-upd">🔄 Sprawdź, czy jest nowsza</button>'
+                 + '<button type="button" data-act="chg-odsw">↻ Odśwież listę</button></div>'
+                 + '<input type="text" class="bls-szuk" id="bls-chg-q" placeholder="szukaj w opisach i modułach…" value="' + blEsc(chgQ) + '">'
+                 + '<div id="bls-chg-lista" class="bls-chg"></div>';
         }
-        // Dziennik centralny (logi modulow -> arkusz „HUB Log"): wynik ostatniej wysylki, kto i z jakiego komputera.
-        html += '<div class="bl-build" id="bl-dz" title="Logi modułów wysyłają się do arkusza „HUB Log” — po godzinie, osobie i komputerze da się ustalić, kto kiedy zrobił co.">'
-            + HUBDZ.stopka() + '</div>';
-        panel.innerHTML = html;
-        {
+        function setKlik(e){
+            const t = e.target && e.target.closest ? e.target.closest('[data-act],[data-tab],[data-menu]') : null;
+            if (!t) return;
+            e.preventDefault(); e.stopPropagation();
+            const tab = t.getAttribute('data-tab');
+            // Przewiniecie zerujemy TYLKO przy zmianie zakladki. setMaluj() woła tez kazdy
+            // ptaszek przy modulach (odswieza pasek „Zastosuj") — tam skok na gore wyrywalby
+            // liste spod reki.
+            if (tab) { setTab = tab; uiSet({ tab: tab }); setMaluj(); setPanel.scrollTop = 0; return; }
+            const me = t.getAttribute('data-menu'), sel = t.getAttribute('data-sel');
+            if (me === 'gora')  { menuPrzestaw(sel, -1); return; }
+            if (me === 'dol')   { menuPrzestaw(sel, 1);  return; }
+            if (me === 'ulub')  { menuUlub(sel);         return; }
+            if (me === 'otworz'){
+                setZamknij();
+                setTimeout(function(){ const b = document.querySelector(sel); if (b) b.click(); }, 0);
+                [20, 200, 600].forEach(function(ms){ setTimeout(ensureClosers, ms); });
+                return;
+            }
+            const co = t.getAttribute('data-act');
+            if (co === 'zamknij') { setZamknij(); return; }
+            if (co === 'pos')     { clearPos(); applyPos(null); if (panel.style.display !== 'none') placePanel(); return; }
+            if (co === 'widok-dom'){ try { GM_setValue(UI_KEY, ''); } catch (er) {} uiCache = null; uiZastosuj(); menuMaluj(); blTick(); setMaluj(); return; }
+            if (co === 'menu-dom') { menuSet({ ukryte: [], kol: [], ulub: [] }); setMaluj(); return; }
+            if (co === 'mod-cofnij'){ setMod = {}; setMaluj(); return; }
+            if (co === 'mod-zastosuj'){
+                const zm = Object.keys(setMod).filter(function(id){ return setMod[id] !== isOn(id); });
+                if (!zm.length) return;
+                const otwarty = HUB_PANELS.filter(function(p){ return panelOpen(document.querySelector(p.sel)); }).length > 0;
+                if (otwarty && !confirm('Przeładowanie strony zamknie otwarte panele HUB-a — to, co w nich stoi, przepadnie.\n\nZastosować zmiany teraz?')) return;
+                zm.forEach(function(id){ try { GM_setValue(HUB + id, setMod[id]); } catch (er) {} });
+                location.reload();
+                return;
+            }
+            if (co === 'chg-odsw')  { chgZaladuj(true); return; }
+            if (co === 'chg-wiecej'){ chgIle = Math.min(200, chgIle + 50); chgZaladuj(true); return; }
+            if (co === 'chg-upd')   { checkUpdate(); return; }
+        }
+        function setZmiana(e){
+            const t = e.target;
+            if (!t || !t.getAttribute) return;
+            const ui = t.getAttribute('data-ui');
+            if (ui) {
+                if (ui === 'szer') uiSet({ szer: Math.max(220, Math.min(400, Number(t.value) || UI_DOM.szer)) });
+                else if (ui === 'maks' || ui === 'skala') { uiSet(blJeden(ui, Number(t.value) || (ui === 'skala' ? 100 : 0))); blTick(); }
+                else if (t.type === 'radio') { uiSet(blJeden(ui, t.value)); if (ui === 'dok') blTick(); setMaluj(); }
+                else { uiSet(blJeden(ui, !!t.checked)); menuMaluj(); }
+                return;
+            }
+            if (t.getAttribute('data-menu') === 'poka') { menuPoka(t.getAttribute('data-sel'), !!t.checked); return; }
+            const mod = t.getAttribute('data-mod');
+            if (mod) { setMod[mod] = !!t.checked; setMaluj(); }
+        }
+        function setWpis(e){
+            const t = e.target;
+            if (!t || !t.getAttribute) return;
+            // Suwak: szerokosc wchodzi na zywo, ale do pamieci idzie dopiero po puszczeniu
+            // (zdarzenie change) — inaczej kazdy piksel to zapis do GM.
+            if (t.getAttribute('data-ui') === 'szer') {
+                const v = Math.max(220, Math.min(400, Number(t.value) || UI_DOM.szer));
+                wrap.style.setProperty('--bl-w', v + 'px');
+                const lab = setPanel && setPanel.querySelector('#bls-szer');
+                if (lab) lab.textContent = v + ' px';
+                if (panel.style.display !== 'none') placePanel();
+                return;
+            }
+            if (t.id === 'bls-chg-q') { chgQ = t.value; chgMaluj(); }
+        }
+
+        // ---------- menu ----------
+        // Menu rysuje sie od nowa po kazdej zmianie ustawien, stad osobna funkcja zamiast
+        // jednorazowego sklejenia HTML-a przy starcie. Nasluchy wieszamy tu, bo innerHTML
+        // wymienia wezly i stare nasluchy odchodza razem z nimi.
+        function menuMaluj(){
+            const m = menuGet();
+            const poz = menuWszystkie(m).filter(function(p){ return isOn(p.t.id) && !p.ukryty; });
+            const ulub = poz.filter(function(p){ return p.ulub; });
+            const reszta = poz.filter(function(p){ return !p.ulub; });
+            const wiersz = function(p){
+                return '<button class="bl-row" data-sel="' + p.t.sel + '"><span class="bl-emoji">' + p.t.icon + '</span>' + blEsc(p.t.label) + '</button>';
+            };
+            let html = '<button class="bl-row bl-gear" id="bl-set-open"><span class="bl-emoji">⚙</span>Ustawienia'
+                     + (chgNowe() ? '<span class="bl-dot" title="Nowe wpisy w Changelogu">●</span>' : '') + '</button>';
+            html += '<div class="bl-sep"></div>';
+            if (ulub.length) { html += ulub.map(wiersz).join(''); if (reszta.length) html += '<div class="bl-sep"></div>'; }
+            html += reszta.map(wiersz).join('');
+            if (!poz.length) html += '<div class="bl-build">Wszystkie narzędzia schowane — „⚙ Ustawienia" → „Moduły".</div>';
+            html += '<div class="bl-sep"></div>';
+            html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
+            // Stopka ze znacznikiem budowy. Znak zastepczy (plik wklejony prosto z repo, nie z kopii)
+            // poznajemy po podkresleniach na poczatku — sam znak nie moze tu stac drugi raz,
+            // bo kopia-wersji.sh podmienia go i sprawdza, ze wystepuje dokladnie raz.
+            {
+                let wer = '?';
+                try { if (typeof GM_info !== 'undefined' && GM_info.script) wer = GM_info.script.version || '?'; } catch (e) {}
+                const opis = /^__/.test(HUB_BUDOWA)
+                    ? 'bez znacznika — plik prosto z repozytorium'
+                    : ('zmiana ' + blEsc(HUB_BUDOWA));
+                html += '<div class="bl-build" title="Ma się zgadzać z: git log -1 --oneline -- Beliani_prologistics_hub.user.js">HUB '
+                    + blEsc(wer) + ' · ' + opis + '</div>';
+            }
+            // Dziennik centralny (logi modulow -> arkusz „HUB Log"): wynik ostatniej wysylki, kto i z jakiego komputera.
+            html += '<div class="bl-build" id="bl-dz" title="Logi modułów wysyłają się do arkusza „HUB Log” — po godzinie, osobie i komputerze da się ustalić, kto kiedy zrobił co.">'
+                + HUBDZ.stopka() + '</div>';
+            panel.innerHTML = html;
+
             const dzBox = panel.querySelector('#bl-dz');
             if (dzBox) dzBox.addEventListener('click', function (e) {
                 const a = e.target && e.target.closest ? e.target.closest('[data-dz]') : null;
@@ -104852,7 +105409,29 @@
                 e.preventDefault(); e.stopPropagation();
                 HUBDZ.klik(a.getAttribute('data-dz'), function () { dzBox.innerHTML = HUBDZ.stopka(); });
             });
+            panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
+                r.addEventListener('click', function(){
+                    const sel = r.getAttribute('data-sel');
+                    panel.style.display = 'none';
+                    setTimeout(function(){ const b = document.querySelector(sel); if (b) b.click(); }, 0);
+                    // panel powstaje dopiero po kliknieciu w schowany guzik, wiec krzyzyk
+                    // wstrzykujemy chwile pozniej
+                    [20, 200, 600].forEach(function(ms){ setTimeout(ensureClosers, ms); });
+                });
+            });
+            const so = panel.querySelector('#bl-set-open');
+            if (so) so.addEventListener('click', function(e){ e.stopPropagation(); panel.style.display = 'none'; setOtworz(); });
+            const upd = panel.querySelector('#bl-update');
+            if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; checkUpdate(); });
+            if (panel.style.display !== 'none') placePanel();
         }
+
+        uiZastosuj();
+        menuMaluj();
+        // Kropka „nowości" ma dzialac bez otwierania zakladki, ale nie moze pytac arkusza przy
+        // kazdym rysowaniu menu. Stad jedno odpytanie na wczytanie strony — i tylko wtedy, gdy
+        // kopia w pamieci jest starsza niz 6 godzin (reszte zalatwia sam HUBDZ.zmiany).
+        setTimeout(function(){ try { if (uiGet().kropka) chgZaladuj(false); } catch (e) {} }, 20000);
 
         wrap.appendChild(btn); wrap.appendChild(panel);
         document.body.appendChild(wrap);
@@ -104905,17 +105484,26 @@
             let r;
             try { r = btn.getBoundingClientRect(); } catch (e) { return; }
             const pw = panel.offsetWidth || 252;
-            const ph = panel.offsetHeight || 0;
             const vw = window.innerWidth || 0;
             const vh = window.innerHeight || 0;
             panel.style.position = 'absolute';
             panel.style.marginTop = '0';
-            const below = vh - r.bottom;
-            if (ph && below < ph + 12 && r.top > below) {
-                panel.style.top = 'auto'; panel.style.bottom = 'calc(100% + 8px)';
-            } else {
+            // Menu NIE MOZE wyjsc poza ekran: siedzi w position:fixed, wiec tego, co wyjechalo,
+            // nie da sie doscignac przewijaniem strony — tak gubily sie ustawienia na laptopie.
+            // Stad wysokosc liczona z wolnego miejsca pod guzikiem (albo nad nim) i wlasne
+            // przewijanie w srodku. Pomiar wymaga zdjecia poprzedniego ograniczenia.
+            panel.style.maxHeight = 'none';
+            const ph = panel.scrollHeight || panel.offsetHeight || 0;
+            const ponizej = Math.max(0, vh - r.bottom - 16);
+            const powyzej = Math.max(0, r.top - 16);
+            const wDol = (ph && ph <= ponizej) || ponizej >= powyzej;
+            if (wDol) {
                 panel.style.bottom = 'auto'; panel.style.top = 'calc(100% + 8px)';
+            } else {
+                panel.style.top = 'auto'; panel.style.bottom = 'calc(100% + 8px)';
             }
+            panel.style.maxHeight = Math.max(160, wDol ? ponizej : powyzej) + 'px';
+            panel.style.overflowY = 'auto';
             if (r.left + pw > vw - 4) {
                 panel.style.left = 'auto'; panel.style.right = '0';
             } else {
@@ -104975,39 +105563,8 @@
             }
             const open = (panel.style.display === 'none');
             panel.style.display = open ? 'block' : 'none';
-            if (open) placePanel();
+            if (open) { chgKropka(); placePanel(); }
             ensureClosers();
-        });
-        panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
-            r.addEventListener('click', function(){
-                const sel = r.getAttribute('data-sel');
-                panel.style.display = 'none';
-                setTimeout(function(){ const b = document.querySelector(sel); if (b) b.click(); }, 0);
-                // panel powstaje dopiero po kliknieciu w schowany guzik, wiec krzyzyk
-                // wstrzykujemy chwile pozniej
-                [20, 200, 600].forEach(function(ms){ setTimeout(ensureClosers, ms); });
-            });
-        });
-        const gear = panel.querySelector('#bl-gear');
-        if (gear) gear.addEventListener('click', function(e){
-            e.stopPropagation();
-            const s = panel.querySelector('#bl-settings');
-            s.style.display = (s.style.display === 'none') ? 'block' : 'none';
-            placePanel();
-        });
-        const upd = panel.querySelector('#bl-update');
-        if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; checkUpdate(); });
-        panel.querySelectorAll('.bl-set-row[data-id]').forEach(function(r){
-            r.addEventListener('click', function(){
-                const id = r.getAttribute('data-id');
-                try { GM_setValue(HUB + id, !isOn(id)); } catch(e){}
-                location.reload();
-            });
-        });
-        const posReset = panel.querySelector('#bl-pos-reset');
-        if (posReset) posReset.addEventListener('click', function(e){
-            e.stopPropagation();
-            clearPos(); applyPos(null); placePanel();
         });
 
         // Escape i klik obok — rejestrowane raz. buildLauncher i tak konczy sie od
