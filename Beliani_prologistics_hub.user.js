@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.13
+// @version      5.60.14
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -34780,8 +34780,14 @@
         // Leen Bakker: oba sklepy na konto 1354 „Leen Bakker Beliani NL" (uzgodnione).
         // Nazwy sklepow to numery z tytulow przelewow — panel poda wlasne, ale te sa
         // pewne i nie zmienia sie po przelaczeniu sklepu.
-        // Limango — podane przez uzytkownika 27.08.2026.
-        'Limango · Limango DE': { bank: '200', booking: '9', acct: '1515' },
+        // Limango Mirakl (26.10.2026): ustawienie 254 „Limango DE NEW" (EUR, booking 9 = Fulfillment No,
+        // numer w kol. 5, kwota w kol. 14, data w kol. 3), konto 1515 „Limango DE" — odczytane
+        // z /api/bankSettings/index/254/. UWAGA: ten klucz istnieje od 27.08.2026 z bankiem 200 i setLoad
+        // NIE nadpisuje zapisanych wartosci — na komputerze, ktory juz ma ten wiersz, bank trzeba przestawic
+        // recznie w ⚙ Konta. Import tego pilnuje (mkLimBankZly).
+        'Limango · Limango DE': { bank: '254', booking: '9', acct: '1515' },
+        // Stary dashboard: ustawienie 200 „Limango DE" (numer w kol. 1, kwota w kol. 8), to samo konto 1515.
+        'Limango stary · Limango DE stary': { bank: '200', booking: '9', acct: '1515' },
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2297': { bank: '', booking: '9', acct: '1354' },
         'Mirakl (Leen Bakker) · Leen Bakker · sklep 2298': { bank: '', booking: '9', acct: '1354' },
         // Furniture 1 (ustalone 17.09.2026): dwa sklepy, jedno konto 1124 i jeden import 166 „Furniture 1".
@@ -37226,7 +37232,11 @@
         // Dopisane recznie poza zrzutem z 15.09.2026: ustawienia Cultury, Altexa i Hobbyboxa SE/DK, odczytane 13.10.2026.
         "257": "Cultura FR", "258": "Altex RO", "259": "Hobbybox SE", "260": "Hobbybox DK",
         // 261 „xxx Lutz HR" — odczytane 21.10.2026 z /api/bankSettings/index/ (SE jeszcze nie ma: ostatni numer to 261).
-        "261": "xxx Lutz HR"
+        "261": "xxx Lutz HR",
+        // 254 „Limango DE NEW" — panel Mirakla. Osobne ustawienie od 200 „Limango DE" (stary dashboard),
+        // bo pliki maja inny uklad: 200 czyta numer z kol. 1 i kwote z 8, a 254 numer z 5, kwote z 14, date z 3.
+        // Odczytane 26.10.2026 z /api/bankSettings/index/254/ (EUR, konto 1515, booking 9).
+        "254": "Limango DE NEW"
     };
     function bsPobrane(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsReczne(){ try { return JSON.parse(GM_getValue(MK_BS_RECZNE, '{}')) || {}; } catch (e){ return {}; } }
@@ -37409,7 +37419,10 @@
         'LEROY MERLIN|IT':                   'https://adeo-marketplace.mirakl.net/',
         'LEROY MERLIN|PT':                   'https://adeo-marketplace.mirakl.net/',
         'LEROY MERLIN|RO':                   'https://adeo-marketplace.mirakl.net/',
-        'LIMANGO|DE':                        'https://partner.limango.de',
+        // Limango sprzedaje od 2026 przez Mirakla — adres prowadzi na TEN panel, nie na stary
+        // dashboard (partner.limango.de). Warunek w mkCele jest ostry: adres logowania musi
+        // wskazywac ten sam host, co regula wyciagu, inaczej cel z MK_LOGIN jest pomijany.
+        'LIMANGO|DE':                        'https://limango.mirakl.net/mmp/shop/documents/accounting',
         'MAISONS DU MONDE|DE':               'https://maisonsdumonde-prod.mirakl.net/',
         'MAISONS DU MONDE|ES':               'https://maisonsdumonde-prod.mirakl.net/',
         'MAISONS DU MONDE|FR':               'https://maisonsdumonde-prod.mirakl.net/',
@@ -37810,7 +37823,13 @@
         // NIE MA, wiec „\bNR\." nie trafialo, a nietrafiony wzorzec referencji KASUJE
         // cala regule (mkDetect robi wtedy `continue`) i wplata zostawala nierozpoznana.
         // Zadamy tylko, zeby przed „MP-" stal znak nie bedacy litera ani cyfra.
-        { mp: 'Limango',        ok: true,  payer: /LIMANGO/i,
+        // STARY DASHBOARD (partner.limango.de). Rozpoznaje go numer „MP-…" w tytule — tylko
+        // takie przelewy maja plik „Gutschrift_MP-…csv" do wczytania. Marketplace nazywa sie
+        // tu „Limango stary", bo panel Mirakla (nizej) ma INNE ustawienie importu (254 zamiast
+        // 200) i inny uklad pliku, a jedno „marketplace · sklep" ma w ustawieniach jeden bank.
+        // Regula stoi PRZED Miraklem swiadomie: nietrafiony wzorzec referencji kasuje cala
+        // regule (mkDetect robi `continue`), wiec przelew BEZ „MP-" sam spada do Mirakla.
+        { mp: 'Limango stary',  ok: true,  payer: /LIMANGO/i,
           ref: /(?:^|[^A-Za-z0-9])(MP-\d{3,})/i,
           // KOMPLET dokumentow z tytulu — ten sam wzorzec, co przy Manorze („NR.<numer>/
           // <data>"). Wezszy wzorzec „MP-\d+" gubil „MP2026-011", a to tez jest dokument
@@ -37819,10 +37838,18 @@
           // Nazwa sklepu WPROST, a nie przez MK_LIM_SHOP: ta stala stoi kilkaset linii
           // nizej, a `const` nie jest wynoszony na gore. Odwolanie do niej z MK_RULES
           // wywalaloby CALY modul przy starcie — „Cannot access before initialization".
-          brand: 'Limango', short: 'Limango', host: '', kind: 'lim', shop: 'Limango DE' },
-        // Limango bez „MP-" w tytule (np. „NR.230253/1.7.2026") — bez noty do pobrania,
-        // ale do arkusza jako Limango DE (ustalone 17.09.2026).
-        { mp: 'Limango',        ok: false, payer: /LIMANGO/i, ark: 'Limango DE' },
+          // Do ARKUSZA i tak idzie „Limango DE" — tak nazywa sie rynek na liscie _Markety
+          // (konto 1515) i tak go pisze zespol. „stary" rozroznia tylko ustawienie importu.
+          brand: 'Limango', short: 'Limango', host: '', kind: 'lim',
+          shop: 'Limango DE stary', ark: 'Limango DE' },
+        // LIMANGO MIRAKL — kanal zywy od 2026. Sklep 2077 na limango.mirakl.net, ustawienie
+        // importu 254 „Limango DE NEW", konto 1515. Tytul przelewu Mirakla nie niesie „MP-",
+        // wiec reguly nie ma po czym rozpoznac poza platnikiem — i wlasnie dlatego stoi nizej:
+        // lapie wszystko, czego nie wzial stary dashboard. Kwoty liczy mkLimBrutto (model
+        // zakupowy, patrz blok „LIMANGO — Mirakl").
+        { mp: 'Limango',        ok: true,  payer: /LIMANGO/i,
+          brand: 'Limango', short: 'Limango', host: 'limango.mirakl.net', kind: 'mirakl',
+          shop: 'Limango DE', ark: 'Limango DE', cur: 'EUR' },
         // Worten ma DWOCH platnikow i dwa konta: „WORTEN-EQUIPAMENTOS PARA O LAR" = PT (1422),
         // „WORTEN ESPANA DISTRIBUCION" = ES (1437). Rozstrzyga platnik, nie tytul.
         { mp: 'Worten',         ok: false, payer: /WORTEN[\s-]*ESPANA/i, ark: 'Worten ES' },
@@ -38458,6 +38485,152 @@
                  reczne: Object.keys(reczne).map(function (k){ return reczne[k]; }), manual: manual, bezNr: bezNr, niepewne: niepewne };
     }
 
+    // ================= LIMANGO — Mirakl: model zakupowy =================
+    // Limango NIE jest posrednikiem: KUPUJE od nas towar za cene pomniejszona o prowizje i dolicza
+    // do tego niemiecki VAT. Na auftragu ma wiec stanac nie zwykle brutto Mirakla (to, co zaplacil
+    // klient), tylko to, co placi Limango:
+    //
+    //     kwota = (cena sprzedazy + wysylka - prowizje) x 1,19
+    //
+    // ZMIERZONE, nie wywnioskowane. Cykl zamkniety 30.06.2026 (381ed94e…): 28 zamowien, KAZDA kwota
+    // co do grosza taka, jak w paczce 2202035, ktora Katarzyna zbudowala recznie — np. 193,73 -> 230,54,
+    // 115,24 -> 137,14, 7,85 -> 9,34. Suma netto 2 614,23 rowna sie netto faktury IN2077A-1 CO DO CENTA.
+    // Sprawdzone tez na cyklu 31.08.2026 (6920b63f…): 132 zamowienia, netto 9 805,95 = netto IN2077A-4.
+    //
+    // Dlaczego nie da sie tego zrobic w mkCls: tam prowizja jest „skip" (nie wchodzi do brutta) i tak
+    // ma byc dla WSZYSTKICH pozostalych Miraklow — u nich na auftrag idzie brutto zamowienia. Limango
+    // jest wyjatkiem, wiec przeliczamy ord/ref PO mkAggregate, z tych samych surowych pozycji.
+    const MK_LIM_VAT = 1.19;
+    // Pozycje skladajace sie na NETTO faktury. Sprzedaz i zwrot licza sie z tych samych czterech
+    // rodzajow, tyle ze w wersji REFUND_ — i wtedy wychodza na minus.
+    const MK_LIM_NETTO = {
+        ORDER_AMOUNT: 1, ORDER_SHIPPING_AMOUNT: 1,
+        PURCHASE_COMMISSION_FEE: 1, PURCHASE_SHIPPING_COMMISSION_FEE: 1
+    };
+    const MK_LIM_NETTO_ZWR = {
+        REFUND_ORDER_AMOUNT: 1, REFUND_ORDER_SHIPPING_AMOUNT: 1,
+        REFUND_PURCHASE_COMMISSION_FEE: 1, REFUND_PURCHASE_SHIPPING_COMMISSION_FEE: 1
+    };
+    function mkLimCzy(j){
+        return String((j && j.mp) || '') === 'Limango'
+            && String((j && j.host) || '').indexOf('limango.mirakl.net') >= 0;
+    }
+    // VAT doliczamy 19% od netto ZAMOWIENIA, a nie bierzemy podatku z pozycji Mirakla. Powod jest
+    // zmierzony: Mirakl ma w tych cyklach zly VAT (CN2077A-4 netto 504,16 z podatkiem 36,97 zamiast
+    // 95,79), a nasze finanse wystawiaja korekty „/2" wlasnie z 19%. Netto x 1,19 odtwarza poprawiona
+    // note CN2077A-4/2 co do centa (599,95), czyli to, co Limango faktycznie potracilo.
+    function mkLimBrutto(netto){ return r2(Number(netto) * MK_LIM_VAT); }
+    // Przelicza wynik mkAggregate na kwoty Limango. Reszta pol (comp, pay, unknown, skipped…) zostaje
+    // nietknieta: sluzy kontroli spojnosci raportu, ktora dalej ma isc na oryginalnych liczbach Mirakla.
+    function mkLimPrzelicz(a, list){
+        const nOrd = {}, nRef = {};
+        (list || []).forEach(function (x){
+            const t = String(x && x.type || '').toUpperCase().replace(/[^A-Z]+/g, '_');
+            const id = String(x && x.orderUuid || '').trim();
+            if (!id) return;
+            const v = Number(x.amount) || 0;
+            if (MK_LIM_NETTO[t]) nOrd[id] = (nOrd[id] || 0) + v;
+            else if (MK_LIM_NETTO_ZWR[t]) nRef[id] = (nRef[id] || 0) + v;
+        });
+        const naBrutto = function (src){
+            const out = {};
+            Object.keys(src).forEach(function (k){
+                const b = mkLimBrutto(src[k]);
+                if (b) out[k] = b;                     // zamowienie, ktore po prowizji schodzi do zera, nie jest pozycja
+            });
+            return out;
+        };
+        const kopia = {};
+        Object.keys(a).forEach(function (k){ kopia[k] = a[k]; });
+        kopia.ord = naBrutto(nOrd);
+        kopia.ref = naBrutto(nRef);
+        kopia.limango = true;
+        return kopia;
+    }
+    // ===== Limango: czy faktura zgadza sie sama ze soba =====
+    // Dokumenty, ktore Mirakl wystawia w NASZYM imieniu, potrafia miec VAT niepasujacy do wlasnego netto.
+    // Zmierzone 26.10.2026 na cyklu 31.08: IN2077A-4 ma netto 9 805,95 (co do centa tyle, ile daja pozycje)
+    // i VAT 1 864,01, a 19% od tego netto to 1 863,13 — roznicy 0,88 nie odtwarza ZADNE grupowanie pozycji
+    // (zamowienie / linia / produkt) ani zaokraglenie (w gore: 1 863,68–1 864,16). CN2077A-3 ma z kolei netto
+    // trzech zamowien (251,33) i VAT czterech (47,77). Skutek przy ksiegowaniu: na koncie 1515 zostaje 0,87.
+    //
+    // To NIE BLOKUJE importu — kwoty na auftragach sa prawidlowe, zle jest podsumowanie na dokumencie.
+    // Uwaga idzie do adnotacji zlecenia i do wiersza na liscie, z nazwiskiem osoby, ktora poprawia to w Sage.
+    const MK_LIM_FV_DOK = '/document-request/private/accounting-document/to-operator';
+    const MK_LIM_FV_OSOBA = 'Dominika Matulka';
+    const MK_LIM_FV_OSOBA_KOMU = 'Dominice Matulce';
+    const MK_LIM_FV_PROG = 0.01;
+    // Zwraca { poz: [...], blad } albo null. NIGDY nie rzuca: kontrola informacyjna nie ma prawa
+    // przewrocic pobrania rozliczenia.
+    async function mkLimKontrolaFv(j, cycIds, list){
+        if (!mkLimCzy(j)) return null;
+        const chce = {};
+        (cycIds || []).forEach(function (c){ if (c) chce[String(c)] = 1; });
+        if (!Object.keys(chce).length) return null;
+        let docs = [];
+        try {
+            docs = mkArr(await mkApi(MK_LIM_FV_DOK + '?limit=50&sort=dateCreated%2CDESC'))
+                   .filter(function (d){ return d && chce[String(d.shopBillingCycleId || '')]; });
+        } catch (e){ return { poz: [], blad: (e && e.message) || String(e) }; }
+        if (!docs.length) return null;
+        // Netto Z POZYCJI, per dokument — ta sama czworka rodzajow, z ktorej liczymy kwoty na auftragi.
+        const netPoz = {};
+        (list || []).forEach(function (x){
+            const t = String(x && x.type || '').toUpperCase().replace(/[^A-Z]+/g, '_');
+            if (!MK_LIM_NETTO[t] && !MK_LIM_NETTO_ZWR[t]) return;
+            const nr = String(x.documentNumber || '');
+            if (!nr) return;
+            netPoz[nr] = r2((netPoz[nr] || 0) + (Number(x.amount) || 0));
+        });
+        const poz = [];
+        docs.forEach(function (d){
+            const nr = String(d.number || '');
+            const nDok = Number(d.totalAmountExcludingTaxes);
+            if (!isFinite(nDok)) return;
+            const vDok = isFinite(Number(d.totalTaxAmount))
+                ? Number(d.totalTaxAmount)
+                : r2(Number(d.totalAmountIncludingTaxes) - nDok);
+            const w = { nr: nr, netto: nDok, vat: vDok, vatMa: r2(Math.abs(nDok) * (MK_LIM_VAT - 1)) };
+            w.vatRoz = r2(Math.abs(vDok) - w.vatMa);
+            const zPoz = netPoz[nr];
+            if (zPoz != null) w.nettoPoz = Math.abs(zPoz);
+            w.nettoRoz = (zPoz == null) ? 0 : r2(Math.abs(zPoz) - Math.abs(nDok));
+            if (Math.abs(w.vatRoz) >= MK_LIM_FV_PROG || Math.abs(w.nettoRoz) >= MK_LIM_FV_PROG) poz.push(w);
+        });
+        return poz.length ? { poz: poz, blad: '' } : null;
+    }
+    // Jedno zdanie do adnotacji zlecenia. Osobno opis kazdego dokumentu — w wierszu listy (mkLimFvHtml).
+    function mkLimFvNota(fv){
+        if (!fv || !fv.poz || !fv.poz.length) return '';
+        return 'Limango wystawiła ' + fv.poz.length + ' dokument' + (fv.poz.length === 1 ? '' : 'y')
+             + ' niezgodny z własnym netto (' + fv.poz.map(function (w){ return w.nr; }).join(', ')
+             + ') — import idzie dalej, ale przekaż to ' + MK_LIM_FV_OSOBA_KOMU + ', żeby poprawiła w Sage';
+    }
+    function mkLimFvOpis(w){
+        const cz = [];
+        if (Math.abs(w.vatRoz) >= MK_LIM_FV_PROG)
+            cz.push('VAT ' + f2(Math.abs(w.vat)) + ', a 19% od netto ' + f2(Math.abs(w.netto))
+                  + ' to ' + f2(w.vatMa) + ' (różnica ' + f2(w.vatRoz) + ')');
+        if (Math.abs(w.nettoRoz) >= MK_LIM_FV_PROG)
+            cz.push('netto dokumentu ' + f2(Math.abs(w.netto)) + ', a z pozycji wychodzi '
+                  + f2(w.nettoPoz) + ' (różnica ' + f2(w.nettoRoz) + ')');
+        return w.nr + ': ' + cz.join(' · ');
+    }
+    // Straz przed importem na ZLE ustawienie. Klucz „Limango · Limango DE" istnieje w ⚙ Konta
+    // od 27.08.2026 z bankiem 200 (stary dashboard: numer w kol. 1, kwota w kol. 8), a setLoad
+    // dosiewa tylko BRAKUJACE klucze — zapisanej wartosci nie nadpisuje. Plik Mirakla ma numer
+    // w kol. 5 i kwote w 14, wiec import na 200 wczytalby same puste wiersze. Lepiej odmowic
+    // i powiedziec, co kliknac, niz zalozyc paczke, w ktorej nic sie nie dopasuje.
+    function mkLimBankZly(j){
+        const sklep = String((j && j.shop) || (j && j.data && j.data.shop) || '');
+        const k = setKey((j && j.mp) || '', sklep);
+        const u = setLoad()[k] || {};
+        if (String(u.bank || '').trim() !== '200') return '';
+        return 'Limango: w „⚙ Konta" przy „' + k + '" stoi ustawienie importu 200 — to STARY dashboard '
+             + '(numer zamówienia w kol. 1, kwota w kol. 8). Mirakl ma własne: 254 „Limango DE NEW" '
+             + '(numer w kol. 5, kwota w kol. 14, konto 1515). Przestaw je i powtórz import.';
+    }
+
     // ===== One-off debit: zwrot czy oplata — z PDF-a dokumentu =====
     // Rodzaj (zwrot dla klienta / oplata operatora) stoi wylacznie w opisie pozycji na fakturze. Trzy znane brzmienia
     // (odczyt 21.10.2026, Home24): „Calculation of a manual refund" (DE, FIN-A-384) i „Belastung zu entstandenen Chargebacks, auf
@@ -38563,6 +38736,11 @@
     const MK_LEROY_HOST = 'adeo-marketplace.mirakl.net';
     const MK_SHOPID = {
         '2750': { mp: 'Mirakl (Empik)', brand: 'Empik', short: 'Empik', host: 'marketplace.empik.com' },
+        // Limango: jeden sklep 2077 („Beliani DE", EUR) — numer stoi takze w numerach dokumentow
+        // wystawianych w naszym imieniu („IN2077A-4", „CN2077A-3"). Nazwe sklepu wpisujemy WPROST:
+        // panel podaje „Beliani DE", a klucz ustawien ma byc ten sam, co etykieta w arkuszu.
+        '2077': { mp: 'Limango', brand: 'Limango', short: 'Limango',
+                  host: 'limango.mirakl.net', shop: 'Limango DE', cur: 'EUR' },
         // Terract: JEDEN sklep (2051) i DWA kanaly sprzedazy w tym samym rozliczeniu —
         // „Gamm Vert" i „Jardiland". To nie sa dwa marketplace'y do rozdzielenia: jedna
         // wyplata, jedno konto (1154), jedno ksiegowanie. Nazwy sklepu NIE wpisujemy —
@@ -38930,6 +39108,7 @@
         const cycIds = o.cycIds || [], shopName = o.shopName || '';
         const docs = o.docs || [], docSum = o.docSum;
         let a = mkAggregate(tx.list, j.ref), split = false;
+        let uzyte = tx.list;              // pozycje, z ktorych policzono „a" (po podziale: tylko te z naszej wyplaty)
         // Liczbe wyplat zapamietujemy PRZED ewentualnym podzialem. Po nim
         // w „a" zostaje juz tylko jedna wyplata, wiec warunek „a.pays.length > 1
         // && split" nie mial prawa sie wykonac i adnotacja o wybraniu jednej
@@ -38941,8 +39120,12 @@
         // wyplate, a odnosnikiem jest numer dokumentu, nie numer wyplaty.
         if (!manor && a.pays.length > 1 && j.ref){
             const sub = tx.list.filter(function (x){ return mkPayRef(x).indexOf(j.ref) >= 0; });
-            if (sub.length){ a = mkAggregate(sub, j.ref); split = true; }
+            if (sub.length){ a = mkAggregate(sub, j.ref); uzyte = sub; split = true; }
         }
+        // Limango kupuje od nas towar, wiec na auftrag idzie cena po prowizji z VAT-em, a nie brutto
+        // zamowienia. Przeliczamy TYLKO ord/ref; kontrola spojnosci raportu (comp, pay) zostaje na
+        // oryginalnych liczbach Mirakla. Patrz blok „LIMANGO — Mirakl: model zakupowy".
+        if (mkLimCzy(j)) a = mkLimPrzelicz(a, uzyte);
         let gross = 0; Object.keys(a.ord).forEach(function (k){ gross = r2(gross + a.ord[k]); });
         let refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
         // Manual credit (uznanie od operatora, np. „Rücknahme Erstattung (Chargeback)"): kwota wplywa do wyplaty, a zespol
@@ -38992,6 +39175,7 @@
                    netOk: full && (bezKwoty || eq(net, j.amount)), netSkip: bezKwoty,
                    ord: a.ord, ref: a.ref, refExtra: refExtra, reczne: a.reczne,
                    unknown: a.unknown, skipped: a.skipped, full: full,
+                   limFv: o.limFv || null,
                    both: both, pays: a.pays.length, split: split,
                    rows: tx.list.length, total: tx.total, pages: tx.pages, how: tx.how };
         const bad = [];
@@ -39029,6 +39213,10 @@
         }
         if (!manor && paysAll > 1 && !split) bad.push('cykl ma ' + paysAll + ' wypłat (' + a.pays.map(function (p){ return f2(p.a); }).join(', ') + '), a pozycje nie wskazują, do której należą — nie rozdzielę ich sam');
         if (!manor && paysAll > 1 && split) j.note = (j.note ? j.note + '; ' : '') + 'cykl ma ' + paysAll + ' wypłat — wziąłem tylko pozycje z ' + j.ref;
+        // Limango: dokument niezgodny z wlasnym netto. ADNOTACJA, nie „bad" — kwoty na auftragach sa dobre,
+        // zle jest podsumowanie na fakturze, a tego nie poprawimy importem.
+        const limNota = mkLimFvNota(o.limFv);
+        if (limNota) j.note = (j.note ? j.note + '; ' : '') + limNota;
         if (!selfOk) bad.push('raport nie domyka się sam: składniki ' + f2(a.comp) + ' vs wypłaty ' + f2(a.payAll));
         if (!manor && a.pays.length && a.pay == null) bad.push('nie wiem, która z wypłat odpowiada temu przelewowi');
         // Empik: kwoty NIE kontrolujemy (patrz MK_BEZ_KWOTY), ale roznice
@@ -39153,7 +39341,10 @@
         // a 27.08.2026 potwierdzone przez uzytkownika dla calego panelu ADEO.
         'Mirakl (Leroy)': 13,
         // Altex RO — ustawienie 258 czyta kwote z 14. kolumny (N), numer z 5. (odczyt ustawienia 13.10.2026).
-        'Altex': 13 };
+        'Altex': 13,
+        // Limango Mirakl — ustawienie 254 czyta kwote z 14. kolumny (N). Tak samo zbudowane sa paczki
+        // wgrywane dotad recznie (2202035, 2202384, 2202402: 26 kolumn, „Amount" na 14. pozycji).
+        'Limango': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -40107,7 +40298,12 @@
         ref:   ['referenznummer', 'reference number', 'reference id'],
         title: ['angebotstitel', 'listing title', 'item title'],
         sku:   ['bestandseinheit', 'custom label'],
-        item:  ['artikelnr.', 'artikelnr', 'item number', 'item id']
+        item:  ['artikelnr.', 'artikelnr', 'item number', 'item id'],
+        // Kraj wysylki i „Zwischensumme Artikel" sa potrzebne TYLKO do odtworzenia brutto
+        // zwrotu, ktoremu eBay nie wypelnil kolumny VAT — patrz ebayBruttoZwrotu. Nie ma ich
+        // na liscie kolumn wymaganych (brak), wiec starszy uklad raportu czyta sie jak dotad.
+        land:  ['versandziel - land', 'versandziel land', 'ship to country', 'buyer country'],
+        sub:   ['zwischensumme artikel', 'item subtotal']
     };
     // Typy wierszy, ktore cokolwiek znacza. Reszta ("Andere Gebühr", "Versandetikett",
     // "Auszahlung") to prowizje i etykiety zwrotne — sa juz potracone w kolumnie netto,
@@ -40188,6 +40384,65 @@
         });
         return c;
     }
+    // Zwrot („Rückerstattung" / „Fall" / „Zahlungsstreitfall"), ktoremu eBay NIE wypelnil
+    // kolumny „Von eBay eingezogene Steuer", niesie kwote NETTO — a auftrag ma brutto.
+    // Zmierzone na wyplacie 7775306283 (26.10.2026, beliani-de): wiersz „Fall" 06-15086-48214
+    // ma −529.40, a auftrag 15569245 wartosc 629.99 (dokladnie te kwote z 19% VAT); drugi
+    // „Fall" 20-15132-35550 ma −84.03 przy auftragu 15698509 na 99.99. Zespol zaksiegowal
+    // oba recznie na PELNE brutto (noty 629.99 i 99.99 w ticketach 688495 i 689297), wiec
+    // brutto jest tu regula ksiegowa, a nie domyslem.
+    //
+    // Brutto odtwarzamy WYLACZNIE z dowodu w tym samym pliku, przy tym samym numerze
+    // zamowienia. Zadnego przeliczania stawka „na slepo":
+    //   (a) inny wiersz tego zamowienia, ktory MA kolumne VAT i te sama kwote netto,
+    //   (b) „Zwischensumme Artikel" innego wiersza tego zamowienia — na wierszach
+    //       „Einbehalten" ta kolumna niesie wartosc auftragu (629.99 = auftrag 15569245,
+    //       639.99 = auftrag 15751928), a na „Bestellung" samo netto, wiec bierzemy ja
+    //       tylko wtedy, gdy rozni sie od netto o stawke, KTORA TEN PLIK pokazuje dla
+    //       tego kraju wysylki (kraj o dwoch stawkach -> nie zgadujemy).
+    // Brak dowodu -> null: kwota zostaje taka jak dotad, a wiersz idzie na liste bezVat
+    // i zlecenie dostaje „wymaga sprawdzenia". Lepiej powiedziec „nie wiem", niz po cichu
+    // zaksiegowac netto.
+    //
+    // Wierszy „Bestellung" to NIE dotyczy i dotyczyc nie moze: tam kwota z eBaya jest tym,
+    // co zaplacil klient. Sprawdzone na 14-15162-59228 z tej samej wyplaty — eBay podal
+    // 77.02, prologistics wzial te cene za netto i dorobil 19% (auftrag 15731585 ma 91.65),
+    // ale wplata 77.02 jest pelna (decyzja uzytkownika 26.10.2026).
+    function ebayBruttoZwrotu(r, c, poZam, stawki){
+        const b = ebayNum(r[c.gross]);
+        if (b == null || !b) return null;
+        const id = c.order >= 0 ? String(r[c.order] || '').trim() : '';
+        const bracia = (id && poZam[id]) ? poZam[id] : [];
+        const zn = b < 0 ? -1 : 1, a = Math.abs(b);
+        for (let i = 0; i < bracia.length; i++){
+            const q = bracia[i];
+            if (q === r) continue;
+            const gq = ebayNum(q[c.gross]), vq = ebayNum(q[c.vat]);
+            if (gq != null && vq != null && Math.abs(Math.abs(gq) - a) < 0.005){
+                return { kw: r2(zn * (Math.abs(gq) + Math.abs(vq))),
+                         skad: 'wiersz „' + String(q[c.typ] || '').trim() + '” tego samego zamówienia' };
+            }
+        }
+        if (c.sub < 0 || c.land < 0) return null;
+        const kraj = String(r[c.land] || '').trim();
+        const kl = (kraj && kraj !== '--' && stawki[kraj]) ? Object.keys(stawki[kraj]) : [];
+        if (kl.length !== 1) return null;
+        const st = Number(kl[0]);
+        if (!(st > 0)) return null;
+        for (let i = 0; i < bracia.length; i++){
+            const s = ebayNum(bracia[i][c.sub]);
+            if (s == null || !s) continue;
+            const as = Math.abs(s);
+            if (Math.abs(as - a) < 0.005) continue;             // to samo netto, nie brutto
+            if (Math.abs(r2(as / (1 + st)) - a) <= 0.01){
+                return { kw: r2(zn * as),
+                         skad: '„Zwischensumme Artikel” wiersza „' + String(bracia[i][c.typ] || '').trim()
+                             + '” tego samego zamówienia (stawka ' + Math.round(st * 100) + '% z tego pliku)' };
+            }
+        }
+        return null;
+    }
+
     function mkParseEbay(text){
         const linie = String(text == null ? '' : text).replace(/^﻿/, '').split(/\r?\n/);
         // Naglowek to pierwszy wiersz o sensownej liczbie kolumn — nazwa pierwszej kolumny
@@ -40244,9 +40499,32 @@
         const wOrd = [], wRef = [];
         let netto = 0, gross = 0, refund = 0, nPos = 0, nZwr = 0, pominiete = 0;
         let payNo = '', payDate = '', curNet = zapowCur, curTx = '';
+        // bruttoZ — zwroty, ktorym odtworzylismy brutto; bezVat — te, ktorym sie nie dalo.
+        const bruttoZ = [], bezVat = [];
+        // Wiersze dzielimy RAZ, przed petla: kwota zwrotu bez kolumny VAT bywa do odtworzenia
+        // z INNEGO wiersza tego samego zamowienia, wiec caly plik musi byc pod reka.
+        const wiersze = [];
         for (let i = hi + 1; i < linie.length; i++){
             const r = ebaySplit(linie[i], sep);
             if (r.length < 5 || !String(r[0] || '').trim()) continue;
+            wiersze.push(r);
+        }
+        // Indeks po numerze zamowienia i stawki VAT, ktore TEN PLIK pokazuje dla danego kraju
+        // wysylki — tylko z wierszy majacych obie kolumny (brutto i VAT pobrany przez eBaya).
+        // Zadnej tabeli stawek: gdyby kraj mial w pliku dwie rozne, ebayBruttoZwrotu odmawia.
+        const poZam = {}, stawki = {};
+        wiersze.forEach(function (r){
+            const id = c.order >= 0 ? String(r[c.order] || '').trim() : '';
+            if (id && id !== '--'){ (poZam[id] = poZam[id] || []).push(r); }
+            if (c.land < 0) return;
+            const g = ebayNum(r[c.gross]), v = ebayNum(r[c.vat]);
+            const kraj = String(r[c.land] || '').trim();
+            if (!kraj || kraj === '--' || !g || v == null) return;
+            const st = (Math.round(Math.abs(v) / Math.abs(g) * 100) / 100).toFixed(2);
+            (stawki[kraj] = stawki[kraj] || {})[st] = 1;
+        });
+        for (let i = 0; i < wiersze.length; i++){
+            const r = wiersze[i];
             const typ = String(r[c.typ] || '').trim();
             const netRow = ebayNum(r[c.net]);
             if (netRow != null) netto = r2(netto + netRow);
@@ -40270,10 +40548,18 @@
             // ile klient faktycznie zaplacil. Sprawdzone: 49,99 (towar) + 10,00 (VAT) = 59,99.
             const b = ebayNum(r[c.gross]), v = ebayNum(r[c.vat]);
             if (b == null && v == null){ pominiete++; continue; }   // wiersz bez kwot
-            const kw = r2((b || 0) + (v || 0));
+            let kw = r2((b || 0) + (v || 0));
+            // Zwrot bez kolumny VAT niesie NETTO — probujemy odtworzyc brutto z tego pliku.
+            const bezKolVat = jestZwrot && v == null && b != null && b !== 0;
+            const odtw = bezKolVat ? ebayBruttoZwrotu(r, c, poZam, stawki) : null;
+            if (odtw) kw = odtw.kw;
             const id = String(r[c.order] || '').trim();
             if (!id || id === '--'){ pominiete++; continue; }
             ids[id] = 1;
+            if (bezKolVat){
+                if (odtw) bruttoZ.push({ id: id, z: r2(b), na: kw, skad: odtw.skad });
+                else      bezVat.push({ id: id, typ: typ, kw: r2(b) });
+            }
             if (jestOrder){
                 if (!kw) continue;
                 ord[id] = r2((ord[id] || 0) + kw);
@@ -40307,6 +40593,8 @@
             netOk: (zapow == null) || eq(netto, zapow),
             ord: ord, ref: ref, refNote: refNote, ids: ids,
             gross: gross, refund: refund, nPos: nPos, nZwr: nZwr, pominiete: pominiete,
+            // zwroty, ktorym eBay nie wypelnil kolumny VAT: odtworzone i te bez dowodu
+            bruttoZ: bruttoZ, bezVat: bezVat,
             // do odtworzenia pliku importu: pierwsza linia pliku (makro kopiuje wlasnie ja
             // jako naglowek), surowe wiersze i numer kolumny, w ktorej ma stanac suma
             hdr0: linie[0] || '', kolSum: 32, wOrd: wOrd, wRef: wRef,
@@ -50061,10 +50349,15 @@
         // Etykieta jak w arkuszu („Altex RO", konto 1378), waluta RON. Host wpisany wprost, nie przez MK_ALX_HOST (martwa strefa).
         { label: 'Altex RO',   mp: 'Altex', brand: 'Altex', short: 'Altex', kind: 'altex',
           host: 'marketplace.altex.ro', shop: 'Altex RO', cur: 'RON' },
-        // Limango nie ma u nas portalu — rozliczenie wrzuca sie plikiem, a wplate
-        // dodaje z wyciagu albo recznie.
-        { label: 'Limango DE', mp: 'Limango', brand: 'Limango', short: 'Limango', kind: 'lim',
-          shop: MK_LIM_SHOP, cur: 'EUR' }
+        // Limango Mirakl — panel limango.mirakl.net, sklep 2077, ustawienie importu 254.
+        // To jest kanal zywy: wplate dodaje sie z wyciagu, z arkusza („Limango DE") albo recznie,
+        // a rozliczenie pobiera sie z panelu jak przy kazdym innym Miraklu.
+        { label: 'Limango DE', mp: 'Limango', brand: 'Limango', short: 'Limango', kind: 'mirakl',
+          host: 'limango.mirakl.net', shop: MK_LIM_SHOP, cur: 'EUR' },
+        // Stary dashboard — rozliczenie wrzuca sie plikiem „Gutschrift_MP-…csv", portalu nie ma.
+        // Zostaje dla zaleglosci: ostatnie dokumenty MP-… Limango rozliczala jeszcze w 10.2026.
+        { label: 'Limango DE stary', mp: 'Limango stary', brand: 'Limango', short: 'Limango',
+          kind: 'lim', shop: 'Limango DE stary', cur: 'EUR' }
     ];
     // Ta sama wplata nie moze trafic do modulu dwa razy — raz recznie, raz z wyciagu.
     // Klucze byloby wtedy rozne, a skutkiem podwojny import i podwojne ksiegowanie.
@@ -55278,16 +55571,27 @@
     // Co panel ma w okolicy tej daty, uporzadkowane wedlug tego, jak blisko jest kwocie.
     // Okno jak przy dopasowaniu szerokim: 10 dni wstecz, 3 w przod — tyle wynosi realny
     // rozjazd miedzy zamknieciem cyklu a ksiegowaniem przelewu w banku.
+    // Jak daleko WSTECZ szukamy kandydatow do recznego wskazania. Dziesiec dni wystarcza
+    // marketplace'om, ktore placa zaraz po zamknieciu cyklu — i tak bylo do 26.10.2026.
+    // Limango placi po TERMINIE Z FAKTURY, czyli ok. 45 dni od zamkniecia (dueDate IN2077A-4:
+    // cykl zamkniety 31.08, termin 16.10, przelew 20.10). Zmierzone na trzech cyklach:
+    // 30.06 -> 01.09 (63 dni), 31.07 -> 14.09 (45), 31.08 -> 20.10 (50). Przy oknie
+    // dziesieciodniowym lista kandydatow byla PUSTA, wiec nie bylo czego wskazac recznie
+    // — a przy Limangu wskazanie reczne to jedyna droga: kwota cyklu nigdy nie rowna sie
+    // przelewowi (korekty VAT na notach i pozycje ze starego dashboardu).
+    // Okno dotyczy TYLKO listy do wyboru. Samo dopasowanie (mkMatchCycle) zostaje bez zmian.
+    const MK_KAND_WSTECZ = { 'Limango': 90 };
     function mkKandydaci(list, j){
         const d0 = mkDay(j && j.date);
         if (d0 == null) return [];
+        const wstecz = MK_KAND_WSTECZ[String((j && j.mp) || '')] || 10;
         const dataCyklu = function (c){
             return mkIso(c && (c.dateCreated || c.creationDate || c.endDate || c.dateEnd ||
                                (c.period && (c.period.endDate || c.period.end)))) || '';
         };
         const out = (list || []).filter(function (c){
             const x = mkCycDay(c);
-            return x != null && (d0 - x) <= 10 * 86400000 && (x - d0) <= 3 * 86400000;
+            return x != null && (d0 - x) <= wstecz * 86400000 && (x - d0) <= 3 * 86400000;
         }).map(function (c){
             const a = cycAmount(c);
             return { id: String((c && c.id) || ''), data: dataCyklu(c), kwota: a,
@@ -58081,6 +58385,19 @@
                                                                   : (' → zwrot ' + f2(Math.abs(x.amt)))));
                       }).join(' · ')) + '</div>';
                 if ((j.data.both || []).length) det += '<div style="color:#c47f00">rozliczone i zwrócone w tym samym cyklu: ' + esc(j.data.both.join(', ')) + ' — pieniądze się znoszą</div>';
+                // Limango: dokument nie zgadza sie sam ze soba. Nie blokuje importu — kwoty na auftragach
+                // sa prawidlowe. Zostaje roznica na koncie rozliczeniowym i ktos musi poprawic dokument w Sage.
+                const lfv = j.data.limFv;
+                if (lfv && (lfv.poz || []).length)
+                    det += '<div style="color:#b45309;font-size:11px;font-weight:700;margin-top:3px">'
+                         + '⚠ Limango wystawiła dokument niezgodny z własnym netto — import tego NIE blokuje</div>'
+                         + '<div style="color:#b45309;font-size:11px">'
+                         + esc(lfv.poz.map(mkLimFvOpis).join(' · '))
+                         + '</div><div style="color:#b45309;font-size:11px">Kwoty na auftragach liczę z pozycji '
+                         + '(netto × 1,19), więc są prawidłowe — nie zgadza się podsumowanie na dokumencie. '
+                         + 'Przekaż to ' + esc(MK_LIM_FV_OSOBA_KOMU) + ', żeby poprawiła w Sage.</div>';
+                if (lfv && lfv.blad)
+                    det += '<div style="color:#888;font-size:10px">nie sprawdziłem dokumentów Limanga: ' + esc(lfv.blad) + '</div>';
                 const sh = mkSheet[mkJobId(j)];
                 const tf = shTrafienie(j, sh);
                 if (tf){
@@ -63674,12 +63991,18 @@
         async function mkMostObsluz(z){
             let odpowiedziano = false;
             try {
-                const bin = atob(String(z.b64 || ''));
-                const u8 = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+                // Zlecenie niesie jeden plik („nazwa"+„b64", tak chodzi PostFinance) albo liste
+                // („pliki", tak chodzi HVB: trzy konta naraz). Obie drogi ida tym samym wczytaniem.
+                const lst = (Array.isArray(z.pliki) && z.pliki.length)
+                    ? z.pliki : [{ nazwa: z.nazwa, b64: z.b64 }];
+                const files = lst.map(function (p){
+                    const bin = atob(String(p.b64 || ''));
+                    const u8 = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+                    return new File([u8], p.nazwa || 'wyciag.csv', { type: 'text/csv' });
+                });
                 const przed = jobsLoad();
-                const wynW = await mkWczytajWyciagi([new File([u8], z.nazwa || 'wyciag.csv', { type: 'text/csv' })],
-                                                    { bezArkusza: true });
+                const wynW = await mkWczytajWyciagi(files, { bezArkusza: true });
                 // Odmowa (trwa przelot) wraca do Bank Importu jako blad — plik trzeba przekazac
                 // jeszcze raz, a nie udawac, ze przyjety.
                 if (wynW && wynW.odmowa) throw new Error(wynW.odmowa);
@@ -64991,21 +65314,36 @@
                            refNote: p.refNote, unknown: {}, skipped: {}, full: true, both: both,
                            pays: 1, split: false, rows: p.nPos + p.nZwr, total: p.nPos + p.nZwr,
                            pages: 1, how: 'plik ' + f.name };
-                j.status = j.data.netOk ? 'ready' : 'partial';
-                j.msg = j.data.netOk ? '' : ('wypłata z pliku ' + f2(p.net) + ' ' + p.cur
-                        + ' nie zgadza się z kwotą zlecenia ' + f2(j.amount) + ' ' + (j.cur || ''));
+                // Zwrot, ktoremu eBay nie wypelnil kolumny VAT, a brutta nie dalo sie odtworzyc
+                // z pliku, niesie NETTO — a nota w tickecie ma isc na brutto. Nie ksiegujemy
+                // takiego zlecenia po cichu: idzie do „wymaga sprawdzenia" z numerami zamowien.
+                const bezV = (p.bezVat || []);
+                const bezVOpis = bezV.length
+                    ? ('zwrot bez kolumny VAT i bez brutta w pliku (kwota może być netto): '
+                       + bezV.slice(0, 6).map(function (x){ return x.id + ' ' + f2(x.kw); }).join(', ')
+                       + (bezV.length > 6 ? (' i ' + (bezV.length - 6) + ' więcej') : ''))
+                    : '';
+                j.status = (j.data.netOk && !bezV.length) ? 'ready' : 'partial';
+                j.msg = [j.data.netOk ? '' : ('wypłata z pliku ' + f2(p.net) + ' ' + p.cur
+                            + ' nie zgadza się z kwotą zlecenia ' + f2(j.amount) + ' ' + (j.cur || '')),
+                         bezVOpis].filter(Boolean).join(' · ');
                 // Kwoty zamowien sa w walucie TRANSAKCJI, a wyplata w walucie konta —
                 // bez tej adnotacji rozjazd miedzy suma pozycji a wplata wyglada na blad.
+                const odtw = (p.bruttoZ || []);
                 j.note = 'kwoty zamówień w ' + (p.curTx || '—') + ', wypłata w ' + (p.cur || '—')
-                       + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia';
+                       + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia'
+                       + (odtw.length ? (' · zwroty bez kolumny VAT policzone na brutto: '
+                            + odtw.map(function (x){ return x.id + ' ' + f2(x.z) + ' → ' + f2(x.na); }).join(', ')) : '');
                 jobsSave(jobs); render();
                 say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
                     + ': ' + p.shop + ' · wypłata nr ' + (p.payNo || '—') + ' z ' + (p.payDate || '—')
                     + ' na ' + f2(p.net) + ' ' + p.cur
                     + ' · zamówień ' + Object.keys(p.ord).length + ' na ' + f2(p.gross) + ' ' + p.curTx
                     + (p.nZwr ? (' · zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund) + ' ' + p.curTx
-                                 + ' — idą na listę zwrotów') : ''),
-                    '#0a7a2f');
+                                 + ' — idą na listę zwrotów') : '')
+                    + (odtw.length ? (' · ' + odtw.length + ' bez kolumny VAT policzone na brutto') : '')
+                    + (bezV.length ? (' · UWAGA: ' + bezVOpis) : ''),
+                    bezV.length ? '#c47f00' : '#0a7a2f');
             };
             rd.readAsArrayBuffer(f);
         }
@@ -66569,11 +66907,14 @@
                     }
                     // One-off debit: zwrot czy oplata — z PDF-a dokumentu (mkOneOffKlasy). Tylko cykl, ktory ma takie pozycje.
                     await mkOneOffKlasy(list, host);
+                    // Limango: czy dokumenty zgadzaja sie same ze soba (VAT wobec wlasnego netto).
+                    // Informacyjnie — nie blokuje importu, patrz mkLimKontrolaFv.
+                    const limFv = await mkLimKontrolaFv(j, cycIds, list);
                     const tx = { list: list, total: totalKnown ? total : null, pages: pages, how: how, full: allFull };
                     const wynik = mkZlozZlecenie(j, tx, {
                         manor: manor, bezKwoty: bezKwoty, byRef: byRef, byKwote: byKwote,
                         cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum, docSumImp: docSumImp,
-                        reczny: reczny });
+                        reczny: reczny, limFv: limFv });
                     // Cykl dobrany po dacie, ktorego kwota nie pasuje — nie jest nasz.
                     // Dopisujemy go do sprawdzonych i szukamy dalej, inaczej przelot po
                     // sklepach wracalby w kolko do tego samego, blednego kandydata.
@@ -69330,6 +69671,15 @@
     // wiersz jest znowu do ksiegowania i nie wolno go pomijac jako „juz zaksiegowanego".
     function mkKsWierszZaks(x){ return Number(x && x.payment_id) > 0 && String(x && x.payment_deleted) !== '1'; }
     function mkKsZaks(rows){ return (rows || []).filter(mkKsWierszZaks).length; }
+    // Zapis KONCOWKI na subkoncie to z zalozenia DRUGA platnosc tego wiersza: glowna kwota stoi juz na auftragu,
+    // a na 8100 idzie sama reszta. Straz „juz zaksiegowany" (ktora chroni zwykly zapis paczki przed dublem) musi
+    // tu wiec ustapic — jej miejsce bierze OPEN AMOUNT: po zaksiegowaniu reszty jest on zerem, wiec drugi zapis
+    // sam sie nie odbedzie. Bez tego od 22.10.2026 (ochrona paczki 2259365, `42ef163`) KAZDA koncowka konczyla sie
+    // „pomijam N z N wierszy — juz zaksiegowany" i zostawala na auftragu, a wiersz stal w paczce jako OK.
+    function mkKsResztka(x, tol){
+        const o = impNum(x && x.open_amount), t = (tol == null ? tolGet() : tol);
+        return o != null && Math.abs(o) >= 0.005 && Math.abs(o) <= t;
+    }
     async function impRows(id){
         const r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
@@ -69373,7 +69723,7 @@
     } catch (e){}
     // Blokada + swiezy odczyt + (gdy trzeba) test spokoju paczki. Zwraca { token, ids, pominiete } — wiersze do zapisu.
     // Rzuca, gdy zapisu robic nie wolno; blokada jest wtedy zwolniona.
-    async function mkKsPrzygotuj(impId, ids, opis){
+    async function mkKsPrzygotuj(impId, ids, opis, opcje){
         const bazowy = mkImpOstatni[impId] ? Object.assign({}, mkImpOstatni[impId]) : null;
         const token = await mkKsBlokada(impId, opis);
         try {
@@ -69401,21 +69751,27 @@
             const poId = {};
             d.rows.forEach(function (x){ poId[String(x.id)] = x; });
             const idsOk = [], pominiete = [];
+            const resztka = !!(opcje && opcje.resztka), tolR = (opcje && opcje.tol != null) ? opcje.tol : tolGet();
             (ids || []).forEach(function (id){
                 const x = poId[String(id)];
                 if (!x) pominiete.push({ id: String(id), powod: 'nie ma już w paczce' });
-                else if (mkKsWierszZaks(x)) pominiete.push({ id: String(id), powod: 'już zaksięgowany (płatność ' + x.payment_id + ')' });
+                else if (mkKsWierszZaks(x) && !resztka) pominiete.push({ id: String(id), powod: 'już zaksięgowany (płatność ' + x.payment_id + ')' });
                 else if (String(x.state) !== 'OK') pominiete.push({ id: String(id), powod: 'status ' + x.state + ', nie OK' });
+                // Resztka: zamiast strazy „juz zaksiegowany" rozstrzyga open amount — zera nie ksiegujemy nigdy,
+                // a kwota poza tolerancja to juz nie koncowka (np. wiersz, ktory w miedzyczasie ktos odksiegowal).
+                else if (resztka && !mkKsResztka(x, tolR))
+                    pominiete.push({ id: String(id), powod: 'open amount ' + String(x.open_amount == null ? '—' : x.open_amount)
+                        + ' — nie ma już reszty do zaksięgowania albo wyszła poza tolerancję ' + f2(tolR) });
                 else idsOk.push(id);
             });
             return { token: token, ids: idsOk, pominiete: pominiete };
         } catch (e){ mkKsZwolnij(impId, token); throw e; }
     }
-    async function mkKsZapis(id, ids, block, opis){
+    async function mkKsZapis(id, ids, block, opis, opcje){
         const impId = String(id);
         mkKsTrwaStart(impId);
         let p;
-        try { p = await mkKsPrzygotuj(impId, ids, opis); }
+        try { p = await mkKsPrzygotuj(impId, ids, opis, opcje); }
         catch (e){ mkKsTrwaKoniec(impId); throw e; }
         mkKsRaport[impId] = { pominiete: p.pominiete, wyslane: p.ids.length };
         let tik = null, poll = null;
@@ -69691,8 +70047,9 @@
         return r.text();
     }
     // „Book on sub-account" — bez przypisania, inny przycisk niz ksiegowanie na koncie glownym.
-    async function impBookSub(id, ids){
-        return mkKsZapis(id, ids, MK_BLOCK_SUB, 'na subkoncie');
+    // opcje.resztka — zapis koncowki: wiersz MA juz platnosc glowna, a na subkonto idzie sama reszta (mkKsResztka).
+    async function impBookSub(id, ids, opcje){
+        return mkKsZapis(id, ids, MK_BLOCK_SUB, 'na subkoncie', opcje);
     }
 
     // ---------- NOT FOUND: sprawdzenie auftragu po numerze fulfilmentu ----------
@@ -70791,7 +71148,7 @@
                     await impState(job.impId, nearNow[i].id, 'OK');
                 }
                 m.textContent = 'księguję na subkoncie…';
-                await impBookSub(job.impId, nearNow.map(function (x){ return x.id; }));
+                await impBookSub(job.impId, nearNow.map(function (x){ return x.id; }), { resztka: true, tol: tol });
                 m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
                 await impCheck(kluczJob);
             } catch (e){
@@ -71538,11 +71895,13 @@
                         z2.j.koncWisi = w2; jobsSave(js2);
                     }
                     faza = 'sub';
-                    await impBookSub(imp, ids);
+                    await impBookSub(imp, ids, { resztka: true, tol: tol });
                     faza = 'po';
                     const pomK = mkKsPominieteOpis(imp), nPomK = (mkKsRaport[String(imp)] || { pominiete: [] }).pominiete.length;
                     if (pomK) bad.push(pomK + ' — nie wysłałem ich drugi raz');
-                    paczek++; wierszy += Math.max(0, ids.length - nPomK); zapisane[String(imp)] = x.p.j;
+                    const nSzlo = Math.max(0, ids.length - nPomK);
+                    if (nSzlo) paczek++;
+                    wierszy += nSzlo; zapisane[String(imp)] = x.p.j;
                     // Otwarty widok tej paczki ma jeszcze czynne „Ustaw OK i zaksięguj na subkoncie" z migawki — gasimy od razu.
                     if (mkImpWidok === String(imp)){
                         const bx = document.getElementById('mk-imp-box'), g = bx ? bx.querySelector('#mk-fix') : null;
@@ -71553,15 +71912,29 @@
                     const js3 = jobsLoad(), z3 = mkKoncJob(js3, x.p);
                     if (z3.j){
                         const w3 = mkKoncWisi(z3.j);
-                        ids.forEach(function (id){ delete w3[id]; });
+                        // Slad zdejmujemy TYLKO z wierszy, ktore wedlug swiezego odczytu nie maja juz reszty. Wiersz
+                        // pominiety przy zapisie zostaje jako „do dokonczenia" — inaczej stalby w paczce ze statusem OK
+                        // (ustawilismy go chwile wczesniej), z groszem na auftragu i bez jednego sladu w HUB-ie.
+                        // Gdy odczytu nie bylo, nie ruszamy niczego: slad 'sub' mowi „nie wiem, czy weszlo".
+                        if (po){
+                            const poId3 = {};
+                            po.forEach(function (y){ poId3[String(y.id)] = y; });
+                            ids.forEach(function (id){
+                                const y = poId3[String(id)];
+                                if (!y || !mkKsResztka(y, tol)) delete w3[id];
+                                else w3[id] = { d: String(y.payment_descr == null ? '' : y.payment_descr), f: 'stan' };
+                            });
+                        }
                         if (Object.keys(w3).length) z3.j.koncWisi = w3; else { delete z3.j.koncWisi; mkProblemZdejmijZ(z3.j, 'koncowki'); }
                         if (po){
                             const nChk = po.filter(function (r){ return String(r.state) === 'CHECK'; }).length;
                             const nNf = impNfZostaje(z3.j, po);
-                            if (!nChk && !nNf) mkProblemZdejmijZ(z3.j, 'ksiegowanie');
+                            const nWisi = Object.keys(mkKoncWisi(z3.j)).length;
+                            if (!nChk && !nNf && !nWisi) mkProblemZdejmijZ(z3.j, 'ksiegowanie');
                             else mkProblemUstawW(z3.j, 'ksiegowanie', 'księgowanie paczki ' + imp,
-                                'końcówki na subkoncie zaksięgowane (' + ids.length + ' poz.), ale zostały w paczce: '
-                                + [nChk ? ('CHECK ' + nChk) : '', nNf ? ('NOT FOUND ' + nNf) : ''].filter(Boolean).join(', ')
+                                'końcówki na subkoncie zaksięgowane (' + nSzlo + ' z ' + ids.length + ' poz.), ale zostały w paczce: '
+                                + [nChk ? ('CHECK ' + nChk) : '', nNf ? ('NOT FOUND ' + nNf) : '', nWisi ? ('końcówki do dokończenia ' + nWisi) : '']
+                                    .filter(Boolean).join(', ')
                                 + ' — te pozycje nie weszły');
                         }
                         jobsSave(js3);
@@ -73199,6 +73572,7 @@
         if (!d) return 'nie umiem odczytać daty wypłaty';
         if (j.kind === 'amz'){ const blok = amzBrakKont(j); if (blok) return blok; }
         if (j.kind === 'alle'){ const blok = alleBrakKont(j); if (blok) return blok; }
+        if (mkLimCzy(j)){ const blok = mkLimBankZly(j); if (blok) return blok; }
         // Allegro nie ma JEDNEJ daty wyplaty: kazda wplata przychodzi w innym dniu, a data
         // stoi przy KAZDYM wierszu pliku (kolumna „data"). Nadpisanie jedna data — pole
         // „overwrite_original_date" w prologistics — zaksiegowaloby cala paczke na jeden
@@ -90240,6 +90614,21 @@
         tolerancja: 0,
         autoOkDo: 0.05,                // CHECK z roznica do 0.05 od razu na OK (decyzja 30.09.2026)
         szukaj: /raiffeisenbank\s*cz\s+beliani\s*sp\b/i
+    }, {
+        id: 'hvb',
+        nazwa: 'HVB',
+        opis: 'Umsatzliste z HypoVereinsbank — trzy konta naraz (DE, EU, Europe). Konto rozpoznaję z kolumny '
+            + 'Kontonummer, a powtórki wobec paczek wgranych wcześniej wyjmuję sam; wierszy z minusem nie ruszam',
+        // Pelna obsluga siedzi w bloku „HVB" nizej (hvbAnaliza, hvbDedup, hvbWyslij) — tu zostaje
+        // tylko wpis, zeby format byl na liscie i mial swoje ustawienia. Plik skladamy sami,
+        // wiec „surowy"/„kwoty"/„daty" sa tu bez znaczenia.
+        hvb: true,
+        mostMkt: true,
+        minKol: 0, kwoty: [], daty: [],
+        konto: '',                     // konto zalezy od Kontonummer — BK_HVB_KONTA
+        waluta: 'EUR',
+        tolerancja: 0.05,
+        szukaj: /^hvb\b/i
     }];
     function fmt(id){ return BK_FORMATY.filter(function (x){ return x.id === id; })[0] || BK_FORMATY[0]; }
 
@@ -90775,6 +91164,322 @@
                  powod: w.powod || '', grupa: w.grupa || '' };
     }
 
+    // ---------- HVB (HypoVereinsbank): wyciag „Umsatzliste" ----------
+    // Trzy konta, trzy ustawienia importu. Wszystko ZMIERZONE 26.10.2026 na paczkach zespolu
+    // (pliki „hvb …", „hvb eu …", „hvb europe …" — kazdy booking 2 „method 2 +name") i na
+    // auftragach, ktore z nich dostaly wplate:
+    //   22889389 -> 132 „HVB UniCredit" -> plan kont 1264 Hypoveriensbank Beliani SP (DE)
+    //   34695423 -> 201 „HVB EU"        -> plan kont 1153 Hypoveriensbank EUR Beliani (EU) GmbH BE
+    //   37664308 -> 262 „HVB Europe"    -> plan kont 1531 Hypoveriensbank EUR Beliani (Europe) GmbH
+    // Konto bierzemy z KOLUMNY „Kontonummer", nie z nazwy pliku: eksport nazywa sie
+    // „<konto>_Umsatzliste (N).csv", ale nazwe przegladarka zmienia przy kazdym pobraniu.
+    // Wierszy z minusem NIE wyjmujemy — zespol importuje je tak samo jak wplaty (w paczkach
+    // z 21–26.10 stoja ÜBERWEISUNG i ENTGELT; to nie jest przeoczenie, tylko ich praktyka).
+    var BK_HVB_NAGL = 'Kontonummer;Buchungsdatum;Valuta;Verwendungszweck;Betrag;Waehrung';
+    var BK_HVB_KONTA = {
+        '22889389': { slot: 'DE',     nazwa: 'HVB DE',     konto: '1264', sufiks: 'hvb',
+                      bankNazwa: 'HVB UniCredit', szukaj: /^hvb\s*unicredit$/i },
+        '34695423': { slot: 'EU',     nazwa: 'HVB EU',     konto: '1153', sufiks: 'hvb eu',
+                      bankNazwa: 'HVB EU',        szukaj: /^hvb\s*eu$/i },
+        '37664308': { slot: 'Europe', nazwa: 'HVB Europe', konto: '1531', sufiks: 'hvb europe',
+                      bankNazwa: 'HVB Europe',    szukaj: /^hvb\s*europe$/i }
+    };
+    var BK_HVB_SLOTY = ['DE', 'EU', 'Europe'];
+    // Czego z wyciagu HVB NIE ksiegujemy tym importem (decyzje uzytkownika 26.10.2026:
+    // „american express nie ksiegujemy my przez import", potem „odloz tak samo przelewy
+    // wychodzace, oplaty banku i zwroty podatku"). Wiersze ZOSTAJA w pliku, bo zespol tez
+    // ich nie wycina (paczka 2262153 z 23.10.2026 ma wiersz Amexa, a minusy sa w kazdej) —
+    // odkladamy je dopiero w widoku paczki: nie ida do ksiegowania i nie prosza o auftrag.
+    //
+    // RODZAJ KSIEGOWANIA STOI NA POCZATKU OPISU i tylko tam go szukamy. Zmierzone na trzech
+    // calorocznych eksportach (11 149 wierszy, 01–10.2026): 1 101 minusow i 10 048 plusow.
+    // Wylacznie minusowe sa: ÜBERWEISUNG 976, ENTGELT 57, ECHTZEITÜBERWEISUNG 29, ABSCHLUSS 25,
+    // LASTSCHRIFT 7, DAUERAUFTRAG 2, PREISE/ENTGELTE 1. Kotwica „^" jest tu konieczna:
+    // „EU-STANDARDÜBERWEISUNG" to 23 wplaty PRZYCHODZACE, a „SEPA-DAUERAUFTRAG" jedna — gdyby
+    // szukac slowa gdziekolwiek, odlozylibysmy prawdziwe zaplaty za zamowienia. Z tego samego
+    // powodu nie ma tu reguly na podatki: na tych trzech kontach NIE MA ani jednego zwrotu
+    // podatku, a „Steuerberaterkammer" i „AGENZIA …" to nazwy klientow (wplaty dodatnie).
+    var BK_HVB_NIE_KSIEG = [
+        { wzor: /^\s*(?:ECHTZEIT)?[ÜU\ufffd]BERWEISUNG\b/i, nazwa: 'przelew wychodzący' },
+        { wzor: /^\s*DAUERAUFTRAG\b/i,                      nazwa: 'przelew wychodzący (stałe zlecenie)' },
+        { wzor: /^\s*(?:ENTGELT|ABSCHLUSS|PREISE\/ENTGELTE)\b/i, nazwa: 'opłata banku' },
+        { wzor: /^\s*LASTSCHRIFT\b/i,                       nazwa: 'polecenie zapłaty (obciążenie)' },
+        { wzor: /american\s+express/i,                      nazwa: 'American Express' }
+    ];
+    // Ktora regula lapie ten opis (albo null). Jedno miejsce dla widoku paczki i podgladu pliku.
+    function bkNieKsieg(lista, tekst){
+        var t = String(tekst == null ? '' : tekst);
+        for (var i = 0; i < (lista || []).length; i++) if (lista[i].wzor.test(t)) return lista[i];
+        return null;
+    }
+    var BK_HVB_JOB     = 'bank_imp_zlecenie_hvb';   // { DE: zlecenie, EU: …, Europe: … }
+    var BK_HVB_WYSLANE = 'bank_imp_hvb_wyslane';    // { slot: { klucz: data } } — wlasna pamiec wysylek
+    var BK_HVB_MKT     = 'bank_imp_hvb_mkt';        // „1" = przy wysylce przekaz pliki do Marketplace's
+    var BK_HVB_PACZEK  = 15;                        // ile poprzednich paczek importu czytamy na konto
+    var BK_HVB_MIN_ZAW = 8;                         // najkrotszy opis, ktory wolno dopasowac zawieraniem
+    function hvbId(s){ return 'hvb:' + s; }
+    function hvbSlotId(id){ var m = /^hvb:(DE|EU|Europe)$/.exec(String(id || '')); return m ? m[1] : ''; }
+    function hvbNrKonta(s){
+        return Object.keys(BK_HVB_KONTA).filter(function (n){ return BK_HVB_KONTA[n].slot === s; })[0] || '';
+    }
+    function hvbK(s){ return BK_HVB_KONTA[hvbNrKonta(s)] || {}; }
+    function hvbF(s){
+        var B = fmt('hvb'), K = hvbK(s);
+        return { id: hvbId(s), hvb: true, slot: s, nazwa: K.nazwa || ('HVB ' + s), waluta: 'EUR',
+                 konto: K.konto || '', mostMkt: true,
+                 tolerancja: 0.05, tolKlucz: 'bank_imp_tolerancja_hvb_' + s,
+                 // Wyciag bankowy, nie eupago: w tabeli ma stac „Zostaje na auftragu" (open amount),
+                 // a nie „Roznica" = wplata − open. Przy zaksiegowanym wierszu open to 0, a roznica
+                 // rowna sie calej wplacie i swieci na czerwono, jakby cos bylo nie tak (zgloszenie
+                 // z panelu 26.10.2026). Ta sama flaga pokazuje prog wyksiegowania na subkoncie.
+                 zostaje: true, nieKsieg: BK_HVB_NIE_KSIEG,
+                 szukaj: K.szukaj || /^hvb$/i, sufiks: K.sufiks || 'hvb', bankNazwa: K.bankNazwa || '',
+                 odbicie: B.odbicie };
+    }
+
+    // Kodowanie rozstrzyga NAGLOWEK, nie zgadywanie po bajtach: nowy eksport to UTF-16LE bez BOM
+    // (sprawdzone na trzech plikach z 26.10.2026), starszy bywa jednobajtowy. Probujemy po kolei
+    // i bierzemy to kodowanie, w ktorym plik zaczyna sie od „Kontonummer" — przy zlym kodowaniu
+    // naglowek nigdy nie wyjdzie (UTF-16 czytany jako Latin-1 to „K\0o\0n\0…", i odwrotnie).
+    function hvbDekoduj(buf){
+        var b = new Uint8Array(buf);
+        // UTF-8 czytamy ŚCIŚLE (fatal): bez tego plik jednobajtowy przechodzi jako UTF-8,
+        // bo „Kontonummer" to czyste ASCII, a „Ü" robi się znakiem zastępczym — i dopiero
+        // porównanie opisów z paczką cicho przestaje trafiać. Windows-1252 jest ostatni,
+        // bo on nie odrzuca niczego (sprawdzone na stanowisku: plik zespołu z prologistics).
+        var prob = [['utf-16le', false], ['utf-8', true], ['windows-1252', false]];
+        for (var i = 0; i < prob.length; i++){
+            var t;
+            try { t = new TextDecoder(prob[i][0], { fatal: prob[i][1] }).decode(b); } catch (e){ continue; }
+            t = t.replace(/^﻿/, '');
+            if (t.indexOf('�') >= 0) continue;
+            if (/^Kontonummer\s*;/.test(t)) return { txt: t, kod: prob[i][0] };
+        }
+        return null;
+    }
+    // Normalizacja opisu — dokladnie ta sama regula, co w skrypcie uzytkownika: zostaja same
+    // cyfry i litery (z niemieckimi), reszta znika. Bank tnie tytul w roznych miejscach
+    // („AUSGEF ÜHRT" raz z jedna spacja, raz z dwiema), wiec bez tego porownanie nie dziala.
+    function hvbNorm(s){ return String(s == null ? '' : s).toLowerCase().replace(/[^0-9a-zäöüß]/g, ''); }
+    // Krotszy opis zawiera sie w dluzszym (min. BK_HVB_MIN_ZAW znakow). Tak lapiemy wiersze,
+    // ktorym bank w nowszym wyciagu dolozyl albo uciol koncowke („AUSGEFÜHRT", „KUNDENREFERENZ").
+    function hvbZawiera(a, b){
+        var s = a.length <= b.length ? a : b, l = a.length <= b.length ? b : a;
+        return s.length >= BK_HVB_MIN_ZAW && l.indexOf(s) >= 0;
+    }
+    function hvbKluczDK(w){ return w.bu + '|' + w.va + '|' + w.kw; }
+    function hvbKlucz(w){ return hvbKluczDK(w) + '|' + w.n; }
+    function hvbKwotaLb(t){
+        var s = String(t == null ? '' : t).trim().replace(/\./g, '').replace(',', '.');
+        return /^-?\d+(\.\d{1,2})?$/.test(s) ? Number(s) : null;
+    }
+    function hvbDataIso(t){
+        var m = String(t == null ? '' : t).trim().match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        return m ? (m[3] + '-' + m[2] + '-' + m[1]) : '';
+    }
+
+    // Rozbior wyciagu. Zwraca { err } albo komplet: wiersze, konto, kodowanie, konce linii.
+    // Wiersz o innej liczbie pol niz 6 odrzucamy z nazwy — doklejanie go na sile zmienialoby
+    // kwote albo opis w pliku, ktory idzie do ksiegowania.
+    function hvbAnaliza(buf, nazwaPliku){
+        var dek = hvbDekoduj(buf);
+        if (!dek) return { err: 'nie wygląda na „Umsatzliste” z HVB — nie znalazłem nagłówka „Kontonummer;Buchungsdatum;…” '
+                              + 'w żadnym ze znanych kodowań (UTF-16LE, UTF-8, Windows-1252)' };
+        var surowe = dek.txt.split('\n');
+        var koniecNL = surowe.length > 1 && surowe[surowe.length - 1] === '';
+        if (koniecNL) surowe.pop();
+        var crlf = /\r$/.test(surowe[0] || '');
+        var linie = surowe.map(function (t){ return /\r$/.test(t) ? t.slice(0, -1) : t; });
+        var hdr = (linie[0] || '').trim();
+        if (hdr !== BK_HVB_NAGL)
+            return { err: 'nagłówek jest inny niż w HVB: „' + hdr.slice(0, 90) + '”' };
+        var out = { kod: dek.kod, crlf: crlf, koniecNL: koniecNL, naglowek: linie[0], plik: nazwaPliku || '',
+                    wiersze: [], bledy: [], konto: '', slot: '', puste: 0, waluty: {} };
+        for (var i = 1; i < linie.length; i++){
+            var l = linie[i];
+            if (!l.replace(/[;\s]/g, '')){ out.puste++; continue; }
+            var p = l.split(';');
+            if (p.length !== 6){
+                out.bledy.push('wiersz ' + (i + 1) + ' ma ' + p.length + ' pól zamiast 6 (średnik w opisie?)');
+                continue;
+            }
+            var w = { i: i, linia: l, ko: p[0].trim(), bu: p[1].trim(), va: p[2].trim(), op: p[3],
+                      kw: p[4].trim(), wal: p[5].trim() };
+            w.lb = hvbKwotaLb(w.kw);
+            w.iso = hvbDataIso(w.bu);
+            if (!w.iso || w.lb === null || !/^\d{2}\.\d{2}\.\d{4}$/.test(w.va)){
+                out.bledy.push('wiersz ' + (i + 1) + ': nie odczytałem daty albo kwoty („' + w.bu + '”, „' + w.kw + '”)');
+                continue;
+            }
+            if (!BK_HVB_KONTA[w.ko]){
+                out.bledy.push('wiersz ' + (i + 1) + ': konto „' + w.ko + '” nie jest jednym z trzech znanych ('
+                               + Object.keys(BK_HVB_KONTA).join(', ') + ')');
+                continue;
+            }
+            if (!out.konto){ out.konto = w.ko; out.slot = BK_HVB_KONTA[w.ko].slot; }
+            else if (w.ko !== out.konto){
+                out.bledy.push('wiersz ' + (i + 1) + ': drugie konto w jednym pliku (' + w.ko + ' obok ' + out.konto + ')');
+                continue;
+            }
+            out.waluty[w.wal || '—'] = 1;
+            w.n = hvbNorm(w.op);
+            out.wiersze.push(w);
+        }
+        if (!out.wiersze.length && !out.bledy.length) out.bledy.push('w pliku nie ma ani jednej transakcji');
+        return out;
+    }
+
+    // Lista paczek importu JEDNEGO ustawienia — tak, jak pyta strona Import payments przy
+    // filtrze banku. Oddaje najwyzej 500 najnowszych; nam wystarcza kilkanascie ostatnich.
+    async function hvbListaBanku(bank){
+        var nr = String(bank == null ? '' : bank).trim();
+        if (!/^\d+$/.test(nr)) throw new Error('nie mam numeru ustawienia importu');
+        var r = await fetch('/api/importPayments/?booking_method=manual&date_type=import_date&inactive=0&page=1&type=Payment&bank_name='
+                            + encodeURIComponent(nr), { credentials: 'same-origin',
+                              headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy liście paczek importu ' + nr);
+        var j = null;
+        try { j = await r.json(); }
+        catch (e){ throw new Error('lista paczek importu: odpowiedź to nie JSON (wygasła sesja prologistics?)'); }
+        if (!j || !Array.isArray(j.parsing_list)) throw new Error('lista paczek importu: odpowiedź bez parsing_list');
+        return j.parsing_list
+            .filter(function (x){ return x && String(x.bank_id) === nr && !/^\s*\[/.test(String(x.filename || '')); })
+            .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
+    }
+    async function hvbTresc(id){
+        var r = await fetch('/api/importPayments/getFileContent/?id=' + encodeURIComponent(id), {
+            credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return await r.arrayBuffer();
+    }
+    // Wiersze z poprzednich paczek TEGO konta. Czytamy paczki wgrane nie wczesniej niz najstarszy
+    // dzien ksiegowania w nowym pliku (paczka wgrana przed tym dniem nie moze zawierac tych wierszy),
+    // zawsze co najmniej trzy ostatnie. Blad odczytu NIE jest pusta lista — wraca jako „nie wiem".
+    async function hvbPoprzednie(slot, odIso, postep){
+        var bank = ustaw(hvbId(slot)).bank;
+        if (!bank) return { err: 'nie wskazano ustawienia importu (krok 2) — bez niego nie wiem, w których paczkach szukać powtórek' };
+        var lista;
+        try { lista = await hvbListaBanku(bank); }
+        catch (e){ return { err: (e && e.message) || String(e) }; }
+        var biore = lista.filter(function (x, idx){
+            return idx < 3 || String(x.updated || '').slice(0, 10) >= odIso;
+        }).slice(0, BK_HVB_PACZEK);
+        var wiersze = [], paczki = [], bledy = [];
+        for (var i = 0; i < biore.length; i++){
+            var p = biore[i];
+            if (postep) try { postep(i + 1, biore.length); } catch (e2){}
+            try {
+                var an = hvbAnaliza(await hvbTresc(p.file_id), String(p.filename || ''));
+                if (an.err){ bledy.push(p.file_id + ': ' + an.err); continue; }
+                var swoje = an.wiersze.filter(function (w){ return w.ko === hvbNrKonta(slot); });
+                swoje.forEach(function (w){ w.paczka = String(p.file_id); });
+                wiersze = wiersze.concat(swoje);
+                paczki.push({ id: String(p.file_id), nazwa: String(p.filename || ''), kiedy: String(p.updated || ''), ile: swoje.length });
+            } catch (e3){ bledy.push(p.file_id + ': ' + ((e3 && e3.message) || e3)); }
+        }
+        if (bledy.length && !paczki.length)
+            return { err: 'nie odczytałem żadnej z ' + biore.length + ' paczek (' + bledy[0] + ')' };
+        return { wiersze: wiersze, paczki: paczki, bledy: bledy, wszystkich: lista.length,
+                 niepelna: lista.length >= 500 };
+    }
+
+    // Powtorki. Dwa poziomy — tak jak w skrypcie uzytkownika:
+    //   1) dokladny: ta sama data ksiegowania, waluta, kwota i znormalizowany opis;
+    //   2) zawieranie: ta sama (data, valuta, kwota), a jeden opis zawiera sie w drugim.
+    // Rozny nadawca przy tej samej kwocie i dacie ma inny opis, wiec zostaje osobnym przelewem.
+    // Trzecie zrodlo to wlasna pamiec wysylek — ratuje, gdy paczki z prologistics nie da sie odczytac.
+    // CELOWO NIE odsiewamy powtorek WEWNATRZ jednego pliku. Bank nie powtarza transakcji w jednym
+    // eksporcie, a dwa identyczne wiersze to dwie prawdziwe wplaty: w calorocznym eksporcie
+    // 22889389 (8880 wierszy, 01–10.2026) takich par jest 4, a w 34695423 (2175) jedna — m.in.
+    // „Eckehard Schmidt 15951287" 50,09 dwa razy 14.10 (klient zaplacil dwa razy). Wyjecie ich
+    // schowaloby nadplate. Jeden plik na konto i tak wpuszczamy tylko raz (hvbWczytaj).
+    function hvbIndeks(wiersze){
+        var ex = {}, dk = {};
+        (wiersze || []).forEach(function (w){
+            ex[hvbKlucz(w)] = w;
+            (dk[hvbKluczDK(w)] = dk[hvbKluczDK(w)] || []).push(w);
+        });
+        return { ex: ex, dk: dk };
+    }
+    function hvbDedup(wiersze, ref, pamiec){
+        var idx = hvbIndeks(ref || []), zostaje = [], wyjete = [];
+        (wiersze || []).forEach(function (w){
+            var k = hvbKlucz(w), kd = hvbKluczDK(w), stary = idx.ex[k], powod = '', skad = '';
+            if (stary){ powod = 'ta sama pozycja'; skad = 'paczka ' + (stary.paczka || '?'); }
+            if (!powod){
+                var kand = (idx.dk[kd] || []).filter(function (x){ return hvbZawiera(x.n, w.n); })[0];
+                if (kand){ powod = 'ten sam przelew, opis ucięty inaczej'; skad = 'paczka ' + (kand.paczka || '?'); }
+            }
+            if (!powod && pamiec && pamiec[k]){ powod = 'ta sama pozycja'; skad = 'moja pamięć wysyłek (' + pamiec[k] + ')'; }
+            if (powod){ w.powod = powod; w.skad = skad; wyjete.push(w); return; }
+            zostaje.push(w);
+        });
+        return { zostaje: zostaje, wyjete: wyjete };
+    }
+
+    // Plik do importu: ten sam naglowek i te same linie co z banku, bez wyjetych, w Latin-1
+    // z CRLF — dokladnie w tej postaci leza pliki zespolu w Import payments (sprawdzone
+    // bajtowo na paczce 2271880: 0xDC za „AUSGEF ”, CRLF, bez BOM).
+    function hvbLatin1(txt){
+        var out = new Uint8Array(txt.length), zam = 0;
+        for (var i = 0; i < txt.length; i++){
+            var c = txt.charCodeAt(i);
+            if (c > 255){ out[i] = 63; zam++; } else out[i] = c;
+        }
+        return { bajty: out, zamienione: zam };
+    }
+    function hvbZbuduj(an, wiersze){
+        var linie = [an.naglowek];
+        (wiersze || []).forEach(function (w){ linie.push(w.linia); });
+        return hvbLatin1(linie.join('\r\n') + '\r\n');
+    }
+    // Kontrola pliku do importu: czyta sie, ma ten sam naglowek, dokladnie te wiersze i te same
+    // pola. Bez niej blad w skladaniu wyszedlby dopiero jako zle zaksiegowana wplata.
+    function hvbKontrola(an, wiersze, bajty){
+        var p = hvbAnaliza(bajty.buffer.slice(bajty.byteOffset, bajty.byteOffset + bajty.byteLength), 'kontrola');
+        if (p.err) return 'plik do importu się nie czyta: ' + p.err;
+        if (p.bledy.length) return 'plik do importu ma wiersze, których nie rozumiem: ' + p.bledy[0];
+        if (p.naglowek.trim() !== an.naglowek.trim()) return 'zmienił się nagłówek';
+        if (p.konto !== an.konto) return 'zmieniło się konto';
+        if (p.wiersze.length !== wiersze.length)
+            return 'jest ' + p.wiersze.length + ' wierszy zamiast ' + wiersze.length;
+        for (var i = 0; i < wiersze.length; i++){
+            var a = wiersze[i], b = p.wiersze[i];
+            if (a.ko !== b.ko || a.bu !== b.bu || a.va !== b.va || a.kw !== b.kw || a.wal !== b.wal || a.n !== b.n)
+                return 'wiersz ' + (i + 1) + ' wyszedł inny niż w wyciągu (' + a.bu + ' ' + a.kw + ')';
+        }
+        return '';
+    }
+    function hvbNazwa(slot, d){
+        return (hvbK(slot).sufiks || 'hvb') + ' ' + pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear()
+             + ' ' + pad2(d.getHours()) + '.' + pad2(d.getMinutes()) + '.csv';
+    }
+    function hvbSuma(lista){
+        return (lista || []).reduce(function (a, w){ return a + (Number(w.lb) || 0); }, 0);
+    }
+    function hvbZakres(lista){
+        var dni = (lista || []).map(function (w){ return w.iso; }).filter(Boolean).sort();
+        if (!dni.length) return '';
+        return dni[0] === dni[dni.length - 1] ? huDataPl(dni[0]) : (huDataPl(dni[0]) + '–' + huDataPl(dni[dni.length - 1]));
+    }
+    function hvbMini(w){
+        return { bu: w.bu, va: w.va, kw: w.kw, lb: w.lb, iso: w.iso, op: String(w.op || '').replace(/\s+/g, ' ').slice(0, 170),
+                 n: w.n, powod: w.powod || '', skad: w.skad || '' };
+    }
+    function hvbZapamietaj(slot, wiersze){
+        var m = jGet(BK_HVB_WYSLANE);
+        var gr = new Date(Date.now() - 150 * 86400000).toISOString().slice(0, 10);
+        var s = (m[slot] && typeof m[slot] === 'object') ? m[slot] : {};
+        Object.keys(s).forEach(function (k){ if (String(s[k]) < gr) delete s[k]; });
+        (wiersze || []).forEach(function (w){ s[hvbKlucz(w)] = w.iso; });
+        m[slot] = s; jSet(BK_HVB_WYSLANE, m);
+    }
+    function hvbPamiec(slot){
+        var m = jGet(BK_HVB_WYSLANE);
+        return (m[slot] && typeof m[slot] === 'object') ? m[slot] : {};
+    }
+    function hvbMktOn(){ return String(gmGet(BK_HVB_MKT, '1')) === '1'; }
+
     // Data platnosci per numer transakcji, prosto z przerobionego pliku. Zapisujemy ja
     // przy zleceniu, bo paczka importu daty nie oddaje, a przy ksiegowaniu wiersza
     // NOT FOUND wprost na auftragu trzeba wiedziec, na ktory dzien.
@@ -90839,8 +91544,8 @@
         // Konto ksiegowania na auftragu. Dla eupago znane z gory, dla pozostalych do
         // wpisania — zgadywanie numeru konta to zle zaksiegowana wplata. Importy pobran
         // („cod_gls" i reszta) nie sa formatami: ich konta potwierdzil uzytkownik 29.09.2026.
-        var P = przewPoUst(id), Cz = czSlotId(id);
-        if (!v.konto) v.konto = P ? P.konto : (Cz ? czF(Cz).konto : (fmt(id).konto || ''));
+        var P = przewPoUst(id), Cz = czSlotId(id), Hv = hvbSlotId(id);
+        if (!v.konto) v.konto = P ? P.konto : (Cz ? czF(Cz).konto : (Hv ? hvbF(Hv).konto : (fmt(id).konto || '')));
         return v;
     }
     function ustawZapisz(id, v){
@@ -90862,13 +91567,19 @@
             s2 += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
         return btoa(s2);
     }
-    async function bkDoMarketplace(nazwa){
-        if (!S.buf) throw new Error('nie mam pliku w pamięci — wgraj go jeszcze raz');
-        if (S.buf.byteLength > 4 * 1024 * 1024)
-            throw new Error('plik ma ponad 4 MB — przekaż go wprost w module Marketplace’s');
+    // „co" to nazwa pliku (bierzemy wtedy S.buf) albo lista { nazwa, buf } — HVB przekazuje
+    // trzy pliki naraz, a most ma je zalozyc jednym przebiegiem, nie trzema po kolei.
+    async function bkDoMarketplace(co){
+        var lista = Array.isArray(co) ? co.slice() : [{ nazwa: co, buf: S.buf }];
+        if (!lista.length || lista.some(function (x){ return !x || !x.buf; }))
+            throw new Error('nie mam pliku w pamięci — wgraj go jeszcze raz');
+        var waga = lista.reduce(function (a, x){ return a + x.buf.byteLength; }, 0);
+        if (waga > 4 * 1024 * 1024)
+            throw new Error('pliki mają razem ponad 4 MB — przekaż je wprost w module Marketplace’s');
         var id = 'm' + Date.now().toString(36);
         gmSet(MKT_MOST_O, '');
-        gmSet(MKT_MOST_Z, JSON.stringify({ id: id, nazwa: nazwa, b64: bkB64(S.buf), kiedy: Date.now() }));
+        gmSet(MKT_MOST_Z, JSON.stringify({ id: id, nazwa: lista[0].nazwa, b64: bkB64(lista[0].buf),
+            pliki: lista.map(function (x){ return { nazwa: x.nazwa, b64: bkB64(x.buf) }; }), kiedy: Date.now() }));
         return await new Promise(function (ok, zle){
             var start = Date.now();
             var zegar = setInterval(function (){
@@ -92082,7 +92793,9 @@
               // ostatni komunikat operacji na paczce — rysowany w JEJ pudelku (klucz: rodzaj + numer)
               pkMsg: {},
               // Raiffeisen CZ: wczytana para plikow (po walucie) i ostatnie narysowane odczyty ich paczek
-              cz: {}, czD: {} };
+              cz: {}, czD: {},
+              // HVB: wczytane pliki po slocie (DE/EU/Europe) — wiersze, powtorki, gotowe bajty
+              hvb: {} };
     function job(){ var o = jGet(BK_JOB_KEY); return (o && o.impId) ? o : null; }
     function jobZapisz(o){ jSet(BK_JOB_KEY, o || {}); }
 
@@ -92116,7 +92829,11 @@
     });
     btn.onclick = function (){
         panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
-        if (panel.style.display === 'block'){ if (fmt(S.format).cz) czSprawdzWszystkie(); else if (job()) sprawdz(); }
+        if (panel.style.display === 'block'){
+            if (fmt(S.format).cz) czSprawdzWszystkie();
+            else if (fmt(S.format).hvb) hvbSprawdzWszystkie();
+            else if (job()) sprawdz();
+        }
     };
 
     function $(s){ return panel.querySelector(s); }
@@ -92166,6 +92883,7 @@
                 return s;
             };
             if (F.cz) h += czUstawieniaHtml(opcje);
+            else if (F.hvb) h += hvbUstawieniaHtml(opcje);
             else h += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
               +  '<label style="font-size:11px;color:#750000;font-weight:700">bank_setting</label>'
               +  '<select id="bk-bank" style="font-size:11px;padding:4px;max-width:320px">' + opcje(S.banki, c.bank) + '</select>'
@@ -92210,12 +92928,15 @@
         // --- plik ---
         h += '<div style="font-size:11px;color:#750000;font-weight:700;margin-bottom:4px">3 · Plik z banku</div>'
           +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
-          +  '<input type="file" id="bk-plik"' + (F.cz ? ' multiple' : '') + ' accept="' + ((F.hu || F.cz) ? '.csv' : '.csv,.xlsx,.xls') + '" style="font-size:12px">'
+          +  '<input type="file" id="bk-plik"' + ((F.cz || F.hvb) ? ' multiple' : '') + ' accept="' + ((F.hu || F.cz || F.hvb) ? '.csv' : '.csv,.xlsx,.xls') + '" style="font-size:12px">'
           +  '<span style="font-size:10px;color:#888">' + (F.cz ? 'CSV prosto z Raiffeisenbank — zaznacz oba pliki naraz (CZK i EUR); walutę rozpoznaję z treści'
-                                                              : (F.hu ? 'CSV prosto z UniCredit (Windows-1250), wyciąg dzienny'
-                                                                      : 'CSV (średnik, UTF-8) albo XLSX')) + '</span></div>';
+                                                              : (F.hvb ? 'CSV „Umsatzliste” prosto z HVB — zaznacz pliki wszystkich kont naraz; DE, EU i Europe rozpoznaję po kolumnie Kontonummer'
+                                                                       : (F.hu ? 'CSV prosto z UniCredit (Windows-1250), wyciąg dzienny'
+                                                                               : 'CSV (średnik, UTF-8) albo XLSX'))) + '</span></div>';
 
-        if (F.cz){
+        if (F.hvb){
+            h += hvbPodgladHtml();
+        } else if (F.cz){
             h += czPodgladHtml();
         } else if (S.rows && F.hu && S.hu){
             var hu = S.hu, wyj = hu.minus.length + hu.ins.length + hu.docs.length;
@@ -92304,15 +93025,18 @@
               +  '<button id="bk-imp-nr-set" style="padding:2px 8px;border:none;border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">zapisz</button></div>';
         }
         h += '<div id="bk-status" style="margin-top:4px;min-height:16px;font-size:12px;font-weight:bold"></div>';
-        h += F.cz ? czPudelkaHtml() : ('<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>');
+        h += F.cz ? czPudelkaHtml()
+           : (F.hvb ? hvbPudelkaHtml()
+                    : ('<div id="bk-imp" style="margin-top:10px' + (j ? '' : ';display:none') + '"></div>'));
         panel.innerHTML = h;
 
         $('#bk-close').onclick = function (){ panel.style.display = 'none'; };
         panel.querySelectorAll('.bk-fmt').forEach(function (b){
-            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; S.hu = null; S.huBajty = null; S.cz = {}; rysuj(); };
+            b.onclick = function (){ S.format = b.getAttribute('data-id'); S.rows = null; S.plik = null; S.hu = null; S.huBajty = null; S.cz = {}; S.hvb = {}; rysuj(); };
         });
         if (S.rows && F.hu && S.hu) huPodepnij(panel, S.hu);
         if (F.cz) czPodepnij();
+        if (F.hvb) hvbPodepnij();
         var lb = $('#bk-listy');
         if (lb) lb.onclick = async function (){
             lb.disabled = true; say('pobieram listy ustawień…', '#666');
@@ -92343,6 +93067,17 @@
                     }
                     ustawZapisz(czId(w), cw);
                 });
+                // HVB: po nazwie („HVB UniCredit", „HVB EU", „HVB Europe") i booking „method 2 +name" —
+                // tak poszlo 100% paczek zespolu w 10.2026. Tylko przy jednym aktywnym trafieniu i pustym polu.
+                if (F2.hvb) BK_HVB_SLOTY.forEach(function (s2){
+                    var ch = ustaw(hvbId(s2)), ph = bkPodpowiedz(b, hvbF(s2));
+                    if (!ch.bank && ph.length === 1){ ch.bank = ph[0].id; ch.bankNm = ph[0].nm; }
+                    if (!ch.booking){
+                        var bk3 = Object.keys(k).filter(function (id){ return !k[id].off && /^method\s*2\s*\+\s*name$/i.test(k[id].nm); });
+                        if (bk3.length === 1){ ch.booking = bk3[0]; ch.bookingNm = k[bk3[0]].nm; }
+                    }
+                    ustawZapisz(hvbId(s2), ch);
+                });
                 rysuj();
                 say('Listy pobrane: ' + Object.keys(b).length + ' ustawień importu, ' + Object.keys(k).length + ' sposobów dopasowania.'
                     + (bkKotwicaKsieg(k) ? '' : ' ⚠ nie widzę znanej pozycji 9 „Fulfillment No”.'), '#0a7a2f');
@@ -92354,6 +93089,7 @@
         var zp = $('#bk-zapisz');
         if (zp) zp.onclick = function (){
             if (fmt(S.format).cz){ czZapiszUstawienia(); return; }
+            if (fmt(S.format).hvb){ hvbZapiszUstawienia(); return; }
             var b = $('#bk-bank').value, k = $('#bk-book').value;
             if (!b || !k){ say('Wskaż oba ustawienia — bez nich nie wyślę pliku.', '#c47f00'); return; }
             var kn = String(($('#bk-konto') || {}).value || '').trim();
@@ -92386,6 +93122,7 @@
         };
         $('#bk-plik').onchange = async function (){
             if (fmt(S.format).cz){ await czWczytaj(Array.prototype.slice.call(this.files || [])); return; }
+            if (fmt(S.format).hvb){ await hvbWczytaj(Array.prototype.slice.call(this.files || [])); return; }
             var f = this.files && this.files[0];
             if (!f) return;
             say('czytam plik…', '#666');
@@ -92484,6 +93221,7 @@
         // Paczke (i paczki pobran) czytamy dopiero przy OTWARTYM panelu. Modul startuje na kazdej
         // stronie prologistics, a przy schowanym panelu to byly zbedne zapytania przy kazdym wejsciu.
         if (F.cz){ if (panel.style.display !== 'none') czSprawdzWszystkie(); }
+        else if (F.hvb){ if (panel.style.display !== 'none') hvbSprawdzWszystkie(); }
         else if (j && panel.style.display !== 'none') sprawdz();
         huNumerPodepnij();
     }
@@ -93006,6 +93744,399 @@
         });
     }
 
+    // ---------- HVB: zlecenia, ekran, wysylka ----------
+    // Trzy pliki -> trzy importy -> trzy zlecenia, kazde ze swoim pudelkiem paczki. Trzymamy je
+    // OSOBNO od zlecenia HU/EuPago i od pary CZ: wyslanie HVB nie zdejmuje z panelu tamtych paczek.
+    function hvbJobRaw(s){ var m = jGet(BK_HVB_JOB); return (m[s] && typeof m[s] === 'object') ? m[s] : {}; }
+    function hvbJob(s){ var o = hvbJobRaw(s); return o.impId ? o : null; }
+    function hvbJobZapisz(s, o){ var m = jGet(BK_HVB_JOB); m[s] = o || {}; jSet(BK_HVB_JOB, m); }
+    function zHvb(impId, s){
+        var pin = String(impId || '');
+        var moj = function (){ var j = hvbJob(s); return (j && pin && String(j.impId) === pin) ? j : null; };
+        var pud = function (){ return $('#bk-imp-hvb-' + s); };
+        return {
+            typ: 'hvb', sid: s, nazwa: hvbK(s).nazwa || s,
+            box: pud,
+            get: moj,
+            set: function (o){ if (moj() && o && String(o.impId) === pin) hvbJobZapisz(s, o); },
+            F: function (){ return hvbF(s); },
+            konto: function (){ return ustaw(hvbId(s)).konto || hvbF(s).konto || ''; },
+            odswiez: function (){ return hvbSprawdz(s); },
+            zapomnij: function (){
+                if (!moj()) return;
+                hvbJobZapisz(s, {});
+                var b = pud(); if (b){ b.style.display = 'none'; b.innerHTML = ''; }
+            }
+        };
+    }
+    async function hvbSprawdz(s){
+        var j = hvbJob(s), box = $('#bk-imp-hvb-' + s);
+        if (!box) return;
+        if (!j){ box.innerHTML = ''; box.style.display = 'none'; return; }
+        box.style.display = 'block';
+        box.innerHTML = '<div style="font-size:11px;color:#666">odczytuję paczkę ' + esc(j.impId) + ' (' + esc(s) + ')…</div>';
+        var Z = zHvb(j.impId, s);
+        try {
+            var d = await bkPaczka(j.impId);
+            if (!Z.get()) return;
+            rysujPaczke(Z, d);
+        } catch (e){
+            box.innerHTML = '<div style="font-size:11px;color:#c00">Nie odczytałem paczki ' + esc(j.impId) + ' (' + esc(s) + '): '
+                          + esc((e && e.message) || e) + '</div>'
+                          + '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">'
+                          + '<button data-bk="err-re" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">↻ spróbuj jeszcze raz</button>'
+                          + '<button data-bk="err-zap" style="padding:2px 8px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:10px">✕ Zapomnij paczkę</button></div>';
+            box.querySelector('[data-bk="err-re"]').onclick = function (){ hvbSprawdz(s); };
+            box.querySelector('[data-bk="err-zap"]').onclick = function (){
+                var nr0 = zNierozstrzygniete(Z.get());
+                if (!confirm('Zapomnieć paczkę ' + j.impId + ' (' + s + ')?\n\n' + (nr0 ? ('⚠ ' + nr0 + '\n\n') : '')
+                    + 'W prologistics nic się nie zmieni — zniknie tylko z tego panelu.')) return;
+                Z.zapomnij();
+            };
+        }
+    }
+    function hvbSprawdzWszystkie(){ BK_HVB_SLOTY.forEach(function (s){ if (hvbJob(s)) hvbSprawdz(s); }); }
+
+    // Ustawienia importu: trzy wiersze zamiast jednego — kazde konto ma swoj bank_setting
+    // i swoje konto w planie kont przy ksiegowaniu wprost na auftragu.
+    function hvbUstawieniaHtml(opcje){
+        var h = '<div style="font-size:11px;color:#750000;margin-bottom:4px">Trzy konta HVB — '
+              + '<span style="font-weight:normal">bank_setting · booking_setting · konto przy księgowaniu wprost na auftragu</span></div>';
+        BK_HVB_SLOTY.forEach(function (s){
+            var c = ustaw(hvbId(s)), Fs = hvbF(s), pB = bkPodpowiedz(S.banki, Fs);
+            h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:3px">'
+              +  '<span style="width:52px;font-size:11px;font-weight:700">' + esc(s) + '</span>'
+              +  '<span style="width:70px;font-size:10px;color:#888">' + esc(hvbNrKonta(s)) + '</span>'
+              +  '<select class="bk-hvb-bank" data-s="' + esc(s) + '" style="font-size:11px;padding:3px;max-width:280px">' + opcje(S.banki, c.bank) + '</select>'
+              +  '<select class="bk-hvb-book" data-s="' + esc(s) + '" style="font-size:11px;padding:3px;max-width:230px">' + opcje(S.ksieg, c.booking) + '</select>'
+              +  '<input class="bk-hvb-konto" data-s="' + esc(s) + '" value="' + esc(c.konto || Fs.konto) + '" style="width:50px;font-size:11px;text-align:right">'
+              +  '<span style="font-size:10px;color:#888">' + (pB.length ? ('pasuje: ' + esc(pB.map(function (x){ return x.nm + ' (' + x.id + ')'; }).join(', ')))
+                                                               : ('szukaj „' + esc(Fs.bankNazwa) + '”')) + '</span></div>';
+        });
+        return h + '<div style="display:flex;gap:8px;align-items:center;margin-top:4px">'
+             + '<button id="bk-zapisz" style="padding:5px 12px;border:none;border-radius:6px;background:#0a7a2f;color:#fff;font-weight:700;cursor:pointer;font-size:11px">💾 Zapisz</button>'
+             + '<button id="bk-listy" style="padding:5px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px">↻ Odśwież listy</button>'
+             + '<span style="font-size:10px;color:#750000">Dotąd: DE → „HVB UniCredit” (132), EU → „HVB EU” (201), Europe → „HVB Europe” (262); wszystkie „method 2 +name”.</span></div>';
+    }
+    function hvbZapiszUstawienia(){
+        var nowe = [], zle = '';
+        BK_HVB_SLOTY.forEach(function (s){
+            var b = String((panel.querySelector('.bk-hvb-bank[data-s="' + s + '"]') || {}).value || '');
+            var k = String((panel.querySelector('.bk-hvb-book[data-s="' + s + '"]') || {}).value || '');
+            var kn = String((panel.querySelector('.bk-hvb-konto[data-s="' + s + '"]') || {}).value || '').trim();
+            if (kn && !/^\d{3,6}$/.test(kn)) zle = s + ': konto to sam numer z planu kont, np. ' + hvbF(s).konto + '.';
+            nowe.push({ s: s, v: { bank: b, bankNm: b ? ((S.banki[b] || {}).nm || '') : '',
+                                   booking: k, bookingNm: k ? ((S.ksieg[k] || {}).nm || '') : '',
+                                   konto: kn } });
+        });
+        if (zle){ say(esc(zle), '#c47f00'); return; }
+        nowe.forEach(function (x){ ustawZapisz(hvbId(x.s), x.v); });
+        rysuj();
+        say('Zapisane: ' + nowe.map(function (x){
+                return x.s + ' → ' + (x.v.bankNm || '— nie wskazane') + (x.v.bank ? (' (' + x.v.bank + ')') : '');
+            }).join(' · ') + '.', '#0a7a2f');
+    }
+
+    function hvbWierszeHtml(lista, zPowodem){
+        var h = '<div style="max-height:220px;overflow:auto;margin-top:4px"><table style="border-collapse:collapse;font-size:10px;width:100%">'
+              + '<tr style="background:#f3f4f6"><th style="text-align:left;padding:1px 5px">Buchung</th>'
+              + '<th style="text-align:left;padding:1px 5px">Valuta</th><th style="text-align:right;padding:1px 5px">Kwota</th>'
+              + '<th style="text-align:left;padding:1px 5px">Verwendungszweck</th>'
+              + (zPowodem ? '<th style="text-align:left;padding:1px 5px">Dlaczego wyjęte</th>' : '') + '</tr>';
+        lista.forEach(function (w){
+            h += '<tr style="border-top:1px solid #eee"><td style="padding:1px 5px;white-space:nowrap">' + esc(w.bu) + '</td>'
+              +  '<td style="padding:1px 5px;white-space:nowrap">' + esc(w.va) + '</td>'
+              +  '<td style="padding:1px 5px;text-align:right;white-space:nowrap' + ((w.lb < 0) ? ';color:#c00' : '') + '">' + esc(w.kw) + '</td>'
+              +  '<td style="padding:1px 5px">' + esc(w.op) + '</td>'
+              +  (zPowodem ? ('<td style="padding:1px 5px;white-space:nowrap;color:#c2410c">' + esc(w.powod) + ' · ' + esc(w.skad) + '</td>') : '')
+              +  '</tr>';
+        });
+        return h + '</table></div>';
+    }
+    function hvbPodgladHtml(){
+        var sloty = BK_HVB_SLOTY.filter(function (s){ return S.hvb && S.hvb[s]; });
+        if (!sloty.length) return '';
+        var h = '', doWys = [];
+        sloty.forEach(function (s){
+            var x = S.hvb[s], an = x.an, zost = x.zostaje || [], wyj = x.wyjete || [];
+            var nieKsM = {};
+            zost.forEach(function (w){
+                var r = bkNieKsieg(BK_HVB_NIE_KSIEG, w.op);
+                if (r) nieKsM[r.nazwa] = (nieKsM[r.nazwa] || 0) + 1;
+            });
+            var nieKsOpis = Object.keys(nieKsM).map(function (k){ return k + ' ' + nieKsM[k]; }).join(', ');
+            var nieKs = Object.keys(nieKsM).reduce(function (a, k){ return a + nieKsM[k]; }, 0);
+            var pusty = !zost.length, blokada = !!x.refBlad && !x.wymus;
+            if (!pusty && !blokada) doWys.push(s);
+            var zly = pusty || blokada;
+            h += '<div style="padding:8px;background:' + (zly ? '#fff7ed' : '#f0fdf4') + ';border:1px solid '
+              +  (zly ? '#fed7aa' : '#bbf7d0') + ';border-radius:6px;margin-bottom:8px">'
+              +  '<div style="font-size:12px;color:' + (zly ? '#c2410c' : '#0a7a2f') + ';font-weight:700">'
+              +  (zly ? '⏸ ' : '✓ ') + esc(hvbK(s).nazwa || s) + ' · konto ' + esc(an.konto) + ' · ' + esc(x.plik) + '</div>'
+              +  '<div style="font-size:11px;color:#166534;margin-top:2px">w pliku: <b>' + an.wiersze.length + '</b>'
+              +  ' · do importu: <b>' + zost.length + '</b> · powtórki wyjęte: <b>' + wyj.length + '</b>'
+              +  (zost.length ? (' · ' + esc(hvbZakres(zost)) + ' · suma ' + f2(hvbSuma(zost)) + ' EUR') : '')
+              +  (x.zamienione ? (' · <span style="color:#c47f00">znaków spoza Latin-1 zamienionych na „?”: ' + x.zamienione + '</span>') : '')
+              +  '</div>'
+              +  (nieKs ? ('<div style="font-size:10px;color:#6b7280;margin-top:1px">w tym <b>' + nieKs + '</b> '
+                              + (nieKs === 1 ? 'wiersz, którego' : 'wierszy, których') + ' tym importem nie księgujemy ('
+                              + esc(nieKsOpis) + ') — zostają w pliku (tak robi zespół), ale w paczce odłożę je '
+                              + 'osobno i nie zaksięguję</div>') : '')
+              +  '<div style="font-size:10px;color:#888;margin-top:1px">kodowanie wejścia: ' + esc(an.kod)
+              +  ' · plik do importu: Latin-1, średnik, CRLF (tak jak paczki zespołu)</div>'
+              +  (x.ref && x.ref.paczki && x.ref.paczki.length
+                    ? ('<div style="font-size:10px;color:#166534;margin-top:1px">porównane z ' + x.ref.paczki.length
+                       + ' ostatnimi paczkami importu (' + esc(x.ref.paczki.map(function (p){ return p.id; }).slice(0, 6).join(', '))
+                       + (x.ref.paczki.length > 6 ? ' …' : '') + '), razem ' + x.ref.wiersze.length + ' wierszy'
+                       + (x.ref.bledy && x.ref.bledy.length ? (' · <span style="color:#c47f00">' + x.ref.bledy.length + ' paczek nie odczytałem</span>') : '')
+                       + '</div>') : '')
+              +  (x.refBlad
+                    ? ('<div style="font-size:11px;color:#c00;margin-top:3px;font-weight:700">⚠ Nie sprawdziłem powtórek wobec prologistics: '
+                       + esc(x.refBlad) + '. Powtórki wyjąłem tylko z własnej pamięci wysyłek i z samego pliku — '
+                       + (x.wymus ? 'wyślę mimo to (tak wybrałeś).'
+                                  : ('to za mało, żeby wysłać. <button class="bk-hvb-wymus" data-s="' + esc(s) + '" style="padding:1px 7px;border:1px solid #c2410c;'
+                                     + 'border-radius:5px;background:#fff;color:#c2410c;cursor:pointer;font-size:10px;font-weight:normal">wyślij mimo to</button>'))
+                       + '</div>') : '')
+              +  (pusty ? '<div style="font-size:11px;color:#c2410c;margin-top:2px;font-weight:700">Po wyjęciu powtórek nie zostaje nic — tego pliku nie wyślę.</div>' : '')
+              +  (an.bledy.length ? ('<div style="font-size:11px;color:#c00;margin-top:2px">⚠ Wierszy, których nie rozumiem: ' + an.bledy.length
+                                     + ' — ' + esc(an.bledy.slice(0, 3).join('; ')) + (an.bledy.length > 3 ? ' …' : '')
+                                     + '. Nie idą do importu.</div>') : '')
+              +  (wyj.length ? ('<details style="margin-top:4px"><summary style="font-size:11px;color:#c2410c;cursor:pointer">Powtórki wyjęte z pliku ('
+                                + wyj.length + ')</summary>' + hvbWierszeHtml(wyj.map(hvbMini), true) + '</details>') : '')
+              +  (zost.length ? ('<details style="margin-top:4px"><summary style="font-size:11px;color:#166534;cursor:pointer">Co idzie do importu ('
+                                 + zost.length + ')</summary>' + hvbWierszeHtml(zost.map(hvbMini), false) + '</details>') : '')
+              +  '<div style="margin-top:5px"><button class="bk-hvb-pobierz" data-s="' + esc(s) + '"' + (pusty ? ' disabled' : '')
+              +  ' style="padding:3px 10px;border:1px solid #750000;border-radius:6px;background:#fff;color:#750000;cursor:pointer;font-size:11px" '
+              +  'title="Plik dokładnie taki, jaki pójdzie do importu.">⬇ Pobierz plik ' + esc(s) + '</button></div>'
+              +  '</div>';
+        });
+        h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
+          +  '<button id="bk-hvb-wyslij"' + (doWys.length ? '' : ' disabled') + ' style="padding:8px 16px;border:none;border-radius:6px;background:'
+          +  (doWys.length ? '#5b21b6' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (doWys.length ? 'pointer' : 'default') + ';font-size:12px">📤 Wyślij do importu'
+          +  (doWys.length ? (': ' + doWys.join(', ')) : '') + '</button>'
+          +  '<span style="font-size:10px;color:#888">Każde konto to osobna paczka. Nazwy: '
+          +  esc(doWys.map(function (s){ return hvbNazwa(s, new Date()); }).join(', ')) + '</span></div>'
+          +  '<div style="margin-bottom:10px"><label style="font-size:11px;color:#750000;cursor:pointer">'
+          +  '<input type="checkbox" id="bk-hvb-mkt"' + (hvbMktOn() ? ' checked' : '') + '> '
+          +  'przy wysyłce przekaż te pliki także do „Księgowanie Marketplace’s” — to on rozpoznaje wypłaty marketplace’ów '
+          +  'po nadawcy i tytule i <b>dopisuje je do arkusza</b> jako „do zrobienia”</label>'
+          +  '<div style="font-size:10px;color:#c47f00;margin-top:2px">Przekazanie <b>nie wyjmuje</b> tych wpłat z pliku '
+          +  'wysyłanego do importu — pilnuj, żeby nie zaksięgować jednej wpłaty dwa razy. Do Marketplace’s idą pliki '
+          +  '<b>w całości</b> (z powtórkami): ten moduł ma własną kontrolę, czy zlecenie już stoi.</div></div>';
+        return h;
+    }
+    // Pudelka paczek + pole na numer, gdy wysylka nie oddala numeru paczki.
+    function hvbPudelkaHtml(){
+        var h = '';
+        BK_HVB_SLOTY.forEach(function (s){
+            var jr = hvbJobRaw(s);
+            if (!jr.impId && jr.nazwa)
+                h += '<div style="margin:4px 0 8px;padding:6px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:11px;color:#7c2d12">'
+                  +  esc(s) + ': plik <b>' + esc(jr.nazwa) + '</b> ' + (jr.stan === 'wysylka' ? 'jest wysyłany' : 'poszedł do importu') + ' '
+                  +  esc(String(jr.czas || '').replace('T', ' ').slice(0, 16))
+                  +  (jr.blad ? (', ale nie wiem, czy paczka powstała (' + esc(jr.blad) + ')') : ', ale nie odczytałem numeru paczki')
+                  +  '. Wpisz numer z adresu …/import_payments/<b>NUMER</b>/ albo zapomnij.'
+                  +  '<div style="margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+                  +  '<input class="bk-hvb-nr" data-s="' + esc(s) + '" placeholder="np. 2271880" style="width:110px;font-size:11px;padding:2px 4px">'
+                  +  '<button class="bk-hvb-nr-set" data-s="' + esc(s) + '" style="padding:2px 9px;border:none;border-radius:5px;background:#5b21b6;color:#fff;cursor:pointer;font-size:11px">Przypnij</button>'
+                  +  '<button class="bk-hvb-nr-zap" data-s="' + esc(s) + '" style="padding:2px 9px;border:1px solid #ccc;border-radius:5px;background:#fff;cursor:pointer;font-size:11px">✕ Zapomnij</button>'
+                  +  '</div></div>';
+            h += '<div id="bk-imp-hvb-' + esc(s) + '" style="display:none;margin-bottom:10px"></div>';
+        });
+        return h;
+    }
+
+    async function hvbWczytaj(pliki){
+        if (!pliki.length) return;
+        say('czytam ' + pliki.length + ' ' + (pliki.length === 1 ? 'plik' : 'pliki') + '…', '#666');
+        var nowe = {}, bledy = [];
+        for (var i = 0; i < pliki.length; i++){
+            var f = pliki[i];
+            try {
+                var buf = await f.arrayBuffer();
+                var an = hvbAnaliza(buf, f.name);
+                if (an.err){ bledy.push(f.name + ': ' + an.err); continue; }
+                if (!an.wiersze.length){
+                    bledy.push(f.name + ': ' + (an.bledy[0] || 'nie ma w nim ani jednej transakcji')); continue;
+                }
+                if (nowe[an.slot]){
+                    bledy.push(f.name + ': drugi plik konta ' + an.konto + ' (pierwszy: ' + nowe[an.slot].plik
+                               + ') — jeden plik na konto'); continue;
+                }
+                nowe[an.slot] = { plik: f.name, an: an, buf: buf, slot: an.slot };
+            } catch (e){ bledy.push(f.name + ': ' + ((e && e.message) || e)); }
+        }
+        // S.hvb ustawiamy DOPIERO po policzeniu powtorek: do tego czasu pozycje nie maja
+        // jeszcze „zostaje"/„wyjete", a kazde przerysowanie panelu probowaloby je narysowac.
+        S.hvb = {};
+        var sloty = BK_HVB_SLOTY.filter(function (s){ return nowe[s]; });
+        // Powtorki liczymy PO wczytaniu wszystkich plikow — kazde konto wobec swoich paczek.
+        for (var k = 0; k < sloty.length; k++){
+            var s = sloty[k], x = nowe[s];
+            var odIso = x.an.wiersze.map(function (w){ return w.iso; }).filter(Boolean).sort()[0] || '';
+            say('szukam powtórek: ' + s + ' — czytam poprzednie paczki importu…', '#666');
+            var ref = await hvbPoprzednie(s, odIso, function (a, b){
+                say('szukam powtórek: ' + s + ' — paczka ' + a + ' z ' + b + '…', '#666');
+            });
+            x.ref = ref.err ? null : ref;
+            x.refBlad = ref.err || '';
+            var d = hvbDedup(x.an.wiersze, (x.ref && x.ref.wiersze) || [], hvbPamiec(s));
+            x.zostaje = d.zostaje; x.wyjete = d.wyjete;
+            var z = hvbZbuduj(x.an, x.zostaje);
+            x.bajty = z.bajty; x.zamienione = z.zamienione;
+            var kt = x.zostaje.length ? hvbKontrola(x.an, x.zostaje, x.bajty) : '';
+            if (kt){ delete nowe[s]; bledy.push(x.plik + ': nie wyślę — ' + kt + '. Zgłoś to z tym plikiem.'); }
+        }
+        S.hvb = nowe;
+        rysuj();
+        var ok = BK_HVB_SLOTY.filter(function (s){ return nowe[s]; });
+        say((ok.length ? ('Wczytane: ' + ok.map(function (s){
+                return s + ' (' + nowe[s].zostaje.length + ' z ' + nowe[s].an.wiersze.length + ')';
+            }).join(', ') + '. Sprawdź, co idzie do importu, i wyślij.') : '')
+            + (bledy.length ? (' <span style="color:#c00">Nie przyjąłem: ' + esc(bledy.join(' · ')) + '</span>') : ''),
+            bledy.length && !ok.length ? '#c00' : '#0a7a2f');
+    }
+
+    async function hvbWyslij(b){
+        // Migawka: w trakcie wysylki czlowiek moze wczytac inne pliki — wysylamy to, co zatwierdzil.
+        var zestaw = S.hvb || {};
+        var sloty = BK_HVB_SLOTY.filter(function (s){
+            var x = zestaw[s]; return x && x.zostaje && x.zostaje.length && (!x.refBlad || x.wymus);
+        });
+        if (!sloty.length){ rysuj(); say('Nie ma czego wysłać.', '#c47f00'); return; }
+        var brak = sloty.filter(function (s){ var c = ustaw(hvbId(s)); return !c.bank || !c.booking; });
+        if (brak.length){ say('Najpierw wskaż ustawienia importu dla ' + brak.join(' i ') + ' (krok 2) i kliknij „Zapisz”.', '#c47f00'); return; }
+        var mkt = hvbMktOn(), czas = new Date(), bloki = [];
+        sloty.forEach(function (s){
+            var x = zestaw[s], c = ustaw(hvbId(s)), nr0 = zNierozstrzygniete(hvbJob(s)), jr0 = hvbJobRaw(s);
+            if (!jr0.impId && jr0.nazwa)
+                nr0 = (nr0 ? (nr0 + ' ') : '') + 'Poprzedni plik ' + jr0.nazwa + ' poszedł bez odczytanego numeru paczki — '
+                    + 'sprawdź Import payments, zanim wyślesz następny.';
+            bloki.push(s + ': ' + hvbNazwa(s, czas) + ' (z ' + x.plik + ')\n'
+                + '  Ustawienie importu: ' + (c.bankNm || '?') + ' (' + c.bank + ') · ' + (c.bookingNm || '?') + ' (' + c.booking + ')\n'
+                + '  Do importu: ' + x.zostaje.length + ' z ' + x.an.wiersze.length + ' · powtórki wyjęte: ' + x.wyjete.length
+                + ' · ' + hvbZakres(x.zostaje) + ' · suma ' + f2(hvbSuma(x.zostaje)) + ' EUR'
+                + (x.refBlad ? ('\n  ⚠ powtórek NIE sprawdziłem wobec prologistics (' + x.refBlad + ') — wysyłasz mimo to') : '')
+                + (nr0 ? ('\n  ⚠ ' + nr0) : ''));
+        });
+        if (!confirm('Wysłać do Import payments ' + sloty.length + ' ' + (sloty.length === 1 ? 'plik' : 'pliki') + '?\n\n'
+            + bloki.join('\n\n') + '\n\nData księgowania: z wiersza pliku (nie nadpisuję).\n'
+            + 'Każdy plik to osobna paczka. Import NIE zaksięguje jej — to osobny przycisk.'
+            + (mkt ? '\n\nPo wysyłce przekażę te pliki do „Księgowanie Marketplace’s” — wypłaty marketplace’ów dopiszą się do arkusza.' : ''))) return;
+        b.disabled = true;
+        var wyniki = [], zNumerem = 0, zle = 0;
+        for (var i = 0; i < sloty.length; i++){
+            var s = sloty[i], x = zestaw[s], nazwa = hvbNazwa(s, czas), c = ustaw(hvbId(s));
+            // Slad PRZED zapytaniem: po F5 albo bledzie w trakcie wiadomo, ktory plik poszedl,
+            // i jest pole na numer paczki zamiast cichej ponownej wysylki.
+            var zl = { impId: '', nazwa: nazwa, format: 'hvb', slot: s, wierszy: x.zostaje.length,
+                       czas: new Date().toISOString(), booked: false, stan: 'wysylka',
+                       daty: {}, hvb: { plik: x.plik, konto: x.an.konto, wiersze: x.zostaje.map(hvbMini) } };
+            hvbJobZapisz(s, zl);
+            say('wysyłam ' + s + '…', '#666');
+            try {
+                var imp = await bkWyslij(new Blob([x.bajty], { type: 'text/csv' }), nazwa, c, { bezZapasu: true });
+                zl.impId = imp; delete zl.stan;
+                hvbJobZapisz(s, zl);
+                // Wiersze pamietamy jako wyslane dopiero przy ZNANEJ paczce — inaczej plik, ktorego
+                // import nie przyjal, bylby potem blokowany jako „juz wyslany".
+                if (imp){ hvbZapamietaj(s, x.zostaje); zNumerem++; }
+                wyniki.push(imp ? (s + ': paczka <b>' + esc(imp) + '</b>')
+                                : (s + ': poszło, ale numeru paczki nie odczytałem — sprawdź niżej'));
+            } catch (e){
+                zl.stan = 'niepewne'; zl.blad = (e && e.message) || String(e);
+                hvbJobZapisz(s, zl); zle++;
+                wyniki.push('<span style="color:#c00">' + s + ': nie wiem, czy paczka powstała — ' + esc(zl.blad) + '</span>');
+            }
+        }
+        var opisMkt = '';
+        if (mkt){
+            say('przekazuję pliki do Księgowania Marketplace’s…', '#666');
+            try {
+                var o = await bkDoMarketplace(sloty.map(function (s){
+                    return { nazwa: zestaw[s].plik, buf: zestaw[s].buf };
+                }));
+                var ar = o.arkusz || {};
+                opisMkt = ' · Marketplace’s: nowych zleceń <b>' + (o.nowych || 0) + '</b>'
+                        + (ar.wTle ? ' (dopis do arkusza trwa w tle — wynik na pasku tamtego modułu)'
+                                   : (ar.dodane ? (', do arkusza dopisane ' + ar.dodane) : ''))
+                        + (ar.blad ? (' · <span style="color:#c00">ARKUSZ: ' + esc(ar.blad) + '</span>') : '');
+            } catch (e2){
+                opisMkt = ' · <span style="color:#c00">nie przekazałem do Marketplace’s: ' + esc((e2 && e2.message) || e2)
+                        + ' — zrób to ręcznie, inaczej wypłaty marketplace’ów nie trafią do arkusza</span>';
+            }
+        }
+        if (S.hvb === zestaw) S.hvb = {};
+        rysuj();
+        say(wyniki.join(' · ') + (zNumerem ? ' — paczki jeszcze NIEZAKSIĘGOWANE.' : '') + opisMkt,
+            (zle || !zNumerem) ? '#c00' : '#0a7a2f');
+    }
+
+    function hvbPodepnij(){
+        var wb = $('#bk-hvb-wyslij');
+        if (wb) wb.onclick = async function (){
+            try { await hvbWyslij(wb); }
+            catch (e){ say('Nie poszło: ' + esc((e && e.message) || e), '#c00'); }
+            finally { if ($('#bk-hvb-wyslij')) $('#bk-hvb-wyslij').disabled = false; }
+        };
+        var mc = $('#bk-hvb-mkt');
+        if (mc) mc.onchange = function (){ gmSet(BK_HVB_MKT, mc.checked ? '1' : '0'); };
+        panel.querySelectorAll('.bk-hvb-pobierz').forEach(function (b){
+            b.onclick = function (){
+                var s = b.getAttribute('data-s'), x = S.hvb && S.hvb[s];
+                if (!x || !x.bajty) return;
+                var a = document.createElement('a'), nazwa = hvbNazwa(s, new Date());
+                a.href = URL.createObjectURL(new Blob([x.bajty], { type: 'text/csv' }));
+                a.download = nazwa;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+                say('Zapisane: ' + esc(nazwa), '#0a7a2f');
+            };
+        });
+        panel.querySelectorAll('.bk-hvb-wymus').forEach(function (b){
+            b.onclick = function (){
+                var s = b.getAttribute('data-s'), x = S.hvb && S.hvb[s]; if (!x) return;
+                if (!confirm('Wysłać ' + s + ' mimo to?\n\nPowtórek NIE sprawdziłem wobec paczek w prologistics ('
+                    + x.refBlad + '), więc w pliku mogą być wpłaty, które już tam są. '
+                    + 'Prologistics oznacza takie wiersze jako już zaimportowane, ale sprawdź paczkę po imporcie.')) return;
+                x.wymus = true; rysuj();
+            };
+        });
+        panel.querySelectorAll('.bk-hvb-nr-set').forEach(function (b){
+            b.onclick = async function (){
+                var s = b.getAttribute('data-s');
+                var nr = String((panel.querySelector('.bk-hvb-nr[data-s="' + s + '"]') || {}).value || '').trim();
+                if (!/^\d{3,9}$/.test(nr)){ say('Numer paczki to same cyfry z adresu …/import_payments/NUMER/.', '#c47f00'); return; }
+                var jr = hvbJobRaw(s);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                b.disabled = true; say('sprawdzam paczkę ' + esc(nr) + '…', '#666');
+                var sp;
+                try { sp = await bkSprawdzNumer(nr, jr.nazwa); }
+                catch (e){ sp = { ok: false, powod: 'nie odczytałem paczki ' + nr + ': ' + ((e && e.message) || e) }; }
+                b.disabled = false;
+                if (!sp.ok){ say('Nie przypinam: ' + esc(sp.powod) + '.', '#c00'); return; }
+                if (sp.potwierdz && !confirm(sp.potwierdz + '\n\nPrzypiąć ją do pliku ' + jr.nazwa + '?')) return;
+                jr = hvbJobRaw(s);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                jr.impId = nr; delete jr.stan; delete jr.blad; hvbJobZapisz(s, jr);
+                if (jr.hvb && jr.hvb.wiersze) hvbZapamietaj(s, jr.hvb.wiersze);
+                say('Zapisane: paczka ' + esc(nr) + ' (' + esc(s) + '). Odczytuję…', '#0a7a2f');
+                rysuj();
+            };
+        });
+        panel.querySelectorAll('.bk-hvb-nr-zap').forEach(function (b){
+            b.onclick = function (){
+                var s = b.getAttribute('data-s'), jr = hvbJobRaw(s);
+                if (jr.impId || !jr.nazwa){ rysuj(); return; }
+                if (!confirm('Zapomnieć plik ' + jr.nazwa + ' (' + s + ')?\n\nZrób to TYLKO wtedy, gdy w Import payments NIE ma '
+                    + 'paczki z tego pliku — inaczej ponowna wysyłka zrobi drugą paczkę z tymi samymi wpłatami.')) return;
+                hvbJobZapisz(s, {});
+                rysuj();
+                say(s + ': zapomniane — możesz wysłać plik jeszcze raz.', '#0a7a2f');
+            };
+        });
+    }
+
     // Paczka odczytana z prologistics — stan bierze sie z systemu, a nie z tego,
     // co sami wyslalismy.
     async function sprawdz(){
@@ -93334,6 +94465,10 @@
         // numer zamowienia zamiast transakcji) zostaja dla EuPago i PostFinance jak dotad.
         // Wyciag HU i paczki pobran maja wlasna, prostsza sciezke NOT FOUND.
         var euNarz = !(F.hu || F.cod || F.cz);
+        // Ktora kolumne pokazujemy przy kwocie: „Zostaje na auftragu" (open amount) czy „Roznica"
+        // (wplata − open). Wyciag bankowy ZAWSZE pierwsza — druga przy zaksiegowanym wierszu
+        // pokazuje cala wplate na czerwono. Flaga wlacza tez prog wyksiegowania na subkoncie.
+        var kolZostaje = !euNarz || !!F.zostaje;
         var num = euNarz ? bkNum : huNum;
         var q = function (s){ return box.querySelector(s); };
         var qa = function (s){ return box.querySelectorAll(s); };
@@ -93347,6 +94482,23 @@
         rows.forEach(function (x){ var s = String(x.state || '?'); (byWsz[s] = byWsz[s] || []).push(x); });
         wlasne.forEach(function (x){ var s = String(x.state || '?'); (by[s] = by[s] || []).push(x); });
         var ok = by['OK'] || [], chk = by['CHECK'] || [], nf = by['NOT FOUND'] || [];
+        // Wiersze spoza ksiegowania (HVB: American Express) odkladamy ZANIM powstana listy:
+        // nie ida pod „Zaksięguj OK", nie prosza o przypisanie auftragu i nie licza sie jako
+        // problem. Gdyby prologistics kiedys dopasowalo taki wiersz do auftragu (OK), tez go
+        // nie zaksiegujemy — to jest sens decyzji „nie ksiegujemy tego importem".
+        var nieKs = [], nieKsPow = {};
+        if (F.nieKsieg && F.nieKsieg.length){
+            var odloz = function (lista){
+                return lista.filter(function (x){
+                    var r = bkNieKsieg(F.nieKsieg, x.payment_descr);
+                    if (!r) return true;
+                    nieKsPow[String(x.id)] = r.nazwa;
+                    nieKs.push(x);
+                    return false;
+                });
+            };
+            ok = odloz(ok); chk = odloz(chk); nf = odloz(nf);
+        }
         // Prologistics samo oznacza pozycje, ktore juz kiedys wczytano — to jedyna
         // kontrola dzialajaca niezaleznie od tego, kto i czym je wprowadzil.
         var seen = rows.filter(function (x){ return String(x.already_imported) === '1' || String(x.already_imported_flag) === '1'; });
@@ -93393,9 +94545,9 @@
                   + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
                   + '<tr style="color:#999;font-size:10px"><td style="padding:1px 6px">Numer w pliku</td>'
                   + '<td style="padding:1px 6px;text-align:right">Wpłata</td>'
-                  + (euNarz ? ('<td style="padding:1px 6px;text-align:right">Open amount</td>'
-                               + '<td style="padding:1px 6px;text-align:right">Różnica</td>')
-                            : '<td style="padding:1px 6px;text-align:right">Zostaje na auftragu</td>')
+                  + (kolZostaje ? '<td style="padding:1px 6px;text-align:right">Zostaje na auftragu</td>'
+                                : ('<td style="padding:1px 6px;text-align:right">Open amount</td>'
+                                   + '<td style="padding:1px 6px;text-align:right">Różnica</td>'))
                   + '<td style="padding:1px 6px">Auftrag</td>'
                   + (kol ? ('<td style="padding:1px 6px">' + kol.naglowek + '</td>') : '')
                   + '</tr>';
@@ -93409,10 +94561,10 @@
                 var kolZost = (o == null) ? '#888' : (Math.abs(o) < 0.005 ? '#0a7a2f' : '#c00');
                 t += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px">' + esc(x.payment_descr) + '</td>'
                   +  '<td style="padding:2px 6px;text-align:right">' + (a == null ? esc(x.amount) : f2(a)) + '</td>'
-                  +  (euNarz
-                        ? ('<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
-                           + '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolRoz + '">' + (df == null ? '—' : f2(df)) + '</td>')
-                        : ('<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolZost + '">' + (o == null ? '—' : f2(o)) + '</td>'))
+                  +  (kolZostaje
+                        ? ('<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolZost + '">' + (o == null ? '—' : f2(o)) + '</td>')
+                        : ('<td style="padding:2px 6px;text-align:right">' + (o == null ? '—' : f2(o)) + '</td>'
+                           + '<td style="padding:2px 6px;text-align:right;font-weight:700;color:' + kolRoz + '">' + (df == null ? '—' : f2(df)) + '</td>'))
                   +  '<td style="padding:2px 6px">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
                   +  (kol ? ('<td style="padding:2px 6px;white-space:nowrap">' + kol.cel(x) + '</td>') : '')
                   +  '</tr>';
@@ -93461,10 +94613,10 @@
         } };
         var tolCtl = function (zGuzikiem){
             return '<div style="margin:-4px 0 8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-                 + '<span style="font-size:10px;color:#666">' + (euNarz ? 'grosze do wyrównania: do'
-                                                                       : 'różnica do wyksięgowania na subkoncie: do') + '</span>'
+                 + '<span style="font-size:10px;color:#666">' + (kolZostaje ? 'różnica do wyksięgowania na subkoncie: do'
+                                                                            : 'grosze do wyrównania: do') + '</span>'
                  + '<input data-bk="tol" value="' + tol.toFixed(2) + '" style="width:56px;font-size:10px;text-align:right">'
-                 + (euNarz ? '' : ('<span style="font-size:10px;color:#666">' + esc(F.waluta || '') + '</span>'))
+                 + (kolZostaje ? ('<span style="font-size:10px;color:#666">' + esc(F.waluta || '') + '</span>') : '')
                  + '<button data-bk="tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
                  + (zGuzikiem
                       ? ('<button data-bk="sub" style="padding:4px 10px;border:none;border-radius:6px;background:#0a7a2f;'
@@ -93516,15 +94668,24 @@
                              + esc(aohStop) + '. Zostaje jak dotąd: próg subkonta albo zmiana statusu ręcznie.</div>') : '')
               +  '</div>';
         }
+        // Odlozone (HVB: American Express) — nad tabelami, zeby bylo widac, czego HUB nie rusza.
+        // „tab" jest var-em definiowanym wyzej w tej funkcji, wiec sekcja musi stac TUTAJ,
+        // a nie przy naglowku paczki (tam jest jeszcze undefined).
+        if (nieKs.length)
+            h += tab('Nie księgujemy tym importem', '#6b7280', nieKs,
+                     'Przelewy wychodzące, opłaty banku i rozliczenia, które nie są zapłatą za zamówienie. '
+                     + 'Zostają w paczce nietknięte (prologistics ma je jako NOT FOUND), nie idą pod „'
+                     + esc(bkBlokKs(Z).opis) + '” i nie pytam o auftrag.',
+                     { naglowek: 'Co to', cel: function (x){ return esc(nieKsPow[String(x.id)] || ''); } });
         if (zNumerem.length)
             h += tab('Numer zamówienia zamiast transakcji — status się NIE zapisał', '#c47f00', zNumerem,
                      'Kwota zgadza się z open amount, więc nie ma tu czego wyjaśniać — nie udało się tylko '
                      + 'ustawić statusu. Kliknij „↻ Odśwież”, żeby spróbować jeszcze raz.', kolChk);
         if (koncowki.length){
-            h += tab(euNarz ? 'Końcówki groszowe — do wyksięgowania na subkoncie' : 'Różnica w progu — do wyksięgowania na subkoncie',
+            h += tab(kolZostaje ? 'Różnica w progu — do wyksięgowania na subkoncie' : 'Końcówki groszowe — do wyksięgowania na subkoncie',
                      '#0a7a2f', koncowki,
                      'Na auftragu zostaje nie więcej niż ' + f2(tol) + ' — '
-                     + (euNarz ? 'to zaokrąglenie, nie rozjazd. ' : 'tyle ustawiłeś jako próg. ')
+                     + (kolZostaje ? 'tyle ustawiłeś jako próg. ' : 'to zaokrąglenie, nie rozjazd. ')
                      + 'Guzik niżej ustawia im status OK i księguje na subkoncie, czyli odpowiada '
                      + 'przyciskowi „' + esc(BK_BLOCK_SUB_OPIS) + '".')
               +  tolCtl(true);
@@ -93532,7 +94693,7 @@
         if (doWyj.length){
             h += tab('CHECK — do wyjaśnienia', '#c47f00', doWyj,
                      'Prologistics oznaczyło te wiersze do sprawdzenia. '
-                     + (euNarz ? 'Różnica 0.00' : '„Zostaje na auftragu” 0.00') + ' znaczy, że powodem '
+                     + (kolZostaje ? '„Zostaje na auftragu” 0.00' : 'Różnica 0.00') + ' znaczy, że powodem '
                      + 'NIE jest kwota — wtedy zajrzyj w auftrag.', kolChk);
             var doWyjOk = doWyj.filter(chkMozna);
             if (doWyjOk.length > 1)
@@ -93549,9 +94710,12 @@
                    + 'color:#c00;cursor:pointer;font-size:10px">↺ Nie są zaksięgowane — zdejmij znacznik (' + chkZaks.length + ')</button></div>';
             // Przy HU kwota ma sie zgadzac (prog 0), ale roznice da sie dac na subkonto:
             // podniesienie progu przenosi wiersz wyzej, do guzika „na subkoncie".
-            if (!euNarz && !koncowki.length)
-                h += '<div style="font-size:10px;color:#888;margin:-2px 0 2px">Kwota ma się zgadzać. Jeśli różnicę '
-                   + 'trzeba dać na subkonto, podnieś próg — wiersze w progu przejdą wyżej, do guzika „'
+            if (kolZostaje && !koncowki.length)
+                h += '<div style="font-size:10px;color:#888;margin:-2px 0 2px">'
+                   + (F.zostaje ? 'Różnicę, która ma zostać wyksięgowana na subkoncie, ustawiasz progiem: '
+                                + 'wiersze mieszczące się w progu przejdą wyżej, pod guzik „'
+                                : 'Kwota ma się zgadzać. Jeśli różnicę trzeba dać na subkonto, podnieś próg — '
+                                + 'wiersze w progu przejdą wyżej, do guzika „')
                    + esc(BK_BLOCK_SUB_OPIS) + '”.</div>' + tolCtl(false);
         }
         if (nf.length){
@@ -104470,7 +105634,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2ae4841 · 22.10.2026 13:51';
+    const HUB_BUDOWA = '357a806 · 26.10.2026 13:23';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
