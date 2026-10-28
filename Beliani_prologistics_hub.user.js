@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.15
+// @version      5.60.16
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14,6 +14,7 @@
 // @match        https://merchant.shoepping.at/*
 // @match        https://marketplace.altex.ro/*
 // @match        https://sellerportal.kaufland.de/*
+// @match        https://partners.vivre.eu/*
 // @match        https://toolbox.manomano.com/*
 // @match        https://clientes.eupago.pt/*
 // @match        https://seller.octopia.com/*
@@ -32,6 +33,7 @@
 // @connect      api-krs.ms.gov.pl
 // @connect      raw.githubusercontent.com
 // @connect      www.prologistics.info
+// @connect      vivre.eu
 // @connect      www.backend-rates.bazg.admin.ch
 // @connect      backend-rates.bazg.admin.ch
 // @connect      prologistics.info
@@ -122,6 +124,8 @@
     // Seller Portal Kauflanda — tak samo: modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
     // Raporty ksiegowe („Your bookings", „pending") HUB zamawia i czyta z prologistics.
     const onKaufl   = () => /^sellerportal\.kaufland\.de$/i.test(H);
+    // Panel Vivre — modul Marketplace jest tam WYKONAWCA mostu, bez guzika.
+    const onVivre   = () => /^partners\.vivre\.eu$/i.test(H);
     // Panel ManoMano — wchodzimy tam WYLACZNIE po to, zeby podejrzec token sesji.
     const onMano    = () => /(^|\.)toolbox\.manomano\.com$/i.test(H);
     // Cnova FR stoi na Octopii. Dopasowanie jest szerokie (cala domena), bo panel
@@ -11530,6 +11534,21 @@
         const vatTekst = String(r.e2e || '') + '|' + String(r.ustrd || '');
         if (c.vatNeed) r.vatHint = vatTekst;
         else if (r.vatHint === vatTekst) c.vatNeed = true;
+        // Zwrot VAT rozpoznany z SAMEJ struktury auftragu, bez slowa „VAT" w tytule (15797102, 27.10.2026):
+        // storno faktury i nowa faktura na NIZSZEJ stawce (chkVatKorekta poz. 'faktury') to ta sama zmiana
+        // stawki, ktora wymaga korekty od finansow co zwrot z „VAT" w tytule. Waskie, zeby zwykly zwrot za
+        // towar na auftragu z historyczna faktura 0% nie blokowal przelewu:
+        //  - stawka musi isc w DOL (p.rate < n.rate) — to zwrot NADPLACONEGO VAT-u, nie korekta w gore;
+        //  - kwota przelewu nie przekracza spadku wartosci faktury z tej zmiany (|storno| - nowa faktura) —
+        //    zwykly zwrot za towar jest wiekszy niz sama roznica stawki, wiec w to okno nie wpada.
+        // vatHint tu NIE ustawiamy — strukture czytamy na nowo za kazdym razem (bez lepkosci po edycji).
+        if (!c.vatNeed && A && A.inv.length && okCcy && !isNaN(kw)) {
+            const ks = chkVatKorekta(A);
+            if (ks && ks.poz === 'faktury' && ks.p.rate != null && ks.n.rate != null && ks.p.rate < ks.n.rate) {
+                const spadek = Math.round((Math.abs(ks.n.amt) - ks.p.amt) * 100) / 100;
+                if (spadek > 0.005 && kw / 100 <= spadek + 0.011) { c.vatNeed = true; c.vatStruct = true; }
+            }
+        }
         if (c.vatNeed) {
             if (!A) { c.fail = true; c.notes.push(['w', 'zwrot VAT: nie mam auftragu, wiec nie sprawdzilem korekty (storno + zmiana stawki)']); }
             else {
@@ -11540,7 +11559,8 @@
                 if (k && k.poz === 'faktury' && !kor && !A.docsBrak) {
                     c.vatOk = false; c.vatKod = 'dok';
                     c.vatBaza = 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty wystawionej recznie przez dzial finansow (np. "Korekta_<numer faktury>.pdf"). '
-                        + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach.';
+                        + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach.'
+                        + (c.vatStruct ? ' (rozpoznane po storno i fakturze na nizszej stawce - w tytule przelewu nie ma "VAT")' : '');
                     c.vatRada = ' Zaczekaj na korekte i usun pozycje z listy (albo dopusc ja swiadomie przyciskiem obok)';
                 } else if (k && k.poz === 'faktury' && !kor) {
                     c.fail = true; c.notes.push(['w', 'zwrot VAT: nie odczytalem tabeli Attached documents auftragu ' + aufNr + ' - sprawdz recznie, czy finanse dodaly korekte']);
@@ -28189,10 +28209,37 @@
                 return pcNormCont(x && x.container) === p.cont;
             });
         }
+        /* ROSZCZENIE JUZ ODJETE PRZEZ INNY WIERSZ tej samej wklejki.
+           Penalty naliczona na POZIOMIE ZAMOWIENIA ma „Container: <UNDEFINED>" —
+           nie jest zapieta na zaden kontener. Numer tej penalty stoi wtedy w notatce
+           KAZDEGO wiersza zamowienia (bierze sie z tytulu), wiec pcPenTwarde uznaje ja
+           za twarda dla wszystkich kontenerow, a pcPenCudza jej nie zdejmuje (brak
+           prawdziwego kontenera). Przez to drugi kontener zamowienia dostawal falszywe
+           „penalty NIE odjeta", chociaz penalty to JEDNO roszczenie, -X raz.
+           order 20531: ECMU5514490 9945.00 -> 9555.00 (penalty 988 -390 odjeta),
+                        CMAU9420816 8925.00 (ta sama penalty 988 — juz poszla).
+           order 19911: TCKU6346579 8614.92 -> 8436.02 (penalty 1370 -178.90 odjeta),
+                        (CAAU7792742) 2340.05 (ta sama penalty 1370 — juz poszla).
+           Zasada: penalty jest skonsumowana, gdy INNY wiersz niosacy ten sam numer
+           odjal dokladnie jej kwote (kwota z notatki tamtego wiersza minus kwota
+           wklejona = |penalty|). Wtedy zarzut na biezacy wiersz nie moze padac. */
+        function pcPenJuzOdjeta(list, p, except){
+            if (!p || !isFinite(p.amt) || !p.amt) return false;
+            return (list || []).some(function (x){
+                if (x === except) return false;
+                var nos = pcRowPenNos(x);
+                if (!nos.length || !p.nos.some(function (n){ return nos.indexOf(n) !== -1; })) return false;
+                var w = pcBalAmtVal(x);
+                if (w == null || !isFinite(w)) return false;
+                return pcMoneyTokens((x && x.note) || '').some(function (g){
+                    return isFinite(g) && Math.abs((g - w) - Math.abs(p.amt)) < 0.005;
+                });
+            });
+        }
         // Roszczenia, ktore POWINNY byly pomniejszyc te wplate, a nie pomniejszyly.
         function pcPenNieodjeta(list, pens, r, rc){
             return pcPenTwarde(pens, r, rc).filter(function (p){
-                return !pcPenOsobno(list, p) && !pcPenCudza(list, p, r);
+                return !pcPenOsobno(list, p) && !pcPenCudza(list, p, r) && !pcPenJuzOdjeta(list, p, r);
             });
         }
         // Co DOKLADNIE jest nie tak, gdy kwota sie nie zgadza. Sama liczba „(-947.96)\"
@@ -34444,7 +34491,9 @@
     const onAlxP   = /^marketplace\.altex\.ro$/i.test(location.hostname);
     // Seller Portal Kauflanda — tak samo: tylko wykonawca mostu (blok „KAUFLAND DE"), bez guzika i bez panelu.
     const onKflP   = /^sellerportal\.kaufland\.de$/i.test(location.hostname);
-    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP && !onShpP && !onAlxP && !onKflP) return;
+    // Panel Vivre — tak samo: tylko wykonawca mostu (blok „VIVRE RO"), bez guzika i bez panelu.
+    const onVivP   = /^partners\.vivre\.eu$/i.test(location.hostname);
+    if (!onProlo && !onMirakl && !onVtex && !onWayf && !onBolP && !onShpP && !onAlxP && !onKflP && !onVivP) return;
     // Dwa te same przyciski braly sie stad, ze panel VTEX osadza aplikacje w ramce —
     // skrypt startowal i w oknie glownym, i w ramce, a kazde ma wlasny dokument, wiec
     // sprawdzanie samego identyfikatora nic nie dawalo. Pracujemy tylko w oknie glownym.
@@ -34751,6 +34800,9 @@
         // Altex RO: ustawienie 258 „Altex RO" (zalozone przez uzytkownika 13.10.2026): RON, konto 1378, booking 9 (Fulfillment
         // No — numer „ATX…-1259" to ff_number auftragu), numer w kolumnie 5, kwota w 14 (MK_KOL_KWOTA), bez kolumny daty.
         'Altex · Altex RO':       { bank: '258', booking: '9', acct: '1378' },
+        // Vivre RO — ustawienie 230 „VIVRE RO" (RON, numer kol. 1, kwota kol. 5 — uklad pliku z panelu),
+        // konto 1373. Booking 9 „Fulfillment No": auftrag ma ff_number = Order ID z Vivre (sprawdzone 28.10.2026).
+        'Vivre · Vivre RO':       { bank: '230', booking: '9', acct: '1373' },
         // Allegro: numeru ustawienia importu nie znamy z gory — modul podpowie go sam
         // po nazwie konta (bsGuess), tak jak przy Amazonie. Konto jest tu pewne.
         'Allegro · Allegro Beliani':        { bank: '', booking: '9', acct: '1071' },
@@ -39908,35 +39960,25 @@
     // Rozliczenie Galaxusa to plik z 24 kolumnami sciagany z „Payout overview". Kolumna N
     // nie ma naglowka i przychodzi pusta — to brutto z VAT, ktore Beliani dolicza samo.
     // Sprawdzone na dwoch wyplatach (4336.22 i 8801.72): N = Sales Price x 1.081 zgadza sie
-    // w 102 wierszach na 102 (przy ilosci 1 — dla wiekszej ilosci patrz galxBrutto: brutto liczy sie od JEDNOSTKI).
+    // w 102 wierszach na 102. VAT liczymy od calego wiersza (pozycji w Excelu), nie od sztuki — patrz galxBrutto.
     // Ostatni wiersz to „Total" — nie jest pozycja i nie liczymy go.
     const MK_GALX_VAT = { 'Galaxus CH': 0.081 };
     function galxVat(shop){
         const v = MK_GALX_VAT[shop];
         return (typeof v === 'number') ? v : 0.081;
     }
-    // BRUTTO POZYCJI. „Sales Price" w pliku Galaxusa to cena netto CALEJ pozycji (ilosc x cena jednostkowa),
-    // a auftrag w prologistics ma brutto zaokraglone do groszy od JEDNOSTKI i dopiero pomnozone przez ilosc:
-    // Galaxus podaje 2 x 74.00 = 148.00, auftrag ma 2 x 79.99 = 159.98, a r2(148 x 1.081) to 159.99 — grosz za duzo.
-    // Zmierzone 22.10.2026 na 10 wyplatach (09–22.10, 504 zamowienia) i 12 paczkach banku 199: 24 zamowienia
-    // roznia sie przy liczeniu od pozycji i od jednostki, a wszystkie 16 CHECK z grosza w tych paczkach to
-    // dokladnie te zamowienia; kolejne osiem zespol poprawil recznie dopiska −0,01 / +0,01 / −0,03 (auftrag 15921004:
-    // wartosc 159.98, wplaty 159.99 i −0.01). Dla ilosci 1 nic sie nie zmienia — z wyjatkiem DOKLADNEJ polowki:
-    // 185.00 x 1.081 = 199.985, a auftrag ma 199.98 (5 na 5 sprawdzonych), wiec polowka idzie W DOL. Inne dokladne
-    // polowki (cena jednostkowa konczaca sie na 5.00 CHF) nie wystapily, regule przyjeto z tego jednego przypadku.
-    // Arytmetyka na calkowitych groszach, zeby 199.985 nie zalezalo od zmiennoprzecinkowej reprezentacji.
-    // Pozycja, ktorej nie da sie podzielic na jednostki co do grosza (w danych nie bylo), liczy sie jak dawniej.
+    // BRUTTO POZYCJI — VAT liczony OD CALEGO WIERSZA pliku (pozycji w Excelu), raz, niezaleznie od ilosci.
+    // Decyzja uzytkownika 28.10.2026: „ma liczyc od kazdej pozycji w excelu, nie od kazdej pozycji artykulow".
+    // „Sales Price" to cena netto calej pozycji (ilosc x cena jednostkowa), wiec brutto = r2(SalesPrice x 1.081).
+    // Dzieki temu dwa zamowienia o tym samym netto maja ten sam VAT niezaleznie od ilosci sztuk: 1 x 407.02
+    // i 2 x 203.51 daja oba 439.99 (liczenie od jednostki dawalo 2 x 219.99 = 439.98 — o grosz mniej i inny VAT).
+    // SKUTEK (swiadomy): na zamowieniach qty>1, gdzie auftrag w prologistics ma brutto skladane od jednostki
+    // (219.99 x 2 = 439.98), wplata 439.99 zostawia −0,01 nadplaty — wiersz CHECK. Ten grosz schodzi na subkonto
+    // 8100 mechanizmem koncowek (wiersze CHECK z |open| <= tolerancja, domyslnie 0,05, po „Zaksieguj paczki").
+    // qty przyjmowane dla zgodnosci sygnatury, ale juz nieuzywane. Ujemna cena (zwrot) daje ujemne brutto.
     function galxBrutto(price, qty, vat){
         if (price == null || !isFinite(price)) return null;
-        const znak = price < 0 ? -1 : 1;
-        const L = Math.round(Math.abs(price) * 100);
-        const q = Math.abs(Math.round(Number(qty))) || 1;
-        if (L % q !== 0) return r2(price * (1 + vat));
-        const bp = Math.round(vat * 10000);
-        const licz = (L / q) * (10000 + bp), dol = Math.floor(licz / 10000);
-        const reszta = licz - dol * 10000;
-        const jedn = (2 * reszta > 10000) ? dol + 1 : dol;          // dokladna polowka w dol
-        return znak * (q * jedn) / 100;
+        return r2(price * (1 + vat));
     }
     // Kolumny szukamy po nazwach, a nie po numerach — gdyby Galaxus dolozyl pole,
     // uklad przesunalby sie i cicho psul kwoty.
@@ -50965,6 +51007,11 @@
         // Zostaje dla zaleglosci: ostatnie dokumenty MP-… Limango rozliczala jeszcze w 10.2026.
         { label: 'Limango DE stary', mp: 'Limango stary', brand: 'Limango', short: 'Limango',
           kind: 'lim', shop: 'Limango DE stary', cur: 'EUR' }
+        ,
+        // Vivre RO — ksiega balansu z partners.vivre.eu, wyplata dobierana po KWOCIE (blok „VIVRE RO").
+        // Etykieta jak w arkuszu („Vivre RO", konto 1373), waluta RON. Host wpisany wprost (martwa strefa).
+        { label: 'Vivre RO',   mp: 'Vivre', brand: 'Vivre', short: 'Vivre', kind: 'vivre',
+          host: 'partners.vivre.eu', shop: 'Vivre RO', cur: 'RON' }
     ];
     // Ta sama wplata nie moze trafic do modulu dwa razy — raz recznie, raz z wyciagu.
     // Klucze byloby wtedy rozne, a skutkiem podwojny import i podwojne ksiegowanie.
@@ -53627,11 +53674,696 @@
         if (j.kind === 'c24'  && j.data && j.data.c24)  return mkCsvCheck24(j.data.c24);
         if (j.kind === 'bol'  && j.data && j.data.bol)  return mkCsvBol(j.data.bol);
         if (j.kind === 'shoep' && j.data && j.data.shoep) return mkCsvShp(j.data.shoep);
+        if (j.kind === 'vivre' && j.data && j.data.vivre) return String(j.data.vivre.csv || '');
         // Kaufland DE: plik w ukladzie paczek recznych (54 kolumny, kol. 15 brutto) zbudowany przy zakladaniu zlecenia.
         // Po imporcie tekst jest kasowany (niesie dane kupujacych) — nowy plik daje dopiero nowe pobranie.
         if (j.kind === 'kfl'  && j.data && j.data.kfl)  return String(j.data.kfl.csv || '');
         if (mkDrv(j)          && j.data && Array.isArray(j.data.pozycje)) return mkDrvPlikImportu(j).tekst;
         return mkCsvText(pairsOf(j), j.mp, j.data && j.data.shop);
+    }
+
+    // ================= VIVRE RO =================
+    // Panel partners.vivre.eu (Next.js, NIE Mirakl; dostawca 11868 „Beliani"). Vivre prowadzi nam BALANS: kazde
+    // zamowienie wchodzi na niego ruchem „Order Payment", prowizja schodzi „Commission", zwrot „Order Refund",
+    // a przelew do banku zdejmuje „Transfer to Stripe". Przelew bierze CALY dostepny balans, wiec wyplata NIE jest
+    // suma zamowien — zwrot sprzed tygodnia obcina wyplate za biezace zamowienia, a przy balansie ujemnym zamowienie
+    // potrafi dostac przelew 0 i nie trafic do zadnej wyplaty (5 z 68 ruchow w roku 11.2025–10.2026, m.in. 7964128
+    // na 809,00 RON). Dlatego ksiegujemy po KSIEDZE, nie po wyplacie — decyzja uzytkownika 28.10.2026 („model B").
+    // Zmierzone 28.10.2026 na eksporcie transakcji i na panelu (pamiec: `vivre-ro-ksiega-i-rabat`):
+    //   ksiega domyka sie sama: Σ Order Payment 41 395,92 − prowizja netto 4 010,62 − zwroty 4 091,80
+    //                           − Σ Transfer to Stripe 33 915,72 = −622,22 RON = −119,44 EUR (balans panelu);
+    //   prowizja 11–15 %, osobno „Commission Discount" (zwykle 1 EUR: 5,00 RON, od lipca 5,20) i korekty prowizji;
+    //   „Platform Charge" z listy wyplat to tylko Order Amount − wyplacona czesc; nie jest prowizja i nic z niej nie ksiegujemy.
+    // Na auftrag idzie KWOTA Z KSIEGI (Order Payment), konto 1373 — tak jak ksiegowal zespol recznie
+    // (auftrag 15579705: „Payment: 1069.00 … Account: 1373"). RABAT PROWIZYJNY: Vivre zapisuje wartosc auftragu
+    // POMNIEJSZONA o rabat (7965458: auftrag 709,00, w ksiedze 703,80, rabat 5,20) — 14 razy w roku, od 0,88 do 26,00 RON.
+    // Zespol ksieguje to dwiema platnosciami: kwota z Vivre na 1373 i rabat na 8100 (auftragi 15222326, 15182427,
+    // 13729968, 14556315, 13660605). HUB robi tak samo, ale rabat wyksiegowuje TYLKO z dowodu: gdy roznica miedzy
+    // wartoscia auftragu a kwota z ksiegi rowna sie wpisowi „Commission Discount" tego zamowienia. Progu tolerancji
+    // do tego NIE uzywamy — jest wspolny dla wszystkich marketplace'ow na komputerze (przy Allegro stoi na 6 PLN).
+    // Import: ustawienie 230 „VIVRE RO" (RON, konto 1373; numer kol. 1, kwota kol. 5 — czyli uklad pliku z panelu,
+    // odczyt ustawienia 28.10.2026). Booking 9 „Fulfillment No": auftrag ma `ff_number` = Order ID z Vivre (sprawdzone
+    // 15950163 → 7965458, 13386627 → 7947190). UWAGA: 12 paczek zespolu z 12.2025–06.2026 nie zaksiegowalo NICZEGO
+    // (payment_id 0); booking „method 1" przypisywal CUDZE auftragi (7951670 → 13388897 zamiast 13744105). Gdyby
+    // pierwsza paczka weszla w calosci jako NOT FOUND, booking przestawia sie w ⚙ Konta.
+    // Wyciagu UniCredit RON HUB nie czyta — Vivre przychodzi z arkusza („Vivre RO", konto 1373) albo z „+ Dodaj wpłatę".
+    // Strony panelu sklada serwer, wiec czytamy je zwyklym GET-em; eksport xlsx to server action Next.js i adresu nie ma.
+    // Lista zamowien niesie dane klientow — jej NIE otwieramy, a z kazdej tabeli wynosimy wylacznie potrzebne kolumny.
+    const MK_VIV_HOST = 'partners.vivre.eu';
+    const MK_VIV_PANEL = 'https://partners.vivre.eu/finance/balance';
+    const MK_VIV_WYPL = 'https://partners.vivre.eu/finance/payouts';
+    const MK_VIV_SHOP = 'Vivre RO';
+    const MK_VIV_NA_STRONIE = 30;       // tyle ruchow na stronie ksiegi (zmierzone)
+    const MK_VIV_STRON = 40;            // najwyzej tyle stron ksiegi (1200 ruchow; caly rok to 235)
+    const MK_VIV_OKNO = [-2, 10];       // dni od „Initiated" wyplaty do daty wplywu na konto
+    const MK_VIV_WSTECZ = 150;          // tyle dni wstecz od daty wplaty ogladamy ruchy ksiegi
+    const MK_VIV_TOL = 0.01;            // zaokraglenia kwot
+    const MK_VIV_NARAZ = 3;             // tyle auftragow czytamy naraz
+    const MK_VIV_MZ = 'mkt_viv_most_z';         // zlecenie: prologistics -> karta panelu
+    const MK_VIV_MO = 'mkt_viv_most_o';         // odpowiedz: karta panelu -> prologistics
+    const MK_VIV_DR = 'mkt_viv_droga';          // ktora droga ostatnio zadzialala
+    const MK_VIV_MP = 'mkt_viv_most_puls';      // znak zycia karty panelu
+    const MK_VIV_SLAD = 'mkt_viv_slad';         // trwaly slad ruchow juz zalatwionych (przezywa „🗑 Wyczyść wszystko")
+    const VIV_DROGI = { bez: 'wprost', z: 'wprost z ciasteczkiem', most: 'przez kartę panelu' };
+    const VIV_NAGL = { 'accept': 'text/html,application/xhtml+xml' };
+    const VIV_NR = /^\d{6,10}$/;
+    // Kolumny, ktore wychodza poza strone panelu. Reszta zostaje w dokumencie roboczym.
+    const VIV_KOL = {
+        ksiega:  ['Order ID', 'Transaction type', 'Created at', 'Original amount', 'Balance after'],
+        wyplaty: ['Amount', 'Payout Id', 'Status', 'Nr. Items', 'Initiated'],
+        wyplata: ['Order ID', 'Transaction ID', 'Date', 'Order Amount', 'Platform Charge', 'Seller Amount']
+    };
+    // Rodzaje ruchu tak, jak pisze je strona (eksport xlsx ma te same pod nazwami ORDER_PAYMENT itd.).
+    const VIV_TYPY = {
+        'order payment': 'wplata', 'order refund': 'zwrot', 'commission': 'prowizja',
+        'commission refund': 'prowizjaZwrot', 'commission discount': 'rabat',
+        'commission discount refund': 'rabatZwrot', 'transfer to stripe': 'przelew',
+        'top up': 'doplata', 'adjustment': 'korekta', 'opening balance': 'otwarcie',
+        'subscription': 'abonament', 'subscription refund': 'abonamentZwrot',
+        'product monthly fee': 'oplataMiesieczna', 'studio image overage': 'oplataStudio'
+    };
+    // Adres sklada KAZDA strona sama — magazynem jedzie tylko nazwa operacji i liczby (biala lista, tylko GET).
+    function vivSciezka(op, a, s){
+        if (op === 'ksiega'){
+            const p = String(s == null ? '1' : s);
+            if (!/^[1-9]\d{0,2}$/.test(p)) throw new Error('Vivre: niepoprawny numer strony księgi „' + p.slice(0, 8) + '”');
+            return '/finance/balance?page=' + p;
+        }
+        if (op === 'wyplaty') return '/finance/payouts';
+        if (op === 'wyplata'){
+            const id = String(a == null ? '' : a);
+            if (!/^\d{1,10}$/.test(id)) throw new Error('Vivre: niepoprawny numer wypłaty „' + id.slice(0, 12) + '”');
+            return '/finance/payouts/' + id;
+        }
+        throw new Error('Vivre: nieznana operacja „' + String(op).slice(0, 20) + '”');
+    }
+    async function vivWprost(op, a, s, zCiastkiem){
+        const url = 'https://' + MK_VIV_HOST + vivSciezka(op, a, s);
+        const hdrs = { 'accept': VIV_NAGL.accept, 'referer': MK_VIV_PANEL };
+        if (zCiastkiem){
+            const ck = await gmCookies('https://' + MK_VIV_HOST + '/');
+            if (ck) hdrs['Cookie'] = ck;
+        }
+        const r = await new Promise(function (ok, nie){
+            if (typeof GM_xmlhttpRequest === 'undefined'){ nie(new Error('brak GM_xmlhttpRequest')); return; }
+            GM_xmlhttpRequest({ method: 'GET', url: url, headers: hdrs, timeout: 60000, onload: ok,
+                onerror: function (){ nie(new Error('nie mogę połączyć się z ' + MK_VIV_HOST
+                    + ' — jeśli ScriptCat pyta o dostęp do vivre.eu, zgódź się')); },
+                ontimeout: function (){ nie(new Error(MK_VIV_HOST + ' nie odpowiedział na czas')); } });
+        });
+        const typ = (String(r.responseHeaders || '').match(/^content-type:\s*([^\r\n;]+)/im) || ['', ''])[1].trim();
+        const fin = String(r.finalUrl || '');
+        return vivSkroc({ status: r.status, typ: typ, tekst: String(r.responseText || ''), host: fin.split('/')[2] || '',
+                          sciezka: fin.replace(/^https?:\/\/[^/]+/, '').split('?')[0] }, op);
+    }
+    // Co przyszlo: strona z tabela (ok), strona logowania albo cos innego. Panel po wygasnieciu sesji przekierowuje
+    // na /login, wiec po samym statusie sie tego nie pozna.
+    function vivRodzaj(x){
+        const t = String((x && x.tekst) || '');
+        const sc = String((x && x.sciezka) || '');
+        if (/<input[^>]+type=["']?password/i.test(t) || /^\/(login|auth|signin)\b/i.test(sc)) return 'logowanie';
+        if (x && x.status === 200 && /<table[\s>]/i.test(t)) return 'ok';
+        return 'inne';
+    }
+    function vivSkroc(x, op){
+        const rodzaj = vivRodzaj(x);
+        return { status: x.status, typ: x.typ || '', host: x.host || MK_VIV_HOST, sciezka: x.sciezka || '',
+                 dl: String(x.tekst || '').length, rodzaj: rodzaj,
+                 T: rodzaj === 'ok' ? vivTabela(x.tekst, VIV_KOL[op] || []) : null };
+    }
+    // Jak WYGLADA odrzucona odpowiedz — nigdy jej tresc.
+    function vivKsztalt(x){
+        const cz = [];
+        cz.push('odpowiedź ' + ((x && x.dl) || 0) + ' znaków');
+        if (!(x && x.dl)) cz.push('treść PUSTA — zapytanie mogło zostać zablokowane, zanim wyszło');
+        else if (x.rodzaj === 'logowanie') cz.push('strona logowania');
+        else cz.push('strona bez tabeli');
+        if (x && x.typ) cz.push('typ ' + x.typ);
+        if (x && x.host && x.host !== MK_VIV_HOST) cz.push('przekierowanie na ' + x.host);
+        return ' [' + cz.join(' · ') + ']';
+    }
+    // ----- odczyt stron panelu (DOMParser, nic nie trafia do drzewa strony) -----
+    function vivTxt(el){ return String((el && el.textContent) || '').replace(/\s+/g, ' ').trim(); }
+    function vivD10(t){ const m = String(t || '').match(/(\d{4}-\d{2}-\d{2})/); return m ? m[1] : ''; }
+    function vivKwota(t){
+        const m = String(t == null ? '' : t).match(/-?[\d., ]*\d/);
+        return m ? mkNum(m[0]) : null;
+    }
+    function vivWaluta(t){ const m = String(t || '').match(/([A-Z]{3})\s*$/); return m ? m[1] : ''; }
+    // Pierwsza tabela strony, zawezona do kolumn `kol`. Naglowek niesie takze komorki filtrow (dlugie listy opcji),
+    // wiec kolumny szukamy po NAZWIE, nie po pozycji. `id` wiersza to numer z odnosnika do szczegolow wyplaty.
+    function vivTabela(html, kol){
+        const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+        const tb = d.querySelector('table');
+        if (!tb) return { hdr: (kol || []).slice(), rows: [], brakTabeli: true };
+        const pelny = Array.prototype.map.call(tb.querySelectorAll('thead th'), vivTxt);
+        const ix = (kol || []).map(function (n){ return pelny.indexOf(n); });
+        const rows = [];
+        Array.prototype.forEach.call(tb.querySelectorAll('tbody tr'), function (tr){
+            const c = Array.prototype.map.call(tr.children, vivTxt);
+            if (c.length < 2) return;
+            const a = tr.querySelector('a[href*="/finance/payouts/"]');
+            const m = a ? String(a.getAttribute('href') || '').match(/\/finance\/payouts\/(\d+)/) : null;
+            rows.push({ id: m ? m[1] : '', c: ix.map(function (i){ return i < 0 ? null : c[i]; }) });
+        });
+        return { hdr: (kol || []).map(function (n, k){ return ix[k] < 0 ? null : n; }), rows: rows };
+    }
+    function vivKolumny(T, nazwy, co){
+        const ix = {};
+        nazwy.forEach(function (n){ ix[n] = T.hdr.indexOf(n); });
+        const brak = nazwy.filter(function (n){ return ix[n] < 0 || T.hdr[ix[n]] == null; });
+        if (brak.length) throw new Error('Vivre: ' + co + ' nie ma kolumn: ' + brak.join(', ') + ' — zmienił się układ panelu');
+        return ix;
+    }
+    // Jedna strona ksiegi: [{ nr, typ, typTxt, dzien, kwota, waluta, saldo }].
+    function vivKsiegaStrona(T){
+        if (!T || T.brakTabeli) throw new Error('Vivre: w odpowiedzi nie ma tabeli balansu');
+        const ix = vivKolumny(T, VIV_KOL.ksiega, 'balans');
+        return T.rows.map(function (r){
+            const c = r.c, txt = String(c[ix['Transaction type']] || '').trim();
+            const sur = String(c[ix['Original amount']] || '');
+            return { nr: String(c[ix['Order ID']] || '').trim(), typTxt: txt,
+                     typ: VIV_TYPY[txt.toLowerCase()] || '', dzien: vivD10(c[ix['Created at']]),
+                     kwota: vivKwota(sur), waluta: vivWaluta(sur), saldo: vivKwota(c[ix['Balance after']]) };
+        });
+    }
+    // Lista wyplat: [{ id, kwota, waluta, pid, status, szt, dzien }], od najnowszej.
+    function vivWyplatyLista(T){
+        if (!T || T.brakTabeli) throw new Error('Vivre: w odpowiedzi nie ma listy wypłat');
+        const ix = vivKolumny(T, VIV_KOL.wyplaty, 'lista wypłat');
+        return T.rows.map(function (r){
+            const c = r.c, sur = String(c[ix['Amount']] || '');
+            return { id: r.id, kwota: vivKwota(sur), waluta: vivWaluta(sur),
+                     pid: String(c[ix['Payout Id']] || '').trim(), status: String(c[ix['Status']] || '').trim().toLowerCase(),
+                     szt: parseInt(String(c[ix['Nr. Items']] || '0'), 10) || 0, dzien: vivD10(c[ix['Initiated']]) };
+        }).filter(function (w){ return /^\d{1,10}$/.test(w.id) && w.kwota != null && /^\d{4}-\d{2}-\d{2}$/.test(w.dzien); });
+    }
+    // Pozycje jednej wyplaty: [{ nr, dzien, order, charge, seller }].
+    function vivWyplataPoz(T, id){
+        if (!T || T.brakTabeli) throw new Error('Vivre: w odpowiedzi nie ma pozycji wypłaty ' + id);
+        const ix = vivKolumny(T, VIV_KOL.wyplata, 'wypłata ' + id);
+        return T.rows.map(function (r){
+            const c = r.c;
+            return { nr: String(c[ix['Order ID']] || '').trim(), dzien: vivD10(c[ix['Date']]),
+                     order: vivKwota(c[ix['Order Amount']]), charge: vivKwota(c[ix['Platform Charge']]),
+                     seller: vivKwota(c[ix['Seller Amount']]) };
+        });
+    }
+
+    // ----- pytajacy (prologistics) — uklad jak przy Altexie -----
+    const vivCzeka = {};
+    let vivMostBrak = 0;
+    function vivMostOdbior(txt){
+        if (!txt) return;
+        let o = null;
+        try { o = JSON.parse(txt); } catch (e){ return; }
+        if (o && o.id && vivCzeka[o.id]) vivCzeka[o.id](o);
+    }
+    if (onProlo){
+        try { GM_addValueChangeListener(MK_VIV_MO, function (k, s, n){ vivMostOdbior(n); }); } catch (e){}
+    }
+    function vivMost(op, a, s){
+        return new Promise(function (resolve, reject){
+            if (typeof GM_setValue === 'undefined' || typeof GM_getValue === 'undefined'){ resolve(null); return; }
+            const t0 = Date.now();
+            const id = t0.toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+            let koniec = false, przyjete = 0, zegar = null, powiedziane = false, puls = 0;
+            try { puls = Number(GM_getValue(MK_VIV_MP, 0)) || 0; } catch (e){}
+            const ack = (puls && t0 - puls < 5 * BOL_MOST_PULS) ? BOL_MOST_ACK_SPI : BOL_MOST_ACK;
+            function sprzataj(){
+                koniec = true;
+                delete vivCzeka[id];
+                if (zegar) clearInterval(zegar);
+                try { GM_setValue(MK_VIV_MZ, ''); GM_setValue(MK_VIV_MO, ''); } catch (e){}
+            }
+            vivCzeka[id] = function (o){
+                if (koniec) return;
+                if (o.etap === 'przyjete'){ if (!przyjete) przyjete = Date.now(); return; }
+                if (o.etap !== 'wynik') return;
+                sprzataj();
+                if (!o.ok){ reject(new Error(String(o.blad || 'karta panelu nie wykonała zapytania'))); return; }
+                resolve({ status: o.status, typ: String(o.typ || '').split(';')[0].trim(), host: MK_VIV_HOST,
+                          sciezka: String(o.sciezka || ''), dl: Number(o.dl) || 0, rodzaj: String(o.rodzaj || 'inne'),
+                          T: o.T || null });
+            };
+            zegar = setInterval(function (){
+                try { vivMostOdbior(String(GM_getValue(MK_VIV_MO, '') || '')); } catch (e){}
+                if (koniec) return;
+                const dt = Date.now() - t0;
+                if (!przyjete && dt > ack){ sprzataj(); vivMostBrak = Date.now(); resolve(null); }
+                else if (!przyjete && dt > BOL_MOST_ACK && !powiedziane){
+                    powiedziane = true;
+                    try { say('Vivre — karta panelu jest otwarta, ale śpi w tle. Czekam, aż się odezwie (do '
+                            + Math.round(ack / 1000) + ' s); szybciej będzie, gdy na nią zajrzysz.'); } catch (e){}
+                }
+                else if (przyjete && Date.now() - przyjete > BOL_MOST_MAX){
+                    sprzataj();
+                    reject(new Error('karta panelu Vivre przyjęła zapytanie, ale nie odpowiedziała w '
+                                   + Math.round(BOL_MOST_MAX / 1000) + ' s'));
+                }
+            }, 250);
+            try { GM_setValue(MK_VIV_MZ, JSON.stringify({ id: id, op: String(op), a: String(a == null ? '' : a),
+                                                          s: String(s == null ? '' : s), kiedy: t0 })); }
+            catch (e){ sprzataj(); resolve(null); }
+        });
+    }
+
+    // ----- wykonawca (karta partners.vivre.eu) — bez guzika i bez panelu, tylko odpowiada -----
+    // Strone czyta SAM (vivSkroc): do magazynu idzie rodzaj odpowiedzi i kilka kolumn tabeli, nigdy HTML.
+    if (onVivP){
+        const widziane = {};
+        const odpowiedz = function (o){
+            o.kiedy = Date.now();
+            try { GM_setValue(MK_VIV_MO, JSON.stringify(o)); } catch (e){}
+        };
+        const obsluz = async function (txt){
+            if (!txt) return;
+            let z = null;
+            try { z = JSON.parse(txt); } catch (e){ return; }
+            if (!z || !z.id || widziane[z.id]) return;
+            widziane[z.id] = 1;
+            if (!z.kiedy || Date.now() - z.kiedy > 120000) return;
+            let sciezka = '';
+            try { sciezka = vivSciezka(z.op, z.a, z.s); } catch (e){ return; }   // spoza bialej listy — bez odpowiedzi
+            odpowiedz({ id: z.id, etap: 'przyjete' });
+            let o;
+            try {
+                const res = await fetch('https://' + MK_VIV_HOST + sciezka, { credentials: 'include', headers: VIV_NAGL });
+                let sc = '';
+                try { sc = new URL(res.url).pathname; } catch (e){}
+                const x = vivSkroc({ status: res.status, typ: String(res.headers.get('content-type') || ''),
+                                     tekst: await res.text(), host: MK_VIV_HOST, sciezka: sc }, z.op);
+                o = { id: z.id, etap: 'wynik', ok: true, status: x.status, typ: x.typ, sciezka: x.sciezka, dl: x.dl,
+                      rodzaj: x.rodzaj, T: x.T };
+            } catch (e){
+                o = { id: z.id, etap: 'wynik', ok: false, blad: String((e && e.message) || e) };
+            }
+            let czeka = false;
+            try { czeka = String(GM_getValue(MK_VIV_MZ, '') || '').indexOf('"' + z.id + '"') >= 0; } catch (e){}
+            if (!czeka) return;
+            odpowiedz(o);
+            setTimeout(function (){
+                try {
+                    const t = String(GM_getValue(MK_VIV_MO, '') || '');
+                    if (t && t.indexOf('"' + z.id + '"') >= 0) GM_setValue(MK_VIV_MO, '');
+                } catch (e){}
+            }, 30000);
+        };
+        let pulsKiedy = 0;
+        const puls = function (){
+            const t = Date.now();
+            if (t - pulsKiedy < BOL_MOST_PULS) return;
+            pulsKiedy = t;
+            try { GM_setValue(MK_VIV_MP, t); } catch (e){}
+        };
+        const tyknij = function (){
+            puls();
+            let v = '';
+            try { v = String(GM_getValue(MK_VIV_MZ, '') || ''); } catch (e){ return; }
+            obsluz(v);
+        };
+        try { GM_addValueChangeListener(MK_VIV_MZ, function (k, s, n){ obsluz(n); }); } catch (e){}
+        try { window.addEventListener('pagehide', function (){ try { GM_setValue(MK_VIV_MP, 0); } catch (e){} }); } catch (e){}
+        let tykow = 0, zapas = false;
+        const zapasowy = function (){ if (zapas) return; zapas = true; setInterval(tyknij, 1000); };
+        try {
+            const url = URL.createObjectURL(new Blob(['setInterval(function(){ postMessage(1); }, 1000);'],
+                                                     { type: 'text/javascript' }));
+            const w = new Worker(url);
+            w.onmessage = function (){ tykow++; tyknij(); };
+            w.onerror = zapasowy;
+            setTimeout(function (){ if (tykow < 1) zapasowy(); }, 4000);
+        } catch (e){ zapasowy(); }
+        tyknij();
+        try {
+            if (!sessionStorage.getItem('hub_viv_gotowa')){
+                sessionStorage.setItem('hub_viv_gotowa', '1');
+                mkToast('HUB ' + MK_VER + ': ta karta podaje księgę Vivre do prologistics. Nic tu nie trzeba klikać — wystarczy, że jest otwarta.');
+            }
+        } catch (e){}
+    }
+
+    // Gdy karta panelu niedawno dala znak zycia, pytamy najpierw przez nia; inaczej zaczynamy droga, ktora ostatnio
+    // zadzialala. Strona logowania z drogi WPROST nie jest stanem sesji (ciasteczko moglo nie pojechac), z mostu — jest.
+    async function vivZapytaj(op, a, s){
+        let pamiec = '', puls = 0;
+        try { pamiec = String(GM_getValue(MK_VIV_DR, '') || ''); } catch (e){}
+        try { puls = Number(GM_getValue(MK_VIV_MP, 0)) || 0; } catch (e){}
+        const kolej = ['bez', 'z', 'most'];
+        const pierwsza = (puls && Date.now() - puls < 5 * BOL_MOST_PULS) ? 'most' : pamiec;
+        if (kolej.indexOf(pierwsza) > 0){ kolej.splice(kolej.indexOf(pierwsza), 1); kolej.unshift(pierwsza); }
+        const proby = [];
+        let r = null, droga = '', ostatni = '';
+        for (let i = 0; i < kolej.length && !r; i++){
+            const d = kolej[i];
+            let x = null;
+            try {
+                if (d === 'most'){
+                    if (Date.now() - vivMostBrak < 20000 && !(puls > vivMostBrak)){ proby.push(VIV_DROGI[d] + ': karta nie odpowiada'); continue; }
+                    x = await vivMost(op, a, s);
+                    if (!x){ proby.push(VIV_DROGI[d] + ': żadna karta ' + MK_VIV_HOST + ' nie odpowiedziała'); continue; }
+                } else x = await vivWprost(op, a, s, d === 'z');
+            } catch (e){
+                proby.push(VIV_DROGI[d] + ': ' + ((e && e.message) || e));
+                continue;
+            }
+            if (x.rodzaj === 'ok' || (d === 'most' && x.rodzaj === 'logowanie')){ r = x; droga = d; }
+            else {
+                const opis = 'HTTP ' + x.status + vivKsztalt(x);
+                proby.push(VIV_DROGI[d] + ': ' + (opis === ostatni ? 'to samo' : opis));
+                ostatni = opis;
+            }
+        }
+        if (!r){
+            throw new Error('Vivre: nie dotarłem do panelu (' + (op === 'ksiega' ? ('balans, strona ' + (s || 1))
+                : (op === 'wyplata' ? ('wypłata ' + a) : 'lista wypłat')) + '). Otwórz ' + MK_VIV_PANEL
+                + ' w drugiej karcie, zaloguj się i zostaw ją otwartą (jeśli już jest otwarta — odśwież ją),'
+                + ' potem kliknij „⬇ Pobierz zestawienia” jeszcze raz TUTAJ. Na panelu nic nie trzeba klikać.'
+                + ' [próby: ' + proby.join(' · ') + ']');
+        }
+        try { mkLog('vivre', (op === 'ksiega' ? ('balans str. ' + (s || 1)) : (op === 'wyplata' ? ('wypłata ' + a) : 'lista wypłat'))
+                            + ' — droga: ' + VIV_DROGI[droga] + ', HTTP ' + r.status
+                            + (proby.length ? (' (wcześniej: ' + proby.join(' · ') + ')') : '')); } catch (e){}
+        if (r.rodzaj === 'logowanie')
+            throw new Error('Vivre: panel pokazał stronę logowania — zaloguj się na ' + MK_VIV_PANEL);
+        if (droga !== pamiec){ try { GM_setValue(MK_VIV_DR, droga); } catch (e){} }
+        return r;
+    }
+    // Ksiega od najnowszego ruchu wstecz, do dnia `odDnia` (wlacznie). Strona oddaje MK_VIV_NA_STRONIE ruchow;
+    // konczymy, gdy strona jest krotsza, gdy ruchy sa starsze niz `odDnia` albo po MK_VIV_STRON stronach.
+    async function vivKsiega(odDnia){
+        const out = [], byl = {};
+        let pelne = false;
+        for (let s = 1; s <= MK_VIV_STRON; s++){
+            const w = vivKsiegaStrona((await vivZapytaj('ksiega', '', s)).T);
+            if (!w.length){ pelne = true; break; }
+            let stare = false;
+            w.forEach(function (x){
+                const id = vivRuchId(x);
+                if (byl[id]) return;
+                byl[id] = 1; out.push(x);
+                if (odDnia && x.dzien && x.dzien < odDnia) stare = true;
+            });
+            if (stare || w.length < MK_VIV_NA_STRONIE){ pelne = true; break; }
+        }
+        if (!pelne) throw new Error('Vivre: księga ma więcej niż ' + (MK_VIV_STRON * MK_VIV_NA_STRONIE)
+                                  + ' ruchów — niepełnej nie liczę');
+        return out;
+    }
+    function vivRuchId(x){ return String(x.nr || '') + '|' + String(x.typ || x.typTxt || '') + '|' + String(x.dzien || '') + '|' + f2(x.kwota); }
+    function vivDni(dataArk, dzien){
+        const a = mkDay(dataArk), b = mkDay(dzien);
+        return (a == null || b == null) ? null : Math.round((a - b) / 86400000);
+    }
+    function vivDmy(d){ return d ? (d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4)) : ''; }
+    // Wplata, ktora przelot moze obsluzyc. TEN SAM warunek liczy licznik (PULAPKI: „Licznik i przelot muszą stawiać ten sam warunek").
+    function vivDoPobrania(j){
+        return !!j && j.kind === 'vivre' && mkTodo(j) && j.amount != null && isFinite(j.amount)
+            && /^\d{4}-\d{2}-\d{2}$/.test(String(j.date || ''));
+    }
+
+    // ----- trwaly slad ruchow juz zalatwionych -----
+    // Ruch zaksiegowany przez HUB albo zastany na auftragu (zespol ksiegowal Vivre recznie do 10.2026) nie moze wrocic
+    // do importu po „🗑 Wyczyść wszystko" — inaczej auftrag dostalby druga platnosc. Klucz to tozsamosc ruchu
+    // (numer, rodzaj, dzien, kwota), wiec przezywa kazde przeliczenie. Trzymamy 400 dni.
+    function vivSladLoad(){
+        try { const o = JSON.parse(GM_getValue(MK_VIV_SLAD, '{}')); return (o && typeof o === 'object') ? o : {}; } catch (e){ return {}; }
+    }
+    function vivSladZapisz(m){
+        const s = vivSladLoad(), granica = Date.now() - 400 * 86400000;
+        let zm = false;
+        Object.keys(m || {}).forEach(function (id){
+            if (s[id] && s[id].st === m[id]) return;
+            s[id] = { st: m[id], t: Date.now() }; zm = true;
+        });
+        Object.keys(s).forEach(function (k){ if (!(s[k] && s[k].t > granica)){ delete s[k]; zm = true; } });
+        if (zm){ try { GM_setValue(MK_VIV_SLAD, JSON.stringify(s)); } catch (e){} }
+    }
+    // Ruchy, ktore juz poszly do importu w zleceniach z TEJ listy (takze jeszcze niezaimportowanych): dwie wplaty
+    // w kolejce nie moga wziac tego samego zamowienia.
+    function vivRuchyZlecen(jobs, wlasny){
+        const m = {};
+        Object.keys(jobs || {}).forEach(function (k){
+            const x = jobs[k];
+            if (k === wlasny || !x || x.kind !== 'vivre' || !x.data || !x.data.vivre) return;
+            if (x.data.netOk !== true) return;
+            (x.data.vivre.ruchy || []).forEach(function (id){ m[id] = k; });
+        });
+        return m;
+    }
+    // Wyplaty wziete juz przez inne zlecenia Vivre (po numerze wyplaty z panelu).
+    function vivWyplatyZajete(jobs, wlasny){
+        const z = {};
+        Object.keys(jobs || {}).forEach(function (k){
+            const x = jobs[k];
+            if (k === wlasny || !x || x.kind !== 'vivre' || !x.data || !x.data.vivre) return;
+            const id = String(x.data.vivre.wyplataId || '');
+            if (id) z[id] = k;
+        });
+        return z;
+    }
+
+    // ----- rozliczenie wyplaty po ksiedze (model B) -----
+    // Wyplata z panelu daje KWOTE i date (do arkusza i do kontroli), a to, co idzie na auftragi, bierze sie
+    // z ksiegi: wszystkie ruchy „Order Payment", ktorych HUB jeszcze nie zalatwil. Zamowienie bez przelewu
+    // (balans byl ujemny) tez wchodzi — inaczej nigdy by sie nie zaksiegowalo.
+    function vivOkno(j, poz){
+        const dni = mkDay(j.date);
+        let od = dni == null ? null : new Date(dni - MK_VIV_WSTECZ * 86400000).toISOString().slice(0, 10);
+        (poz || []).forEach(function (p){ if (p.dzien && (!od || p.dzien < od)) od = p.dzien; });
+        return od || '';
+    }
+    // Rabat prowizyjny tego zamowienia: „Commission Discount" minus cofniecia. Vivre zapisuje wartosc auftragu
+    // POMNIEJSZONA o rabat, wiec to jest ta roznica, ktora wolno wyksiegowac na subkonto.
+    function vivRabaty(ksiega){
+        const m = {};
+        (ksiega || []).forEach(function (x){
+            if (!x.nr) return;
+            if (x.typ === 'rabat') m[x.nr] = r2((m[x.nr] || 0) + (x.kwota || 0));
+        });
+        return m;
+    }
+    function vivRozlicz(j, wyp, poz, ksiega, zajeteRuchy){
+        const slad = vivSladLoad();
+        const okno = vivOkno(j, poz);
+        const p = { wyplataId: wyp.id, wyplataPid: wyp.pid, wyplataDzien: wyp.dzien, wyplataKwota: r2(wyp.kwota),
+                    okno: okno, poz: (poz || []).slice(), rabaty: vivRabaty(ksiega),
+                    wplaty: [], zwroty: [], ruchy: [], pominiete: [], bledy: [],
+                    prowizja: 0, sumaPoz: 0 };
+        // Kontrola kasowa: suma „Seller Amount" pozycji wyplaty musi dac przelew.
+        p.sumaPoz = r2((poz || []).reduce(function (s, x){ return s + (x.seller || 0); }, 0));
+        if (!eq(p.sumaPoz, wyp.kwota))
+            p.bledy.push('pozycje wypłaty dają ' + f2(p.sumaPoz) + ', a panel mówi o ' + f2(wyp.kwota));
+        if (wyp.waluta && wyp.waluta !== 'RON')
+            p.bledy.push('wypłata w walucie ' + wyp.waluta + ', a konto Vivre RO prowadzimy w RON');
+        (ksiega || []).forEach(function (x){
+            if (!x.dzien || (okno && x.dzien < okno)) return;
+            if (x.typ === 'prowizja' || x.typ === 'prowizjaZwrot') p.prowizja = r2(p.prowizja + (x.kwota || 0));
+            if (x.typ !== 'wplata' && x.typ !== 'zwrot') return;
+            const id = vivRuchId(x);
+            if (!VIV_NR.test(x.nr)){ p.bledy.push('ruch „' + x.typTxt + '” bez numeru zamówienia (' + x.dzien + ')'); return; }
+            if (x.kwota == null){ p.bledy.push(x.nr + ': ruch „' + x.typTxt + '” bez kwoty'); return; }
+            if (slad[id]){ p.pominiete.push({ nr: x.nr, dzien: x.dzien, kwota: x.kwota, id: id, czemu: slad[id].st === 'reka'
+                ? 'zaksięgowane poza HUB-em' : 'HUB już to zaksięgował' }); return; }
+            if (zajeteRuchy && zajeteRuchy[id]){ p.pominiete.push({ nr: x.nr, dzien: x.dzien, kwota: x.kwota, id: id,
+                czemu: 'weszło już do innego zlecenia' }); return; }
+            const w = { nr: x.nr, dzien: x.dzien, kwota: r2(Math.abs(x.kwota)), id: id };
+            if (x.typ === 'wplata') p.wplaty.push(w); else p.zwroty.push(w);
+            p.ruchy.push(id);
+        });
+        return p;
+    }
+    // Auftrag kazdej wplaty: czytamy go PRZED importem. Zespol ksiegowal Vivre recznie przez caly rok, wiec
+    // zamowienie z platnoscia na auftragu musi wypasc z paczki — inaczej auftrag dostalby druga platnosc.
+    async function vivAuftragi(p, powiedz){
+        const doImportu = [], reka = [], slad = {};
+        let zrobione = 0;
+        const kolejka = p.wplaty.slice();
+        const robotnik = async function (){
+            while (kolejka.length){
+                const w = kolejka.shift();
+                let st = null;
+                try {
+                    const f = await crFind(w.nr);
+                    if (f.err && !f.pusto){ w.blad = f.err; reka.push(w); continue; }
+                    if (!f.nums.length){ w.blad = 'nie ma auftragu o numerze ' + w.nr; reka.push(w); continue; }
+                    let num = f.nums[0], rr = await crRead(num);
+                    if (f.nums.length > 1 && rr.ok && (rr.ffy || []).indexOf(w.nr) < 0){
+                        const num2 = f.nums[1], rr2 = await crRead(num2);
+                        if (rr2.ok && (rr2.ffy || []).indexOf(w.nr) >= 0){ num = num2; rr = rr2; }
+                    }
+                    w.auftrag = num;
+                    if (!rr.ok){
+                        w.blad = rr.deleted ? ('auftrag ' + num + ' jest SKASOWANY') : (rr.err || 'nie odczytałem auftragu ' + num);
+                        reka.push(w); continue;
+                    }
+                    if ((rr.ffy || []).indexOf(w.nr) < 0){
+                        w.blad = 'auftrag ' + num + ' ma inny numer zamówienia (' + ((rr.ffy || [])[0] || '—') + ')';
+                        reka.push(w); continue;
+                    }
+                    if (rr.nPay > 0){
+                        w.blad = 'auftrag ' + num + ' ma już ' + rr.nPay + ' płatność/płatności';
+                        slad[w.id] = 'reka'; p.pominiete.push({ nr: w.nr, dzien: w.dzien, kwota: w.kwota, id: w.id,
+                            czemu: 'auftrag ' + num + ' ma już płatność — zaksięgowane poza HUB-em' });
+                        continue;
+                    }
+                    w.open = rr.open;
+                    // Rabat prowizyjny: roznica miedzy wartoscia auftragu a kwota z ksiegi musi zgadzac sie
+                    // z wpisem „Commission Discount". Inaczej nie zgadujemy — wiersz zostanie CHECK-iem.
+                    const roz = (rr.open == null) ? null : r2(rr.open - w.kwota);
+                    const rab = r2(p.rabaty[w.nr] || 0);
+                    w.roznica = roz;
+                    w.rabat = (roz != null && roz > 0.005 && Math.abs(roz - rab) <= MK_VIV_TOL) ? roz : 0;
+                    if (roz != null && roz > 0.005 && !w.rabat)
+                        w.uwaga = 'auftrag ma ' + f2(rr.open) + ', a w księdze jest ' + f2(w.kwota)
+                                + (rab ? (' — rabat w księdze to ' + f2(rab)) : ' — w księdze nie ma rabatu tej kwoty');
+                    if (roz != null && roz < -0.005)
+                        w.uwaga = 'auftrag ma ' + f2(rr.open) + ', czyli MNIEJ niż kwota z księgi ' + f2(w.kwota);
+                    doImportu.push(w);
+                } catch (e){
+                    w.blad = (e && e.message) || String(e);
+                    reka.push(w);
+                } finally {
+                    zrobione++;
+                    if (powiedz) powiedz(zrobione, p.wplaty.length);
+                }
+            }
+        };
+        const ilu = Math.min(MK_VIV_NARAZ, Math.max(1, p.wplaty.length));
+        await Promise.all(Array.from({ length: ilu }, robotnik));
+        if (Object.keys(slad).length) vivSladZapisz(slad);
+        doImportu.sort(function (a, b){ return a.dzien < b.dzien ? -1 : (a.dzien > b.dzien ? 1 : (+a.nr - +b.nr)); });
+        p.doImportu = doImportu;
+        p.reka = reka;
+        p.ruchy = doImportu.map(function (w){ return w.id; }).concat(p.zwroty.map(function (z){ return z.id; }));
+        return p;
+    }
+    // Plik w ukladzie panelu: ustawienie 230 czyta numer z kolumny 1 i kwote z kolumny 5. Naglowek zostaje —
+    // dokladnie tak wygladaja pliki, ktore zespol wgrywal recznie (paczka 1667067).
+    function vivCsv(p){
+        const l = ['Order ID;Country;Transaction ID;Date;Order Amount;Platform Charge;Seller Amount'];
+        (p.doImportu || []).forEach(function (w){
+            l.push([w.nr, 'Romania', '', w.dzien, f2(w.kwota) + 'RON', '', ''].join(';'));
+        });
+        return l.join('\r\n') + '\r\n';
+    }
+    function vivZastosuj(j, p){
+        const bad = p.bledy.slice();
+        const ord = {}, ref = {}, refDaty = {};
+        (p.doImportu || []).forEach(function (w){ ord[w.nr] = r2((ord[w.nr] || 0) + w.kwota); });
+        (p.zwroty || []).forEach(function (z){ ref[z.nr] = r2((ref[z.nr] || 0) + z.kwota); refDaty[z.nr] = z.dzien; });
+        const gross = r2(Object.keys(ord).reduce(function (s, k){ return s + ord[k]; }, 0));
+        const zw = r2(Object.keys(ref).reduce(function (s, k){ return s + ref[k]; }, 0));
+        const both = Object.keys(ord).filter(function (k){ return ref[k] != null; });
+        p.csv = vivCsv(p);
+        p.gross = gross;
+        p.zwrotySum = zw;
+        j.data = { vivre: p, shop: j.shop || MK_VIV_SHOP, gross: gross, refund: bad.length ? 0 : zw,
+                   net: p.sumaPoz, netOk: !bad.length, ord: ord, ref: bad.length ? {} : ref,
+                   refDaty: bad.length ? {} : refDaty, unknown: {}, skipped: {}, full: true, both: both,
+                   pays: 1, split: false, rows: (p.doImportu || []).length, total: (p.doImportu || []).length, pages: 1,
+                   how: 'wypłata Vivre ' + p.wyplataId + ' z ' + vivDmy(p.wyplataDzien) };
+        j.status = bad.length ? 'partial' : 'ready';
+        j.msg = bad.join('; ');
+        const rab = (p.doImportu || []).filter(function (w){ return w.rabat; });
+        j.note = 'do importu wpłaty z księgi Vivre (' + (p.doImportu || []).length + ')'
+               + (rab.length ? (' · rabat prowizyjny na subkonto: ' + rab.length + ' na ' + f2(r2(rab.reduce(function (s, w){ return s + w.rabat; }, 0)))) : '')
+               + (zw ? (' · zwroty ' + Object.keys(ref).length + ' na ' + f2(zw) + ' — idą na listę zwrotów, każdy ze swoją datą') : '')
+               + ((p.reka || []).length ? (' · do ręki: ' + p.reka.length) : '');
+        return bad;
+    }
+
+    // ----- ramka przy zleceniu -----
+    function vivBox(j){
+        if (!onProlo || j.kind !== 'vivre' || !j.data || !j.data.vivre) return '';
+        const p = j.data.vivre;
+        const rab = (p.doImportu || []).filter(function (w){ return w.rabat; });
+        const sumRab = r2(rab.reduce(function (s, w){ return s + w.rabat; }, 0));
+        const kwOk = j.data.netOk === true && eq(p.sumaPoz, j.amount);
+        let h = '<div>wypłata <b>' + esc(p.wyplataId) + '</b> z ' + esc(vivDmy(p.wyplataDzien))
+              + ' · <a href="' + esc(MK_VIV_WYPL) + '" target="_blank" rel="noopener" style="color:#1d4ed8">wypłaty w panelu</a>'
+              + ' · <a href="' + esc(MK_VIV_PANEL) + '" target="_blank" rel="noopener" style="color:#1d4ed8">księga</a></div>'
+              + '<div>pozycje wypłaty <b>' + f2(p.sumaPoz) + '</b> = wpłata ' + (kwOk ? '✓' : '<b style="color:#b91c1c">✗ ' + f2(j.amount) + '</b>')
+              + ' · prowizja w oknie ' + f2(p.prowizja) + ' zostaje na koncie</div>'
+              + '<div>z księgi: wpłaty <b>' + ((p.doImportu || []).length) + '</b> na ' + f2(p.gross)
+              + (p.zwrotySum ? (' · zwroty ' + (p.zwroty || []).length + ' na ' + f2(p.zwrotySum)) : '')
+              + ((p.pominiete || []).length ? (' · pominięte ' + p.pominiete.length) : '') + '</div>';
+        if (rab.length){
+            h += '<div style="margin-top:4px;padding:5px 7px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:5px">'
+               + '<b>Rabat prowizyjny — ' + rab.length + ' poz. na ' + f2(sumRab) + '</b>'
+               + ' — Vivre zapisało wartość auftragu pomniejszoną o rabat, więc po zaksięgowaniu paczki ta różnica'
+               + ' zostanie na auftragu jako CHECK i wychodzi osobną płatnością na subkonto (8100).'
+               + '<div style="margin-top:3px;font-size:11px;color:#1e3a8a">'
+               + rab.map(function (w){ return esc(w.nr) + ' ' + f2(w.rabat); }).join(' · ') + '</div>'
+               + (j.booked ? ('<button class="mk-vivrab" data-k="' + esc(j.__k || j.ref || '') + '"'
+                    + ' style="margin-top:5px;padding:4px 9px;background:#1d4ed8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px">'
+                    + '▶ Wyksięguj rabaty na subkoncie (' + rab.length + ')</button>') : '')
+               + '</div>';
+        }
+        if ((p.reka || []).length){
+            h += '<div style="margin-top:4px;padding:5px 7px;background:#fef3c7;border:1px solid #fcd34d;border-radius:5px">'
+               + '<b>Do ręki — ' + p.reka.length + ' poz.</b><div style="margin-top:3px;font-size:11px;color:#92400e">'
+               + p.reka.map(function (w){ return esc(w.nr) + ' ' + f2(w.kwota) + ' — ' + esc(w.blad || ''); }).join('<br>')
+               + '</div></div>';
+        }
+        const uw = (p.doImportu || []).filter(function (w){ return w.uwaga; });
+        if (uw.length){
+            h += '<div style="margin-top:4px;font-size:11px;color:#92400e">'
+               + uw.map(function (w){ return '⚠ ' + esc(w.nr) + ': ' + esc(w.uwaga); }).join('<br>') + '</div>';
+        }
+        return h;
+    }
+    // Rabaty na subkonto: wiersze paczki, ktorych open amount rowna sie rabatowi z ksiegi. Tolerancji NIE
+    // ruszamy — podajemy ja tej jednej operacji (mkKsResztka bierze ja z opcji), bo prog w ustawieniach jest
+    // wspolny dla wszystkich marketplace'ow na tym komputerze.
+    async function vivRabatyKsieguj(btn, j){
+        const p = j && j.data && j.data.vivre;
+        if (!p || !j.impId) return;
+        const rab = (p.doImportu || []).filter(function (w){ return w.rabat; });
+        if (!rab.length) return;
+        const stary = btn ? btn.textContent : '';
+        if (btn){ btn.disabled = true; btn.textContent = '⏳ czytam paczkę…'; }
+        try {
+            const { rows } = await impRows(j.impId);
+            const wg = {};
+            rab.forEach(function (w){ wg[w.nr] = w; });
+            const doZapisu = [], opis = [];
+            rows.forEach(function (x){
+                const nr = String(x.payment_descr || '').trim();
+                const w = wg[nr];
+                if (!w || String(x.state) !== 'CHECK') return;
+                const o = impNum(x.open_amount);
+                if (o == null || Math.abs(Math.abs(o) - w.rabat) > MK_VIV_TOL) return;
+                doZapisu.push(x.id);
+                opis.push(nr + ' ' + f2(w.rabat));
+            });
+            if (!doZapisu.length){
+                say('Vivre: w paczce ' + j.impId + ' nie ma wierszy, których reszta równa się rabatowi z księgi'
+                    + ' — albo rabaty są już wyksięgowane, albo auftragi zmieniły się od pobrania.', '#c47f00');
+                return;
+            }
+            const maks = r2(Math.max.apply(null, rab.map(function (w){ return w.rabat; })));
+            if (!confirm('Wyksięgować rabat prowizyjny na subkoncie (8100)?\n\nPaczka ' + j.impId + '\nPozycji: '
+                       + doZapisu.length + '\n' + opis.join('\n')
+                       + '\n\nKażdy wiersz przechodzi na OK i idzie „Book on sub-account”.')) return;
+            if (btn) btn.textContent = '⏳ księguję…';
+            for (const id of doZapisu) await impState(j.impId, id, 'OK');
+            await impBookSub(j.impId, doZapisu, { resztka: true, tol: maks + MK_VIV_TOL });
+            const po = await impRows(j.impId);
+            const zostalo = po.rows.filter(function (x){
+                return doZapisu.indexOf(x.id) >= 0 && Math.abs(impNum(x.open_amount) || 0) >= 0.005;
+            }).length;
+            say(zostalo ? ('Vivre: wysłałem ' + doZapisu.length + ' rabatów, ale ' + zostalo
+                           + ' wierszy nadal ma resztę — sprawdź paczkę ' + j.impId)
+                        : ('Vivre: rabaty wyksięgowane na subkoncie (' + doZapisu.length + ' poz. na '
+                           + f2(r2(rab.reduce(function (s, w){ return s + w.rabat; }, 0))) + ')'),
+                zostalo ? '#c47f00' : '');
+            render();
+        } catch (e){
+            say('Vivre: nie udało się wyksięgować rabatów — ' + ((e && e.message) || e), '#b91c1c');
+        } finally {
+            if (btn){ btn.disabled = false; btn.textContent = stary; }
+        }
     }
 
     // ================= KAUFLAND DE =================
@@ -59269,6 +60001,7 @@
                 det += bolBox(j);
                 det += shpBox(j);
                 det += alxBox(j);
+                det += vivBox(j);
                 det += kflBox(j);
                 det += obiChKontrolaHtml(j);
                 det += obiChRefBox(j);
@@ -59968,6 +60701,16 @@
                 delete j.data;
                 jobsSave(jobs); render();
                 say('Zlecenie Altex na ' + f2(j.amount) + ' wróciło do pobrania — kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
+            };
+        });
+        // Vivre — rabat prowizyjny na subkoncie (8100) po zaksiegowaniu paczki.
+        out.querySelectorAll('.mk-vivrab').forEach(function (b){
+            b.onclick = function(){
+                if (mkPrzelotTrwa()){ say('Trwa pobieranie zestawień — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+                if (mkImpBieg || mkKsiegBieg){ say('Trwa księgowanie — spróbuj po jego zakończeniu.', '#c47f00'); return; }
+                const k = b.getAttribute('data-k'), jobs = jobsLoad(), j = jobs[k];
+                if (!j || j.kind !== 'vivre') return;
+                vivRabatyKsieguj(b, j);
             };
         });
         // Altex — pozycja wstrzymana zalatwiona poza HUB-em (osobny przelew, zwrot klientowi…): odhaczenie i „↶ cofnij".
@@ -68499,6 +69242,74 @@
             }
             return ok;
         }
+        // Vivre RO — ksiega z panelu, wyplata dobierana po KWOCIE i dacie (blok „VIVRE RO").
+        async function vivPass(jobs){
+            const left = Object.keys(jobs).filter(function (k){ return vivDoPobrania(jobs[k]); }).sort(function (a, b){
+                const x = jobs[a], y = jobs[b];
+                return String(x.date) < String(y.date) ? -1 : (String(x.date) > String(y.date) ? 1 : (Number(x.amount) - Number(y.amount)));
+            });
+            if (!left.length) return 0;
+            const wszystkim = function (tekst, blad){
+                left.forEach(function (k){ jobs[k].msg = tekst; if (blad) jobs[k].status = 'err'; });
+                jobsSave(jobs); render();
+                say('Vivre: ' + tekst, '#c47f00');
+            };
+            say('Vivre — pobieram listę wypłat z panelu…');
+            let lista;
+            try { lista = vivWyplatyLista((await vivZapytaj('wyplaty')).T); }
+            catch (e){ wszystkim(withLogin({ brand: 'Vivre', shop: MK_VIV_SHOP, host: MK_VIV_HOST }, (e && e.message) || String(e)), true); return 0; }
+            if (!lista.length){
+                wszystkim('panel Vivre nie pokazał ani jednej wypłaty — sprawdź, czy jesteś zalogowany na ' + MK_VIV_WYPL, true);
+                return 0;
+            }
+            // Ksiege czytamy RAZ na przelot — jest wspolna dla wszystkich zlecen Vivre.
+            let ksiega = null, pozPamiec = {};
+            let ok = 0;
+            for (let i = 0; i < left.length; i++){
+                const j = jobs[left[i]];
+                const zajeteW = vivWyplatyZajete(jobs, left[i]);
+                const kand = lista.filter(function (w){
+                    if (zajeteW[w.id]) return false;
+                    if (!eq(w.kwota, j.amount)) return false;
+                    const d = vivDni(j.date, w.dzien);
+                    return d != null && d >= MK_VIV_OKNO[0] && d <= MK_VIV_OKNO[1];
+                });
+                if (kand.length !== 1){
+                    j.msg = kand.length
+                        ? ('w panelu Vivre jest ' + kand.length + ' wypłat na ' + f2(j.amount) + ' w okolicach ' + j.date
+                           + ' (' + kand.map(function (w){ return w.id + ' z ' + w.dzien; }).join(', ') + ') — nie zgaduję, która to')
+                        : ('w panelu Vivre nie ma wolnej wypłaty na ' + f2(j.amount) + ' z okolic ' + j.date
+                           + ' (najnowsze: ' + lista.slice(0, 3).map(function (w){
+                                 return f2(w.kwota) + ' z ' + w.dzien + (zajeteW[w.id] ? ' — już przy innym zleceniu' : ''); }).join(' · ') + ')');
+                    jobsSave(jobs); render(); continue;
+                }
+                const wyp = kand[0];
+                try {
+                    if (!pozPamiec[wyp.id]){
+                        say('Vivre — czytam pozycje wypłaty ' + wyp.id + '…');
+                        pozPamiec[wyp.id] = vivWyplataPoz((await vivZapytaj('wyplata', wyp.id)).T, wyp.id);
+                    }
+                    if (!ksiega){
+                        say('Vivre — czytam księgę balansu…');
+                        ksiega = await vivKsiega(vivOkno(j, pozPamiec[wyp.id]));
+                    }
+                    const p = vivRozlicz(j, wyp, pozPamiec[wyp.id], ksiega, vivRuchyZlecen(jobs, left[i]));
+                    if (p.wplaty.length)
+                        await vivAuftragi(p, function (n, m){ say('Vivre — sprawdzam auftragi: ' + n + ' z ' + m + '…'); });
+                    else { p.doImportu = []; p.reka = []; p.ruchy = p.zwroty.map(function (z){ return z.id; }); }
+                    vivZastosuj(j, p);
+                    ok++;
+                } catch (e){
+                    j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e));
+                }
+                jobsSave(jobs); render();
+            }
+            return ok;
+        }
+        function vivLeft(jobs){
+            return Object.keys(jobs).filter(function (k){ return vivDoPobrania(jobs[k]); }).length;
+        }
+
         function alxLeft(jobs){
             return Object.keys(jobs).filter(function (k){ return alxDoPobrania(jobs[k]); }).length;
         }
@@ -68936,9 +69747,9 @@
             // Trademax: tytul odlozony w trakcie importu — zlecenie wraca do kolejki z tym tytulem, zanim policzymy, co pobrac.
             try { tmTytulyOdlozone(); } catch (e){}
             let jobs = jobsLoad();
-            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nTm = tmLeft(jobs), nBol = bolLeft(jobs), nShp = shpLeft(jobs), nAlx = alxLeft(jobs);
+            const nGalx = galxLeft(jobs), nWayf = wayfLeft(jobs), nEbay = ebayLeft(jobs), nC24 = c24Left(jobs), nMano = manoLeft(jobs), nCnov = cnovLeft(jobs), nBb = bbLeft(jobs), nHd = hdLeft(jobs), nF1 = f1Left(jobs), nTm = tmLeft(jobs), nBol = bolLeft(jobs), nShp = shpLeft(jobs), nAlx = alxLeft(jobs), nViv = vivLeft(jobs);
             // CHECK24 doliczamy do komunikatu, ale NIE do przelotu — nie ma czym go pobrac.
-            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nTm && !nBol && !nShp && !nAlx){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
+            if (!mkLeft(jobs) && !nGalx && !nWayf && !nEbay && !nC24 && !nMano && !nCnov && !nBb && !nHd && !nF1 && !nTm && !nBol && !nShp && !nAlx && !nViv){ say('Nie ma zleceń do pobrania.' + hdCzekaNaPlik(jobs), '#c47f00'); return; }
             // Na samym Miraklu obslugujemy tylko ta instancje, na ktorej stoimy —
             // z prologistics mozemy przelecac wszystkie po kolei.
             // Na stronie danej platformy obslugujemy tylko ja — z prologistics wszystkie.
@@ -68967,6 +69778,8 @@
             const shp  = obca ? 0 : nShp;
             // Altex RO — raporty z marketplace.altex.ro (wprost albo przez otwarta karte panelu): z prologistics.
             const alx  = obca ? 0 : nAlx;
+            // Vivre RO — ksiega balansu z partners.vivre.eu (wprost albo przez otwarta karte panelu): z prologistics.
+            const viv  = obca ? 0 : nViv;
             if (!hosts.length && !vhosts.length && !galx && !wayf && !ebay && !c24p && !mano && !cnov && !bb && !hd && !f1n && !tmn && !bol && !shp && !alx){ say('Nie ma zleceń do pobrania.', '#c47f00'); return; }
             const plat = hosts.concat(vhosts).concat(galx ? [MK_GALX_HOST] : []).concat(wayf ? [MK_WAYF_HOST] : [])
                               .concat(ebay ? [MK_EBAY_HOST] : []).concat(c24p ? [MK_C24_HOST] : [])
@@ -68988,7 +69801,8 @@
                     .concat(tmn ? ['  • ' + TM_PRZELOT_NAZWA + ' — ' + tmn + ' szt.'] : [])
                     .concat(bol ? ['  • ' + MK_BOL_HOST + ' — ' + bol + ' szt.'] : [])
                     .concat(shp ? ['  • ' + MK_SHP_HOST + ' — ' + shp + ' szt.'] : [])
-                    .concat(alx ? ['  • ' + MK_ALX_HOST + ' — ' + alx + ' szt.'] : []).join('\n')
+                    .concat(alx ? ['  • ' + MK_ALX_HOST + ' — ' + alx + ' szt.'] : [])
+                    .concat(viv ? ['  • ' + MK_VIV_HOST + ' — ' + viv + ' szt.'] : []).join('\n')
                 + '\n\nModuł będzie przełączał aktywny sklep w Twojej sesji Mirakla. Nie korzystaj w tym czasie z Mirakla w innych kartach.'
                 + '\nNa koniec każdej platformy wracam na sklep, od którego zacząłem.')) return;
             b.disabled = true; if (b2) b2.disabled = true;
@@ -69074,6 +69888,11 @@
                 seen++;
                 try { ok += await mkPrzelot('Altex', 'altex', MK_ALX_HOST, 'Altex', alxPass); }
                 catch (e){ problem.push(MK_ALX_HOST + ': ' + ((e && e.message) || e)); }
+            }
+            if (viv){
+                seen++;
+                try { ok += await mkPrzelot('Vivre', 'vivre', MK_VIV_HOST, 'Vivre', vivPass); }
+                catch (e){ problem.push(MK_VIV_HOST + ': ' + ((e && e.message) || e)); }
             }
             for (let hi = 0; hi < hosts.length; hi++){
                 const host = hosts[hi];
@@ -106989,7 +107808,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'd7c9a43 · 27.10.2026 12:59';
+    const HUB_BUDOWA = 'd808352 · 28.10.2026 10:18';
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -107000,7 +107819,7 @@
         { id: 'spmost',   name: 'Saferpay — most do panelu', test: onSaferpay,  init: init_spmost },
         { id: 'rec',      name: 'Rejestrator zapytań panelu', test: onOcto,   init: init_rec },
         { id: 'auftrag',  name: 'Ksiegowanie w auftragu',    test: onProlo,   init: init_auftrag },
-        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol() || onShoep() || onAltex() || onKaufl(), init: init_mkt },
+        { id: 'mkt',      name: "Ksiegowanie Marketplace's", test: () => onProlo() || onMirakl() || onVtex() || onWayfair() || onBol() || onShoep() || onAltex() || onKaufl() || onVivre(), init: init_mkt },
         { id: 'bank',     name: 'Bank Import',               test: onProlo,   init: init_bank },
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
