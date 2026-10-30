@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.60.17
+// @version      5.61
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -184,7 +184,68 @@
     //  * „kto" bierze z linku „Logout <imie nazwisko>" w prologistics (inne hosty — ostatnia znana osoba).
     // Odbiornik: „Apps Script — HUB Log i zmiany.js" (poza gitem). Klucz musi byc ten sam po obu stronach.
     const HUB_DZ_URL    = 'https://script.google.com/macros/s/AKfycbzu4ZwWf8QRPvmAZU_3Lv-gFrhnB60eZK5tJTllkyUUAPstHDuIcY5Is89vf-m5bQEf/exec';
-    const HUB_DZ_SECRET = '0537c2c859eec51870c0d90d';
+    // ===== Jeden klucz do wszystkich Apps Scriptow =====
+    // Do 5.60.17 kazdy z siedmiu kluczy byl wpisany w tym pliku, a plik lezal na PUBLICZNYM
+    // repozytorium GitHub (29.10.2026: 115 klonow z 52 roznych zrodel w 14 dni). Klucz w kodzie
+    // to klucz w swiecie — i zadna ostroznosc przy samym pliku tego nie zmienia.
+    // Teraz klucz wpisuje sie RAZ na komputer (⚙ Ustawienia -> Polaczenia). Siedzi w pamieci
+    // menedzera skryptow, ktora przezywa podmiane wersji, wiec kolejne wydania nic nie wymagaja.
+    // Adresy wdrozen zostaja w pliku: sam adres bez klucza niczego nie otwiera.
+    const HUB_KLUCZ_KEY = 'beliani_hub_klucz_v1';
+    function hubKlucz(){ try { return String(GM_getValue(HUB_KLUCZ_KEY, '') || '').trim(); } catch (e){ return ''; } }
+    function hubKluczUstaw(v){ try { GM_setValue(HUB_KLUCZ_KEY, String(v == null ? '' : v).trim()); return true; } catch (e){ return false; } }
+    // Adresy wdrozen w JEDNYM miejscu. Nie sa tajne (bez klucza niczego nie otwieraja),
+    // ale musza byc widoczne z okna ustawien — moduly siedza w osobnych domknieciach
+    // i ich wlasnych stalych stamtad nie widac (PULAPKI: zasieg domkniec).
+    const HUB_WDROZENIA = [
+        { id: 'dz', nazwa: 'Dziennik i Changelog', url: HUB_DZ_URL },
+        { id: 'mkt', nazwa: 'Arkusz Marketplace', url: 'https://script.google.com/macros/s/AKfycbzJ-55TNvMZob4CEpD0nlLLLmZApdH8oGFZA1nfpe3PuIMWz_0OWf_1vAvDS7juD6_TrQ/exec' },
+        { id: 'chn', nazwa: 'Chińskie — przenieś ordery', url: 'https://script.google.com/macros/s/AKfycbxvn9s4kOmbhhZ2vRZgHZ2EYu3A_hJyFnVu7tVJ4vp0MLEB0ZXzJObfAct6biUr6z_K/exec' },
+        { id: 'tis', nazwa: 'TEST Issue — spółki', url: 'https://script.google.com/macros/s/AKfycbyDCIR0IYjcMOJIfzDlEXNAHk3v8aJnXl1tLtvB1LXRKTZ3rigYIGXpNirHjDBxJrAS/exec' },
+        { id: 'f1', nazwa: 'Furniture 1 / Trademax', url: 'https://script.google.com/a/macros/beliani.com/s/AKfycbznTDhSNHPzcIf1X8YPcouzq_rjkcmDEJM_Euv4vzcZHK0NtXbQultM2QCSsK7nZlXR/exec' },
+        { id: 'rcn', nazwa: 'Reconciliation — mapowania', url: 'https://script.google.com/macros/s/AKfycbzmW39JkoDLN582PJpo-tPDHvmABDfB-V5Ko6vxBKd-AAsJdMcEdQzvYM7pfo1AJu7d/exec' },
+        { id: 'rcnz', nazwa: 'Reconciliation — zapis', url: 'https://script.google.com/macros/s/AKfycbxHXe5KI9hfdFtaf7nB-vdc9nMF65fg3Si-Hmra8UiEMWdt9bxHnv2yhhSok5mHqwfm/exec' }
+    ];
+    // Nadpisanie adresu (⚙ Ustawienia -> Połączenia). Wbudowany adres wystarcza, dopoki wdrozenie
+    // zyje pod tym samym URL-em — a zyje, bo wydajemy NOWA WERSJE tego samego wdrozenia. Nadpisanie
+    // jest wyjsciem awaryjnym: gdyby ktorys skrypt trzeba bylo odtworzyc gdzie indziej, da sie go
+    // przestawic bez wydawania nowej wersji HUB-a.
+    const HUB_ADRESY_KEY = 'beliani_hub_adresy_v1';
+    function hubAdresy(){
+        try { const o = JSON.parse(GM_getValue(HUB_ADRESY_KEY, '{}')); return (o && typeof o === 'object') ? o : {}; }
+        catch (e){ return {}; }
+    }
+    function hubAdresUstaw(id, url){
+        const o = hubAdresy(), v = String(url == null ? '' : url).trim();
+        if (v) o[id] = v; else delete o[id];
+        try { GM_setValue(HUB_ADRESY_KEY, JSON.stringify(o)); return true; } catch (e){ return false; }
+    }
+    function hubUrlWbudowany(id){
+        for (let i = 0; i < HUB_WDROZENIA.length; i++) if (HUB_WDROZENIA[i].id === id) return HUB_WDROZENIA[i].url;
+        return '';
+    }
+    function hubUrl(id){ return hubAdresy()[id] || hubUrlWbudowany(id); }
+    function hubUrlWlasny(id){ return !!hubAdresy()[id]; }
+    // Jednorazowo: adresy, ktore ktos wpisal recznie w modulach, zanim pola stamtad znikly
+    // (29.10.2026). Bez tego taki adres przestalby dzialac po cichu. Klucze ze starych
+    // ustawien NIE sa przenoszone — po rotacji i tak sa martwe, a jeden z nich (arkusz
+    // Marketplace) zapisywal sie kazdemu do pamieci automatycznie.
+    const HUB_MIG_KEY = 'beliani_hub_adresy_mig_v1';
+    (function hubPrzeniesAdresy(){
+        try {
+            if (GM_getValue(HUB_MIG_KEY, '')) return;
+            const czytaj = function (k){ try { const o = JSON.parse(GM_getValue(k, 'null')); return (o && typeof o === 'object') ? o : null; } catch (e){ return null; } };
+            const we = [['tis', czytaj('tis_ust'), 'url'], ['chn', czytaj('chn_transfer_settings_v1'), 'url'],
+                        ['mkt', czytaj('mkt_sheet'), 'url'], ['f1', czytaj('mkt_f1_drive'), 'url'],
+                        ['rcn', czytaj('recon_ust'), 'url'], ['rcnz', czytaj('recon_ust'), 'urlZapis']];
+            we.forEach(function (w){
+                const o = w[1]; if (!o) return;
+                const v = String(o[w[2]] || '').trim();
+                if (v && v !== hubUrlWbudowany(w[0])) hubAdresUstaw(w[0], v);
+            });
+            GM_setValue(HUB_MIG_KEY, new Date().toISOString());
+        } catch (e){}
+    })();
 
     const HUBDZ = (function () {
         const K_CFG   = HUB + 'dz_cfg_v1';       // { on, url, komp: { id, nazwa } }
@@ -455,7 +516,7 @@
                     if (gm.length) { paczka = gm.splice(0, W_PACZCE - paczka.length).concat(paczka); zapisz(K_KOL, gm); }
                 }
                 if (!paczka.length) return;
-                const mk = function () { return JSON.stringify({ secret: HUB_DZ_SECRET, action: 'log', rows: paczka }); };
+                const mk = function () { return JSON.stringify({ secret: hubKlucz(), action: 'log', rows: paczka }); };
                 let body = mk();
                 while (body.length > MAX_PACZKA && paczka.length > 1) { doWyslania.unshift(paczka.pop()); body = mk(); }
                 wysylka = true;
@@ -477,7 +538,7 @@
         function sprawdz(cb) {
             const c = cfg();
             if (!c.url) { cb('brak adresu wdrożenia'); return; }
-            zadanie(c.url, JSON.stringify({ secret: HUB_DZ_SECRET, action: 'ping' }), function (err, j) {
+            zadanie(c.url, JSON.stringify({ secret: hubKlucz(), action: 'ping' }), function (err, j) {
                 if (err) { zapiszStan(false, err); cb(err); return; }
                 const o = function (x) { return x ? (x.nazwa + ': ' + x.wiersze + ' wierszy') : 'BRAK zakładki'; };
                 const txt = 'Apps Script ' + (j.wersja || '?') + ' · zmiany → ' + o(j.zmiany) + ' · log → ' + o(j.log);
@@ -550,7 +611,7 @@
             if (!swiezo && k && (Date.now() - (k.t || 0) < CHG_WAZNA) && (k.n || 0) >= ile) { cb(null, k.rows, k.t); return; }
             const c = cfg();
             if (!c.url) { cb('brak adresu wdrożenia', k && k.rows, k && k.t); return; }
-            zadanie(c.url, JSON.stringify({ secret: HUB_DZ_SECRET, action: 'changelog', n: ile }), function (err, j) {
+            zadanie(c.url, JSON.stringify({ secret: hubKlucz(), action: 'changelog', n: ile }), function (err, j) {
                 if (err) { cb(err, k && k.rows, k && k.t); return; }
                 const rows = Array.isArray(j.rows) ? j.rows : [];
                 const t = Date.now();
@@ -13602,8 +13663,6 @@
     // „Company Overview”). Wdrożony przez użytkownika 09.10.2026 (konto finance.archive),
     // wbudowany na jego prośbę. Puste pole w „⚙ Ustawienia” = ten adres. Nowe WDROŻENIE
     // (nie nowa wersja) zmienia adres — wtedy trzeba go tu podmienić.
-    var TIS_URL_DEF = 'https://script.google.com/macros/s/AKfycbyDCIR0IYjcMOJIfzDlEXNAHk3v8aJnXl1tLtvB1LXRKTZ3rigYIGXpNirHjDBxJrAS/exec';
-    var TIS_SECRET_DEF = 'FL6hgqimKKN1OV4aTxfvy7ATEuTw2Zp4';
 
     // Pola issue faktur PO NUMERZE (typy Shipping / FTL / Customs / CD / Routes Invoice
     // Payment mają te same numery — odczyt z żywego panelu 07.10.2026). Po nazwie nie
@@ -13669,9 +13728,10 @@
     function adresOk(u){ return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec\/?$/.test(String(u || '').trim()); }
     // Adres spoza wzorca wdrożenia nie idzie do zapytania nigdy (przeglądarka potrafi wpisać
     // w takie pole login — PULAPKI „Pole hasła w panelu to formularz logowania”).
+    // Adres i klucz maja JEDNO zrodlo: ⚙ Ustawienia -> Połączenia. Wlasne pola w module zniknely
+    // 29.10.2026 — trzymaly m.in. klucz zapisany kiedys w pamieci, ktory po rotacji bylby martwy.
     function polaczenie(){
-        var u = ust(), uu = u.url.trim(), ss = u.secret.trim(), zly = !!uu && !adresOk(uu);
-        return { url: (uu && !zly) ? uu : TIS_URL_DEF, secret: (ss && !zly) ? ss : TIS_SECRET_DEF, zly: zly };
+        return { url: hubUrl('tis'), secret: hubKlucz(), zly: false };
     }
 
     // ---------- drobne ----------
@@ -16163,8 +16223,8 @@
     function htmlUst(){
         var u = ust(), pol = polaczenie();
         return '<div class="tis-box"><b>⚙ Ustawienia (ten komputer)</b><br>'
-          + '<label class="tis-mut">Adres skryptu spółek (puste = wbudowany) <input class="tis-in" id="tis-u-url" type="text" name="tis-apps-script-adres" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="width:520px" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(u.url) + '"></label><br>'
-          + '<label class="tis-mut">Klucz (puste = wbudowany) <input class="tis-in" id="tis-u-sec" type="text" name="tis-apps-script-klucz" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="width:300px;-webkit-text-security:disc" value="' + esc(u.secret) + '"></label><br>'
+          + '<div class="tis-mut">Adres skryptu i klucz: <b>⚙ Ustawienia → Połączenia</b> (wspólne dla wszystkich modułów HUB-a).'
+          + (hubKlucz() ? '' : ' <b style="color:#b45309">Klucza jeszcze nie wpisano — skrypt spółek nie odpowie.</b>') + '</div>'
           + '<label class="tis-mut">Folder Pobranych (do odczytu w Claude) <input class="tis-in" id="tis-u-pob" type="text" name="tis-folder-pobranych" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="width:300px" placeholder="C:\\Users\\<login>\\Downloads" value="' + esc(u.pobrane) + '"></label><br>'
           + '<button type="button" class="tis-btn" data-akcja="ust-zapisz">Zapisz</button>'
           + '<button type="button" class="tis-btn tis-btn2" data-akcja="ust-ping"' + (pol.url ? '' : ' disabled') + '>Sprawdź skrypt</button>'
@@ -16412,15 +16472,12 @@
         else if (a === 'ust'){ S.ustOtw = !S.ustOtw; rysuj(); }
         else if (a === 'spolki') pobierzSpolki();
         else if (a === 'ust-zapisz'){
-            var u = ust(), nu = (document.getElementById('tis-u-url') || {}).value || '';
-            if (nu.trim() && !adresOk(nu)){ say('To nie wygląda na adres wdrożenia Apps Scriptu (https://script.google.com/macros/s/…/exec) — nie zapisuję.', 'err'); rysuj(); return; }
-            u.url = nu.trim(); u.secret = ((document.getElementById('tis-u-sec') || {}).value || '').trim(); u.pobrane = ((document.getElementById('tis-u-pob') || {}).value || '').trim();
+            var u = ust();
+            u.pobrane = ((document.getElementById('tis-u-pob') || {}).value || '').trim();
             ustZapisz(u); say('Zapisane.', 'ok'); rysuj();
             if (polaczenie().url) pobierzSpolki();
         }
         else if (a === 'ust-ping'){
-            var pole1 = (document.getElementById('tis-u-url') || {}).value || '';
-            if (pole1.trim() !== ust().url.trim()){ say('Najpierw „Zapisz”, potem „Sprawdź skrypt” — sprawdzam zapisany adres.', 'warn'); rysujStan(); return; }
             zapytajAppsScript('ping').then(function (j){ say('Skrypt odpowiada: arkusz „' + j.arkusz + '”, zakładka „' + j.zakladka + '”, wersja ' + j.wersja + '.', 'ok'); })
                 .catch(function (e){ say('Skrypt nie odpowiada: ' + (e.message || e), 'err'); }).then(rysuj);
         }
@@ -31625,12 +31682,10 @@
         })();
         // Przenoszenie korzysta z tych samych tabel co Kopiuj — po poprawkach i bez kosza.
         var CHN_TRANSFER_KEY = 'chn_transfer_settings_v1';
-        var CHN_TRANSFER_URL = 'https://script.google.com/macros/s/AKfycbxvn9s4kOmbhhZ2vRZgHZ2EYu3A_hJyFnVu7tVJ4vp0MLEB0ZXzJObfAct6biUr6z_K/exec';
-        var CHN_TRANSFER_SECRET = 'qazNimDaWsxHsX87654567865ssjdbsajdbxzbxczvshdgsaydgs3434242a';
+        // Adres i klucz z jednego miejsca (⚙ Ustawienia -> Połączenia); wlasne pola w tym oknie
+        // zniknely 29.10.2026 razem z kluczem wpisanym w plik HUB-a.
         function chnTransferSettings(){
-            var saved = {};
-            try { saved = JSON.parse(GM_getValue(CHN_TRANSFER_KEY, '{}')) || {}; } catch(e){}
-            return { url: saved.url || CHN_TRANSFER_URL, secret: saved.secret || CHN_TRANSFER_SECRET };
+            return { url: hubUrl('chn'), secret: hubKlucz() };
         }
         function chnTransferRows(html, kind){
             var doc = new DOMParser().parseFromString(html, 'text/html'), width = kind === 'bal' ? 6 : 5;
@@ -31682,21 +31737,12 @@
                 + '<h3 style="margin-top:0">Przenieś ordery do arkusza „Chińskie”</h3>'
                 + '<p>Balance i DEPO trafią do osobnych zakładek, z linkami i kolorami. W nagłówku każdej listy będzie data oraz suma tylko tej listy. Przenoszone są aktywne wiersze z przetworzonej tabeli.</p>'
                 + '<label>Data listy <input type="date" data-date></label>'
-                + '<details data-config><summary style="margin:12px 0;cursor:pointer">Połączenie z Apps Script (ustaw raz)</summary>'
-                + '<label>Adres wdrożenia /exec<input data-url type="url" style="display:block;width:100%" placeholder="https://script.google.com/macros/s/…/exec"></label>'
-                + '<label>Klucz połączenia<input data-secret type="password" autocomplete="off" style="display:block;width:100%"></label>'
-                + '<p>Adres wdrożenia jest już wpisany. Klucz wpisz raz — będzie automatycznie zapamiętany w tej przeglądarce.</p></details>'
+                + '<p style="color:#666">Adres i klucz: ⚙ Ustawienia → Połączenia — wspólne dla wszystkich modułów HUB-a.</p>'
                 + '<p data-summary></p><p data-msg style="white-space:pre-wrap"></p>'
                 + '<div data-actions style="display:flex;gap:8px;flex-wrap:wrap"><button data-check>Sprawdź i przenieś</button><button data-close>Zamknij</button></div></div>';
             document.body.appendChild(box);
             var dateEl = box.querySelector('[data-date]'), msg = box.querySelector('[data-msg]'), summary = box.querySelector('[data-summary]');
-            dateEl.value = balSheetToday(); box.querySelector('[data-url]').value = cfg.url || ''; box.querySelector('[data-secret]').value = cfg.secret || '';
-            box.querySelector('[data-config]').open = !cfg.secret;
-            box.querySelector('[data-secret]').addEventListener('input', function(){
-                var saved = chnTransferSettings();
-                saved.secret = this.value.trim();
-                GM_setValue(CHN_TRANSFER_KEY, JSON.stringify(saved));
-            });
+            dateEl.value = balSheetToday();
             var busy = false;
             box.querySelector('[data-close]').onclick = function(){ if (!busy) box.remove(); };
             function summarize(){ try { var p = chnTransferPayload(dateEl.value); summary.textContent = 'Balance: ' + p.counts.bal + ' pozycji / ' + p.sums.bal.toFixed(2) + '; DEPO: ' + p.counts.dep + ' pozycji / ' + p.sums.dep.toFixed(2) + '; łącznie: ' + (p.sums.bal + p.sums.dep).toFixed(2) + ' · ' + p.unique + ' różnych orderów.'; } catch(e){ summary.textContent = e.message; } }
@@ -31729,10 +31775,9 @@
                 freeze(true); msg.textContent = 'Sprawdzam zakładki i istniejące listy…';
                 box.querySelectorAll('[data-choice]').forEach(function(el){ el.remove(); });
                 try {
-                    cfg = { url: box.querySelector('[data-url]').value.trim(), secret: box.querySelector('[data-secret]').value.trim() };
-                    if (!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(cfg.url) || cfg.secret.length < 24) throw new Error('Uzupełnij adres /exec oraz klucz połączenia (minimum 24 znaki).');
+                    cfg = chnTransferSettings();
+                    if (!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(cfg.url) || cfg.secret.length < 24) throw new Error('Wpisz klucz w ⚙ Ustawienia → Połączenia (minimum 24 znaki).');
                     var payload = chnTransferPayload(dateEl.value);
-                    GM_setValue(CHN_TRANSFER_KEY, JSON.stringify(cfg));
                     var preview = await chnTransferRequest(cfg, { action: 'preview', payload: payload });
                     msg.textContent = preview.message;
                     var choices = preview.exists ? [['Zastąp istniejącą listę', 'replace'], ['Dodaj poniżej mimo to', 'append']] : [['Przenieś obie listy', 'append']];
@@ -35606,7 +35651,7 @@
     // Adres i klucz siedza w ustawieniach, nie w kodzie: adres jest jak haslo, a klucz
     // ma zostac tylko u Ciebie.
     const MK_SH_KEY = 'mkt_sheet';
-    const MK_SH_DEF = 'https://script.google.com/macros/s/AKfycbzJ-55TNvMZob4CEpD0nlLLLmZApdH8oGFZA1nfpe3PuIMWz_0OWf_1vAvDS7juD6_TrQ/exec';
+    const MK_SH_DEF = hubUrl('mkt');
     // Adresy WCZESNIEJSZYCH wdrozen. Trzymamy je po to, zeby przeniesc tych, ktorzy
     // maja ktorys zapisany w ustawieniach — patrz shCfg. Stare wdrozenia serwuja kod
     // bez nowych akcji i nie da sie tego odkrecic: w Apps Script adres jest przypiety
@@ -35633,7 +35678,6 @@
     //  Wymiana klucza = zmiana w Apps Scripcie i w TEJ JEDNEJ LINII, po czym
     //  rozeslanie nowej wersji.
     // ==========================================================================
-    const MK_SH_SECRET = '123456';
 
     // Najstarsze wdrozenie Apps Scriptu, ktore umie wszystko, czego HUB od niego chce:
     // zakladki osob („MM/RRRR Ula", „MM/RRRR Tomasz"), Booked przestawiany dopiero po
@@ -35645,22 +35689,12 @@
     function shCfg(){
         let o = null;
         try { o = JSON.parse(GM_getValue(MK_SH_KEY, 'null')); } catch (e){}
-        if (!o || typeof o !== 'object') o = { url: MK_SH_DEF, secret: '', on: true };
-        // Uzupelniamy z wbudowanych wartosci takze wtedy, gdy cos JUZ jest zapisane
-        // z pustym polem — inaczej osoba, ktora raz dotknela ustawien przed
-        // wbudowaniem klucza, zostalaby z nieczynnym arkuszem po aktualizacji.
-        let zmiana = false;
-        if (!o.url){ o.url = MK_SH_DEF; zmiana = true; }
-        if (!o.secret){ o.secret = MK_SH_SECRET; zmiana = true; }
-        if (o.secret === 'WPISZ_TU_SECRET') o.secret = '';
-        // Wartosc wbudowana jest tylko DOMYSLNA: kto raz otworzyl ⚙ Konta, ma adres
-        // zapisany, a zapis przykrywa domysl. Bez tej podmiany taka osoba po aktualizacji
-        // pukalaby dalej pod martwe wdrozenie i widziala „nie zna akcji todo", nie majac
-        // pojecia dlaczego. Podmieniamy WYLACZNIE doslownie stary adres — kto wpisal
-        // wlasny, zostaje przy swoim.
-        if (MK_SH_STARE.indexOf(o.url) >= 0){ o.url = MK_SH_DEF; zmiana = true; }
-        if (zmiana) shSave(o);
-        return o;
+        if (!o || typeof o !== 'object') o = {};
+        // Adres i klucz maja JEDNO zrodlo: ⚙ Ustawienia -> Połączenia. Do 29.10.2026 dalo sie je
+        // nadpisac tutaj, a ta funkcja ZAPISYWALA wbudowany klucz do pamieci przegladarki.
+        // Po rotacji kluczy zostawalaby tam martwa wartosc i arkusz przestalby dzialac bez
+        // zadnego komunikatu — dlatego pol juz nie ma, a stary zapis jest ignorowany.
+        return { url: hubUrl('mkt'), secret: hubKlucz(), on: o.on !== false };
     }
     function shSave(o){ try { GM_setValue(MK_SH_KEY, JSON.stringify(o)); } catch (e){} }
     function shReq(method, url, body){
@@ -37006,7 +37040,7 @@
     function shWhy(cfg){
         if (!cfg.on)     return 'wyłączony ptaszek „Dopisuj do arkusza" w ⚙ Konta';
         if (!cfg.url)    return 'brak adresu wdrożenia w ⚙ Konta';
-        if (!cfg.secret) return 'brak SECRET-u — wpisz go w ⚙ Konta albo wbuduj w skrypcie (MK_SH_SECRET)';
+        if (!cfg.secret) return 'brak klucza — wpisz go raz w ⚙ Ustawieniach → Połączenia';
         return 'arkusz nie odpowiedział';
     }
     async function shPost(rows){
@@ -45187,8 +45221,7 @@
     // Adres wdrozenia Apps Scriptu „Furniture1 pliki” (tylko do odczytu, konto imienne).
     // Wbudowany na stale, zeby kazdy dostawal go z wersja i nie wpisywal recznie w ⚙ Konta —
     // ten sam wzorzec co RCN_URL_DEF przy Reconciliation. Wlasny adres z ⚙ Konta ma pierwszenstwo.
-    const F1_URL_DEF = 'https://script.google.com/a/macros/beliani.com/s/AKfycbznTDhSNHPzcIf1X8YPcouzq_rjkcmDEJM_Euv4vzcZHK0NtXbQultM2QCSsK7nZlXR/exec';
-    const F1_SECRET_DEF = 'e6lO7bC63sim9_r1DnL8nkkuE1x6-4KDp2EBKYlsPx0';
+    const F1_URL_DEF = hubUrl('f1');
     const F1_DRIVE_KEY = 'mkt_f1_drive';
     const F1_DRIVE_WERSJA = '2026-09-17';      // najstarsza wersja skryptu, ktora ten kod rozumie
     const F1_DRIVE_PARTIA = 20;                // = MAX_PLIKOW w Apps Scripcie
@@ -45206,18 +45239,9 @@
     // przegladarki potrafi wpisac login do pola adresu, a haslo do pola klucza — PULAPKI) jest
     // ignorowany i czyszczony razem z kluczem, bo klucz przyszedl z tego samego autouzupelnienia.
     function f1Cfg(){
-        let o = null;
-        try { o = JSON.parse(GM_getValue(F1_DRIVE_KEY, 'null')); } catch (e){ o = null; }
-        if (!o || typeof o !== 'object') o = {};
-        const url = (typeof o.url === 'string') ? o.url.trim() : '';
-        const secret = (typeof o.secret === 'string') ? o.secret.trim() : '';
-        const zly = !!url && !f1AdresOk(url);
-        if (zly){ try { GM_setValue(F1_DRIVE_KEY, JSON.stringify({ url: '', secret: '' })); } catch (e){} }
-        return {
-            url: (url && !zly) ? url : F1_URL_DEF,
-            secret: (secret && !zly) ? secret : F1_SECRET_DEF,
-            urlWlasny: !!url && !zly, secretWlasny: !!secret && !zly, zlyZapis: zly
-        };
+        // jak wyzej: adres i klucz wylacznie z ⚙ Ustawienia -> Połączenia
+        return { url: hubUrl('f1'), secret: hubKlucz(),
+                 urlWlasny: hubUrlWlasny('f1'), secretWlasny: false, zlyZapis: false };
     }
 
     // Zapis z pol ustawien. Zly adres NIE jest zapisywany wcale (ani klucz obok niego) —
@@ -45229,7 +45253,7 @@
         if (url && !f1AdresOk(url)){
             throw new Error('wpisany adres nie wygląda na adres wdrożenia Apps Scriptu (https://script.google.com/macros/s/…/exec) — nie zapisuję ani adresu, ani klucza');
         }
-        const zapis = { url: url === F1_URL_DEF ? '' : url, secret: secret === F1_SECRET_DEF ? '' : secret };
+        const zapis = { url: url === F1_URL_DEF ? '' : url, secret: secret === hubKlucz() ? '' : secret };
         try { GM_setValue(F1_DRIVE_KEY, JSON.stringify(zapis)); }
         catch (e){ throw new Error('nie mogę zapisać ustawień Drive Furniture 1: ' + ((e && e.message) || e)); }
         return f1Cfg();
@@ -69253,8 +69277,7 @@
         h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px">'
           +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
           +  '<label style="font-size:11px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="mk-sh-on"' + (sc.on ? ' checked' : '') + '>Dopisuj do arkusza po zaksięgowaniu</label>'
-          +  '<input id="mk-sh-url" value="' + esc(sc.url || '') + '" placeholder="adres wdrożenia /exec" style="flex:1;min-width:220px;font-size:10px;padding:3px 5px">'
-          +  '<input id="mk-sh-sec" type="password" value="' + esc(sc.secret || '') + '" placeholder="SECRET" style="width:110px;font-size:10px;padding:3px 5px">'
+          +  '<span style="font-size:10px;color:#888">Adres i klucz: ⚙ Ustawienia → Połączenia</span>'
           +  '<button id="mk-sh-test" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">Sprawdź</button>'
           // Nazwy poprawiaja sie same tylko przy pobieraniu i przy ksiegowaniu. Zlecenie
           // juz zrobione nie przechodzi przez zadne z tych miejsc, wiec poprawka wgrana
@@ -69262,9 +69285,7 @@
           +  '<button id="mk-sh-nazwy" title="Przechodzi po wszystkich zleceniach z wierszem w arkuszu i wysyła nazwę sklepu oraz numer rozliczenia. Nie księguje i nie rusza kwot." style="padding:3px 10px;border:1px solid #7c3aed;border-radius:6px;background:#fff;color:#7c3aed;cursor:pointer;font-size:10px">✍ Popraw nazwy</button>'
           +  '<span id="mk-sh-msg" style="font-size:10px;color:#666"></span></div>'
           +  '<div style="font-size:10px;color:#888;margin-top:3px">Adres jest jak hasło — kto go ma, może dopisywać wiersze. SECRET musi być ten sam, co w Apps Scripcie.'
-          +  (MK_SH_SECRET !== 'WPISZ_TU_SECRET'
-              ? ' <b>Klucz jest wbudowany w skrypt</b> — nic nie musisz wpisywać, chyba że chcesz użyć własnego.'
-              : ' <b>Klucz nie jest jeszcze wbudowany</b> — wpisz go tu albo w skrypcie, w linii MK_SH_SECRET.')
+          +  ' Klucz wpisuje się <b>raz</b> w ⚙ Ustawieniach → Połączenia i obowiązuje wszystkie skrypty; tu tylko wtedy, gdy ten arkusz ma mieć własny.'
           +  '</div>'
           +  '</div>';
         // Drive Furniture 1 — Apps Script „HUB Furniture1 pliki" z konta imiennego. Pola wypelniamy
@@ -69275,10 +69296,7 @@
         h += '<div style="margin-bottom:8px;padding:6px 8px;background:#fff;border:1px solid #ede9fe;border-radius:6px">'
           +  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
           +  '<b style="font-size:11px;color:#5b21b6">Drive Furniture 1</b>'
-          +  '<input id="mk-f1-url" type="text" autocomplete="off" spellcheck="false" value="' + esc(f1c.url || '') + '"'
-          +  ' placeholder="adres wdrożenia /exec (Apps Script „HUB Furniture1 pliki”)" style="flex:1;min-width:220px;font-size:10px;padding:3px 5px">'
-          +  '<input id="mk-f1-sec" type="text" autocomplete="off" spellcheck="false" value="' + esc(f1c.secret || '') + '"'
-          +  ' placeholder="klucz" style="width:110px;font-size:10px;padding:3px 5px;-webkit-text-security:disc">'
+          +  '<span style="font-size:10px;color:#888">Adres i klucz: ⚙ Ustawienia → Połączenia</span>'
           +  '<button id="mk-f1-test" type="button" style="padding:3px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">Sprawdź</button>'
           +  '<span id="mk-f1-msg" style="font-size:10px;color:#666"></span></div>'
           +  '<div style="font-size:10px;color:#888;margin-top:3px">Faktury zbiorcze i korekty Furniture 1 (LT i HU) — HUB czyta je przy „⬇ Pobierz zestawienia”. '
@@ -69449,8 +69467,7 @@
         // ustawienia arkusza zapisujemy od razu przy zmianie — nie chowamy ich za „Zapisz",
         // bo ten guzik dotyczy tabeli kont i pojawia sie tylko gdy sa jakies sklepy
         (function (){
-            const u = box.querySelector('#mk-sh-url'), s = box.querySelector('#mk-sh-sec'),
-                  o = box.querySelector('#mk-sh-on'), t = box.querySelector('#mk-sh-test'),
+            const o = box.querySelector('#mk-sh-on'), t = box.querySelector('#mk-sh-test'),
                   m = box.querySelector('#mk-sh-msg');
             if (!u) return;
             const bn = box.querySelector('#mk-sh-nazwy');
@@ -69485,7 +69502,7 @@
                 }
                 bn.disabled = false;
             };
-            const put = function (){ shSave({ url: u.value.trim(), secret: s.value, on: !!o.checked }); };
+            const put = function (){ shSave({ on: !!o.checked }); };
             [u, s].forEach(function (el){ el.onchange = put; el.onblur = put; });
             o.onchange = put;
             t.onclick = async function(){
@@ -69530,9 +69547,8 @@
         // Drive Furniture 1: zapis przy zmianie pola (zly adres nie zapisuje niczego — ani adresu,
         // ani klucza obok), „Sprawdź" = ping z wersja skryptu i opisem przejrzanych folderow.
         (function (){
-            const u = box.querySelector('#mk-f1-url'), s = box.querySelector('#mk-f1-sec'),
-                  t = box.querySelector('#mk-f1-test'), m = box.querySelector('#mk-f1-msg');
-            if (!u || !s || !t || !m) return;
+            const t = box.querySelector('#mk-f1-test'), m = box.querySelector('#mk-f1-msg');
+            if (!t || !m) return;
             const pisz = function (tekst, kol){ m.style.color = kol || '#666'; m.textContent = tekst; };
             const zapisz = function (){
                 try { f1Save({ url: u.value, secret: s.value }); return true; }
@@ -104511,8 +104527,7 @@
     // finance.archive). Puste pole w ustawieniach znaczy „wartosc wbudowana" — nowa wersja
     // HUB-a nie wymaga wpisywania od nowa. Zmiany skryptu: Zarzadzaj wdrozeniami → Nowa
     // wersja; nowe wdrozenie zmienia adres i trzeba go tu podmienic.
-    var RCN_URL_DEF = 'https://script.google.com/macros/s/AKfycbzmW39JkoDLN582PJpo-tPDHvmABDfB-V5Ko6vxBKd-AAsJdMcEdQzvYM7pfo1AJu7d/exec';
-    var RCN_SECRET_DEF = '0K6RMfRKST3aK2padogXe0dyAYjVRjFA';
+    var RCN_URL_DEF = hubUrl('rcn');
     // Zapis obrotowek do folderu Drive „0004 Reconciliation › Lucanet import". OSOBNY projekt
     // Apps Script („Apps Script — Reconciliation zapis LucaNet.js"), nie skrypt mapowan: tamten
     // ma zakres drive.readonly i fizycznie nie moze niczego zmienic na Dysku — i tak ma zostac
@@ -104521,8 +104536,7 @@
     // 2026-10-08) — wbudowane na prosbe uzytkownika, jak adres mapowan wyzej. Puste pole w panelu
     // znaczy „wartosc wbudowana”; nowe wdrozenie (nie nowa wersja) zmienia adres i trzeba go tu
     // podmienic. Klucz jest inny niz klucz mapowan: adres i klucz do odczytu nie otwieraja zapisu.
-    var RCN_URL_ZAPIS_DEF = 'https://script.google.com/macros/s/AKfycbxHXe5KI9hfdFtaf7nB-vdc9nMF65fg3Si-Hmra8UiEMWdt9bxHnv2yhhSok5mHqwfm/exec';
-    var RCN_SECRET_ZAPIS_DEF = 'FfpOoDw693hSFDv7jA1zLNiC8BPLnWsp';
+    var RCN_URL_ZAPIS_DEF = hubUrl('rcnz');
     var RCN_TOL_DEF = 0.05;
     // Tolerancja pary od 18.09.2026: max(tol ; min(sufit ; wzgledny% × baza)), baza =
     // max(|netto A|, |netto B|) w CHF. Sam czlon kwotowy robil BLAD z 15–57 CHF roznicy
@@ -104610,19 +104624,15 @@
     // prologistics.info/<login> i wracalo 404. Klucz przy zlym adresie tez odrzucamy: przyszedl
     // z tego samego autouzupelnienia.
     function rcnPolaczenie(){
-        var u = rcnUst(), uu = u.url.trim(), ss = u.secret.trim();
-        var zly = !!uu && !rcnAdresOk(uu);
-        return { url: (uu && !zly) ? uu : RCN_URL_DEF, secret: (ss && !zly) ? ss : RCN_SECRET_DEF,
-                 urlWlasny: !!uu && !zly, secretWlasny: !!ss && !zly, zlyZapis: zly };
+        return { url: hubUrl('rcn'), secret: hubKlucz(),
+                 urlWlasny: hubUrlWlasny('rcn'), secretWlasny: false, zlyZapis: false };
     }
     // To samo dla skryptu zapisu. Wbudowanego adresu nie ma: pusty url = „skrypt niewdrozony”.
     function rcnPolaczenieZapis(){
-        var u = rcnUst(), uu = u.urlZapis.trim(), ss = u.secretZapis.trim();
-        var zly = !!uu && !rcnAdresOk(uu);
-        return { url: (uu && !zly) ? uu : RCN_URL_ZAPIS_DEF, secret: (ss && !zly) ? ss : RCN_SECRET_ZAPIS_DEF,
-                 urlWlasny: !!uu && !zly, secretWlasny: !!ss && !zly, zlyZapis: zly,
+        return { url: hubUrl('rcnz'), secret: hubKlucz(),
+                 urlWlasny: hubUrlWlasny('rcnz'), secretWlasny: false, zlyZapis: false,
                  brak: 'brak adresu skryptu zapisu do „Lucanet import” — wdróż „Apps Script — Reconciliation zapis LucaNet.js” '
-                     + 'i wklej jego adres /exec w „⚙ Połączenie z Drive”' };
+                     + 'i wpisz jego adres /exec w ⚙ Ustawienia → Połączenia' };
     }
     // Sprzatanie zapisu z autouzupelnienia: zly adres razem z kluczem znika z ustawien (klucz
     // byl najpewniej haslem do prologistics i nie moze lezec w magazynie skryptu).
@@ -108414,7 +108424,7 @@
                 if (S.drive.stan === 'brak' && rcnPolaczenie().url) S.drive.stan = 'nic';
             } else if (pole === 'secret'){
                 var nowySec = String(el.value || '').trim();
-                ust.secret = (nowySec === RCN_SECRET_DEF) ? '' : nowySec; rcnUstZapisz(ust);
+                ust.secret = (nowySec === hubKlucz()) ? '' : nowySec; rcnUstZapisz(ust);
             } else if (pole === 'urlZapis'){
                 var nowyZ = String(el.value || '').trim();
                 if (nowyZ && !rcnAdresOk(nowyZ)){
@@ -108430,7 +108440,7 @@
                 S.zapMsg = null;
             } else if (pole === 'secretZapis'){
                 var nowyZs = String(el.value || '').trim();
-                ust.secretZapis = (nowyZs === RCN_SECRET_ZAPIS_DEF) ? '' : nowyZs; rcnUstZapisz(ust);
+                ust.secretZapis = (nowyZs === hubKlucz()) ? '' : nowyZs; rcnUstZapisz(ust);
             } else return;
             przelicz(); rysuj();
         } catch (e){
@@ -108580,13 +108590,11 @@
            // Oba pola wypelnione tym, czego HUB uzywa, i bez type="password": przegladarka bierze
            // pusty tekst przed polem hasla za logowanie i wpisuje tam login i haslo do prologistics.
            // Maskowanie klucza robi CSS, a pole wypelnione nie jest autouzupelniane.
-           + '<label class="rcn-mut">Adres wdrożenia</label><input class="rcn-in" type="text" name="rcn-apps-script-adres" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-pole="url" style="flex:1;min-width:320px" placeholder="https://script.google.com/macros/s/…/exec" value="'
-           + esc(pol.url) + '">'
-           + '<label class="rcn-mut">Klucz</label><input class="rcn-in" type="text" name="rcn-apps-script-klucz" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-pole="secret" style="width:200px;-webkit-text-security:disc" value="' + esc(pol.secret) + '">'
+           + '<span class="rcn-mut">Adres i klucz: ⚙ Ustawienia → Połączenia</span>'
            + '<button type="button" class="rcn-btn rcn-btn2" data-akcja="ping"' + (S.zajete.ping || !pol.url ? ' disabled' : '') + '>Sprawdź</button></div>'
            + '<div class="rcn-mut" style="margin-top:4px">'
-           + (pol.urlWlasny ? 'Adres wpisany ręcznie' : 'Adres wbudowany w HUB') + ' · ' + (pol.secretWlasny ? 'klucz wpisany ręcznie' : 'klucz wbudowany')
-           + '. Zapis po wyjściu z pola; wyczyszczenie pola wraca do wartości wbudowanej.</div>'
+           + (pol.urlWlasny ? 'Adres nadpisany w Połączeniach' : 'Adres wbudowany w HUB')
+           + ' · klucz wspólny. Zmiana: ⚙ Ustawienia → Połączenia.</div>'
            + (S.polMsg ? '<div class="rcn-msg rcn-' + esc(S.polMsg.c) + '">' + esc(S.polMsg.t) + '</div>' : '')
            + htmlPolZapis()
            + '</div></details>';
@@ -108700,9 +108708,7 @@
     function htmlPolZapis(){
         var pz = rcnPolaczenieZapis();
         return '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;padding-top:6px;border-top:1px dashed var(--rcn-bor)">'
-             + '<label class="rcn-mut">Adres zapisu („Lucanet import”)</label><input class="rcn-in" type="text" name="rcn-apps-script-zapis" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-pole="urlZapis" style="flex:1;min-width:320px" placeholder="https://script.google.com/macros/s/…/exec — osobny skrypt zapisu" value="'
-             + esc(pz.url) + '">'
-             + '<label class="rcn-mut">Klucz</label><input class="rcn-in" type="text" name="rcn-apps-script-zapis-klucz" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-pole="secretZapis" style="width:200px;-webkit-text-security:disc" value="' + esc(pz.secret) + '">'
+             + '<span class="rcn-mut">Adres i klucz: ⚙ Ustawienia → Połączenia</span>'
              + '<button type="button" class="rcn-btn rcn-btn2" data-akcja="ping-zapis"' + (S.zajete.pingZapis ? ' disabled' : '') + '>Sprawdź</button></div>'
              + '<div class="rcn-mut" style="margin-top:4px">Osobny skrypt, jedyny z prawem zapisu: dokłada obrotówki do „0004 Reconciliation › Lucanet import › MM/RRRR” '
              + 'i podmienia poprzednią obrotówkę tej samej spółki. Skrypt mapowań wyżej zostaje tylko do odczytu.'
@@ -109211,7 +109217,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '58018e6 · 29.10.2026 12:56';
+    const HUB_BUDOWA = '3e87af3 · 29.10.2026 16:20';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -109999,7 +110005,7 @@
             if (['obok', 'jeden', 'bez'].indexOf(u.dok) < 0) u.dok = UI_DOM.dok;
             u.maks = [0, 2, 3, 4].indexOf(Number(u.maks)) >= 0 ? Number(u.maks) : 0;
             u.skala = [100, 95, 90, 85, 80].indexOf(Number(u.skala)) >= 0 ? Number(u.skala) : 100;
-            if (['widok', 'moduly', 'changelog'].indexOf(u.tab) < 0) u.tab = UI_DOM.tab;
+            if (['widok', 'moduly', 'polaczenia', 'changelog'].indexOf(u.tab) < 0) u.tab = UI_DOM.tab;
             u.napis = !!u.napis; u.kropka = !!u.kropka;
             uiCache = u;
             return u;
@@ -110259,13 +110265,15 @@
         }
         function setMaluj(){
             if (!setPanel) return;
-            const tabs = [['widok', 'Widok'], ['moduly', 'Moduły'], ['changelog', 'Changelog']];
+            const tabs = [['widok', 'Widok'], ['moduly', 'Moduły'], ['polaczenia', 'Połączenia'], ['changelog', 'Changelog']];
             let h = '<div class="bls-head"><b>Ustawienia HUB-a</b><button type="button" class="bls-x" data-act="zamknij" title="Zamknij (Esc)">✕</button></div>';
             h += '<div class="bls-tabs">' + tabs.map(function(x){
                 return '<button type="button" class="bls-tab' + (setTab === x[0] ? ' on' : '') + '" data-tab="' + x[0] + '">' + x[1]
                      + (x[0] === 'changelog' && chgNowe() ? ' <span class="bl-dot">●</span>' : '') + '</button>';
             }).join('') + '</div>';
-            h += '<div class="bls-body">' + (setTab === 'widok' ? setWidokHtml() : (setTab === 'moduly' ? setModulyHtml() : setChgHtml())) + '</div>';
+            h += '<div class="bls-body">' + (setTab === 'widok' ? setWidokHtml()
+                    : (setTab === 'moduly' ? setModulyHtml()
+                    : (setTab === 'polaczenia' ? setPolHtml() : setChgHtml()))) + '</div>';
             setPanel.innerHTML = h;
             if (setTab === 'changelog') { chgMaluj(); chgZaladuj(false); }
         }
@@ -110360,6 +110368,83 @@
                  + '<input type="text" class="bls-szuk" id="bls-chg-q" placeholder="szukaj w opisach i modułach…" value="' + blEsc(chgQ) + '">'
                  + '<div id="bls-chg-lista" class="bls-chg"></div>';
         }
+        // ---------- Polaczenia: jeden klucz do wszystkich Apps Scriptow ----------
+        // Stan sprawdzenia zyje w pamieci strony - po F5 znow „nie sprawdzone". To celowo:
+        // zielone ma znaczyc „pytalem przed chwila i odpowiedzial", a nie „kiedys dzialalo".
+        let polStan = {};
+        let polBieg = false;
+        function polPing(w, klucz, cb){
+            try {
+                GM_xmlhttpRequest({
+                    method: 'POST', url: hubUrl(w.id) || w.url, timeout: 25000,
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    data: JSON.stringify({ secret: klucz, action: 'ping' }),
+                    onload: function(r){
+                        const txt = String((r && r.responseText) || '');
+                        // Nie kazdy skrypt zna akcje „ping" - ale KAZDY sprawdza klucz przed akcja.
+                        // Dlatego „nieznana akcja" tez znaczy, ze klucz przeszedl.
+                        if (/z[lł]y klucz|nieprawid[lł]owy klucz|nie ma klucza|nie wpisano klucza/i.test(txt)) return cb('zly', 'zly klucz albo skrypt go nie ma');
+                        if (/<html/i.test(txt) && /accounts\.google\.com|Sign in|Zaloguj/i.test(txt)) return cb('blad', 'wdrozenie prosi o logowanie Google');
+                        if (r && r.status >= 400) return cb('blad', 'HTTP ' + r.status);
+                        return cb('ok', '');
+                    },
+                    onerror:   function(){ cb('blad', 'brak polaczenia'); },
+                    ontimeout: function(){ cb('blad', 'brak odpowiedzi w 25 s'); }
+                });
+            } catch (e){ cb('blad', 'menedzer skryptow odmowil zapytania'); }
+        }
+        function polSprawdz(){
+            const k = hubKlucz();
+            if (!k) { alert('Najpierw wpisz klucz i kliknij „Zapisz".'); return; }
+            if (polBieg) return;
+            polBieg = true;
+            let zostalo = HUB_WDROZENIA.length;
+            HUB_WDROZENIA.forEach(function(w){ polStan[w.id] = { stan: 'czeka', txt: '' }; });
+            setMaluj();
+            HUB_WDROZENIA.forEach(function(w){
+                polPing(w, k, function(stan, txt){
+                    polStan[w.id] = { stan: stan, txt: txt };
+                    if (--zostalo <= 0) polBieg = false;
+                    if (setPanel && setPanel.style.display !== 'none' && setTab === 'polaczenia') setMaluj();
+                });
+            });
+        }
+        function setPolHtml(){
+            const k = hubKlucz();
+            const ZN = { ok: ['\u2714', '#15803d', 'klucz dziala'], zly: ['\u2716', '#b91c1c', 'zly klucz'],
+                         blad: ['\u26a0', '#b45309', 'nie odpowiada'], czeka: ['\u23f3', '#666', 'pytam...'] };
+            let h = '<div style="font-size:12.5px;line-height:1.5;color:#332524">'
+                  + '<b>Klucz do arkuszy i Dysku</b><br>'
+                  + 'Jeden klucz obsluguje wszystkie ' + HUB_WDROZENIA.length + ' polaczen HUB-a z Apps Scriptami. Wpisujesz go '
+                  + '<b>raz na tym komputerze</b> \u2014 zostaje w pamieci menedzera skryptow i przezywa kazda kolejna wersje HUB-a, '
+                  + 'wiec przy aktualizacji nie trzeba go podawac ponownie.<br>'
+                  + '<span style="color:#666">W samym pliku HUB-a klucza nie ma i nie moze byc \u2014 plik bywa publiczny. '
+                  + 'Klucz dostaniesz od osoby, ktora prowadzi HUB-a; nie przesylaj go dalej.</span></div>';
+            h += '<div style="margin:12px 0 8px"><input type="password" id="bls-klucz" autocomplete="off" spellcheck="false" '
+               + 'data-lpignore="true" data-1p-ignore="true" placeholder="wklej klucz" value="' + blEsc(k) + '" '
+               + 'style="width:320px;padding:6px 8px;border:1px solid #DBD9D7;border-radius:6px;font-family:monospace"> '
+               + '<button type="button" data-act="klucz-zapisz">Zapisz</button> '
+               + '<button type="button" data-act="klucz-sprawdz"' + (polBieg ? ' disabled' : '') + '>'
+               + (polBieg ? 'Sprawdzam...' : 'Sprawdz polaczenia') + '</button></div>';
+            if (!k) h += '<div style="font-size:12px;color:#b45309;margin-bottom:8px">Klucza nie ma. Moduly, ktore pisza do arkuszy albo na Dysk, '
+                       + 'powiedza o tym wprost i nic nie wysla. Reszta HUB-a dziala normalnie.</div>';
+            h += '<table style="border-collapse:collapse;font-size:12.5px;width:100%">';
+            HUB_WDROZENIA.forEach(function(w){
+                const s = polStan[w.id], z = s ? ZN[s.stan] : null, wl = hubUrlWlasny(w.id);
+                h += '<tr><td style="padding:4px 10px 4px 0;border-bottom:1px solid #f0eeed">' + blEsc(w.nazwa)
+                   + (wl ? ' <span style="color:#b45309" title="adres nadpisany na tym komputerze">• własny adres</span>' : '')
+                   + ' <button type="button" data-act="klucz-adres" data-id="' + w.id + '" '
+                   + 'style="border:0;background:none;color:#888;cursor:pointer;font-size:11px;padding:0 2px" '
+                   + 'title="Zmień adres wdrożenia tego skryptu">✎</button></td>'
+                   + '<td style="padding:4px 0;border-bottom:1px solid #f0eeed;color:' + (z ? z[1] : '#999') + '">'
+                   + (z ? z[0] + ' ' + (s.txt || z[2]) : '\u2014 nie sprawdzone') + '</td></tr>';
+            });
+            h += '</table>';
+            h += '<div style="font-size:11.5px;color:#888;margin-top:10px">Sprawdzenie pyta kazde wdrozenie o „ping". '
+               + 'Skrypt, ktory tej akcji nie zna, odpowie „nieznana akcja" \u2014 i to tez liczy sie jako <b>klucz dziala</b>, '
+               + 'bo klucz sprawdzany jest przed akcja.</div>';
+            return h;
+        }
         function setKlik(e){
             const t = e.target && e.target.closest ? e.target.closest('[data-act],[data-tab],[data-menu]') : null;
             if (!t) return;
@@ -110381,6 +110466,34 @@
             }
             const co = t.getAttribute('data-act');
             if (co === 'zamknij') { setZamknij(); return; }
+            if (co === 'klucz-zapisz') {
+                const pole = setPanel.querySelector('#bls-klucz');
+                hubKluczUstaw(pole ? pole.value : '');
+                polStan = {};                       // stary wynik nie opisuje juz nowego klucza
+                setMaluj();
+                return;
+            }
+            if (co === 'klucz-sprawdz') { polSprawdz(); return; }
+            if (co === 'klucz-adres') {
+                // Wyjscie awaryjne: adres wdrozenia da sie przestawic bez nowej wersji HUB-a.
+                // Puste pole wraca do wbudowanego.
+                const id = t.getAttribute('data-id');
+                const w = HUB_WDROZENIA.filter(function(x){ return x.id === id; })[0];
+                if (!w) return;
+                const teraz = hubAdresy()[id] || '';
+                const v = prompt('Adres wdrożenia dla „' + w.nazwa + '”.\n\n'
+                    + 'Pusty = wbudowany w HUB:\n' + hubUrlWbudowany(id), teraz);
+                if (v === null) return;
+                const vv = String(v).trim();
+                if (vv && !/^https:\/\/script\.google\.com\/(?:a\/macros\/[A-Za-z0-9.-]+\/s|macros\/s)\/[A-Za-z0-9_-]+\/exec\/?$/.test(vv)) {
+                    alert('To nie wygląda na adres wdrożenia Apps Scriptu (kończy się na /exec) — nie zapisuję.');
+                    return;
+                }
+                hubAdresUstaw(id, vv);
+                polStan = {};
+                setMaluj();
+                return;
+            }
             if (co === 'pos')     { clearPos(); applyPos(null); if (panel.style.display !== 'none') placePanel(); return; }
             if (co === 'widok-dom'){ try { GM_setValue(UI_KEY, ''); } catch (er) {} uiCache = null; uiZastosuj(); menuMaluj(); blTick(); setMaluj(); return; }
             if (co === 'menu-dom') { menuSet({ ukryte: [], kol: [], ulub: [] }); setMaluj(); return; }
