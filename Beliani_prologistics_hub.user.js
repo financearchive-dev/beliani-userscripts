@@ -110034,7 +110034,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'd89b1af · 02.11.2026 08:15';
+    const HUB_BUDOWA = 'eb8dd4f · 02.11.2026 08:26';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -110814,6 +110814,7 @@
         const VER_KEY   = HUB + 'wersja_github_v1';     // { latest, ts } — kopia ostatniego sprawdzenia (throttling)
         const VER_ODLOZ = HUB + 'wersja_odlozona_v1';   // numer wersji schowanej guzikiem „Pozniej"
         let verDostepna = '';                            // numer nowszej wersji, gdy jest — czyta go menuMaluj
+        let verAktualna = false;                         // true = sprawdzone i masz najnowsza (zielony wiersz w menu)
         function verTeraz(){ try { if (typeof GM_info !== 'undefined' && GM_info.script) return GM_info.script.version || '?'; } catch(e){} return '?'; }
         // Porownanie po segmentach liczbowo: 5.62.1 > 5.62, 5.63 > 5.62.1 (ten sam wzor co cmp w checkUpdate).
         function verCmp(a,b){ var pa=String(a).split('.').map(Number), pb=String(b).split('.').map(Number); for (var i=0;i<Math.max(pa.length,pb.length);i++){ var x=pa[i]||0, y=pb[i]||0; if (x!==y) return x-y; } return 0; }
@@ -110831,8 +110832,31 @@
                 + '\u2022 ScriptCat: przy skrypcie „Sprawd\u017a aktualizacje" (albo Link Import \u2192 wklej \u2192 OK)\n'
                 + '\u2022 Otworzy\u0142em stron\u0119 instalacji — potwierd\u017a w mened\u017cerze skrypt\u00f3w.');
         }
+        // Czerwona kropka na guziku „Narzędzia" — zeby bylo widac, ze jest nowsza wersja,
+        // bez otwierania menu. Kropka siedzi na samym btn (nie na panelu), wiec przezywa
+        // kazde przerysowanie menu (menuMaluj wymienia tylko innerHTML panelu).
+        function verBtnKropka(pokaz){
+            let d = btn.querySelector('.bl-upd-kropka');
+            if (pokaz) {
+                if (!d) {
+                    d = document.createElement('span');
+                    d.className = 'bl-upd-kropka';
+                    d.title = 'Jest nowsza wersja HUB-a — „Narzędzia" → „Uaktualnij"';
+                    d.style.cssText = 'position:absolute;top:-3px;right:-3px;width:11px;height:11px;border-radius:50%;'
+                        + 'background:#dc2626;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.2);pointer-events:none;z-index:1';
+                    btn.style.position = 'relative';   // relative bez przesuniec nie rusza guzika; wrap i tak jest position:fixed
+                    btn.appendChild(d);
+                }
+            } else if (d && d.parentNode) {
+                d.parentNode.removeChild(d);
+            }
+        }
         function verMenuZnacznik(latest){
-            verDostepna = verNowsza(latest) ? latest : '';
+            // Trzy stany: nowsza (verDostepna), sprawdzone i aktualna (verAktualna), nieznane (oba puste).
+            if (verNowsza(latest))   { verDostepna = latest; verAktualna = false; }
+            else if (latest)         { verDostepna = '';     verAktualna = true;  }   // GitHub odpowiedzial: masz najnowsza
+            else                     { verDostepna = '';     verAktualna = false; }   // nie udalo sie sprawdzic
+            try { verBtnKropka(!!verDostepna); } catch(e){}
             try { menuMaluj(); } catch(e){}
         }
         function verBanerSchowaj(){ const b = document.getElementById('beliani-wersja-baner'); if (b && b.parentNode) b.parentNode.removeChild(b); }
@@ -111476,6 +111500,10 @@
                 html += '<button class="bl-row" id="bl-update" style="background:#fef3c7;color:#92400e;font-weight:600" '
                       + 'title="Na GitHubie jest nowsza wersja HUB-a — kliknij, aby zaktualizować"><span class="bl-emoji">🔄</span>'
                       + 'Uaktualnij — jest nowsza (' + blEsc(verDostepna) + ')!</button>';
+            } else if (verAktualna) {
+                html += '<button class="bl-row" id="bl-update" style="color:#15803d" '
+                      + 'title="Masz najnowszą wersję HUB-a — kliknij, aby sprawdzić ponownie"><span class="bl-emoji">✅</span>'
+                      + 'Masz najnowszą (' + blEsc(verTeraz()) + ') — sprawdź ponownie</button>';
             } else {
                 html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
             }
