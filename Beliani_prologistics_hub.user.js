@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.62
+// @version      5.62.1
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -110034,7 +110034,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'bdb4816 · 30.10.2026 15:57';
+    const HUB_BUDOWA = 'd89b1af · 02.11.2026 08:15';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -110784,6 +110784,8 @@
                         var m = (resp.responseText || '').match(/@version\s+([0-9.]+)/);
                         var latest = m ? m[1] : null;
                         if (!latest) { alert('Nie uda\u0142o si\u0119 odczyta\u0107 wersji z GitHub.' + tip); return; }
+                        // Reczne sprawdzenie odswieza tez stan automatu: kopie w pamieci i wiersz \u201eUaktualnij" w menu.
+                        try { verZapiszDoPamieci(latest); verMenuZnacznik(latest); } catch(e){}
                         if (cmp(latest, current) > 0) {
                             if (confirm('Nowa wersja: ' + latest + ' (masz ' + current + ').' + tip + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
                                 window.open(RAW, '_blank');
@@ -110795,6 +110797,87 @@
                     onerror: function(){ alert('Nie uda\u0142o si\u0119 sprawdzi\u0107 wersji (po\u0142\u0105czenie).' + tip); }
                 });
             } catch(e){ window.open(RAW, '_blank'); }
+        }
+
+        // ===== Automatyczne wykrywanie nowszej wersji ==============================
+        // Przy wczytaniu strony HUB sam pyta GitHub o najnowsza wersje (RAW, raz na
+        // kilka godzin — tak samo oszczednie jak kropka „nowosci" w Changelogu). Gdy na
+        // GitHubie jest nowsza, pokazuje komunikat „Jest nowsza wersja, czy chcesz
+        // uaktualnic?" z guzikiem „Uaktualnij". „Pozniej" chowa komunikat do czasu, az
+        // pojawi sie JESZCZE nowsza wersja. Niezaleznie od komunikatu wiersz „Uaktualnij"
+        // w menu podswietla sie numerem nowej wersji — zostaje nawet po schowaniu komunikatu.
+        const VER_RAW = (function(){
+            let u = 'https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
+            try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) u = GM_info.script.downloadURL; } catch(e){}
+            return u;
+        })();
+        const VER_KEY   = HUB + 'wersja_github_v1';     // { latest, ts } — kopia ostatniego sprawdzenia (throttling)
+        const VER_ODLOZ = HUB + 'wersja_odlozona_v1';   // numer wersji schowanej guzikiem „Pozniej"
+        let verDostepna = '';                            // numer nowszej wersji, gdy jest — czyta go menuMaluj
+        function verTeraz(){ try { if (typeof GM_info !== 'undefined' && GM_info.script) return GM_info.script.version || '?'; } catch(e){} return '?'; }
+        // Porownanie po segmentach liczbowo: 5.62.1 > 5.62, 5.63 > 5.62.1 (ten sam wzor co cmp w checkUpdate).
+        function verCmp(a,b){ var pa=String(a).split('.').map(Number), pb=String(b).split('.').map(Number); for (var i=0;i<Math.max(pa.length,pb.length);i++){ var x=pa[i]||0, y=pb[i]||0; if (x!==y) return x-y; } return 0; }
+        function verNowsza(latest){ return !!latest && verCmp(latest, verTeraz()) > 0; }
+        function verOdczytZPamieci(){ try { const s = GM_getValue(VER_KEY, ''); return s ? JSON.parse(s) : null; } catch(e){ return null; } }
+        function verZapiszDoPamieci(latest){ try { GM_setValue(VER_KEY, JSON.stringify({ latest: latest, ts: Date.now() })); } catch(e){} }
+        // Otwarcie instalacji: link RAW do schowka + strona instalacji (menedzer skryptow przechwytuje .user.js).
+        // Window.open w handlerze klikniecia (gest uzytkownika), wiec popup-blocker go nie zdejmie.
+        function verOtworzInstalacje(){
+            let copied = false;
+            try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(VER_RAW, 'text'); copied = true; } } catch(e){}
+            try { window.open(VER_RAW, '_blank'); } catch(e){}
+            alert('Aktualizacja HUB-a:\n\n'
+                + (copied ? '\ud83d\udccb Link RAW jest w schowku.\n' : 'Link RAW:\n' + VER_RAW + '\n')
+                + '\u2022 ScriptCat: przy skrypcie „Sprawd\u017a aktualizacje" (albo Link Import \u2192 wklej \u2192 OK)\n'
+                + '\u2022 Otworzy\u0142em stron\u0119 instalacji — potwierd\u017a w mened\u017cerze skrypt\u00f3w.');
+        }
+        function verMenuZnacznik(latest){
+            verDostepna = verNowsza(latest) ? latest : '';
+            try { menuMaluj(); } catch(e){}
+        }
+        function verBanerSchowaj(){ const b = document.getElementById('beliani-wersja-baner'); if (b && b.parentNode) b.parentNode.removeChild(b); }
+        function verBanerPokaz(latest){
+            verBanerSchowaj();
+            const box = document.createElement('div');
+            box.id = 'beliani-wersja-baner';
+            box.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483646;'
+                + 'background:#fffbeb;border:1px solid #f59e0b;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);'
+                + 'padding:12px 16px;max-width:min(520px,92vw);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;color:#422006';
+            box.innerHTML =
+                '<div style="font-weight:700;margin-bottom:4px">\ud83d\udd04 Jest nowsza wersja — czy chcesz uaktualni\u0107?</div>'
+              + '<div style="color:#92400e;margin-bottom:10px">Masz HUB ' + blEsc(verTeraz()) + ', najnowsza na GitHubie to <b>' + blEsc(latest) + '</b>.</div>'
+              + '<div style="display:flex;gap:8px;justify-content:flex-end">'
+              + '<button type="button" id="bl-ver-pozniej" style="padding:6px 12px;border:1px solid #d6cfc2;border-radius:7px;background:#fff;cursor:pointer">P\u00f3\u017aniej</button>'
+              + '<button type="button" id="bl-ver-teraz" style="padding:6px 14px;border:0;border-radius:7px;background:#b45309;color:#fff;font-weight:600;cursor:pointer">Uaktualnij</button>'
+              + '</div>';
+            document.body.appendChild(box);
+            const teraz = box.querySelector('#bl-ver-teraz');
+            if (teraz) teraz.addEventListener('click', function(){ verBanerSchowaj(); verOtworzInstalacje(); });
+            const poz = box.querySelector('#bl-ver-pozniej');
+            if (poz) poz.addEventListener('click', function(){ try { GM_setValue(VER_ODLOZ, latest); } catch(e){} verBanerSchowaj(); });
+        }
+        function verMozeBaner(latest){
+            verMenuZnacznik(latest);                 // zawsze: ustawia verDostepna i odswieza wiersz w menu
+            if (!verNowsza(latest)) return;
+            let odloz = ''; try { odloz = GM_getValue(VER_ODLOZ, '') || ''; } catch(e){}
+            if (odloz && verCmp(latest, odloz) <= 0) return;   // ta wersja (albo starsza) juz schowana „Pozniej"
+            verBanerPokaz(latest);
+        }
+        function verSprawdzZGitHub(cb){
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: VER_RAW + '?t=' + Date.now(), timeout: 20000,
+                    onload:    function(resp){ const m = (resp && resp.responseText || '').match(/@version\s+([0-9.]+)/); cb(m ? m[1] : null); },
+                    onerror:   function(){ cb(null); },
+                    ontimeout: function(){ cb(null); }
+                });
+            } catch(e){ cb(null); }
+        }
+        function verAuto(){
+            const z = verOdczytZPamieci();
+            // Kopia mlodsza niz 3 h wystarcza — nie pytamy GitHuba przy kazdej nawigacji po panelu.
+            if (z && z.latest && (Date.now() - (Number(z.ts) || 0) < 3*3600e3)) { verMozeBaner(z.latest); return; }
+            verSprawdzZGitHub(function(latest){ if (!latest) return; verZapiszDoPamieci(latest); verMozeBaner(latest); });
         }
 
         // ===== Ustawienia: Widok · Moduły · Changelog ==============================
@@ -111389,7 +111472,13 @@
             html += reszta.map(wiersz).join('');
             if (!poz.length) html += '<div class="bl-build">Wszystkie narzędzia schowane — „⚙ Ustawienia" → „Moduły".</div>';
             html += '<div class="bl-sep"></div>';
-            html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
+            if (verDostepna) {
+                html += '<button class="bl-row" id="bl-update" style="background:#fef3c7;color:#92400e;font-weight:600" '
+                      + 'title="Na GitHubie jest nowsza wersja HUB-a — kliknij, aby zaktualizować"><span class="bl-emoji">🔄</span>'
+                      + 'Uaktualnij — jest nowsza (' + blEsc(verDostepna) + ')!</button>';
+            } else {
+                html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
+            }
             // Stopka ze znacznikiem budowy. Znak zastepczy (plik wklejony prosto z repo, nie z kopii)
             // poznajemy po podkresleniach na poczatku — sam znak nie moze tu stac drugi raz,
             // bo kopia-wersji.sh podmienia go i sprawdza, ze wystepuje dokladnie raz.
@@ -111437,6 +111526,9 @@
         // kazdym rysowaniu menu. Stad jedno odpytanie na wczytanie strony — i tylko wtedy, gdy
         // kopia w pamieci jest starsza niz 6 godzin (reszte zalatwia sam HUBDZ.zmiany).
         setTimeout(function(){ try { if (uiGet().kropka) chgZaladuj(false); } catch (e) {} }, 20000);
+        // Automatyczne wykrywanie nowszej wersji: raz na wczytanie strony (kilka sekund po
+        // starcie), a GitHub pytany najwyzej raz na 3 h — reszte zalatwia kopia w pamieci.
+        setTimeout(function(){ try { verAuto(); } catch (e) {} }, 8000);
 
         wrap.appendChild(btn); wrap.appendChild(panel);
         document.body.appendChild(wrap);
