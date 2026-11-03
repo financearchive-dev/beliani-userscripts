@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63
+// @version      5.63.1
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -36970,6 +36970,11 @@
         'Mirakl (Leroy) · Leroy Merlin IT': { bank: '', booking: '9', acct: '1362' },
         'Mirakl (Leroy) · Leroy Merlin ES': { bank: '', booking: '9', acct: '1117' },
         'Mirakl (Leroy) · Leroy Merlin PT': { bank: '', booking: '9', acct: '1455' },
+        // RO (03.11.2026, odczyt /api/bankSettings/index/255/): ustawienie 255 „LEROY MERLIN RON" — RON, konto 1381
+        // „Leroy Merlin RO Beliani (EU) Gmbh", booking 9, numer kol. 5, kwota kol. 14, czyli ten sam uklad co 102/140/156/241
+        // pozostalych Leroyow. PT to 241 „Leroy Merlin PT" (EUR, konto 1455) — ale jego klucz juz istnieje, wiec 241
+        // podpowie ⚙ Konta po nazwie, a do zapisu potrzebne jest „Zapisz".
+        'Mirakl (Leroy) · Leroy Merlin RO': { bank: '255', booking: '9', acct: '1381' },
         // Brico Depot ES i PT: jeden panel (marketplace.bricodepot.es), dwa sklepy.
         // Konta z planu kont: 1150 „Brico Depot ES Beliani DE", 1151 „Brico Depot PT
         // Beliani DE". Importy z listy bank settings: 186 „Brico Depot ES Beliani DE",
@@ -37115,6 +37120,20 @@
             const o12 = d['OBI CH · OBI CH'];
             if (o12 && String(o12.booking) === '9'){ o12.booking = '12'; add++; }
             migMark('obich-booking-12');
+        }
+        // Sklepy, ktore do 5.63 nie mialy w MK_SHOPID jawnej nazwy, a zlecenia dostawaly nazwe z panelu albo numer:
+        // ustawienia wpisane pod stara nazwa przechodza na nowa. Tylko puste pola nowego klucza — wpisu czlowieka pod
+        // nowa nazwa nie ruszamy — a stary klucz zostaje, bo czekaja przy nim zlecenia sprzed zmiany.
+        if (!migDone('sklepy-klucze-563')){
+            [['Mirakl (Carrefour) · Beliani France', 'Mirakl (Carrefour) · Carrefour FR'],
+             ['Mirakl (Leroy) · Leroy Merlin · sklep 14955', 'Mirakl (Leroy) · Leroy Merlin PT'],
+             ['Mirakl (Leroy) · Leroy Merlin · sklep 15335', 'Mirakl (Leroy) · Leroy Merlin RO']].forEach(function (p){
+                const st = d[p[0]];
+                if (!st || skas.indexOf(p[1]) >= 0) return;
+                const nw = d[p[1]] || (d[p[1]] = { bank: '', booking: st.booking || '9', acct: '' });
+                ['bank', 'acct'].forEach(function (f){ if (!nw[f] && st[f]){ nw[f] = st[f]; add++; } });
+            });
+            migMark('sklepy-klucze-563');
         }
         if (add) setSave(d);
         return d;
@@ -39811,7 +39830,9 @@
         // 254 „Limango DE NEW" — panel Mirakla. Osobne ustawienie od 200 „Limango DE" (stary dashboard),
         // bo pliki maja inny uklad: 200 czyta numer z kol. 1 i kwote z 8, a 254 numer z 5, kwote z 14, date z 3.
         // Odczytane 26.10.2026 z /api/bankSettings/index/254/ (EUR, konto 1515, booking 9).
-        "254": "Limango DE NEW"
+        "254": "Limango DE NEW",
+        // 255 „LEROY MERLIN RON" — odczytane 03.11.2026 z /api/bankSettings/index/255/ (RON, konto 1381, uklad jak 241).
+        "255": "LEROY MERLIN RON"
     };
     function bsPobrane(){ try { return JSON.parse(GM_getValue(MK_BS_KEY, '{}')) || {}; } catch (e){ return {}; } }
     function bsReczne(){ try { return JSON.parse(GM_getValue(MK_BS_RECZNE, '{}')) || {}; } catch (e){ return {}; } }
@@ -41416,7 +41437,11 @@
         '26268': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // UK
         // Shop ID wprost z kolumny „Shop ID" trzech prawdziwych eksportow Carrefoura —
         // ta sama wartosc w kazdym wierszu kazdego z nich, tak jak przy pozostalych.
-        '3052': { mp: 'Mirakl (Carrefour)', brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net' },
+        // Jawna nazwa (03.11.2026): panel nazywa ten sklep „Beliani France", wiec bez niej zlecenie po pobraniu rozliczenia
+        // dostawalo klucz ustawien „Mirakl (Carrefour) · Beliani France", a bank_setting 190 i konto 1149 stoja pod
+        // „Carrefour FR" (tam wpisuje je regula wyciagu) — zwroty wychodzily „konto nieustawione". Tak samo jak 4474 nizej.
+        '3052': { mp: 'Mirakl (Carrefour)', brand: 'Carrefour', short: 'Carrefour', host: 'carrefourfr.mirakl.net',
+                  shop: 'Carrefour FR' },
         // Carrefour ES — sklep 4474, panel podaje nazwe „Beliani España", wiec bez wlasnej etykiety klucz ustawien
         // i nazwa w arkuszu rozjechalyby sie z „Carrefour ES" (konto 1062). Tak samo rozwiazana jest Cultura i Vente FR.
         // Odczyt panelu 29.10.2026: /sellerpayment/private/shops/current -> {name:'Beliani España', uuid:4474, EUR}.
@@ -41433,6 +41458,14 @@
                   host: MK_LEROY_HOST, shop: 'Leroy Merlin IT' },
         '5318': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
                   host: MK_LEROY_HOST, shop: 'Leroy Merlin ES' },
+        // PT i RO — z listy sklepow panelu (/_menu, 03.11.2026): ten sam login widzi 2327 „Beliani", 14955 „Beliani PT"
+        // i 15335 „Beliani RO" (sklep biezacy 14955: /sellerpayment/private/shops/current -> „Beliani PT", EUR).
+        // Bez wpisu PT szedl jako „Leroy Merlin · sklep 14955" i nie trafial w konto 1455. Waluty sklepu RO nie czytalem
+        // (wymaga przelaczenia sklepu) — bez „cur", choc ustawienie importu 255 jest w RON.
+        '14955': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                   host: MK_LEROY_HOST, shop: 'Leroy Merlin PT' },
+        '15335': { mp: 'Mirakl (Leroy)', brand: 'Leroy Merlin', short: 'Leroy',
+                   host: MK_LEROY_HOST, shop: 'Leroy Merlin RO' },
         // Leen Bakker ma DWA sklepy na jednym hoscie — 2297 i 2298 stoja wprost
         // w tytulach przelewow („for shop 2297" / „for shop 2298"). Numer jest tu
         // jedynym pewnym rozroznieniem, wiec — jak przy Leroyu — „shop" nadpisuje
@@ -47144,8 +47177,8 @@
     // Sukces = WYLACZNIE ok === true: Google oddaje bledy jako strone HTML ze statusem 200.
     function f1DriveReq(akcja, dane){
         const c = f1Cfg();
-        if (!c.url) return Promise.reject(new Error('brak adresu wdrożenia Apps Scriptu „Furniture1 pliki” — wpisz go w ⚙ Konta → Drive Furniture 1'));
-        if (!c.secret) return Promise.reject(new Error('brak klucza do Apps Scriptu „Furniture1 pliki” — wpisz go w ⚙ Konta → Drive Furniture 1'));
+        if (!c.url) return Promise.reject(new Error('brak adresu wdrożenia Apps Scriptu „Furniture1 pliki” — wpisz go w ⚙ Ustawienia → Połączenia'));
+        if (!c.secret) return Promise.reject(new Error('brak klucza do Apps Scriptu „Furniture1 pliki” — wpisz go w ⚙ Ustawienia → Połączenia'));
         const tresc = {};
         if (dane && typeof dane === 'object') Object.keys(dane).forEach(function (k){ tresc[k] = dane[k]; });
         // Na koncu, zeby pole z „dane" nie podmienilo klucza ani akcji.
@@ -48134,7 +48167,7 @@
             ctx.zrodlo = 'pliki wgrane ręcznie';
             ctx.bezProblemu = true;
             ctx.gdzie = { opis: 'pliki wgrane ręcznie (' + reczne.length + ')', kompletna: false,
-                          uwagi: ['Google Drive Furniture 1 nie jest ustawiony — wpisz adres i klucz w ⚙ Konta → Drive Furniture 1'] };
+                          uwagi: ['Google Drive Furniture 1 nie jest ustawiony — wpisz adres i klucz w ⚙ Ustawienia → Połączenia'] };
             pliki = reczne;
         } else {
             const zb = await f1PlikiZDrive(najstarsza, reczne);
@@ -48218,7 +48251,7 @@
         const ctx = {
             zrodlo: 'pliki wgrane ręcznie', dozwolone: dozw,
             gdzie: { opis: 'pliki wgrane ręcznie (' + reczne.length + ')', kompletna: false,
-                     uwagi: ['Google Drive Furniture 1 nie jest ustawiony — wpisz adres i klucz w ⚙ Konta → Drive Furniture 1'] },
+                     uwagi: ['Google Drive Furniture 1 nie jest ustawiony — wpisz adres i klucz w ⚙ Ustawienia → Połączenia'] },
             paczki: function (bank){ return f1PaczkiDoZapory(bank, odPaczek, cache); }
         };
         let pliki = reczne, uwagaDrive = '';
@@ -50413,7 +50446,7 @@
             ctx.zrodlo = 'pliki wgrane ręcznie';
             ctx.bezProblemu = true;
             ctx.gdzie = { opis: 'pliki wgrane ręcznie (' + reczne.length + ')', kompletna: false,
-                          uwagi: ['Google Drive nie jest ustawiony — wpisz adres i klucz w ⚙ Konta → Drive Furniture 1 (ten sam skrypt czyta folder Trademax)'] };
+                          uwagi: ['Google Drive nie jest ustawiony — wpisz adres i klucz w ⚙ Ustawienia → Połączenia (ten sam skrypt czyta folder Trademax)'] };
             pliki = reczne;
         } else {
             // Rozliczenia Trademax dopinamy PRZED ustaleniem, co pobrac z Drive: wplata z pelna lista dokumentow potrzebuje tylko
@@ -59838,9 +59871,9 @@
     // Kazdy operator ma wlasna instancje Mirakla (venteunique-prod…, home24…), wiec host
     // nie jest jeden — ustawiamy go przed obsluga kazdej platformy. Na samym Miraklu
     // pracujemy oczywiscie z tym, na ktorym stoimy.
-    let _host = '', MK_TOK = '';
+    let _host = '', MK_TOK = '', MK_MENU = null;   // MK_MENU: numery sklepow z /_menu biezacego hosta (null = nie wiem)
     function mkHost(){ return onMirakl ? location.hostname : (_host || 'venteunique-prod.mirakl.net'); }
-    function mkSetHost(h){ if (h && h !== _host){ _host = h; MK_TOK = ''; } }   // zmiana hosta unieważnia token
+    function mkSetHost(h){ if (h && h !== _host){ _host = h; MK_TOK = ''; MK_MENU = null; } }   // zmiana hosta unieważnia token
     function mkBase(){ return onMirakl ? '' : ('https://' + mkHost()); }
 
     // Na Miraklu token bierzemy z ciasteczka, nie ze znacznika <meta>: po przelaczeniu
@@ -59866,7 +59899,7 @@
     // i sklep biezacy. Odswiezamy je raz na host.
     async function mkBoot(){
         if (onMirakl) return { tok: mkXsrf(), ids: mkShopIds(), home: MK_HOME };
-        if (MK_TOK) return { tok: MK_TOK, ids: mkShopIds(), home: mkHomeGet() };
+        if (MK_TOK) return { tok: MK_TOK, ids: mkShopIds(), home: mkHomeGet(), menu: MK_MENU };
         const r = await gmGet(mkBase() + '/', { 'accept': 'text/html' });
         const h = String(r.responseText || '');
         if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' na ' + mkHost());
@@ -59874,6 +59907,20 @@
         if (!m) throw new Error('nie widzę tokena na ' + mkHost() + ' — zaloguj się tam w przeglądarce i spróbuj ponownie');
         MK_TOK = m[1];
         mkShopIdsFrom(h);
+        // Pelna lista sklepow tego loginu: panel przy kazdym wczytaniu strony pyta o /_menu, a odpowiedz ma
+        // „shopSelectorList" — to samo, co widac po rozwinieciu przelacznika sklepow („url":"/switch-shop/2005").
+        // Do 5.63 lista brala sie WYLACZNIE z pamieci komputera, a ta rosla tylko po rozwinieciu przelacznika na
+        // panelu — Vente z 15 sklepow mial u jednej osoby 2 (03.11.2026). Zmierzone na zywych panelach tego dnia:
+        // Vente 15 z 15, Home24 5 z 5, ADEO 3 z 3; /_usercontext daje 1, /userinfo 0. Pytamy przy KAZDYM wejsciu
+        // na host (jedno zapytanie, ok. 0,2 s), bo sklep dochodzi i znika bez wiedzy HUB-a. Odmowa nic nie psuje:
+        // zostaje pamiec i MK_SHOPID, jak dotad.
+        try {
+            const mn = await gmGet(mkBase() + '/_menu', { 'accept': 'application/json, */*' });
+            if (mn.status >= 200 && mn.status < 300){
+                const t = mkMenuSklepy(String(mn.responseText || ''));
+                if (t){ MK_MENU = (t.match(/\d+/g) || []); mkShopIdsFrom(t); }
+            }
+        } catch (e){}
         // Strona glowna listy sklepow nie zawiera, ale naglowek Mirakla pobiera ja
         // z /_usercontext. Sprobujmy — jesli nic tam nie ma, nic sie nie zmienia.
         if (mkShopIds().length < 2){
@@ -59884,7 +59931,7 @@
         }
         const cm = h.match(/"currentShopUUID"\s*:\s*"?(\d+)"?/);
         if (cm) mkHomeSet(cm[1]);
-        return { tok: MK_TOK, ids: mkShopIds(), home: cm ? cm[1] : '' };
+        return { tok: MK_TOK, ids: mkShopIds(), home: cm ? cm[1] : '', menu: MK_MENU };
     }
     async function mkApi(path){
         if (onMirakl){
@@ -61011,6 +61058,18 @@
         mapArr(MK_SHOPS_KEY, mkHost()).forEach(function (x){ if (!seen[x]) { seen[x] = 1; ids.push(x); } });
         if (ids.length) mapPut(MK_SHOPS_KEY, mkHost(), ids);
         return ids;
+    }
+    // Z odpowiedzi /_menu bierzemy WYLACZNIE „shopSelectorList" i jego adresy „/switch-shop/NNNN" — reszta menu niesie
+    // wlasne adresy i liczby, a mkShopIdsFrom lapie numery z kilku wzorcow. Oddaje tekst w ksztalcie, ktory mkShopIdsFrom
+    // rozumie („/switch-shop/2005 /switch-shop/2337 …"), albo pusty, gdy to nie JSON z ta lista.
+    function mkMenuSklepy(txt){
+        let j = null;
+        try { j = JSON.parse(String(txt || '')); } catch (e){ return ''; }
+        const l = j && Array.isArray(j.shopSelectorList) ? j.shopSelectorList : [];
+        return l.map(function (x){
+            const m = String((x && x.url) || '').match(/^\/switch-shop\/(\d+)$/);
+            return m ? ('/switch-shop/' + m[1]) : '';
+        }).filter(Boolean).join(' ');
     }
     function mkShopIds(){ return mkShopIdsFrom(onMirakl && document.documentElement ? document.documentElement.innerHTML : ''); }
     // Czy to strona logowania Mirakla. Rozpoznajemy po polu hasla ORAZ po tym, ze nie ma
@@ -66385,6 +66444,12 @@
                 const a = acc.filter(function (x){ return x.n === String(c.acct || ''); })[0];
                 g[key] = { key: key, date: j.date, acct: c.acct || '', accNm: a ? a.nm : '', rows: [], shops: {}, sum: 0, keys: [], seen: {} };
             }
+            // Bez zapisanego konta: czy ⚙ Konta podpowiada je w polu? Wtedy brakuje tylko „Zapisz” i lista ma to powiedziec
+            // wprost — dotad czlowiek widzial konto w ⚙ Konta, a tu „konto nieustawione”, i nie wiedzial dlaczego.
+            if (!c.acct && !g[key].podp){
+                const zg = mkAcctGuess(mkMarkaSklepu(j.data.shop) || j.brand, j.data.shop, acc);
+                if (zg) g[key].podp = zg.n;
+            }
             g[key].shops[j.data.shop] = 1;
             // Jedno zestawienie = jeden wiersz w arkuszu, nawet gdy ma kilka zwrotow.
             // Liczy sie KLUCZ zlecenia, nie referencja: zlecenia z arkusza maja ja pusta,
@@ -67007,7 +67072,8 @@
               +  (zrobiona ? ';opacity:.72' : '') + '">'
               +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               +  '<b style="font-size:11px">' + esc(x.date) + '</b>'
-              +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')</span>') + '</span>'
+              +  '<span style="font-size:11px;color:#374151">' + (x.acct ? esc(x.acct + (x.accNm ? (' — ' + x.accNm) : '')) : '<span style="color:#c47f00">konto nieustawione (' + esc(Object.keys(x.shops).join(', ')) + ')'
+                    + (x.podp ? (' — w ⚙ Konta czeka podpowiedź ' + esc(x.podp) + ', kliknij tam „Zapisz”') : '') + '</span>') + '</span>'
               +  '<span style="font-size:11px;color:#666">' + x.rows.length + ' poz. · ' + f2(x.sum) + '</span>'
               +  (function (){
                     const s = st[k];
@@ -71249,7 +71315,9 @@
             const j = jobs[k];
             if (!j.data || !j.data.shop) return;
             const key = setKey(j.mp, j.data.shop);
-            if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(mkMarkaSklepu(j.data.shop) || j.brand, j.data.shop, acc) || {}).n || '' };
+            // zJob: wiersza NIE MA w ustawieniach — konto w polu to tylko podpowiedz i do zapisu potrzebne jest „Zapisz".
+            // Bez tego znaczka konto stalo w polu jak zapisane, a zwroty dalej pisaly „konto nieustawione" (03.11.2026).
+            if (!rows[key]) rows[key] = { bank: '', booking: '9', acct: (mkAcctGuess(mkMarkaSklepu(j.data.shop) || j.brand, j.data.shop, acc) || {}).n || '', zJob: true };
         });
         const keys = Object.keys(rows).sort();
         const bk = bkLoad();
@@ -71302,10 +71370,11 @@
             });
             return '<datalist id="mk-dl-book">' + o + '</datalist>';
         }
-        function fieldAcct(val){
+        function fieldAcct(val, hl){
             const a = acc.filter(function (x){ return x.n === String(val || ''); })[0];
             const lbl = a ? (a.n + ' — ' + a.nm) : (val || '');
-            return '<input class="mk-s-acct" list="mk-dl-acct" value="' + esc(lbl) + '" placeholder="numer lub nazwa…" style="width:230px;font-size:11px">';
+            return '<input class="mk-s-acct" list="mk-dl-acct" value="' + esc(lbl) + '" placeholder="numer lub nazwa…" style="width:230px;font-size:11px'
+                 + (hl ? ';background:#fef9c3' : '') + '">';
         }
         let h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
               + '<b style="font-size:11px;color:#5b21b6">Konta i ustawienia importu</b>'
@@ -71385,7 +71454,7 @@
               +  '<td style="padding:2px 4px">bank_setting (mapowanie kolumn)</td>'
               +  '<td style="padding:2px 4px">booking (po czym dopasować)</td>'
               +  '<td style="padding:2px 4px">Konto (informacyjnie)</td><td></td><td></td></tr>';
-            let sugN = 0;
+            let sugN = 0, niezapN = 0;
             keys.forEach(function (k, i){
                 const c = rows[k];
                 // podpowiedz tylko gdy jednoznaczna; do zapisu i tak potrzebne klikniecie
@@ -71396,11 +71465,12 @@
                 const cand = c.bank ? [] : bsGuess(bs, String(k).split('·').pop());
                 const sug = cand.length === 1 ? cand[0].id : '';
                 if (sug) sugN++;
+                if (c.zJob) niezapN++;
                 h += '<tr style="border-top:1px solid #ede9fe" data-k="' + esc(k) + '">'
                   +  '<td style="padding:3px 4px;white-space:nowrap">' + esc(k) + '</td>'
                   +  '<td style="padding:3px 4px">' + fieldBank(c.bank || sug, sug && !c.bank) + '</td>'
                   +  '<td style="padding:3px 4px">' + fieldBook(c.booking || '9') + '</td>'
-                  +  '<td style="padding:3px 4px">' + fieldAcct(c.acct) + '</td>'
+                  +  '<td style="padding:3px 4px">' + fieldAcct(c.acct, !!(c.zJob && c.acct)) + '</td>'
                   +  (function (){
                         // Samo „✓" przy wpisanym numerze nie mowilo NIC — znaczylo tylko
                         // tyle, ze pole nie jest puste. Numer moze wskazywac cudze
@@ -71430,6 +71500,7 @@
                         } else {
                             kol = '#c47f00'; txt = 'brak bank_setting';
                         }
+                        if (c.zJob) txt += ' · <b>niezapisany</b> — bank i konto wejdą do ustawień dopiero po „Zapisz”';
                         return '<td style="padding:3px 4px;white-space:nowrap;color:' + kol + '">' + txt + '</td>';
                      })()
                   +  '<td style="padding:3px 4px;text-align:center">'
@@ -71475,9 +71546,10 @@
                 const m0 = box.querySelector('#mk-set-msg');
                 if (m0){
                     m0.style.color = sugN ? '#a16207' : '#c47f00';
-                    m0.textContent = sugN
+                    m0.textContent = (sugN
                         ? ('podpowiedzi: ' + sugN + ' z ' + keys.length + ' — sprawdź i zapisz')
-                        : ('mam ' + bsN + ' pozycji Bank settings — wybierz z listy w kolumnie bank_setting');
+                        : ('mam ' + bsN + ' pozycji Bank settings — wybierz z listy w kolumnie bank_setting'))
+                        + (niezapN ? (' · niezapisanych wierszy: ' + niezapN + ' — zwroty ich kont nie znają, dopóki nie klikniesz „Zapisz”') : '');
                 }
             }
             // Usuwanie wiersza ustawien. Pytamy KOMPLETEM tego, co zniknie — bez
@@ -71540,7 +71612,9 @@
         (function (){
             const o = box.querySelector('#mk-sh-on'), t = box.querySelector('#mk-sh-test'),
                   m = box.querySelector('#mk-sh-msg');
-            if (!u) return;
+            // Do 5.63.1 stalo tu „if (!u)" — pola adresu i klucza zniknely 29.10.2026 (`3e87af3`), a ich nazwy
+            // zostaly. ReferenceError przerywal renderSet, zanim podpial „Sprawdź", Furniture 1 i „↻ Odśwież".
+            if (!o || !t || !m) return;
             const bn = box.querySelector('#mk-sh-nazwy');
             if (bn) bn.onclick = async function(){
                 bn.disabled = true; m.style.color = '#666'; m.textContent = 'poprawiam nazwy…';
@@ -71574,13 +71648,12 @@
                 bn.disabled = false;
             };
             const put = function (){ shSave({ on: !!o.checked }); };
-            [u, s].forEach(function (el){ el.onchange = put; el.onblur = put; });
             o.onchange = put;
             t.onclick = async function(){
                 put(); t.disabled = true; m.style.color = '#666'; m.textContent = 'sprawdzam…';
                 try {
                     const c = shCfg();
-                    if (!c.url || !c.secret) throw new Error('podaj adres i SECRET');
+                    if (!c.url || !c.secret) throw new Error('brak ' + (c.url ? 'klucza' : 'adresu') + ' — wpisz go w ⚙ Ustawienia → Połączenia');
                     const r = await shReq('GET', c.url + (c.url.indexOf('?') < 0 ? '?' : '&') + 'secret=' + encodeURIComponent(c.secret));
                     // Nazwa zakladki spod GID nic nie mowi o tym, gdzie TRAFIA wiersz —
                     // ta jest dobierana po dacie wplaty. Pokazujemy wiec, czy zakladki
@@ -71621,14 +71694,9 @@
             const t = box.querySelector('#mk-f1-test'), m = box.querySelector('#mk-f1-msg');
             if (!t || !m) return;
             const pisz = function (tekst, kol){ m.style.color = kol || '#666'; m.textContent = tekst; };
-            const zapisz = function (){
-                try { f1Save({ url: u.value, secret: s.value }); return true; }
-                catch (e){ pisz('✗ ' + ((e && e.message) || e), '#c00'); return false; }
-            };
-            u.onchange = function (){ if (zapisz()) pisz('✓ zapisane', '#0a7a2f'); };
-            s.onchange = function (){ if (zapisz()) pisz('✓ zapisane', '#0a7a2f'); };
+            // Pol adresu i klucza tu juz nie ma (od 29.10.2026 wylacznie ⚙ Ustawienia -> Połączenia), wiec nie ma
+            // czego zapisywac — „Sprawdź" od razu pyta skrypt.
             t.onclick = async function (){
-                if (!zapisz()) return;
                 t.disabled = true;
                 pisz('sprawdzam… (przejście folderów HU i LT trwa do pół minuty)');
                 try {
@@ -73342,8 +73410,14 @@
                     // domenie (XXXL Group) HUB nie dziala, wiec lista rosla wylacznie o sklep
                     // biezacy. Mömax AT, XXXLutz CZ i RO nie bylyby odwiedzone nigdy, choc
                     // wiadomo, ze sa pod tym samym loginem. Sklep biezacy idzie pierwszy.
-                    const zPamieci = boot.ids || [];
+                    // Lista z /_menu (mkBoot) to sklepy, ktore TEN login widzi TERAZ — wiec to ona jest „potwierdzona".
+                    // Pamiec komputera bywa starsza (sklep zawieszony, inny login tego samego panelu, jak przy ADEO),
+                    // a sklep z pamieci szedl bez sprawdzenia: przy przelaczeniu, ktore nie weszlo, zostalby opisany
+                    // cudza etykieta. Gdy /_menu odpowiedzial, numery spoza niego sprawdzamy jak te z MK_SHOPID nizej.
+                    const zMenu = Array.isArray(boot.menu) && boot.menu.length ? boot.menu.map(String) : null;
+                    const zPamieci = zMenu || boot.ids || [];
                     const ids = zPamieci.slice();
+                    if (zMenu) (boot.ids || []).forEach(function (id){ if (ids.indexOf(String(id)) < 0) ids.push(String(id)); });
                     const zMapy = mkSklepyPanelu(host);
                     // Strona glowna nie zawsze niesie currentShopUUID. Bez sklepu wyjsciowego
                     // petla po numerach z mapy pomijala sklep biezacy spoza mapy i nie miala
@@ -73431,7 +73505,7 @@
                         ? (' Sprawdziłem ' + ile + ' sklep'
                            + (ile === 1 ? '' : (ile < 5 ? 'y' : 'ów'))
                            + ' na tym panelu: ' + odwiedzone.join(', ') + '.'
-                           + ((ile === 1 && !mkSklepyPanelu(host).length)
+                           + ((ile === 1 && !mkSklepyPanelu(host).length && !zMenu)   // z /_menu lista jest pelna — rada nic nie da
                                 ? ' Jeśli sklepów jest więcej, wejdź raz na panel — moduł zapamięta ich listę.'
                                 : ''))
                         : '';
@@ -78969,6 +79043,32 @@
             if (ile) jobsSaveScal(stare);
             migMark('obich-zwroty-brutto-553');
             if (ile) mkLog('obich', 'zwroty przeliczone na brutto w ' + ile + ' zleceniach OBI CH (jednorazowo, 5.53)');
+        } catch (e){}
+    }
+    // Jednorazowo (5.63): zlecenia pobrane, zanim sklepy Carrefour FR 3052 i Leroy PT/RO dostaly w MK_SHOPID jawna
+    // nazwe, trzymaja w data.shop nazwe z panelu („Beliani France") albo numer („Leroy Merlin · sklep 14955"). Od tej
+    // nazwy zalezy klucz ustawien — czyli konto zwrotow i bank_setting importu — wiec bez przepisania zostalyby przy
+    // starym kluczu az do wyczyszczenia listy. Rusza wylacznie te dokladne nazwy; ustawienia przenosi setLoad.
+    if (onProlo && !migDone('sklepy-nazwy-563')){
+        try {
+            const stare = jobsLoad();
+            let ile = 0;
+            Object.keys(stare).forEach(function (k){
+                const j = stare[k];
+                if (!j || !j.data || !j.data.shop) return;
+                const s = String(j.data.shop);
+                let nowa = '';
+                if (j.mp === 'Mirakl (Carrefour)' && s === 'Beliani France') nowa = 'Carrefour FR';
+                const m = s.match(/^Leroy Merlin · sklep (\d+)$/);
+                if (j.mp === 'Mirakl (Leroy)' && m){
+                    const w = mkShopWpis(m[1], MK_LEROY_HOST);
+                    if (w && w.shop) nowa = w.shop;
+                }
+                if (nowa && nowa !== s){ j.data.shop = nowa; ile++; }
+            });
+            if (ile) jobsSaveScal(stare);
+            migMark('sklepy-nazwy-563');
+            if (ile) mkLog('mirakl', 'nazwy sklepów poprawione w ' + ile + ' zleceniach (Carrefour FR, Leroy PT/RO — jednorazowo, 5.63)');
         } catch (e){}
     }
     render();
@@ -111233,7 +111333,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '63f8c46 · 03.11.2026 10:31';
+    const HUB_BUDOWA = '2809131 · 03.11.2026 12:21';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
