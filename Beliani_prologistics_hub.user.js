@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.2
+// @version      5.63.3
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -49,6 +49,7 @@
 // @connect      leenbakker.nl
 // @connect      castorama.fr
 // @connect      castorama.pl
+// @connect      home-you.com
 // @connect      xxxlgroup.com
 // @connect      bricodepot.es
 // @connect      homedeco.nl
@@ -36996,6 +36997,13 @@
         // uklad MK_HDR, jak Castorama PL. Odczytane 13.10.2026 z ustawienia #257 (paczek importu jeszcze
         // nie ma — dotad zespol ksiegowal brutto zamowienia recznie na auftragu, na 1376).
         'Mirakl (Cultura) · Cultura FR': { bank: '257', booking: '9', acct: '1376' },
+        // Bricomarché FR: panel bricomarchefr-prod.mirakl.net, sklep 3464. Import 229 „BRICOMARCHE FR":
+        // EUR, konto 1529, booking 9 (Fulfillment No), numer w kol. 5, kwota w 14 (MK_KOL_KWOTA). Odczyt 03.11.2026.
+        // Wplata z UBS (Mangopay „SAS EQUIPEMEN") dalej tylko dopisuje sie do arkusza; zlecenie z arkusza.
+        'Mirakl (Bricomarche) · Bricomarche FR': { bank: '229', booking: '9', acct: '1529' },
+        // Home&You PL: panel marketplace.home-you.com, sklep 2064. Import 178 „Home & You Beliani PL":
+        // PLN, konto 1120, booking 9, numer w kol. 5, kwota w 14 (MK_KOL_KWOTA). Odczyt 03.11.2026.
+        'Mirakl (Home&You) · Home&You PL': { bank: '178', booking: '9', acct: '1120' },
         // Hobbybox SE i DK: ten sam panel co Hobbybox FI (ipagencyfi-prod.mirakl.net), sklepy 4314 „Beliani SE" (SEK)
         // i 4313 „Beliani DK" (DKK) — w MK_SHOPID z jawnymi nazwami. Ustawienia 259 „Hobbybox SE" (SEK, konto 1540)
         // i 260 „Hobbybox DK" (DKK, konto 1541) to kopie 226 „Hobbybox FI": booking 9, data w kolumnie 3, numer w 5,
@@ -40433,6 +40441,15 @@
         // na UBS 01.09.2026: „237151 SAS EQUIPEMEN"). Zlecenia nie zakladamy — wplata ma
         // trafic do arkusza (ustalone 17.09.2026). MUSI stac przed zapasowa „nieznany sklep".
         { mp: 'Bricomarche',    ok: false, payer: /MANGOPAY/i, ref: /(SAS\s*EQUIPEMEN)/i, ark: 'Bricomarche FR' },
+        // Bricomarché FR — pelny automat „z arkusza" (decyzja uzytkownika 03.11.2026). Panel
+        // bricomarchefr-prod.mirakl.net, jeden sklep 3464 „BELIANI FR" (MK_SHOPID z jawna nazwa
+        // „Bricomarche FR"), EUR, cykle miesieczne (pspName NOT_SPECIFIED). Wplata z UBS (Mangopay
+        // „… SAS EQUIPEMEN") DALEJ tylko dopisuje sie do arkusza regula ok:false WYZEJ — decyzja z 17.09.2026
+        // nietknieta. Ta regula ok:true daje mkCele cel „Bricomarche FR" z HOSTEM: zlecenie zakladasz
+        // „z arkusza" albo „+ Dodaj wplate", a HUB pobiera cykl z panelu po kwocie i buduje plik na 229/1529.
+        // Platnik /(?!)/ nie trafia NIGDY (mkDetect jako jedyny czyta r.payer) — jak Cultura FR i B&Q UK.
+        { mp: 'Mirakl (Bricomarche)', ok: true, payer: /(?!)/, brand: 'Bricomarche', short: 'Bricomarche',
+          host: 'bricomarchefr-prod.mirakl.net', shop: 'Bricomarche FR', cur: 'EUR' },
         // B&Q UK (Kingfisher) — wyplata co dwa tygodnie w GBP, na konto 1146. Wyciagu tego konta nikt do HUB-a
         // nie wgrywa, wiec zlecenie bierze sie Z ARKUSZA („B&Q UK") albo z „+ Dodaj wpłatę" — tak samo jak
         // Castorama PL i Cultura FR. Platnik /(?!)/ nie trafia NIGDY: regula istnieje po to, zeby cel „B&Q UK"
@@ -40619,6 +40636,14 @@
         // Cykl dobiera sie po kwocie (mkMatchAmt), waluta celu to domyslne EUR.
         { mp: 'Mirakl (Cultura)', ok: true, payer: /(?!)/,
           brand: 'Cultura', short: 'Cultura', host: 'culturafr-prod.mirakl.net' },
+        // Home&You PL — panel marketplace.home-you.com (wlasna domena, stad osobny @connect home-you.com),
+        // jeden sklep 2064 „Beliani" (MK_SHOPID z jawna nazwa „Home&You PL"), PLN, cykle dwa razy w miesiacu
+        // (ok. 14. i koniec miesiaca, pspName NOT_SPECIFIED). Wyplata wplywa na konto PLN, ktorego wyciagu
+        // HUB nie wczytuje — zlecenie bierze sie „z arkusza" („Home&You PL") albo z „+ Dodaj wplate", tak samo
+        // jak Castorama PL i Cultura FR. Platnik /(?!)/ nie trafia nigdy; regula daje mkCele cel z hostem.
+        // Import 178 „Home & You Beliani PL": PLN, konto 1120, booking 9, kwota w kol. 14 (MK_KOL_KWOTA).
+        { mp: 'Mirakl (Home&You)', ok: true, payer: /(?!)/, brand: 'Home&You', short: 'Home&You',
+          host: 'marketplace.home-you.com', shop: 'Home&You PL', cur: 'PLN' },
         // Bloop PT placi przez Stripe: platnik „STRIPE PAYMENTS UK LTD", tytul „BLOOP <kod>".
         { mp: 'Bloop',          ok: false, payer: /STRIPE/i, ref: /(BLOOP)/i, ark: 'Bloop PT' },
         // Furniture 1 — DWOCH platnikow, jedno konto 1124, dwie etykiety (ustalone 17.09.2026):
@@ -41595,7 +41620,17 @@
         '3481': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
         '2999': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
         '3436': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
-        '4820': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' }
+        '4820': { mp: 'Mirakl (Home24)', brand: 'Home24', short: 'Home24', host: 'home24.mirakl.net' },
+        // Bricomarché FR: sklep 3464 odczytany 03.11.2026 z panelu (/_usercontext currentShop 3464,
+        // shops/current „BELIANI FR", EUR; jedyny sklep loginu). Nazwe wpisujemy jawnie — panel mowi
+        // „BELIANI FR", a etykieta z _Markety to „Bricomarche FR" (jak Cultura „Beliani.fr" -> „Cultura FR").
+        '3464': { mp: 'Mirakl (Bricomarche)', brand: 'Bricomarche', short: 'Bricomarche',
+                  host: 'bricomarchefr-prod.mirakl.net', shop: 'Bricomarche FR', cur: 'EUR' },
+        // Home&You PL: sklep 2064 odczytany 03.11.2026 z panelu (/_usercontext currentShop 2064,
+        // shops/current „Beliani", PLN; jedyny sklep loginu). Nazwe wpisujemy jawnie — panel mowi
+        // „Beliani", a etykieta z _Markety to „Home&You PL".
+        '2064': { mp: 'Mirakl (Home&You)', brand: 'Home&You', short: 'Home&You',
+                  host: 'marketplace.home-you.com', shop: 'Home&You PL', cur: 'PLN' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -42064,7 +42099,11 @@
         'Altex': 13,
         // Limango Mirakl — ustawienie 254 czyta kwote z 14. kolumny (N). Tak samo zbudowane sa paczki
         // wgrywane dotad recznie (2202035, 2202384, 2202402: 26 kolumn, „Amount" na 14. pozycji).
-        'Limango': 13 };
+        'Limango': 13,
+        // Bricomarché FR (229) i Home&You PL (178) — ustawienia importu czytaja kwote z 14. kolumny (N),
+        // a domyslny uklad Mirakla stawia ja w 15. (O). Odczyt ustawien 03.11.2026 (amount_column_number „14",
+        // tak samo jak Altex 258 i Leroy). numer zamowienia dalej w 5. kolumnie (c[4]), zgodny z descr/ff col 5.
+        'Mirakl (Bricomarche)': 13, 'Mirakl (Home&You)': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -111333,7 +111372,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '1e7ccf2 · 03.11.2026 12:41';
+    const HUB_BUDOWA = '514a41a · 03.11.2026 14:11';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -112084,8 +112123,19 @@
                 // Reczne sprawdzenie odswieza tez stan automatu: kopie w pamieci i wiersz \u201eUaktualnij" w menu.
                 try { verZapiszDoPamieci(w.latest); verMenuZnacznik(w.latest); } catch(e){}
                 if (verCmp(w.latest, current) > 0) {
-                    if (confirm('Nowa wersja: ' + w.latest + ' (masz ' + current + ').' + obcy + tip + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
+                    // Instalacje tej wersji otwarto po zaladowaniu karty \u2014 nie proponujemy jej drugi raz, tylko odswiezenie.
+                    const st = verInstStan(w.latest);
+                    if (st === 'odswiez') { verPytajOdswiez(w.latest); return; }
+                    const nieweszla = st === 'nieweszla'
+                        ? '\n\nInstalacj\u0119 tej wersji ju\u017c otwierano, a ta strona (za\u0142adowana p\u00f3\u017aniej) dalej dzia\u0142a na ' + current
+                          + ' \u2014 aktualizacja w mened\u017cerze skrypt\u00f3w chyba nie zosta\u0142a zatwierdzona.'
+                        : '';
+                    if (confirm('Nowa wersja: ' + w.latest + ' (masz ' + current + ').' + nieweszla + obcy + tip
+                        + '\n\nPo zainstalowaniu od\u015bwie\u017c stron\u0119 (F5) \u2014 dopiero wtedy zacznie dzia\u0142a\u0107 nowa wersja.'
+                        + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
                         window.open(RAW, '_blank');
+                        verInstZapisz(w.latest);
+                        try { verBanerPokaz(w.latest, 'odswiez'); verBtnKropka(true); menuMaluj(); } catch(e){}
                     }
                 } else {
                     alert('Masz najnowsz\u0105 wersj\u0119 (' + current + ').\nGitHub podaje ' + w.latest + ' \u2014 zapyta\u0142em: ' + RAW
@@ -112142,6 +112192,12 @@
         // i kto sprawdzil tuz przed wgraniem nowej wersji, przez 3 h widzial „masz najnowsza".
         const VER_WAZNE = 15 * 60e3;
         const VER_ODLOZ = HUB + 'wersja_odlozona_v1';   // numer wersji schowanej guzikiem „Pozniej"
+        // Slad otwarcia instalacji: { wersja, ts }. Bez niego karta po „Uaktualnij" dalej pokazywala „jest nowsza"
+        // (dziala na kodzie z chwili zaladowania, GM_info mowi stara wersje), a klik dawal instalacje drugi,
+        // trzeci raz — „mozna aktualizowac w nieskonczonosc" (zgloszenie 03.11.2026). Ta sama wartosc w GM widza
+        // wszystkie karty, wiec karta otwarta wczesniej tez wie, ze wystarczy F5.
+        const VER_INST  = HUB + 'wersja_instalacja_v1';
+        const VER_START = Date.now();                    // chwila startu kodu w TEJ karcie (porownywana ze sladem)
         let verDostepna = '';                            // numer nowszej wersji, gdy jest — czyta go menuMaluj
         let verAktualna = false;                         // true = sprawdzone i masz najnowsza (zielony wiersz w menu)
         function verTeraz(){ try { if (typeof GM_info !== 'undefined' && GM_info.script) return GM_info.script.version || '?'; } catch(e){} return '?'; }
@@ -112150,16 +112206,48 @@
         function verNowsza(latest){ return !!latest && verCmp(latest, verTeraz()) > 0; }
         function verOdczytZPamieci(){ try { const s = GM_getValue(VER_KEY, ''); return s ? JSON.parse(s) : null; } catch(e){ return null; } }
         function verZapiszDoPamieci(latest){ try { GM_setValue(VER_KEY, JSON.stringify({ latest: latest, ts: Date.now() })); } catch(e){} }
+        function verInstOdczyt(){ try { const s = GM_getValue(VER_INST, ''); const o = s ? JSON.parse(s) : null; return (o && o.wersja) ? o : null; } catch(e){ return null; } }
+        function verInstZapisz(wersja){ if (!wersja) return; try { GM_setValue(VER_INST, JSON.stringify({ wersja: String(wersja), ts: Date.now() })); } catch(e){} }
+        function verGodz(ts){ const d = new Date(Number(ts) || 0); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+        // Co wiadomo o instalacji wersji „latest" (albo nowszej):
+        //  ''          — nikt jej nie otwieral albo ta karta juz dziala na tej wersji;
+        //  'odswiez'   — instalacje otwarto PO zaladowaniu tej strony: karta dziala na starym kodzie, wystarczy F5;
+        //  'nieweszla' — strona zaladowala sie juz PO otwarciu instalacji, a dalej ma stara wersje: instalacja nie doszla.
+        function verInstStan(latest){
+            const m = verInstOdczyt();
+            if (!m || !latest || verCmp(m.wersja, latest) < 0) return '';
+            if (!verNowsza(m.wersja)) return '';
+            return (Number(m.ts) || 0) >= VER_START ? 'odswiez' : 'nieweszla';
+        }
         // Otwarcie instalacji: link RAW do schowka + strona instalacji (menedzer skryptow przechwytuje .user.js).
         // Window.open w handlerze klikniecia (gest uzytkownika), wiec popup-blocker go nie zdejmie.
-        function verOtworzInstalacje(){
+        function verOtworzInstalacje(latest){
             let copied = false;
             try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(VER_RAW, 'text'); copied = true; } } catch(e){}
             try { window.open(VER_RAW, '_blank'); } catch(e){}
+            verInstZapisz(latest || verDostepna);
             alert('Aktualizacja HUB-a:\n\n'
                 + (copied ? '\ud83d\udccb Link RAW jest w schowku.\n' : 'Link RAW:\n' + VER_RAW + '\n')
                 + '\u2022 ScriptCat: przy skrypcie „Sprawd\u017a aktualizacje" (albo Link Import \u2192 wklej \u2192 OK)\n'
-                + '\u2022 Otworzy\u0142em stron\u0119 instalacji — potwierd\u017a w mened\u017cerze skrypt\u00f3w.');
+                + '\u2022 Otworzy\u0142em stron\u0119 instalacji — potwierd\u017a w mened\u017cerze skrypt\u00f3w.\n\n'
+                + 'Po zainstalowaniu od\u015bwie\u017c t\u0119 stron\u0119 (F5). Do tego czasu ta karta (i inne karty otwarte wcze\u015bniej) '
+                + 'dzia\u0142a na starej wersji i mo\u017ce dalej pokazywa\u0107 „jest nowsza" \u2014 drugi raz instalowa\u0107 nie trzeba.');
+        }
+        // Pytanie w karcie, w ktorej instalacje juz otwarto: najpierw odswiezenie, a dopiero gdy ktos go nie chce
+        // — czy otworzyc instalacje jeszcze raz (na wypadek, gdyby nie doszla do skutku).
+        function verPytajOdswiez(latest){
+            const m = verInstOdczyt();
+            if (confirm('Instalacj\u0119 wersji ' + latest + (m ? ' otwarto o ' + verGodz(m.ts) : ' ju\u017c otwarto') + '.\n'
+                + 'Ta karta dzia\u0142a jeszcze na HUB ' + verTeraz() + ' \u2014 nowa wersja zacznie dzia\u0142a\u0107 dopiero po od\u015bwie\u017ceniu strony.\n\n'
+                + 'OK \u2014 od\u015bwie\u017c stron\u0119 teraz (F5).\nAnuluj \u2014 nie od\u015bwie\u017caj.')) {
+                try { location.reload(); } catch(e){}
+                return;
+            }
+            if (confirm('Otworzy\u0107 stron\u0119 instalacji wersji ' + latest + ' jeszcze raz?\n\n'
+                + 'Tylko gdy instalacja nie dosz\u0142a do skutku \u2014 po zatwierdzonej aktualizacji wystarczy F5.')) {
+                verOtworzInstalacje(latest);
+                verBanerPokaz(latest, 'odswiez');
+            }
         }
         // Czerwona kropka na guziku „Narzędzia" — zeby bylo widac, ze jest nowsza wersja,
         // bez otwierania menu. Kropka siedzi na samym btn (nie na panelu), wiec przezywa
@@ -112170,12 +112258,14 @@
                 if (!d) {
                     d = document.createElement('span');
                     d.className = 'bl-upd-kropka';
-                    d.title = 'Jest nowsza wersja HUB-a — „Narzędzia" → „Uaktualnij"';
                     d.style.cssText = 'position:absolute;top:-3px;right:-3px;width:11px;height:11px;border-radius:50%;'
                         + 'background:#dc2626;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.2);pointer-events:none;z-index:1';
                     btn.style.position = 'relative';   // relative bez przesuniec nie rusza guzika; wrap i tak jest position:fixed
                     btn.appendChild(d);
                 }
+                d.title = (verDostepna && verInstStan(verDostepna) === 'odswiez')
+                    ? 'Nowa wersja HUB-a zainstalowana — odśwież stronę (F5)'
+                    : 'Jest nowsza wersja HUB-a — „Narzędzia" → „Uaktualnij"';
             } else if (d && d.parentNode) {
                 d.parentNode.removeChild(d);
             }
@@ -112189,32 +112279,119 @@
             try { menuMaluj(); } catch(e){}
         }
         function verBanerSchowaj(){ const b = document.getElementById('beliani-wersja-baner'); if (b && b.parentNode) b.parentNode.removeChild(b); }
-        function verBanerPokaz(latest){
+        // Baner w trzech trybach (atrybut data-tryb):
+        //  'nowa'      — jest nowsza wersja: „Uaktualnij" / „Pozniej";
+        //  'nieweszla' — instalacje tej wersji juz otwierano, a strona zaladowana pozniej dalej ma stara: „Uaktualnij jeszcze raz";
+        //  'odswiez'   — instalacje otwarto po zaladowaniu tej karty: guzik „Odswiez strone", BEZ drugiego „Uaktualnij".
+        // Po kliknieciu „Uaktualnij" baner nie znika, tylko przechodzi w 'odswiez' — dotad znikal i wracal w kolejnej
+        // karcie z „Uaktualnij", co wygladalo, jakby instalacja nie weszla.
+        function verBanerPokaz(latest, tryb){
             verBanerSchowaj();
+            tryb = tryb || 'nowa';
+            const odsw = tryb === 'odswiez';
+            const m = verInstOdczyt();
             const box = document.createElement('div');
             box.id = 'beliani-wersja-baner';
+            box.setAttribute('data-tryb', tryb);
+            box.setAttribute('data-wersja', String(latest));
             box.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483646;'
-                + 'background:#fffbeb;border:1px solid #f59e0b;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);'
-                + 'padding:12px 16px;max-width:min(520px,92vw);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;color:#422006';
+                + (odsw ? 'background:#eff6ff;border:1px solid #3b82f6;color:#1e3a8a;'
+                        : 'background:#fffbeb;border:1px solid #f59e0b;color:#422006;')
+                + 'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);'
+                + 'padding:12px 16px;max-width:min(520px,92vw);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif';
+            const kol = odsw ? '#1e40af' : '#92400e';
+            let tytul, opis, glowny;
+            if (odsw) {
+                tytul = '↻ Nowa wersja ' + blEsc(latest) + ' — odśwież stronę';
+                opis = 'Ta karta działa jeszcze na HUB ' + blEsc(verTeraz())
+                    + (m ? ' (instalację otwarto o ' + verGodz(m.ts) + ')' : '') + '. '
+                    + 'Gdy w menedżerze skryptów aktualizacja jest już zatwierdzona („Aktualizuj"), naciśnij F5 — '
+                    + 'nowa wersja zacznie działać dopiero po odświeżeniu strony. <b>Drugi raz instalować nie trzeba.</b>'
+                    + '<div style="margin-top:6px;font-size:12px"><a href="#" id="bl-ver-znowu" style="color:#1e40af">'
+                    + 'nie zainstalowało się? otwórz instalację jeszcze raz</a></div>';
+                glowny = '<button type="button" id="bl-ver-odswiez" style="padding:6px 14px;border:0;border-radius:7px;background:#1d4ed8;color:#fff;font-weight:600;cursor:pointer">↻ Odśwież stronę</button>';
+            } else if (tryb === 'nieweszla') {
+                tytul = '🔄 Instalacja wersji ' + blEsc(latest) + ' nie weszła?';
+                opis = 'Instalację otwierano' + (m ? ' o ' + verGodz(m.ts) : '') + ', a ta strona — załadowana już później — '
+                    + 'dalej działa na HUB ' + blEsc(verTeraz()) + '. W menedżerze skryptów trzeba zatwierdzić aktualizację '
+                    + '(„Aktualizuj"), a potem odświeżyć stronę (F5).';
+                glowny = '<button type="button" id="bl-ver-teraz" style="padding:6px 14px;border:0;border-radius:7px;background:#b45309;color:#fff;font-weight:600;cursor:pointer">Uaktualnij jeszcze raz</button>';
+            } else {
+                tytul = '🔄 Jest nowsza wersja — czy chcesz uaktualnić?';
+                opis = 'Masz HUB ' + blEsc(verTeraz()) + ', najnowsza na GitHubie to <b>' + blEsc(latest) + '</b>.'
+                    + '<div style="margin-top:4px;font-size:12px">Po zainstalowaniu odśwież stronę (F5) — dopiero wtedy zacznie działać nowa wersja.</div>';
+                glowny = '<button type="button" id="bl-ver-teraz" style="padding:6px 14px;border:0;border-radius:7px;background:#b45309;color:#fff;font-weight:600;cursor:pointer">Uaktualnij</button>';
+            }
             box.innerHTML =
-                '<div style="font-weight:700;margin-bottom:4px">\ud83d\udd04 Jest nowsza wersja — czy chcesz uaktualni\u0107?</div>'
-              + '<div style="color:#92400e;margin-bottom:10px">Masz HUB ' + blEsc(verTeraz()) + ', najnowsza na GitHubie to <b>' + blEsc(latest) + '</b>.</div>'
+                '<div style="font-weight:700;margin-bottom:4px">' + tytul + '</div>'
+              + '<div style="color:' + kol + ';margin-bottom:10px">' + opis + '</div>'
               + '<div style="display:flex;gap:8px;justify-content:flex-end">'
-              + '<button type="button" id="bl-ver-pozniej" style="padding:6px 12px;border:1px solid #d6cfc2;border-radius:7px;background:#fff;cursor:pointer">P\u00f3\u017aniej</button>'
-              + '<button type="button" id="bl-ver-teraz" style="padding:6px 14px;border:0;border-radius:7px;background:#b45309;color:#fff;font-weight:600;cursor:pointer">Uaktualnij</button>'
+              + '<button type="button" id="bl-ver-pozniej" style="padding:6px 12px;border:1px solid #d6cfc2;border-radius:7px;background:#fff;cursor:pointer">Później</button>'
+              + glowny
               + '</div>';
             document.body.appendChild(box);
             const teraz = box.querySelector('#bl-ver-teraz');
-            if (teraz) teraz.addEventListener('click', function(){ verBanerSchowaj(); verOtworzInstalacje(); });
+            if (teraz) teraz.addEventListener('click', function(){
+                verOtworzInstalacje(latest);
+                verBanerPokaz(latest, 'odswiez');
+                try { verBtnKropka(!!verDostepna); } catch(e){}
+                try { menuMaluj(); } catch(e){}
+            });
+            const ods = box.querySelector('#bl-ver-odswiez');
+            if (ods) ods.addEventListener('click', function(){ try { location.reload(); } catch(e){} });
+            const znowu = box.querySelector('#bl-ver-znowu');
+            if (znowu) znowu.addEventListener('click', function(e){
+                e.preventDefault();
+                verOtworzInstalacje(latest);
+                verBanerPokaz(latest, 'odswiez');
+            });
             const poz = box.querySelector('#bl-ver-pozniej');
-            if (poz) poz.addEventListener('click', function(){ try { GM_setValue(VER_ODLOZ, latest); } catch(e){} verBanerSchowaj(); });
+            // „Pozniej" przy odswiezeniu chowa baner tylko w tej karcie — wersji nie odkladamy, bo instalacja juz poszla.
+            if (poz) poz.addEventListener('click', function(){ if (!odsw) { try { GM_setValue(VER_ODLOZ, latest); } catch(e){} } verBanerSchowaj(); });
         }
         function verMozeBaner(latest){
             verMenuZnacznik(latest);                 // zawsze: ustawia verDostepna i odswieza wiersz w menu
             if (!verNowsza(latest)) return;
+            const st = verInstStan(latest);
+            if (st === 'odswiez') { verBanerPokaz(latest, 'odswiez'); return; }   // instalacje otwarto po zaladowaniu tej karty
             let odloz = ''; try { odloz = GM_getValue(VER_ODLOZ, '') || ''; } catch(e){}
             if (odloz && verCmp(latest, odloz) <= 0) return;   // ta wersja (albo starsza) juz schowana „Pozniej"
-            verBanerPokaz(latest);
+            verBanerPokaz(latest, st === 'nieweszla' ? 'nieweszla' : 'nowa');
+        }
+        // Slad instalacji zapisany w INNEJ karcie (albo powrot na te karte): zwykly baner przechodzi w „odswiez",
+        // a wiersz menu i kropka mowia to samo. Schowanego banera nie wyciagamy z powrotem.
+        function verInstZmiana(){
+            if (!verDostepna) return;
+            try { verBtnKropka(true); } catch(e){}
+            try { menuMaluj(); } catch(e){}
+            const b = document.getElementById('beliani-wersja-baner');
+            if (b && b.getAttribute('data-tryb') !== 'odswiez' && verInstStan(verDostepna) === 'odswiez') verBanerPokaz(verDostepna, 'odswiez');
+        }
+        try { if (typeof GM_addValueChangeListener === 'function') GM_addValueChangeListener(VER_INST, function(){ verInstZmiana(); }); } catch(e){}
+        try { document.addEventListener('visibilitychange', function(){ if (!document.hidden) verInstZmiana(); }); } catch(e){}
+        // Wiersz „Uaktualnij" w menu (rysuje go menuMaluj) i jego klikniecie. Cztery stany: odswiez strone (instalacje
+        // otwarto po zaladowaniu tej karty), jest nowsza, masz najnowsza, nie sprawdzone.
+        function verMenuWiersz(){
+            if (verDostepna && verInstStan(verDostepna) === 'odswiez') {
+                return '<button class="bl-row" id="bl-update" style="background:#dbeafe;color:#1e3a8a;font-weight:600" '
+                     + 'title="Instalację nowej wersji już otwarto — ta karta działa na starej, wystarczy odświeżyć stronę"><span class="bl-emoji">↻</span>'
+                     + 'Odśwież stronę — wersja ' + blEsc(verDostepna) + ' zainstalowana (ta karta: ' + blEsc(verTeraz()) + ')</button>';
+            }
+            if (verDostepna) {
+                return '<button class="bl-row" id="bl-update" style="background:#fef3c7;color:#92400e;font-weight:600" '
+                     + 'title="Na GitHubie jest nowsza wersja HUB-a — kliknij, aby zaktualizować"><span class="bl-emoji">🔄</span>'
+                     + 'Uaktualnij — jest nowsza (' + blEsc(verDostepna) + ')!</button>';
+            }
+            if (verAktualna) {
+                return '<button class="bl-row" id="bl-update" style="color:#15803d" '
+                     + 'title="Masz najnowszą wersję HUB-a — kliknij, aby sprawdzić ponownie"><span class="bl-emoji">✅</span>'
+                     + 'Masz najnowszą (' + blEsc(verTeraz()) + ') — sprawdź ponownie</button>';
+            }
+            return '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
+        }
+        function verMenuKlik(){
+            if (verDostepna && verInstStan(verDostepna) === 'odswiez') { verPytajOdswiez(verDostepna); return; }
+            checkUpdate();
         }
         function verSprawdzZGitHub(cb){ verPobierz(VER_RAW, function(w){ cb(w.latest); }); }
         function verAuto(){
@@ -112816,17 +112993,7 @@
             html += reszta.map(wiersz).join('');
             if (!poz.length) html += '<div class="bl-build">Wszystkie narzędzia schowane — „⚙ Ustawienia" → „Moduły".</div>';
             html += '<div class="bl-sep"></div>';
-            if (verDostepna) {
-                html += '<button class="bl-row" id="bl-update" style="background:#fef3c7;color:#92400e;font-weight:600" '
-                      + 'title="Na GitHubie jest nowsza wersja HUB-a — kliknij, aby zaktualizować"><span class="bl-emoji">🔄</span>'
-                      + 'Uaktualnij — jest nowsza (' + blEsc(verDostepna) + ')!</button>';
-            } else if (verAktualna) {
-                html += '<button class="bl-row" id="bl-update" style="color:#15803d" '
-                      + 'title="Masz najnowszą wersję HUB-a — kliknij, aby sprawdzić ponownie"><span class="bl-emoji">✅</span>'
-                      + 'Masz najnowszą (' + blEsc(verTeraz()) + ') — sprawdź ponownie</button>';
-            } else {
-                html += '<button class="bl-row" id="bl-update"><span class="bl-emoji">🔄</span>Uaktualnij (sprawdź wersję)</button>';
-            }
+            html += verMenuWiersz();
             // Stopka ze znacznikiem budowy. Znak zastepczy (plik wklejony prosto z repo, nie z kopii)
             // poznajemy po podkresleniach na poczatku — sam znak nie moze tu stac drugi raz,
             // bo kopia-wersji.sh podmienia go i sprawdza, ze wystepuje dokladnie raz.
@@ -112864,7 +113031,7 @@
             const so = panel.querySelector('#bl-set-open');
             if (so) so.addEventListener('click', function(e){ e.stopPropagation(); panel.style.display = 'none'; setOtworz(); });
             const upd = panel.querySelector('#bl-update');
-            if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; checkUpdate(); });
+            if (upd) upd.addEventListener('click', function(){ panel.style.display = 'none'; verMenuKlik(); });
             if (panel.style.display !== 'none') placePanel();
         }
 
