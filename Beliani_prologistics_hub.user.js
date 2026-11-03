@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.1
+// @version      5.63.2
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -111333,7 +111333,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2809131 · 03.11.2026 12:21';
+    const HUB_BUDOWA = '1e7ccf2 · 03.11.2026 12:41';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -112051,8 +112051,7 @@
         const panel = document.createElement('div'); panel.id = 'beliani-launch-panel'; panel.style.display = 'none';
 
         function checkUpdate(){
-            var RAW = 'https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
-            try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) RAW = GM_info.script.downloadURL; } catch(e){}
+            var RAW = verAdres();
             var copied = false;
             try { if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(RAW, 'text'); copied = true; } } catch(e){}
             // navigator.clipboard.writeText zwraca Promise — samo wejscie do try NIE znaczy,
@@ -112072,45 +112071,76 @@
             var tip = copied
                 ? '\n\n\ud83d\udccb Link RAW skopiowany do schowka.\n\u2022 ScriptCat: Link Import \u2192 wklej (Ctrl+V) \u2192 OK  (albo przy skrypcie: Sprawd\u017a aktualizacje)\n\u2022 Tampermonkey: potwierd\u017a poni\u017cej, aby otworzy\u0107 stron\u0119 instalacji'
                 : '\n\nLink RAW: ' + RAW;
-            var current = '?';
-            try { if (typeof GM_info !== 'undefined' && GM_info.script) current = GM_info.script.version || '?'; } catch(e){}
-            function cmp(a,b){ var pa=String(a).split('.').map(Number), pb=String(b).split('.').map(Number); for (var i=0;i<Math.max(pa.length,pb.length);i++){ var x=pa[i]||0, y=pb[i]||0; if (x!==y) return x-y; } return 0; }
-            try {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: RAW + '?t=' + Date.now(),
-                    onload: function(resp){
-                        var m = (resp.responseText || '').match(/@version\s+([0-9.]+)/);
-                        var latest = m ? m[1] : null;
-                        if (!latest) { alert('Nie uda\u0142o si\u0119 odczyta\u0107 wersji z GitHub.' + tip); return; }
-                        // Reczne sprawdzenie odswieza tez stan automatu: kopie w pamieci i wiersz \u201eUaktualnij" w menu.
-                        try { verZapiszDoPamieci(latest); verMenuZnacznik(latest); } catch(e){}
-                        if (cmp(latest, current) > 0) {
-                            if (confirm('Nowa wersja: ' + latest + ' (masz ' + current + ').' + tip + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
-                                window.open(RAW, '_blank');
-                            }
-                        } else {
-                            alert('Masz najnowsz\u0105 wersj\u0119 (' + current + ').' + tip);
-                        }
-                    },
-                    onerror: function(){ alert('Nie uda\u0142o si\u0119 sprawdzi\u0107 wersji (po\u0142\u0105czenie).' + tip); }
-                });
-            } catch(e){ window.open(RAW, '_blank'); }
+            var current = verTeraz();
+            // Do 5.63.1 komunikat mowil tylko \u201eMasz najnowsza (5.63)" \u2014 nie bylo widac, KOGO HUB zapytal ani co
+            // uslyszal. Przy instalacji z innego linku (np. ze strony konkretnego commita) HUB pyta tamten adres
+            // i dostaje zawsze ten sam, stary plik; bez adresu w komunikacie nie dalo sie tego rozpoznac.
+            var obcy = verAdresInny(RAW)
+                ? '\n\n\u26a0 HUB pyta o wersj\u0119 pod adresem INNYM ni\u017c g\u0142\u00f3wny (tak zosta\u0142 zainstalowany). '
+                  + 'Je\u015bli ta wersja jest stara, zainstaluj HUB raz od nowa z g\u0142\u00f3wnego linku:\n' + verAdresGlowny()
+                : '';
+            verPobierz(RAW, function(w){
+                if (!w.latest) { alert('Nie uda\u0142o si\u0119 sprawdzi\u0107 wersji na GitHubie (' + w.blad + ').\nAdres: ' + RAW + obcy + tip); return; }
+                // Reczne sprawdzenie odswieza tez stan automatu: kopie w pamieci i wiersz \u201eUaktualnij" w menu.
+                try { verZapiszDoPamieci(w.latest); verMenuZnacznik(w.latest); } catch(e){}
+                if (verCmp(w.latest, current) > 0) {
+                    if (confirm('Nowa wersja: ' + w.latest + ' (masz ' + current + ').' + obcy + tip + '\n\nOtworzy\u0107 stron\u0119 instalacji teraz?')) {
+                        window.open(RAW, '_blank');
+                    }
+                } else {
+                    alert('Masz najnowsz\u0105 wersj\u0119 (' + current + ').\nGitHub podaje ' + w.latest + ' \u2014 zapyta\u0142em: ' + RAW
+                        + '\nGitHub trzyma kopi\u0119 pliku do 5 minut: tu\u017c po wgraniu nowej wersji mo\u017ce jeszcze podawa\u0107 poprzedni\u0105 \u2014 sprawd\u017a ponownie za chwil\u0119.'
+                        + obcy + tip);
+                }
+            });
         }
 
         // ===== Automatyczne wykrywanie nowszej wersji ==============================
-        // Przy wczytaniu strony HUB sam pyta GitHub o najnowsza wersje (RAW, raz na
-        // kilka godzin — tak samo oszczednie jak kropka „nowosci" w Changelogu). Gdy na
+        // Przy wczytaniu strony HUB sam pyta GitHub o najnowsza wersje (RAW, sam poczatek
+        // pliku, najwyzej raz na 15 min — VER_WAZNE). Gdy na
         // GitHubie jest nowsza, pokazuje komunikat „Jest nowsza wersja, czy chcesz
         // uaktualnic?" z guzikiem „Uaktualnij". „Pozniej" chowa komunikat do czasu, az
         // pojawi sie JESZCZE nowsza wersja. Niezaleznie od komunikatu wiersz „Uaktualnij"
         // w menu podswietla sie numerem nowej wersji — zostaje nawet po schowaniu komunikatu.
-        const VER_RAW = (function(){
-            let u = 'https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js';
+        // Funkcje, nie stale: checkUpdate stoi w pliku wyzej i bywa wolany z ustawien — deklaracja funkcji
+        // jest gotowa od poczatku, a const czytany przed swoja linia rzucilby ReferenceError.
+        function verAdresGlowny(){ return 'https://raw.githubusercontent.com/financearchive-dev/beliani-userscripts/main/Beliani_prologistics_hub.user.js'; }
+        function verAdres(){
+            let u = verAdresGlowny();
             try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) u = GM_info.script.downloadURL; } catch(e){}
             return u;
-        })();
+        }
+        // „Inny niz glowny" = nie ta galaz main tego repozytorium (np. link do konkretnego commita) — taki adres
+        // oddaje zawsze ten sam plik, wiec „najnowsza" stoi tam w miejscu. refs/heads/main to ten sam plik co main.
+        function verAdresInny(u){ return !/\/financearchive-dev\/beliani-userscripts\/(?:refs\/heads\/)?main\/Beliani_prologistics_hub\.user\.js(?:[?#]|$)/.test(String(u || '')); }
+        // Numer wersji z GitHuba. Pytamy tylko o POCZATEK pliku (Range 0-4095): @version stoi w 4. linii, a caly
+        // plik ma 7,6 MB — do 5.63.1 kazde sprawdzenie sciagalo go w calosci i dlatego automat pytal raz na 3 h.
+        // GitHub oddaje na to 206 z samym kawalkiem (sprawdzone 03.11.2026); serwer, ktory Range zignoruje,
+        // odda 200 z calym plikiem i odczyt dalej dziala. Dopisek ?t= NIE omija pamieci GitHuba (jego CDN pomija
+        // zapytanie w adresie, kopia zyje do 5 min) — zostaje tylko na pamiec przegladarki.
+        function verPobierz(url, cb){
+            let raz = false;
+            const kon = function(w){ if (raz) return; raz = true; try { cb(w); } catch(e){} };
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url + (url.indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now(), timeout: 20000,
+                    headers: { 'Range': 'bytes=0-4095' },
+                    onload: function(resp){
+                        const st = Number(resp && resp.status) || 0;
+                        if (st && st !== 200 && st !== 206) { kon({ latest: null, url: url, blad: 'HTTP ' + st }); return; }
+                        const m = String((resp && resp.responseText) || '').match(/@version\s+([0-9.]+)/);
+                        kon(m ? { latest: m[1], url: url } : { latest: null, url: url, blad: 'w odpowiedzi nie ma linii @version' });
+                    },
+                    onerror:   function(){ kon({ latest: null, url: url, blad: 'brak połączenia' }); },
+                    ontimeout: function(){ kon({ latest: null, url: url, blad: 'GitHub nie odpowiedział w 20 s' }); }
+                });
+            } catch(e){ kon({ latest: null, url: url, blad: (e && e.message) || String(e) }); }
+        }
+        const VER_RAW = verAdres();
         const VER_KEY   = HUB + 'wersja_github_v1';     // { latest, ts } — kopia ostatniego sprawdzenia (throttling)
+        // Jak dlugo wazna jest kopia odpowiedzi GitHuba. Do 5.63.1 byly to 3 h (bo pytanie kosztowalo 7,6 MB)
+        // i kto sprawdzil tuz przed wgraniem nowej wersji, przez 3 h widzial „masz najnowsza".
+        const VER_WAZNE = 15 * 60e3;
         const VER_ODLOZ = HUB + 'wersja_odlozona_v1';   // numer wersji schowanej guzikiem „Pozniej"
         let verDostepna = '';                            // numer nowszej wersji, gdy jest — czyta go menuMaluj
         let verAktualna = false;                         // true = sprawdzone i masz najnowsza (zielony wiersz w menu)
@@ -112186,20 +112216,11 @@
             if (odloz && verCmp(latest, odloz) <= 0) return;   // ta wersja (albo starsza) juz schowana „Pozniej"
             verBanerPokaz(latest);
         }
-        function verSprawdzZGitHub(cb){
-            try {
-                GM_xmlhttpRequest({
-                    method: 'GET', url: VER_RAW + '?t=' + Date.now(), timeout: 20000,
-                    onload:    function(resp){ const m = (resp && resp.responseText || '').match(/@version\s+([0-9.]+)/); cb(m ? m[1] : null); },
-                    onerror:   function(){ cb(null); },
-                    ontimeout: function(){ cb(null); }
-                });
-            } catch(e){ cb(null); }
-        }
+        function verSprawdzZGitHub(cb){ verPobierz(VER_RAW, function(w){ cb(w.latest); }); }
         function verAuto(){
             const z = verOdczytZPamieci();
-            // Kopia mlodsza niz 3 h wystarcza — nie pytamy GitHuba przy kazdej nawigacji po panelu.
-            if (z && z.latest && (Date.now() - (Number(z.ts) || 0) < 3*3600e3)) { verMozeBaner(z.latest); return; }
+            // Kopia mlodsza niz VER_WAZNE (15 min) wystarcza — nie pytamy GitHuba przy kazdej nawigacji po panelu.
+            if (z && z.latest && (Date.now() - (Number(z.ts) || 0) < VER_WAZNE)) { verMozeBaner(z.latest); return; }
             verSprawdzZGitHub(function(latest){ if (!latest) return; verZapiszDoPamieci(latest); verMozeBaner(latest); });
         }
 
@@ -112854,7 +112875,7 @@
         // kopia w pamieci jest starsza niz 6 godzin (reszte zalatwia sam HUBDZ.zmiany).
         setTimeout(function(){ try { if (uiGet().kropka) chgZaladuj(false); } catch (e) {} }, 20000);
         // Automatyczne wykrywanie nowszej wersji: raz na wczytanie strony (kilka sekund po
-        // starcie), a GitHub pytany najwyzej raz na 3 h — reszte zalatwia kopia w pamieci.
+        // starcie), a GitHub pytany najwyzej raz na 15 min (VER_WAZNE) — reszte zalatwia kopia w pamieci.
         setTimeout(function(){ try { verAuto(); } catch (e) {} }, 8000);
 
         wrap.appendChild(btn); wrap.appendChild(panel);
