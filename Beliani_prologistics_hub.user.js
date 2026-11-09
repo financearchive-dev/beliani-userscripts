@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.6
+// @version      5.63.7
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -21932,13 +21932,18 @@
     // wstrzymany depozyt 22005 („deposit ON HOLD") na „waiting for SM". Teraz kontener
     // wybieramy po statusie: dokladnie jeden w „in payment"/„deposit booked" → zmieniamy;
     // zaden albo kilka → nic nie ruszamy i mowimy, co stoi na stronie.
+    // 09.11.2026: dodane „Deposit approved”. Gdy depozyt zaksieguje narzedzie systemowe (plik do banku
+    // skladany poza HUB-em), platnosc jest w Payments, ale kontener zostaje na „Deposit approved” — HUB
+    // przy „juz zaksiegowane” nie dokladal drugiej platnosci (dobrze), ale status stal. Teraz advansuje go
+    // tak samo jak kazdy zaksiegowany depozyt: → „waiting for SM”. ensureContainerStatus idzie TYLKO po
+    // potwierdzonej platnosci (ok albo alreadyBooked), wiec advans ze stanu „Deposit approved” jest bezpieczny.
     // Licza sie przy tym tylko kontenery TEGO orderu. Kontener innego orderu (wysylka razem,
     // „to be shipped with") ma w wierszu data-real-master-id = swoj numer, a w pierwszej kratce
     // link „(1)" do tamtego orderu; wlasny ma 0, takze gdy stoi przy nim „Subcontainer in OPS …"
     // (13.10.2026: 71 orderow 22100–22170, bez wyjatku). Do 5.60.04 obcy liczyl sie jak wlasny:
     // 12.10.2026 na 22130 stal 51925 z 22145 (oba depozyty w jednym przebiegu, oba „in payment")
     // obok wlasnego 51905 — HUB odmowil („kilka kontenerow") i 51905 przestawiono recznie.
-    const DEPO_ST_Z = /^(in payment|deposit booked)$/i;
+    const DEPO_ST_Z = /^(in payment|deposit booked|deposit approved)$/i;
     // { obcy, order } — obcy: kontener innego orderu, order: jego numer z linku ('' gdy go nie
     // widac). Wiersz bez data-real-master-id (inny uklad strony) liczy sie jak wlasny — jak do 5.60.04.
     function depoKontObcy(doc, s, cid) {
@@ -21975,11 +21980,11 @@
             }).join(', ');
             const kand = kont.filter(function (k) { return !k.obcy && DEPO_ST_Z.test(k.label); });
             if (kand.length > 1) {
-                return { html: ' <span style="color:#dc2626">| status: NIE zmieniam — kilka kontenerów tego orderu w „in payment"/„deposit booked" (' +
+                return { html: ' <span style="color:#dc2626">| status: NIE zmieniam — kilka kontenerów tego orderu w „in payment"/„deposit booked"/„Deposit approved" (' +
                     opis + ') — ustaw ręcznie</span>' };
             }
             if (!kand.length) {
-                return { html: ' <span style="color:#b45309">| status: nic nie zmieniam — żaden kontener tego orderu nie stoi na „in payment"/„deposit booked" (' +
+                return { html: ' <span style="color:#b45309">| status: nic nie zmieniam — żaden kontener tego orderu nie stoi na „in payment"/„deposit booked"/„Deposit approved" (' +
                     opis + ')</span>' };
             }
             const sel = kand[0].sel, cid = kand[0].cid;
@@ -23763,12 +23768,16 @@
             // zmianie banku dostawcy. Wartosci odkodowane tak jak numer konta.
             var msw = h.match(/name="swift_no"[^>]*value="([^"]*)"/); var cardSw = msw ? pcAttrDecode(msw[1]).trim() : '';
             var mbn = h.match(/name="beneficiary_bank_name"[^>]*value="([^"]*)"/); var cardBn = mbn ? pcAttrDecode(mbn[1]).trim() : '';
+            // Beneficjent i nazwa firmy z karty — do kontroli nazw w Sprawdzaniu (bcNazwyOcena, 09.11.2026).
+            // Spacja przed „name=" pilnuje, zeby „name" nie trafilo w data-name="name" ani podobne.
+            var mbe = h.match(/\sname="beneficiary_name"[^>]*value="([^"]*)"/); var cardBe = mbe ? pcAttrDecode(mbe[1]).trim() : '';
+            var mnz = h.match(/\sname="name"[^>]*value="([^"]*)"/); var cardNz = mnz ? pcAttrDecode(mnz[1]).trim() : '';
             if (cardSw || cardBn || acc) _cardBic[c] = { acc: acc, swift: cardSw, bank: cardBn };
             else delete _cardBic[c];
             var adr = pcSupAdres(h);
             if (adr) _adr[c] = adr;
             else if (bezPamieci) delete _adr[c];   // ↻: adres zdjety z karty nie moze zostac ze starego odczytu
-            _sup[c] = { acc: acc, accRaw: accRaw, info: info, conf: pcBankConf(h), docs: pcSupDocs(h), adres: adr, swift: cardSw, bank: cardBn }; return _sup[c];
+            _sup[c] = { acc: acc, accRaw: accRaw, info: info, conf: pcBankConf(h), docs: pcSupDocs(h), adres: adr, swift: cardSw, bank: cardBn, benef: cardBe, nazwa: cardNz }; return _sup[c];
         }
         // Konto ZAWSZE z karty pobranej w tej sesji strony. _acc idzie przez GM_setValue
         // i nie wygasa — do 5.60.03 wystarczylo, ze byl, i karty nie czytalismy wcale:
@@ -25889,6 +25898,11 @@
         // zostaje pusty i blokuje plik — nigdy z cudzego bloku.
         function painBlokDlaKonta(bk, acc, G){
             var dom = (bk && bk.bank) || null;
+            // Zadnego bloku P/I — nazwa beneficjenta konta z karty z karty (painNazwaKarty); dotad zostawala pusta.
+            if (acc && !dom){
+                var bezPI = painNazwaZKarty(G, acc, null);
+                return { b: bezPI, pasuje: false, bicSrc: '' };
+            }
             if (!acc || !dom || !dom.acc || accTenSam(dom.acc, acc))
                 return { b: dom, pasuje: !!(dom && dom.acc && acc && accTenSam(dom.acc, acc)), bicSrc: '' };
             // Skad sa dane banku — te same opisy co w painBankOfG (drugi przeglad: przy bloku innym niz
@@ -25919,7 +25933,37 @@
             // beneficjent; z karty bierzemy wylacznie SWIFT i nazwe banku.
             var zKarty = painKartaBlok(G, acc, dom);
             if (zKarty) return { b: zKarty, pasuje: true, bicSrc: 'z karty dostawcy (P/I opisuje inne, starsze konto tego dostawcy)', zKarty: true };
-            return { b: dom, pasuje: false, bicSrc: '' };
+            // Bez bloku z karty (karta bez poprawnego SWIFT-u) zostaje blok P/I innego konta — ale NAZWA
+            // beneficjenta konta z karty dalej ma byc ta z karty (painNazwaKarty, 09.11.2026).
+            return { b: painNazwaZKarty(G, acc, dom), pasuje: false, bicSrc: '' };
+        }
+        /* ===== Beneficjent konta z karty (09.11.2026) =====
+           Zamowienia 19383/19384 (Moen, karta 2037): balance poszedl na konto z karty (posrednik KINFUNG
+           od 07.2026), ale z nazwa TEXTILE — starego posrednika z P/I z marca. painKartaBlok bral z karty
+           SWIFT, bank i konto, a beneficjenta zostawial z P/I („to ten sam beneficjent" — prawda przy
+           Habitus, gdzie zmienil sie sam bank). Ostrzezenie o bloku innego konta (accBlokInne) sie nie
+           zapalalo, bo blok dostawal konto karty. Teraz: gdy przelew idzie na konto Z KARTY, zaden blok P/I
+           go nie opisuje, a karta ma „Beneficiary's name" — nazwa do pliku idzie z karty, z ostrzezeniem
+           (painRowUwagi), ktore mowi, jaka nazwe mial P/I. Nazwa podobna (skroty, uciecie) — zostaje z P/I. */
+        function painNazwaKarty(G, acc){
+            if (!G || !G.cid || !acc) return '';
+            var s = _sup[G.cid];
+            if (!s || !s.benef) return '';
+            var kacc = s.acc || (_cardBic[G.cid] && _cardBic[G.cid].acc) || '';
+            if (!kacc || !accTenSam(kacc, acc)) return '';
+            return String(s.benef).trim();
+        }
+        // Kopia bloku z nazwa beneficjenta z karty (albo ten sam blok, gdy nie ma czego zmieniac).
+        function painNazwaZKarty(G, acc, blok, accP){
+            var nk = painNazwaKarty(G, acc);
+            if (!nk || (blok && blok.name && bcNazwaPodobna(nk, blok.name))) return blok;
+            var o = {};
+            if (blok) for (var k in blok) if (Object.prototype.hasOwnProperty.call(blok, k)) o[k] = blok[k];
+            o.nameP = (blok && blok.name) || '';
+            // Konto, ktore opisywal P/I z ta stara nazwa (painKartaBlok podmienil juz konto bloku na kartowe).
+            o.nameAccP = accP != null ? String(accP || '') : ((blok && blok.acc) || '');
+            o.name = nk; o.nameZKarty = true;
+            return o;
         }
         // Blok bankowy zlozony z danych KARTY dostawcy: SWIFT i nazwa banku z karty, numer konta
         // z karty, a reszta (nazwa beneficjenta, adres) skopiowana z bloku P/I (dom). Zwraca null,
@@ -25936,7 +25980,8 @@
             o.swift = sw; o.swiftBad = false;
             if (card.bank) o.bankName = card.bank;   // wiersz czyta nazwe banku z b.bankName
             o.zKarty = true;
-            return o;
+            // Beneficjent z karty, gdy karta go ma i jest inny niz w P/I (Moen: TEXTILE → KINFUNG).
+            return painNazwaZKarty(G, acc, o, (dom && dom.acc) || '');
         }
         function painAccSrcTxt(r){
             if (r.accSrc === 'reczne') return 'wpisane ręcznie w oknie przelewów';
@@ -26053,6 +26098,12 @@
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
                     title: String(V('title', pcTitleFor(G)) || ''),
                     name: String(V('name', b.name || '')),
+                    // Nazwa a karta dostawcy (painNazwaZKarty, 09.11.2026): czy nazwa jest z karty zamiast z P/I,
+                    // jaka nazwe mial P/I i jakiego konta dotyczyl, oraz beneficjent karty do porownania.
+                    nameRecznie: ed.name != null && String(ed.name) !== '',
+                    nazwaZKarty: !!b.nameZKarty, nazwaPI: b.nameP || '', nazwaPIacc: b.nameAccP || '',
+                    kartaBenef: (G.cid && _sup[G.cid] && _sup[G.cid].benef) || '',
+                    kartaBenefAcc: (G.cid && _sup[G.cid] && _sup[G.cid].acc) || '',
                     acc: accV,
                     accZdjete: accCz.zdjete, accNieczyt: !accCz.czytelne, accProp: accCz.prop, accPropWiele: accCz.propWiele,
                     // Zapisy tego samego rachunku do wyboru i ten, ktory idzie do pliku.
@@ -26187,8 +26238,22 @@
                 warns.push('konto ' + painAccSrcTxt(r) + ': ' + r.accSrcWhy + '.');
             if (r.accSrc === 'naglowek' && painNorm(r.acc) && !(r.accKarta && accTenSam(r.accKarta, r.acc)))
                 warns.push('konto poprawione ręcznie w nagłówku dostawcy (na karcie: ' + (r.accKarta || '—') + ').');
-            if (r.accBlokInne) warns.push('konto ' + r.acc + ' jest ' + painAccSrcTxt(r) + ', a blok bankowy P/I, z którego są nazwa, bank i SWIFT, mówi o koncie '
+            if (r.accBlokInne) warns.push('konto ' + r.acc + ' jest ' + painAccSrcTxt(r) + ', a blok bankowy P/I, z którego są '
+                + (r.nazwaZKarty ? '' : 'nazwa, ') + 'bank i SWIFT, mówi o koncie '
                 + r.accBlokInne + ' — sprawdź, czy SWIFT i bank pasują do konta przelewu.');
+            // Nazwa beneficjenta (09.11.2026, Moen 19383/19384: balance na konto KINFUNG z nazwa TEXTILE z P/I).
+            // Nazwa wpisana recznie w oknie przelewow to decyzja czlowieka — wtedy milczymy.
+            if (!r.nameRecznie && r.nazwaZKarty)
+                warns.push('nazwa beneficjenta „' + r.name + '” jest z karty dostawcy (beneficjent konta ' + r.acc + ')'
+                    + (r.nazwaPI ? (', a P/I podaje „' + r.nazwaPI + '”' + (r.nazwaPIacc ? (' przy innym koncie (' + r.nazwaPIacc + ')') : '')
+                                    + ' — dostawca zmienił beneficjenta? Upewnij się, na jaką nazwę ma iść przelew.')
+                                 : ' — P/I nie podaje beneficjenta; sprawdź nazwę przed wysłaniem.'));
+            else if (!r.nameRecznie && r.kartaBenef && painNorm(r.name) && !bcNazwaPodobna(r.kartaBenef, r.name))
+                warns.push('nazwa do pliku „' + r.name + '” ≠ beneficjent na karcie dostawcy „' + r.kartaBenef + '”'
+                    + (r.kartaBenefAcc && painNorm(r.acc) && accTenSam(r.kartaBenefAcc, r.acc)
+                        ? ' — a przelew idzie właśnie na konto z karty'
+                        : (r.kartaBenefAcc ? (' (karta ma konto ' + r.kartaBenefAcc + ')') : ''))
+                    + ' — upewnij się, na jaką nazwę ma iść przelew.');
             if (r.kartaZm && r.kartaZm.length) warns.push('konto na karcie dostawcy zmieniło się przy ↻ (' + r.kartaZm.join('; ')
                 + ') — przelew idzie na numer ' + painAccSrcTxt(r) + ', sprawdź go przed wysłaniem.');
             if (r.kontoChg) warns.push((r.kontoChg === 'old'
@@ -27895,8 +27960,15 @@
                 // wiec to nie jest kolejne zapytanie.
                 var docs = [];
                 if (cid){ try { docs = await companyToDocs(cid); } catch (e){ docs = []; } }
+                // Beneficjent i nazwa firmy z karty (bcNazwyOcena). Strona karty jest juz w _sup —
+                // fetchCompany jej nie pobiera drugi raz. Karta nieprzeczytana = null, nie „pusta nazwa".
+                var karta = null;
+                if (cid){
+                    try { var sk = await fetchCompany(cid); if (sk && !sk.failed) karta = { benef: sk.benef || '', nazwa: sk.nazwa || '', acc: sk.acc || '' }; }
+                    catch (e){ karta = null; }
+                }
                 out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom,
-                                cid: cid || '', slady: bcSladyKonta(o, cid), docs: docs };
+                                cid: cid || '', slady: bcSladyKonta(o, cid), docs: docs, karta: karta };
                 zrobione++;
                 if (say) say('Sprawdzam zamówienia: ' + zrobione + '/' + wszystkie.length + '…', '#666');
                 return true;
@@ -28259,10 +28331,52 @@
                     }
                     // Nazwa jest DRUGORZEDNA — nigdy nie blokuje, najwyzej zwraca uwage.
                     var nz = bcNazwaEq(bank.name || '', q.name);
-                    kon(o, 'beneficjent z P/I ↔ z potwierdzenia', bank.name || '—', q.name || '—',
-                        nz.ok ? 'ok' : (nz.brak ? 'uwaga' : 'uwaga'));
+                    // P/I opisuje INNE konto niz to, na ktore poszedl przelew — wtedy zgodnosc nazwy z P/I niczego
+                    // nie potwierdza (19383, 06.11.2026: P/I i przelew „TEXTILE", a konto bylo juz KINFUNG-a; zielony
+                    // haczyk przy nazwie uspokajal). Zolte z dopiskiem; nazwe rozstrzyga kontrola z karta (bcNazwyOcena).
+                    var piInne = !!(piAcc && q.acct && !bcKontoEq(piAcc, q.acct).ok);
+                    kon(o, 'beneficjent z P/I ↔ z potwierdzenia', bank.name || '—',
+                        (q.name || '—') + (nz.ok && piInne ? (' — ale P/I opisuje inne konto (' + piAcc + '), więc zgodność nazwy z P/I niczego nie potwierdza') : ''),
+                        (nz.ok && !piInne) ? 'ok' : 'uwaga');
                     if (!nz.ok && !nz.brak) w.uwagi.push(o + ': beneficjent „' + (bank.name || '—') + '” vs „' + (q.name || '—') + '”');
                 });
+                // Nazwy dostawcy ze wszystkich zrodel tego przelewu (bcNazwyOcena). Karte bierzemy raz na dostawce.
+                var zrN = [], kartyByly = {};
+                if (q.name) zrN.push({ n: q.name, rodzaj: 'ten', et: 'TEN PRZELEW (potwierdzenie)', acc: q.acct || '' });
+                moje.forEach(function (o){
+                    var dd = out.dane[o] || {}, pi0 = dd.pi || {}, bank0 = pi0.piBank || pi0.piBankRaw || {};
+                    var kk = dd.karta;
+                    if (dd.cid && kk && !kartyByly[dd.cid]){
+                        kartyByly[dd.cid] = 1;
+                        // Konto do porownania „wlasciciela": ze swiezego odczytu karty, a gdy go nie ma — to, co
+                        // podal companyToAcc (ten sam numer, tylko z pamieci).
+                        var accK = kk.acc || dd.accSys || '';
+                        if (kk.benef) zrN.push({ n: kk.benef, rodzaj: 'karta-benef', cid: dd.cid, acc: accK,
+                            et: 'karta dostawcy ' + dd.cid + ': Beneficiary\'s name', dop: accK ? (' (konto ' + accK + ')') : '' });
+                        bcNazwyKarty(kk.nazwa).forEach(function (n){
+                            zrN.push({ n: n, rodzaj: 'karta-firma', cid: dd.cid, et: 'karta dostawcy ' + dd.cid + ': nazwa firmy' });
+                        });
+                    }
+                    if (bank0.name) zrN.push({ n: bank0.name, rodzaj: 'pi', o: o, acc: bank0.acc || pi0.piAcc || '', et: 'P/I',
+                        dop: (bank0.acc || pi0.piAcc) ? (' (konto ' + (bank0.acc || pi0.piAcc) + ')') : '' });
+                    var pp0 = poprz[o];
+                    if (pp0 && pp0.nazwa) zrN.push({ n: pp0.nazwa, rodzaj: 'poprz', o: o, acc: pp0.acct || '', et: 'poprzedni przelew',
+                        dop: (pp0.dzien ? (' z ' + pp0.dzien) : '') + (pp0.acct ? (' (konto ' + pp0.acct + ')') : '') });
+                });
+                var NZ = bcNazwyOcena(zrN, q.name || '', q.acct || '');
+                w.nazwy = NZ;
+                NZ.porown.forEach(function (p){
+                    kon('', 'nazwa na przelewie ↔ beneficjent konta na karcie ' + p.cid, q.name || '—',
+                        p.wlasciciel + ' (konto ' + p.acc + ')', p.ok ? 'ok' : 'zle');
+                });
+                if (zrN.length){
+                    kon('', 'nazwy dostawcy (karta, P/I, poprzedni przelew, ten przelew)',
+                        NZ.grupy.length === 1 ? 'jedna nazwa' : (NZ.grupy.length + ' różne nazwy'),
+                        NZ.grupy.map(function (g){ return '„' + g.n + '”' + (g.ten ? ' ← ten przelew' : ''); }).join(' · '),
+                        NZ.kilka ? 'uwaga' : 'ok');
+                }
+                if (NZ.blad) w.bledy.push(NZ.blad);
+                if (NZ.uwaga) w.uwagi.push(NZ.uwaga);
                 var tt = bcTytulOk(q.msg, moje, pcts);
                 kon('', 'tytuł ↔ numery zamówień', (moje || []).join(', ') || '—',
                     tt.brak.length ? ('brakuje: ' + tt.brak.join(', ')) : 'wszystkie są',
@@ -28507,6 +28621,8 @@
                    + (w.orders || []).map(bcOrdLink).join(', ') + '</span>'
                    + '</span></div>'
                    + '<div style="font-size:11px;color:#666;margin-top:2px">' + esc(w.tytul) + '</div>';
+                // Nazwy dostawcy — wyrazna ramka nad lista porownan (bcNazwyHtml).
+                h += bcNazwyHtml(w.nazwy);
                 // Pelna lista porownan — takze tych udanych. Bez niej widac bylo tylko
                 // zastrzezenia i nie bylo wiadomo, CO w ogole zostalo sprawdzone.
                 // Kontrole stoja w SEKCJACH — jedna na zamowienie, plus „cały przelew".
@@ -29090,6 +29206,124 @@
             return (pp.rodzaj || 'przelew') + ' z ' + (pp.dzien || '—')
                  + (pp.plik ? ('  ·  ' + String(pp.plik).slice(0, 60)) : '');
         }
+        /* ===== Nazwa beneficjenta: kilka nazw dostawcy i nazwa ↔ wlasciciel konta (09.11.2026) =====
+           Zamowienia 19383 i 19384 (Moen, karta 2037). Producent Moen placil kiedys przez posrednika
+           TIANJIN TEXTILE GROUP — tak stoi w P/I z marca (beneficjent i konto …0420) i tak poszedl depozyt
+           06.03. W lipcu posrednikiem zostal TIANJIN KINFUNG: na karcie beneficjent KINFUNG i konto …3647,
+           komentarz „balance to be paid to new account number". Balance 06.11 poszedl na NOWE konto z karty,
+           ale ze STARA nazwa TEXTILE z P/I — i Sprawdzanie go przepuscilo: nazwe porownywalo z P/I (stare,
+           wiec „zgodne") i z poprzednim przelewem (tez stary). Karty nie czytalo wcale.
+           Dwie kontrole:
+           1. nazwa ↔ wlasciciel konta — przelew poszedl na konto Z KARTY, a karta ma beneficjenta: nazwa na
+              potwierdzeniu ma byc ta z karty. Inaczej BLAD — przelew na konto jednej firmy z nazwa drugiej;
+           2. kilka nazw — wszystkie nazwy dostawcy z karty (beneficjent i nazwa firmy, bywa „A / B"), z P/I,
+              z poprzedniego przelewu i z tego potwierdzenia. Dwie i wiecej rozne: UWAGA z lista „ktora skad".
+              Prosba uzytkownika: „jak jest wiele nazw, to musi uczulic" — takze wtedy, gdy wszystko sie zgadza
+              (producent na karcie, posrednik na przelewie to dla Moen stan normalny).                        */
+        // Klucz nazwy: bcNormNazwa + skroty, ktore karty, P/I i banki zapisuja roznie.
+        function bcNazwaKlucz(s){
+            var t = String(s == null ? '' : s).replace(/\bint['’`]?l\b/gi, ' international ');
+            return bcNormNazwa(t)
+                .replace(/\bIMP\b/g, 'IMPORT').replace(/\bEXP\b/g, 'EXPORT')
+                .replace(/\bINTL\b/g, 'INTERNATIONAL').replace(/\bMFG\b/g, 'MANUFACTURING')
+                .replace(/\s+/g, ' ').trim();
+        }
+        // Ta sama firma? Rowne klucze, te same slowa w innej kolejnosci albo krotsza zaczyna dluzsza
+        // (bank i karta ucinaja nazwe). Krotsza musi miec co najmniej dwa slowa i 12 znakow:
+        // samo „TIANJIN" zaczyna i TEXTILE, i KINFUNG.
+        function bcNazwaPodobna(a, b){
+            var x = bcNazwaKlucz(a), y = bcNazwaKlucz(b);
+            if (!x || !y) return false;
+            if (x === y) return true;
+            var kr = x.length <= y.length ? x : y, dl = (kr === x) ? y : x;
+            if (kr.indexOf(' ') > 0 && kr.length >= 12 && dl.indexOf(kr) === 0) return true;
+            return x.split(' ').sort().join(' ') === y.split(' ').sort().join(' ');
+        }
+        // Nazwa firmy z karty bywa podwojna: „Moen Furniture Tianjin Co., ltd/ TIANJIN KINFUNG …".
+        // Ten sam podzial co pcKilkaNazw (Wprowadzanie).
+        function bcNazwyKarty(s){
+            return String(s == null ? '' : s).split(/\s*\/\s*|\(|\)/)
+                .map(function (x){ return String(x || '').trim(); })
+                .filter(function (x){ return bcNazwaKlucz(x).length >= 3; });
+        }
+        // zr: [{ n, rodzaj: 'ten'|'karta-benef'|'karta-firma'|'pi'|'poprz', et, dop, o, acc, cid }]
+        //  -> { grupy: [{ n, zrodla, ten }], kilka, zle: null|{ wlasciciel, cid, acc, skad }, uwaga, blad, porown }
+        function bcNazwyOcena(zr, qName, qAcct){
+            var grupy = [];
+            (zr || []).forEach(function (z){
+                if (!z || !bcNazwaKlucz(z.n)) return;
+                var g = null;
+                for (var i = 0; i < grupy.length && !g; i++)
+                    if (grupy[i].wsz.some(function (n){ return bcNazwaPodobna(n, z.n); })) g = grupy[i];
+                if (!g){ g = { n: String(z.n).trim(), wsz: [], et: [], gdzie: {}, ten: false }; grupy.push(g); }
+                g.wsz.push(z.n);
+                // Pokazujemy najdluzsza postac — ucieta przez bank mowi mniej.
+                if (String(z.n).trim().length > g.n.length) g.n = String(z.n).trim();
+                if (z.rodzaj === 'ten') g.ten = true;
+                // Zrodlo = etykieta + dopisek (konto); zamowienia tego samego zrodla zbieramy w jedna pozycje
+                // (P/I 19383, 19384 (konto ...)), zamiast powtarzac je po razie na zamowienie.
+                var kl = z.et + '\u0001' + (z.dop || '');
+                if (!g.gdzie[kl]){ g.gdzie[kl] = []; g.et.push(kl); }
+                if (z.o && g.gdzie[kl].indexOf(z.o) < 0) g.gdzie[kl].push(z.o);
+            });
+            grupy.forEach(function (g){
+                g.zrodla = g.et.map(function (kl){
+                    var o = g.gdzie[kl], cz = kl.split('\u0001');
+                    return cz[0] + (o.length ? (' ' + o.join(', ')) : '') + (cz[1] || '');
+                });
+            });
+            var out = { grupy: grupy, kilka: grupy.length >= 2, zle: null, uwaga: '', blad: '', porown: [] };
+            // Wlasciciel konta wg karty — tylko gdy przelew poszedl na konto Z KARTY.
+            if (qName) (zr || []).forEach(function (z){
+                if (!z || z.rodzaj !== 'karta-benef' || !z.acc || !qAcct) return;
+                if (!bcKontoEq(z.acc, qAcct).ok) return;
+                var zgodna = bcNazwaPodobna(z.n, qName);
+                out.porown.push({ wlasciciel: z.n, cid: z.cid || '', acc: qAcct, ok: zgodna });
+                if (zgodna || out.zle) return;
+                // Skad wziela sie nazwa z przelewu — te same zrodla sklejone po zamowieniach („P/I 19383, 19384").
+                var skad = [], skadO = {}, skadK = [];
+                (zr || []).forEach(function (y){
+                    if (!y || y.rodzaj === 'ten' || y === z || !bcNazwaPodobna(y.n, qName)) return;
+                    var kl = y.et + '\u0001' + (y.dop || '');
+                    if (!skadO[kl]){ skadO[kl] = []; skadK.push(kl); }
+                    if (y.o && skadO[kl].indexOf(y.o) < 0) skadO[kl].push(y.o);
+                });
+                skadK.forEach(function (kl){
+                    var cz = kl.split('\u0001');
+                    skad.push(cz[0] + (skadO[kl].length ? (' ' + skadO[kl].join(', ')) : '') + (cz[1] || ''));
+                });
+                out.zle = { wlasciciel: z.n, cid: z.cid || '', acc: qAcct, skad: skad };
+            });
+            if (out.zle)
+                out.blad = 'nazwa na przelewie „' + qName + '” nie pasuje do konta ' + out.zle.acc + ': na karcie dostawcy '
+                         + (out.zle.cid || '') + ' beneficjentem tego konta jest „' + out.zle.wlasciciel + '”'
+                         + (out.zle.skad.length ? (' — nazwa „' + qName + '” stoi w: ' + out.zle.skad.join('; ')) : '')
+                         + '. Przelew poszedł na konto jednej firmy z nazwą drugiej — sprawdź, na jaką nazwę ma iść';
+            if (out.kilka)
+                out.uwaga = 'kilka nazw dostawcy (' + grupy.length + ') — upewnij się, na jaką nazwę ma iść przelew: '
+                          + grupy.map(function (g){ return '„' + g.n + '” (' + g.zrodla.join('; ') + ')'; }).join(' · ');
+            return out;
+        }
+        // Ramka nad lista porownan — wyrazna, zeby nie zginela miedzy innymi uwagami (19383: w tym samym
+        // wierszu staly juz czerwone bledy konta P/I, ktore wszyscy znali, i nazwa przeszla niezauwazona).
+        function bcNazwyHtml(nz){
+            if (!nz || !(nz.kilka || nz.zle)) return '';
+            var kol = nz.zle ? '#c00' : '#6a4a9c', tlo = nz.zle ? '#fdecea' : '#f4effa';
+            var h = '<div class="bc-nazwy" style="margin-top:5px;padding:5px 8px;border-radius:6px;background:' + tlo
+                  + ';border:1px solid ' + kol + ';font-size:11px;line-height:1.5">'
+                  + '<b style="color:' + kol + '">' + (nz.zle ? '✗ Nazwa nie pasuje do konta' : '≡ Kilka nazw dostawcy')
+                  + ' — upewnij się, na jaką nazwę ma iść przelew</b>';
+            if (nz.zle)
+                h += '<div style="color:#c00;margin-top:2px">Ten przelew poszedł na konto <span style="font-family:monospace">'
+                   + esc(nz.zle.acc) + '</span>, którego beneficjentem na karcie dostawcy ' + esc(nz.zle.cid) + ' jest <b>„'
+                   + esc(nz.zle.wlasciciel) + '”</b> — a nazwa na przelewie jest inna.</div>';
+            h += '<ul style="margin:3px 0 0;padding-left:16px">';
+            (nz.grupy || []).forEach(function (g){
+                h += '<li><b>„' + esc(g.n) + '”</b> <span style="color:#555">— ' + esc(g.zrodla.join('; ')) + '</span>'
+                   + (g.ten ? ' <b style="color:' + kol + '">← na tę nazwę poszedł ten przelew</b>' : '') + '</li>';
+            });
+            return h + '</ul></div>';
+        }
         async function bcGrabConfs(orders, day, io, say, workers){
             var IO = io || bcIO(), ord = (orders || []).slice(), errs = [];
             var stat = { orders: ord.length, pages: 0, pageErr: 0, docs: 0, sameDay: 0, noDate: 0,
@@ -29547,6 +29781,16 @@
         }
 
         function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
+        // Dopisek pod polem nazwy beneficjenta: skad nazwa, gdy nie z P/I, albo jaki beneficjent stoi na karcie,
+        // gdy jest inny niz nazwa do pliku (painNazwaZKarty, 09.11.2026).
+        function painNazwaNote(r){
+            if (!r || r.nameRecznie) return '';
+            if (r.nazwaZKarty)
+                return '<div style="font-size:10px;color:#6a4a9c;line-height:1.3" title="' + pcAttr('Przelew idzie na konto z karty dostawcy, a karta podaje tego beneficjenta.\nP/I: ' + (r.nazwaPI || '—') + (r.nazwaPIacc ? ('\nkonto w P/I: ' + r.nazwaPIacc) : '')) + '">≡ z karty dostawcy' + (r.nazwaPI ? (' · w P/I: „' + esc(String(r.nazwaPI).slice(0, 40)) + '”') : '') + '</div>';
+            if (r.kartaBenef && painNorm(r.name) && !bcNazwaPodobna(r.kartaBenef, r.name))
+                return '<div style="font-size:10px;color:#c47f00;line-height:1.3">⚠ na karcie: „' + esc(String(r.kartaBenef).slice(0, 40)) + '”</div>';
+            return '';
+        }
         function painInp(k, key, val, w, ph, cls){
             return '<input type="text" class="pain-ed ' + (cls || '') + '" data-key="' + pcAttr(key) + '" data-k="' + k + '" value="' + pcAttr(val == null ? '' : String(val)) + '"'
                  + (ph ? ' placeholder="' + pcAttr(ph) + '"' : '') + ' style="width:' + w + 'px;font-size:11px;padding:1px 3px;border:1px solid #ddd;border-radius:3px">';
@@ -29678,7 +29922,7 @@
                        + (r.nBal ? ('balance ' + r.nBal + '×' + (r.sumBal ? (' ' + r.sumBal.toFixed(2)) : '')) : '')
                        + '</div></td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;text-align:right;vertical-align:top">' + painInp('amount', r.key, r.amount.toFixed(2), 78) + (r.amountEdited ? '<div style="font-size:10px;color:#0a58ca">było ' + r.amountBase.toFixed(2) + '</div>' : '') + '</td>'
-                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + painNazwaNote(r) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + painAccNote(r) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('bic', r.key, r.bic, 95) + (r.bic && !painBicOk(r.bic) ? '<div style="font-size:10px;color:#c00">zły BIC</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('town', r.key, r.town, 105) + '</td>'
@@ -29886,6 +30130,9 @@
         function pcKilkaNazw(G, poprz, nazwaDoPliku){
             var zrodla = [];
             String((G && G.sup) || '').split(/\s*[\/]\s*|\(|\)/).forEach(function (x){ var n = String(x || '').trim(); if (n) zrodla.push({ n: n, src: 'karta' }); });
+            // Beneficjent z karty (09.11.2026) — przy Moen to on jest aktualnym posrednikiem.
+            var sk0 = (G && G.cid && _sup[G.cid]) || null;
+            if (sk0 && sk0.benef) zrodla.push({ n: String(sk0.benef).trim(), src: 'karta: beneficjent' });
             if (nazwaDoPliku) zrodla.push({ n: String(nazwaDoPliku).trim(), src: 'P/I (do pliku)' });
             if (poprz && poprz.nazwa) zrodla.push({ n: String(poprz.nazwa).trim(), src: 'poprzedni przelew' });
             var rozne = [];
@@ -34408,11 +34655,17 @@
                             + 'Potwierdzenia biorę z sekcji „Payment conformation" na zamówieniu: '
                             + 'albo ich tam nie ma, albo mają inną datę niż wpisana obok.', '#c00');
                     } else {
+                        // Przelewy z kilkoma nazwami dostawcy (bcNazwyOcena) — osobno, zeby nie zginely w „z zastrzeżeniami".
+                        var nNaz = (r.wiersze || []).filter(function (w){ return w.nazwy && (w.nazwy.kilka || w.nazwy.zle); }).length;
+                        var nNazZle = (r.wiersze || []).filter(function (w){ return w.nazwy && w.nazwy.zle; }).length;
                         mow('Gotowe: ' + (r.wiersze || []).length + ' potwierdzeń, '
                             + (zle ? (zle + ' z zastrzeżeniami') : 'bez zastrzeżeń')
+                            + (nNaz ? ('. NAZWY: ' + nNaz + ' przelewów z kilkoma nazwami dostawcy'
+                                       + (nNazZle ? (', w tym ' + nNazZle + ' z nazwą niepasującą do konta') : '')
+                                       + ' — upewnij się co do nazwy') : '')
                             + (brakP ? ('. UWAGA: ' + brakP + ' zamówień BEZ potwierdzenia ('
                                         + r.bezPotw.join(', ') + ') — tych nie sprawdziłem.') : '.'),
-                            (zle || brakP) ? '#c00' : '#0a7a2f');
+                            (zle || brakP) ? '#c00' : (nNaz ? '#c47f00' : '#0a7a2f'));
                     }
                 } catch (e){
                     mow('Nie doszło do skutku: ' + String((e && e.message) || e), '#c00');
@@ -106583,7 +106836,7 @@
       +   'Płatność szukana jest w tabelce <b>Eupago Payments</b>, idąc łańcuchem auftragów. '
       +   'Przed zwrotem HUB sprawdza <b>zwroty tej płatności w eupago</b>, noty w ticketach i Payments auftragu '
       +   '(zmiana stawki VAT to nie zwrot). Ślad, który niczego nie rozstrzyga, daje stan <b>niepewne</b> — '
-      +   'takie sprawy (i „do potwierdzenia") wysyłasz do Claude jedną paczką ZIP.'
+      +   'takie sprawy (i „do potwierdzenia" oraz „do ręki") wysyłasz do Claude jedną paczką ZIP.'
       + '</div>'
       + '<textarea id="zwr-paste" spellcheck="false" placeholder="Wklej wiersze ze skrzynki…" '
       +   'style="width:100%;height:90px;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:12px;resize:vertical;box-sizing:border-box;font-family:monospace"></textarea>'
@@ -107488,6 +107741,9 @@
         r.st = 'busy'; r.msg = '';
         dz('=== sprawdzam', r.rodzaj || '?', r.nr, '===');
         var u = await ustalProsbe(r);
+        // Skad zaczac lancuch — potrzebne paczce dla Claude przy wierszu „do ręki" (zwClZbierz).
+        r.aufyU = (u.aufy || []).map(String);
+        r.zrodloAuf = u.zrodloAuf ? String(u.zrodloAuf) : '';
         // Brak prosby NIE konczy sprawy. Szukamy platnosci dalej, zeby dalo sie
         // zaakceptowac wiersz recznie — inaczej kazda nietypowa prosba to „do reki".
         var pr = u.pr || null;
@@ -108085,18 +108341,20 @@
         if (s.length > 1500) s = s.slice(0, 1500) + ' …[ucięte]';
         return zwMaskuj(s);
     }
-    var ZW_ST_OPIS = { ok: 'gotowe do zwrotu', reczne: 'do ręcznego potwierdzenia', 'brak-aut': 'ponad limit osoby proszącej' };
+    var ZW_ST_OPIS = { ok: 'gotowe do zwrotu', reczne: 'do ręcznego potwierdzenia', 'brak-aut': 'ponad limit osoby proszącej',
+                       err: 'do ręki — HUB nie dokończył sprawdzania (powód w „Uwagi HUB-a”)' };
     function zwStanOpis(r){
         if (r.st === 'niepewne') return 'niepewne (bez tych śladów byłoby: ' + (ZW_ST_OPIS[r.stPrzed] || r.stPrzed || '—') + ')';
         return ZW_ST_OPIS[r.st] || r.st || '—';
     }
     function zwSprawaTxt(r){
-        var L = [], D = r.dos || {}, Z = r.slady || {};
+        var L = [], D = r.dos || {}, Z = r.slady || D.slady || {};
         L.push('=== SPRAWA ' + r.nr + ' ===');
         L.push('Numer we wklejce: ' + r.nr + ' (' + (r.rodzaj || '?') + ')' + (r.rma ? (' · ticket ' + r.rma) : '')
              + (r.auf ? (' · auftrag z płatnością eupago ' + r.auf) : ''));
         if (r.odwiedzone && r.odwiedzone.length > 1) L.push('Łańcuch auftragów: ' + r.odwiedzone.join(' → '));
         if (D.tickety && D.tickety.length) L.push('Tickety auftragu: ' + D.tickety.join(', '));
+        if (D.nieodczytane && D.nieodczytane.length) L.push('Nie odczytałem: ' + D.nieodczytane.join(', '));
         L.push('Stan w HUB: ' + zwStanOpis(r));
         L.push('Uwagi HUB-a: ' + zwMaskuj(r.msg || '—'));
         L.push('');
@@ -108110,19 +108368,29 @@
              + (r.zgodaKto ? (' · zgoda: ' + r.zgodaKto + ' (' + (r.zgodaSkad || '') + ', ' + (r.zgodaData || '') + ')') : ''));
         L.push('');
         L.push('WPŁATA W EUPAGO');
-        L.push('  ' + (r.platData || '?') + ' · ' + f2(r.platKwota) + ' EUR · referencja ' + (r.euRef || '—')
+        if (!r.platData && r.platKwota == null)
+            L.push('  HUB jej nie znalazł' + ((r.odwiedzone && r.odwiedzone.length)
+                   ? (' — żaden auftrag łańcucha (' + r.odwiedzone.join(', ') + ') nie ma tabelki Eupago Payments') : '')
+                 + '. Ustal z danych, czym i na którym auftragu klient zapłacił.');
+        else L.push('  ' + (r.platData || '?') + ' · ' + f2(r.platKwota) + ' EUR · referencja ' + (r.euRef || '—')
              + ' · stan wiersza płatności: ' + stanPL(r.estado) + (r.mies != null ? (' · ' + r.mies + ' mies. temu') : ''));
         L.push('');
         L.push('ZWROTY W EUPAGO (osobne wiersze „reembolsada” z tym samym identyfikatorem — pieniądze, które wyszły)');
         var eu = Z.eu || [];
-        if (!eu.length) L.push('  brak');
+        if (Z.eu == null) L.push('  nie sprawdzano — HUB nie doszedł do tego kroku');
+        else if (!eu.length) L.push('  brak');
         eu.forEach(function (z){
             L.push('  ' + z.data + ' ' + z.hora + ' · ' + f2(z.kwota) + ' EUR · refundID ' + (z.refundID || '—') + ' · '
                  + (z.direct === '1' ? 'zwrot bezpośredni (API)' : (z.direct === '0' ? 'zwrot z panelu / przelewem' : 'rodzaj nieznany')));
         });
         L.push('');
-        L.push('PAYMENTS NA AUFTRAGU ' + (r.auf || '') + ' (data | konto | kwota) — konto ' + ZW_KONTO + ' to eupago');
-        (D.wyplaty || []).forEach(function (p){ L.push('  ' + p.data + ' | ' + p.konto + ' | ' + f2(p.kwota)); });
+        var wieleAuf = (D.aufy || []).length > 1;
+        L.push(wieleAuf ? ('PAYMENTS NA AUFTRAGACH ŁAŃCUCHA (auftrag | data | konto | kwota) — konto ' + ZW_KONTO + ' to eupago')
+                        : ('PAYMENTS NA AUFTRAGU ' + (r.auf || ((D.aufy || [])[0] || {}).auf || '') + ' (data | konto | kwota) — konto '
+                           + ZW_KONTO + ' to eupago'));
+        (D.wyplaty || []).forEach(function (p){
+            L.push('  ' + ((wieleAuf && p.auf) ? (p.auf + ' | ') : '') + p.data + ' | ' + p.konto + ' | ' + f2(p.kwota));
+        });
         if (!(D.wyplaty || []).length) L.push('  brak');
         (Z.przeks || []).forEach(function (x){
             L.push('  ↳ para zmiany stawki VAT (HUB nie liczy jej jako zwrotu): storno ' + f2(x.storno.kwota)
@@ -108135,7 +108403,7 @@
         nt.forEach(function (n){ L.push('  ticket ' + n.rma + ' · ' + n.data + ' · ' + f2(n.kwota) + ' EUR · „' + n.tekst + '”'); });
         L.push('');
         L.push('REFUND REQUEST (narzędzie zwrotów przelewem)');
-        var tl = [].concat((D.toolA || []).map(function (t){ var x = Object.assign({}, t); x.gdzie = 'auftrag ' + r.auf; return x; }),
+        var tl = [].concat((D.toolA || []).map(function (t){ var x = Object.assign({}, t); x.gdzie = 'auftrag ' + (t.auf || r.auf); return x; }),
                            (Z.toolTk || []).map(function (t){ var x = Object.assign({}, t); x.gdzie = 'ticket ' + t.rma; return x; }));
         if (!tl.length) L.push('  brak');
         tl.forEach(function (t){
@@ -108146,6 +108414,11 @@
         L.push('');
         L.push('OPEN AMOUNT auftragu (Auftrag value − Total of Payments): ' + f2(r.open)
              + ' · auftrag skasowany: ' + (r.deleted === true ? 'tak' : (r.deleted === false ? 'nie' : '?')));
+        (D.aufy || []).forEach(function (a){
+            L.push('  auftrag ' + a.auf + ': open ' + f2(a.open) + ' · skasowany: '
+                 + (a.deleted === true ? 'tak' : (a.deleted === false ? 'nie' : '?'))
+                 + ' · tabelka Eupago Payments: ' + (a.eu ? ('tak, pozycji ' + a.eu) : 'brak'));
+        });
         L.push('');
         var kom = (D.kom || []).slice().sort(function (a, b){ return String(a.data || '') < String(b.data || '') ? -1 : 1; });
         L.push('KOMENTARZE (auftrag i tickety, od najstarszego; numery kont i e-maile zamaskowane) — ' + kom.length);
@@ -108193,6 +108466,14 @@
         l.push('- Komentarz „<referencja> Reembolso <kwota> €” albo „Refund done …” to ślad wykonanego zwrotu.');
         l.push('- Refund request: „Refund Done” = zwrot przelewem już zrobiony; „Refund approved” = tylko zgoda; „Refund not approved” / „Refund Deactivated” = nie do wykonania.');
         l.push('- Nigdy nie zwracamy więcej niż wpłata minus to, co już zwrócono w eupago.');
+        if (lista.some(function (r){ return r.st === 'err'; })){
+            l.push('');
+            l.push('Sprawy „do ręki” (stan w HUB: do ręki): HUB nie dokończył sprawdzania — powód stoi w „Uwagi HUB-a”, najczęściej'
+                 + ' nie znalazł płatności eupago w łańcuchu auftragów. W pliku jest wszystko, co HUB przeczytał z auftragów łańcucha'
+                 + ' i ich ticketów. Ustal dodatkowo, czym i na którym auftragu klient zapłacił (konto w Payments, komentarze).'
+                 + ' HUB takiego zwrotu sam NIE puści — DO_ZWROTU to podpowiedź dla człowieka: w DLACZEGO napisz, skąd i jak zwrócić'
+                 + ' (np. inny auftrag, inna metoda płatności, przelew).');
+        }
         l.push('');
         l.push('WERDYKT:');
         l.push('- ZROBIONY — ta prośba jest już załatwiona (pieniądze wyszły w eupago albo inną drogą).');
@@ -108226,17 +108507,103 @@
         L.push([ZW_CL_SPIS, '', 'ten spis'].join(T));
         lista.forEach(function (r){
             L.push(['sprawa-' + r.nr + '.txt', r.nr,
-                    'wszystko o sprawie: prośba, wpłata, zwroty w eupago, Payments, noty w ticketach, Refund request, komentarze'].join(T));
+                    (r.st === 'err' ? 'sprawa „do ręki” — wszystko, co HUB przeczytał z łańcucha auftragów i ich ticketów: '
+                                    : 'wszystko o sprawie: ')
+                    + 'prośba, wpłata, zwroty w eupago, Payments, noty w ticketach, Refund request, komentarze'].join(T));
         });
         return L.join('\r\n');
     }
+    // „do ręki" (err) doszlo 09.11.2026 na prosbe uzytkownika: wiersz, przy ktorym HUB nie dokonczyl
+    // sprawdzania (np. brak tabelki Eupago Payments w lancuchu), to tez sprawa bez pewnosci.
     function zwClKandydaci(){
-        return S.rows.filter(function (r){ return r.nr && (r.st === 'niepewne' || r.st === 'reczne'); });
+        return S.rows.filter(function (r){ return r.nr && (r.st === 'niepewne' || r.st === 'reczne' || r.st === 'err'); });
     }
-    function zwClStart(){
+    // Wiersz „do ręki" zwykle nie ma materialu (r.dos) — sprawdzanie stanelo, zanim go zebralo.
+    // Zbieramy go dopiero tu: auftragi lancucha (albo te, od ktorych sprawdzanie zaczynalo), ich
+    // tickety i ticket z wklejki. Tylko odczyt, z pamieci strony (CACHE) — te same strony, ktore widzial HUB.
+    var ZW_CL_TICKETY = 12;
+    // Strona, ktorej sprawdzanie nie odczytalo, siedzi w pamieci jako porazka — czytamy ja jeszcze raz.
+    async function zwClCzytaj(klucz, n, czyt, czytC){
+        var x = await czytC(n);
+        if (x && x.ok) return x;
+        x = await czyt(n);
+        if (x && x.ok) CACHE[klucz + n] = Promise.resolve(x);
+        return x;
+    }
+    async function zwClZbierz(r){
+        if (r.dos) return;
+        var aufy = [], w = {};
+        [].concat(r.odwiedzone || [], r.auf ? [r.auf] : [], r.aufyU || [], r.zrodloAuf ? [r.zrodloAuf] : [],
+                  (r.rodzaj === 'auftrag' && r.nr) ? [r.nr] : []).forEach(function (n){
+            n = String(n || ''); if (n && !w[n]){ w[n] = 1; aufy.push(n); }
+        });
+        aufy = aufy.slice(0, ZW_SKOKI);
+        // Lancuch dociagamy falami (do ZW_SKOKI): gdy sprawdzanie stanelo na nieodczytanym auftragu,
+        // jego dalszych auftragow w r.odwiedzone nie ma.
+        var aW = [], fala = aufy.slice();
+        while (fala.length){
+            var wynF = await Promise.all(fala.map(function (n){ return zwClCzytaj('a', n, czytajAuftrag, czytajAuftragC); }));
+            aW = aW.concat(wynF);
+            fala = [];
+            wynF.forEach(function (a){
+                ((a && a.ok && a.dalej) || []).forEach(function (n){
+                    n = String(n); if (!w[n] && aufy.length < ZW_SKOKI){ w[n] = 1; aufy.push(n); fala.push(n); }
+                });
+            });
+        }
+        var wyplaty = [], toolA = [], komL = [], tk = [], blad = [], aInfo = [], przeks = [];
+        aW.forEach(function (a, i){
+            if (!a || !a.ok){ blad.push('auftrag ' + aufy[i]); return; }
+            (a.wyplaty || []).forEach(function (p){ var x = Object.assign({}, p); x.auf = aufy[i]; wyplaty.push(x); });
+            (a.tool || []).forEach(function (t){ var x = Object.assign({}, t); x.auf = aufy[i]; toolA.push(x); });
+            // Pary zmiany stawki VAT liczymy w obrebie JEDNEGO auftragu — miedzy auftragami nie paruja sie.
+            przeks = przeks.concat(juzZwrocone(a.wyplaty || [], []).przeks);
+            komL.push(a.kom || []);
+            aInfo.push({ auf: aufy[i], open: a.open, deleted: a.deleted, eu: (a.eu || []).length });
+            (a.tickety || []).forEach(function (t){ t = String(t); if (tk.indexOf(t) < 0) tk.push(t); });
+        });
+        [r.rma, r.rodzaj === 'ticket' ? r.nr : ''].forEach(function (t){ t = String(t || ''); if (t && tk.indexOf(t) < 0) tk.unshift(t); });
+        if (tk.length > ZW_CL_TICKETY){
+            blad.push('pominięte tickety (limit ' + ZW_CL_TICKETY + '): ' + tk.slice(ZW_CL_TICKETY).join(', '));
+            tk = tk.slice(0, ZW_CL_TICKETY);
+        }
+        var tW = await Promise.all(tk.map(function (n){ return zwClCzytaj('t', n, czytajTicket, czytajTicketC); }));
+        var noty = [], toolTk = [];
+        tW.forEach(function (t, i){
+            if (!t || !t.ok){ blad.push('ticket ' + tk[i]); return; }
+            (t.noty || []).forEach(function (n){
+                if (n.kwota > 0) noty.push({ kwota: n.kwota, data: n.data, rma: tk[i], tekst: n.tekst });
+            });
+            (t.tool || []).forEach(function (tw){ var x = Object.assign({}, tw); x.rma = tk[i]; toolTk.push(x); });
+            komL.push(t.kom || []);
+        });
+        r.dos = { kom: scalKomentarze(komL), wyplaty: wyplaty, toolA: toolA, tickety: tk, aufy: aInfo, nieodczytane: blad,
+                  slady: { noty: noty, toolTk: toolTk, przeks: przeks, eu: null } };
+        dz('claude: zebrane do ręki', r.nr, 'auftragow=' + aufy.length, 'ticketow=' + tk.length,
+           'wyplat=' + wyplaty.length, 'komentarzy=' + r.dos.kom.length, blad.length ? ('nieodczytane: ' + blad.join('; ')) : '');
+    }
+    async function zwClStart(){
         if (S.busy){ say('Poczekaj, aż skończy się sprawdzanie albo zwroty.', '#c47f00'); return; }
         var lista = zwClKandydaci();
         if (!lista.length){ say('Nie ma spraw bez pewności — nic do wysłania.', '#c47f00'); return; }
+        var brak = lista.filter(function (r){ return !r.dos; });
+        if (brak.length){
+            var wiersze = S.rows;
+            S.busy = true; S.clZbiera = true; render();
+            try {
+                for (var bi = 0; bi < brak.length; bi++){
+                    say('Zbieram dane spraw „do ręki” dla Claude: ' + (bi + 1) + ' z ' + brak.length + '…', '#c47f00');
+                    await zwClZbierz(brak[bi]);
+                }
+            } catch (e){
+                say('Nie zebrałem danych dla Claude: ' + (e && e.message ? e.message : e), '#c00');
+                return;
+            } finally { S.busy = false; S.clZbiera = false; render(); }
+            // „Wyczyść" w trakcie zbierania — lista jest inna, paczki nie skladamy.
+            if (S.rows !== wiersze){ say('Lista się zmieniła w trakcie zbierania — kliknij „① Paczka ZIP dla Claude” jeszcze raz.', '#c47f00'); return; }
+            lista = zwClKandydaci();
+            if (!lista.length){ say('Nie ma spraw bez pewności — nic do wysłania.', '#c47f00'); return; }
+        }
         var d = new Date();
         var nazwa = 'HUB-zwroty-' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '-'
                   + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds()) + '.zip';
@@ -108307,6 +108674,10 @@
                 if (r.st !== 'blok'){ r.stPrzedClaude = r.st; r.st = 'blok'; r.sel = false; }
                 dopisz(r, 'Claude: zwrot już zrobiony — ' + (r.claude.dlaczego || '—')
                         + (r.claude.dowod ? (' [' + r.claude.dowod + ']') : ''));
+            } else if (r.st === 'err'){
+                // „do ręki": HUB zwrotu nie puszcza — werdykt zostaje podpowiedzia dla czlowieka, przy wierszu.
+                dopisz(r, 'Claude: ' + (wer === 'DO_ZWROTU' ? ('do zwrotu ' + f2(r.claude.kwota)) : 'nie wie')
+                        + ' — ' + (r.claude.dlaczego || '—') + (r.claude.dowod ? (' [' + r.claude.dowod + ']') : ''));
             } else if (wer === 'DO_ZWROTU' && r.claude.kwota != null && r.kwota != null && Math.abs(r.claude.kwota - r.kwota) >= ZW_TOL){
                 dopisz(r, 'Claude proponuje zwrot ' + f2(r.claude.kwota) + ' zamiast ' + f2(r.kwota) + ' — sprawdź, zanim potwierdzisz');
             }
@@ -108326,13 +108697,14 @@
         var h = '<div style="margin-bottom:8px;padding:8px 10px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;font-size:12px;color:#3b0764">'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               + '<b>🤖 Sprawy bez pewności: ' + kand.length + '</b>'
-              + '<span style="color:#6b21a8">(„niepewne — był już zwrot?” i „do potwierdzenia”)</span>'
-              + (kand.length ? ('<button id="zwr-cl-zip" style="' + BT + 'background:#6b21a8;color:#fff;border:none">① Paczka ZIP dla Claude ('
-                                + kand.length + ')</button>') : '')
+              + '<span style="color:#6b21a8">(„niepewne — był już zwrot?”, „do potwierdzenia” i „do ręki”)</span>'
+              + (kand.length ? ('<button id="zwr-cl-zip"' + (S.clZbiera ? ' disabled' : '') + ' style="' + BT
+                                + 'background:#6b21a8;color:#fff;border:none' + (S.clZbiera ? ';opacity:.6;cursor:wait' : '') + '">'
+                                + (S.clZbiera ? '⏳ Zbieram dane…' : ('① Paczka ZIP dla Claude (' + kand.length + ')')) + '</button>') : '')
               + '</div>'
               + '<div style="font-size:10px;color:#6b21a8;margin-top:3px">Do Claude idą komentarze tych spraw (z danymi klientów); '
               + 'numery kont i e-maile są zamaskowane. Werdykt „ZROBIONY” blokuje wiersz; zgody na zwrot Claude nie daje — '
-              + 'decyzja zostaje przy wierszu.</div>';
+              + 'przy „do ręki” werdykt jest tylko podpowiedzią; decyzja zostaje przy wierszu.</div>';
         if (S.cl){
             h += '<div style="margin-top:6px">ZIP: <b>' + esc(S.cl.nazwa) + '</b> (' + S.cl.kb + ' kB, ' + S.cl.nr.length + ' spraw) — '
                + esc(S.cl.sciezka) + '</div>'
@@ -115079,7 +115451,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '6323fc9 · 09.11.2026 10:26';
+    const HUB_BUDOWA = '2827242 · 09.11.2026 13:53';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -116276,7 +116648,7 @@
     (document.body || document.documentElement).appendChild(panel);
     btn.onclick = function (){
         panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
-        if (panel.style.display === 'block') rysuj();
+        if (panel.style.display === 'block'){ rysuj(); odswiezStany(); }
     };
 
     var GUZ = 'padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px';
@@ -116288,7 +116660,7 @@
               + '<div style="font-size:11px;color:#555;margin-bottom:8px">Wrzuć pliki z maili przewoźników — kilka naraz, także przeciągnięte prosto z poczty. '
               + 'Przewoźnika rozpoznaję po treści: ' + COD_KOLEJ.map(function (k){ return COD_PRZEW[k].nazwa; }).join(', ') + '. '
               + 'Z każdego pliku robię import do jego ustawienia w prologistics, sprawdzam auftragi z pliku i księguję „' + COD_BLOCK_OPIS + '”.</div>'
-              + '<div id="cod-drop" style="border:2px dashed #c4b5fd;border-radius:8px;padding:14px;text-align:center;background:#faf5ff;color:#5b21b6">'
+              + '<div id="cod-drop" style="border:2px dashed #FFCCB7;border-radius:8px;padding:14px;text-align:center;background:#F6E7E6;color:#750000">'
               + '📎 Upuść tu pliki albo <label style="text-decoration:underline;cursor:pointer">wybierz z dysku'
               + '<input id="cod-plik" type="file" multiple accept=".xls,.xlsx,.csv,.txt" style="display:none"></label></div>';
         h += rysujNowe() + rysujZlecenia();
@@ -116301,11 +116673,11 @@
 
     function rysujNowe(){
         if (!S.nowe.length) return '';
-        var h = '<div style="margin-top:12px;padding:8px;border:1px solid #ddd6fe;border-radius:8px;background:#fff">'
-              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><b style="color:#5b21b6">Nowe pliki (' + S.nowe.length + ')</b>'
+        var h = '<div style="margin-top:12px;padding:8px;border:1px solid #DBD9D7;border-radius:8px;background:#fff">'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><b style="color:#750000">Nowe pliki (' + S.nowe.length + ')</b>'
               + '<label style="font-size:12px;font-weight:600">Data wpłaty (data paczki): <input id="cod-data-wsz" type="date" value="' + esc(S.dataWsz) + '" style="font-size:12px"></label>'
               + '<span style="font-size:10px;color:#666">ustawia datę wszystkim plikom poniżej; każdą możesz zmienić osobno</span></div>'
-              + '<table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11px"><tr style="background:#f5f3ff;text-align:left">'
+              + '<table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11px"><tr style="background:#F6E7E6;text-align:left">'
               + '<th style="padding:3px">Przewoźnik</th><th>Plik</th><th style="text-align:right;padding:3px 8px">Pozycji</th><th style="text-align:right;padding:3px 8px">Suma</th>'
               + '<th style="padding:3px 8px">Import do</th><th>Data paczki</th><th></th></tr>';
         S.nowe.forEach(function (n, i){
@@ -116317,7 +116689,7 @@
                + '<td style="padding:3px 8px;white-space:nowrap">' + (P ? (P.bank + ' · konto ' + P.konto) : '') + '</td>'
                + '<td>' + (w ? '<input type="date" data-cod-data="' + i + '" value="' + esc(n.data) + '" style="font-size:11px">' : '')
                + (w && w.data && w.data !== n.data ? '<div style="font-size:10px;color:#666">w pliku: ' + esc(isoPl(w.data))
-                   + ' <a href="#" data-cod-uzyj="' + i + '" style="color:#5b21b6">użyj</a><div>' + esc(w.dataZrodlo) + '</div></div>' : '') + '</td>'
+                   + ' <a href="#" data-cod-uzyj="' + i + '" style="color:#750000">użyj</a><div>' + esc(w.dataZrodlo) + '</div></div>' : '') + '</td>'
                + '<td><button data-cod-usun="' + i + '" style="' + GUZ + '">✕</button></td></tr>';
             var bl = (n.blad ? [n.blad] : []).concat(w ? w.bledy : []).concat(n.duble ? n.duble.bledy : []);
             var uw = (w ? w.uwagi : []).concat(n.duble ? n.duble.uwagi : []);
@@ -116363,7 +116735,12 @@
         otw.forEach(function (id){ h += rysujZ(m[id]); });
         if (zak.length){
             h += '<details style="margin-top:6px"><summary style="cursor:pointer;font-size:11px;color:#15803d">✔ Zaksięgowane (' + zak.length + ')</summary>';
-            zak.forEach(function (id){ h += rysujZ(m[id]); });
+            h += rysujZ(m[zak[0]]);   // tylko ostatnio zaksięgowana (lista jest posortowana od najnowszej)
+            if (zak.length > 1){
+                h += '<details style="margin-top:4px"><summary style="cursor:pointer;font-size:11px;color:#888">…starsze (' + (zak.length - 1) + ')</summary>';
+                zak.slice(1).forEach(function (id){ h += rysujZ(m[id]); });
+                h += '</details>';
+            }
             h += '<button id="cod-czysc-zak" style="' + GUZ + ';margin-top:4px">Wyczyść zaksięgowane z listy</button></details>';
         }
         return h;
@@ -116390,7 +116767,7 @@
         if (a && a.nfTrack.length && z.impId)
             g += '<button data-cod-nftrack="' + esc(z.id) + '" style="' + GUZ + '">🔍 Szukaj auftragów po numerze przesyłki (' + a.nfTrack.length + ')</button>';
         g += '<button data-cod-zap="' + esc(z.id) + '" style="' + GUZ + ';color:#888">✕ Zapomnij</button>';
-        h += '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' + (zaj ? '<span style="font-size:11px;color:#5b21b6">⏳ ' + esc(zaj) + '</span>' : g) + '</div>';
+        h += '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' + (zaj ? '<span style="font-size:11px;color:#750000">⏳ ' + esc(zaj) + '</span>' : g) + '</div>';
         if (S.msg[z.id]) h += '<div style="margin-top:4px;font-size:11px;color:' + (S.msg[z.id].k || '#333') + '">' + S.msg[z.id].t + '</div>';
         if (a) h += rysujAnalize(z, a);
         return h + '</div>';
@@ -116500,7 +116877,7 @@
         if (!confirm('Wysłać do importu ' + lst.length + ' plik(ów)?\n\n' + txtc
             + '\n\nKażdy plik to osobna paczka w Import payments. Po imporcie sprawdzę auftragi z pliku (inny auftrag niż w pliku przepnę sam) '
             + 'i pokażę guzik „Zaksięguj OK” — samo wysłanie niczego nie księguje.')) return;
-        S.wysylam = true; mow('nowe', '⏳ wysyłam…', '#5b21b6'); rysuj();
+        S.wysylam = true; mow('nowe', '⏳ wysyłam…', '#750000'); rysuj();
         hubDz('COD', 'start', 'wysyłka ' + lst.length + ' plików');
         var wyslane = 0;
         for (var k = 0; k < lst.length; k++){
@@ -116579,6 +116956,31 @@
         } catch (e){
             mow(id, '✖ ' + esc((e && e.message) || e), '#c00');
         }
+        delete S.zajete[id]; rysuj();
+    }
+
+    // Status z prologistics (read-only): przy otwarciu panelu odswiezamy paczki jeszcze w stanie
+    // „import" — czytamy paczke (bez zadnego zapisu: ani przepnij, ani trackNf) i gdy wszystkie wiersze
+    // sa juz zaksiegowane w prologistics, przestawiamy stan na „zaksiegowane". Dzieki temu paczka, ktora
+    // prologistics dopasowal sam (InPost, booking 3), nie zostaje myslaco jako „zaimportowane".
+    async function odswiezStany(){
+        var m = zlecenia(), ids = Object.keys(m).filter(function (id){
+            var z = m[id];
+            return z.impId && !z.lekki && z.stan === 'import' && !S.anal[id] && !S.zajete[id];
+        });
+        for (var i = 0; i < ids.length; i++) await odswiezStan(ids[i]);
+    }
+    async function odswiezStan(id){
+        var z = zlecenie(id);
+        if (!z || !z.impId || z.lekki || S.zajete[id] || z.stan !== 'import' || S.anal[id]) return;
+        S.zajete[id] = 'sprawdzam stan paczki ' + z.impId + '…'; rysuj();
+        try {
+            var d = await paczka(z.impId), a = analiza(z, d);
+            S.anal[id] = a; S.d[id] = d;
+            if (a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length){
+                z.stan = 'zaksiegowane'; zapiszZ(z);
+            }
+        } catch (e){ /* milczkiem — zostaje „zaimportowane", czlowiek moze kliknac „↻ Sprawdź paczkę" */ }
         delete S.zajete[id]; rysuj();
     }
 
@@ -116868,7 +117270,7 @@
             .bl-panel[data-bl-mod="marta"]   {--bl-tint:#DD7E6B;}
             .bl-panel[data-bl-mod="auftrag"] {--bl-tint:#9FC5E8;}
             .bl-panel[data-bl-mod="bank"]    {--bl-tint:#D5A6BD;}
-            .bl-panel[data-bl-mod="cod"]     {--bl-tint:#C9DAF8;}
+            .bl-panel[data-bl-mod="cod"]     {--bl-tint:#EA9999;}
             .bl-panel[data-bl-mod="recon"]   {--bl-tint:#8E7CC3;}
         `);
 
