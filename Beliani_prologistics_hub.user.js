@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.7
+// @version      5.63.8
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -16926,7 +16926,7 @@
         var saT = ibtPole('saldo').trim(), saL = saT ? ibtLiczba(saT) : null, sa = saT ? (saL ? saL.v : NaN) : null;
         var wal = ibtPole('wal'), tyt = ibtPole('tyt').replace(/\s+/g, ' ').trim();
         var login = ibtPole('osoba'), osoba = S.ibt.osoby.filter(function (x){ return x.login === login; })[0] || null;
-        var B = [], O = [];
+        var B = [], O = [], I = [];
         if (!kz) B.push('wybierz rachunek „skąd”');
         if (!kd) B.push('wybierz rachunek „dokąd”');
         if (kz && kd && z === d) B.push('„skąd” i „dokąd” to ten sam rachunek');
@@ -16964,7 +16964,10 @@
         if (szcz && szcz.stan === 'ok' && osoba){
             if (szcz.restr && szcz.dostep.indexOf(osoba.login) < 0 && szcz.resp !== osoba.login)
                 O.push('issue ' + is.id + ' ma ograniczony dostęp, a ' + osoba.nazwa + ' nie ma go na liście — może issue nie zobaczyć');
-            if (szcz.resp === osoba.login) O.push(osoba.nazwa + ' już jest osobą odpowiedzialną — zmiany osoby (i maila) nie będzie, pójdzie sam komentarz');
+            // Ta sama osoba to nie powód do ostrzeżenia: HUB odbija jeszcze raz, bo mail „Please answer Issue” wychodzi
+            // tylko przy Reassign, a „@Imię” w komentarzu maila nie wysyła (09.11.2026 — 441008: zlecenie 320 000 USD
+            // do osoby, która po „Confirmed” została odpowiedzialna, poszło bez maila).
+            if (szcz.resp === osoba.login) I.push(osoba.nazwa + ' już jest osobą odpowiedzialną — HUB odbije jeszcze raz na tę samą osobę (mail wychodzi tylko przy odbiciu) i sprawdzi w Mail log, czy mail wyszedł');
         }
         var dub = (szcz && szcz.stan === 'ok' && isFinite(kw) && kw > 0) ? ibtDubel(szcz.kom, kw, tyt) : null;
         if (dub) O.push('w tym issue ' + String(dub.kiedy).slice(0, 16) + ' ' + dub.kto + ' zlecił(a) już ' + ibtKwotaTxt(kw) + (dub.tytul ? ' z tym samym tytułem' : '') + ' — sprawdź, czy to nie ten sam przelew');
@@ -16972,7 +16975,7 @@
         // Screen wgrany już do TEGO issue (komentarz wtedy nie poszedł) — podgląd pokazuje jego link.
         var scrT = scr ? (scr.wgrany && is && scr.wgrany.id === is.id ? scr.wgrany.link : IBT_SCR_PODGLAD) : null;
         var tekst = (kz && kd && osoba && isFinite(kw) && kw > 0 && wal && tyt) ? ibtTekst(osoba, uid, kz, kd, kw, wal, tyt, sa, scrT) : '';
-        return { K: K, kz: kz, kd: kd, pas: pas, is: is, szcz: szcz, kw: kw, sa: sa, wal: wal, tyt: tyt, osoba: osoba, uid: uid, B: B, O: O, tekst: tekst, dub: dub, scr: scr };
+        return { K: K, kz: kz, kd: kd, pas: pas, is: is, szcz: szcz, kw: kw, sa: sa, wal: wal, tyt: tyt, osoba: osoba, uid: uid, B: B, O: O, I: I, tekst: tekst, dub: dub, scr: scr };
     }
 
     // ---------- prologistics: ZAPIS (wyłącznie „Zlecenie przelewu wewnętrznego”) ----------
@@ -16990,8 +16993,69 @@
     }
     function zmienOdpowiedzialnego(id, login){
         return zapytanie(API + '/changeResponsible/?comment_type=issuelog&page_id=' + encodeURIComponent(id) + '&resp_person=' + encodeURIComponent(login), TIS_API_MS)
-            .then(function (r){ return r.status; });
+            .then(function (r){
+                // Przy odbiciu na tę samą osobę odczyt „kto jest odpowiedzialny” niczego nie dowodzi — odmowę
+                // serwera trzeba złapać z samej odpowiedzi (strona issue czyta z niej pole success).
+                if (!r.ok) throw new Error('zmiana osoby: HTTP ' + r.status);
+                return r.text().then(function (t){
+                    var j = null; try { j = JSON.parse(t); } catch (e){}
+                    if (j && j.success === false) throw new Error('prologistics odmówił zmiany osoby (' + JSON.stringify(j).slice(0, 160) + ')');
+                    return r.status;
+                });
+            });
     }
+    // Mail log issue (09.11.2026). Strona issue po „Reassign” czyta /api/comments/emaillog/?page_id=…&output=1
+    // i bierze z odpowiedzi listę email_log (reactjs/dist/main_logs.js); tę samą listę oddaje odczyt komentarzy
+    // (/api/issueLog/comments/). Kształtu pojedynczego wpisu nie widziałem na żywo — wpisy porównujemy w całości,
+    // a mail o nowej osobie odpowiedzialnej poznajemy po słowie „responsible” (w Mail log: new_responsible_issue).
+    var IBT_MAIL_PROB = 8, IBT_MAIL_PIERWSZY = 1500, IBT_MAIL_ODSTEP = 2500;
+    var IBT_MAIL_S = Math.round((IBT_MAIL_PIERWSZY + (IBT_MAIL_PROB - 1) * IBT_MAIL_ODSTEP) / 1000);
+    function ibtMailLog(id){
+        var lista = function (j){ if (j && Array.isArray(j.email_log)) return j.email_log; throw new Error('odpowiedź bez listy Mail log'); };
+        return api('/api/comments/emaillog/?page_id=' + encodeURIComponent(id) + '&output=1', true).then(lista)
+            .catch(function (){ return api(API + '/comments/?comment_type=issuelog&page_id=' + encodeURIComponent(id), true).then(lista); });
+    }
+    function ibtMailOMailu(e){ return /responsible/i.test(JSON.stringify(e)); }
+    // Wpisy „po”, których nie było „przed” (z powtórzeniami — dwa takie same maile to dwa wpisy).
+    function ibtMailNowe(przed, po){
+        var licz = {};
+        przed.forEach(function (e){ var k = JSON.stringify(e); licz[k] = (licz[k] || 0) + 1; });
+        return po.filter(function (e){ var k = JSON.stringify(e); if (licz[k]){ licz[k]--; return false; } return true; });
+    }
+    // Wynik: { stan: 'tak' | 'nie' | 'inny' | 'nieznany', powod }. Nie rzuca — Mail log to kontrola, nie zapis.
+    function ibtMailPo(id, przed){
+        if (!przed) return Promise.resolve({ stan: 'nieznany', powod: 'Mail log nie dał się odczytać przed odbiciem' });
+        var proba = 0, bledy = 0, inne = 0;
+        function krok(){
+            proba++;
+            return czekaj(proba === 1 ? IBT_MAIL_PIERWSZY : IBT_MAIL_ODSTEP).then(function (){ return ibtMailLog(id); }).then(function (po){
+                var nowe = ibtMailNowe(przed, po);
+                // Gdy zmienił się KAŻDY wpis (np. pole z „ile minut temu”), porównanie w całości nic nie mówi —
+                // zostaje liczba wpisów o nowej osobie odpowiedzialnej.
+                var calosc = przed.length > 0 && po.length > 0 && nowe.length === po.length;
+                var ileMail = function (l){ return l.filter(ibtMailOMailu).length; };
+                if (ileMail(po) > ileMail(przed) || (!calosc && nowe.some(ibtMailOMailu))) return { stan: 'tak' };
+                inne = calosc ? Math.max(0, po.length - przed.length) : nowe.length;
+                return null;
+            }, function (){ bledy++; return null; }).then(function (w){
+                if (w) return w;
+                if (proba < IBT_MAIL_PROB) return krok();
+                if (bledy === proba) return { stan: 'nieznany', powod: 'Mail log nie dał się odczytać po odbiciu' };
+                return { stan: inne ? 'inny' : 'nie' };
+            });
+        }
+        return krok();
+    }
+    function ibtMailOpis(w){
+        var m = w.mail;
+        if (!m) return '';
+        if (m.stan === 'tak') return ' — mail „Please answer Issue” widać w Mail log.';
+        if (m.stan === 'nie') return ' — ✖ ale w Mail log przez ' + IBT_MAIL_S + ' s nie pojawił się żaden mail'
+            + (w.ponowne ? ' (prologistics przy odbiciu na tę samą osobę go nie wysłał)' : '') + ' — daj znać (' + w.osoba + ') inaczej, np. na Teams.';
+        if (m.stan === 'inny') return ' — ⚠ w Mail log przybył mail, ale nie rozpoznałem w nim „new_responsible_issue” — sprawdź Mail log w issue.';
+        return ' — Mail log nie sprawdzony (' + (m.powod || '?') + ')' + (w.ponowne ? ', więc nie wiem, czy mail do ' + w.osoba + ' wyszedł — sprawdź Mail log w issue.' : '.');
+    }
+    function ibtMailZle(w){ return !!(w.mail && (w.mail.stan === 'nie' || w.mail.stan === 'inny' || (w.ponowne && w.mail.stan === 'nieznany'))); }
     // Screen salda do issue (14.10.2026): ten sam zapis co „dodaj plik” w panelu Issue Log (init_issuelog,
     // uploadFile — tamtej funkcji stąd nie widać, osobne domknięcie). prologistics sam dopisuje wtedy komentarz
     // „Images have been attached: …”. Adres obrazu: original_url = /doc.php?issue_doc_id=N (obraz w pełnym
@@ -17127,10 +17191,10 @@
                      : 'Najpierw wgram do issue screen salda (' + scr.nazwaPlik + ', ' + scrKB + ' KB) — prologistics sam dopisze komentarz „Images have been attached”. Link do screena pójdzie w linii salda.\n\n') : '')
             + 'Komentarz:\n' + ibtPokaz(st.tekst) + '\n\n'
             + (st.O.length ? 'Ostrzeżenia, które przyjmujesz:\n• ' + st.O.join('\n• ') + '\n\n' : '')
-            + (zmiana ? 'Potem zmiana osoby odpowiedzialnej na: ' + osoba.nazwa + ' (prologistics wyśle mail „Please answer Issue”).'
-                      : osoba.nazwa + ' już jest osobą odpowiedzialną — pójdzie sam komentarz.') + '\n\nWysłać?')) return;
-        S.ibt.wysylam = true; S.ibt.wynik = { c: 'info', t: '⏳ Wysyłam zlecenie do issue ' + id + (scr ? ' (najpierw screen salda)' : '') + '…' }; rysuj();
-        var w = { id: id, tytul: st.is.tytul, tekst: tekstBez, osoba: osoba.nazwa, kom: false, reassign: zmiana ? false : 'bez zmiany', blad: '', kiedy: new Date(), screen: null, linkKlik: null };
+            + (zmiana ? 'Potem zmiana osoby odpowiedzialnej na: ' + osoba.nazwa + ' (prologistics wyśle mail „Please answer Issue”; sprawdzę w Mail log, czy wyszedł).'
+                      : osoba.nazwa + ' już jest osobą odpowiedzialną — potem odbiję jeszcze raz na tę samą osobę, żeby prologistics wysłał mail „Please answer Issue”, i sprawdzę w Mail log, czy wyszedł.') + '\n\nWysłać?')) return;
+        S.ibt.wysylam = true; S.ibt.wynik = { c: 'info', t: '⏳ Wysyłam zlecenie do issue ' + id + (scr ? ' (najpierw screen salda)' : '') + '… Po odbiciu sprawdzam Mail log (do ' + IBT_MAIL_S + ' s).' }; rysuj();
+        var w = { id: id, tytul: st.is.tytul, tekst: tekstBez, osoba: osoba.nazwa, kom: false, reassign: false, ponowne: !zmiana, mail: null, blad: '', kiedy: new Date(), screen: null, linkKlik: null };
         // To samo zlecenie: ta sama treść, a ze screenem — ta sama treść z dopiskiem „(screen: …)” (link jest za każdym razem
         // inny). W obie strony: zlecenie wysłane ze screenem blokuje też to samo bez screena (przegląd 14.10.2026).
         function toSamo(c){ var n = ibtNorm(c.tekst); return n === celBez || n.indexOf(celBez + ' (screen:') === 0; }
@@ -17170,10 +17234,16 @@
             if (!ok) throw new Error('komentarza w issue ' + id + ' NIE widzę po zapisie — sprawdź issue, zanim wyślesz ponownie; osoby odpowiedzialnej nie zmieniałem');
             w.kom = true;
             return (scr ? linkKlikalny() : Promise.resolve()).then(function (){
-                if (!zmiana) return;
-                return zmienOdpowiedzialnego(id, osoba.login)
+                // Odbicie idzie ZAWSZE, także na osobę, która już jest odpowiedzialna (09.11.2026): mail „Please answer
+                // Issue” wychodzi tylko przy Reassign. Mail log czytany przed odbiciem i po — to on mówi, czy mail wyszedł.
+                var mailPrzed = null;
+                return ibtMailLog(id).then(function (l){ mailPrzed = l; }, function (){ mailPrzed = null; })
+                    .then(function (){ return zmienOdpowiedzialnego(id, osoba.login); })
                     .then(function (){ return potwierdz(function (){ return issueZNumeru(id, true).then(function (it){ return (it.resp_username || '') === osoba.login; }); }); })
-                    .then(function (ok2){ w.reassign = !!ok2; }, function (e){ w.reassign = false; w.blad = String(e.message || e); });
+                    .then(function (ok2){
+                        w.reassign = !!ok2;
+                        if (ok2) return ibtMailPo(id, mailPrzed).then(function (m){ w.mail = m; });
+                    }, function (e){ w.reassign = false; w.blad = String(e.message || e); });
             });
         }).catch(function (e){
             w.blad = String(e.message || e);
@@ -17188,8 +17258,11 @@
             // Odmowy „trwa wysyłka” przy screenie nie są już prawdą (przegląd 14.10.2026).
             if (/^Trwa wysyłka/.test(S.ibt.scrInfo || '')) S.ibt.scrInfo = '';
             var scrOpis = w.kom && w.screen ? ' Screen salda wgrany do issue, link w linii salda' + (w.linkKlik === false ? ' — UWAGA: prologistics zapisał link jako zwykły tekst (adres widać, ale nie jest klikalny)' : '') + '.' : '';
-            if (w.kom && w.reassign !== false)
-                S.ibt.wynik = { c: w.linkKlik === false ? 'warn' : 'ok', t: '✔ Issue ' + id + ': komentarz dodany i potwierdzony; ' + (w.reassign === true ? 'osoba odpowiedzialna: ' + w.osoba + ' (potwierdzone) — prologistics wysyła mail „Please answer Issue”.' : 'osoba odpowiedzialna bez zmian (' + w.osoba + ' już nią była).') + scrOpis };
+            if (w.kom && w.reassign === true)
+                S.ibt.wynik = { c: (w.linkKlik === false || ibtMailZle(w)) ? 'warn' : 'ok', t: '✔ Issue ' + id + ': komentarz dodany i potwierdzony; '
+                    + (w.ponowne ? 'odbite jeszcze raz na ' + w.osoba + ' (już wcześniej osoba odpowiedzialna)' : 'osoba odpowiedzialna: ' + w.osoba + ' (potwierdzone)') + ibtMailOpis(w) + scrOpis };
+            else if (w.kom && w.ponowne)
+                S.ibt.wynik = { c: 'warn', t: '✔ Komentarz w issue ' + id + ' dodany, ale ✖ ponowne odbicie na ' + w.osoba + ' (żeby poszedł mail) się nie udało' + (w.blad ? ' (' + w.blad + ')' : '') + ' — mail nie wyszedł: zrób „Reassign” ręcznie na stronie issue albo daj znać inaczej.' + scrOpis };
             else if (w.kom)
                 S.ibt.wynik = { c: 'warn', t: '✔ Komentarz w issue ' + id + ' dodany, ale ✖ zmiany osoby odpowiedzialnej na ' + w.osoba + ' nie potwierdziłem' + (w.blad ? ' (' + w.blad + ')' : '') + ' — zrób „Reassign” ręcznie na stronie issue.' + scrOpis };
             else S.ibt.wynik = { c: 'err', t: '✖ ' + (w.blad || 'nie wysłane') };
@@ -18353,7 +18426,8 @@
         if (st.B.length) h += '<ul class="tis-ibt-o">' + st.B.map(function (t){ return '<li class="b">✖ ' + esc(t) + '</li>'; }).join('') + '</ul>';
         if (st.O.length) h += '<ul class="tis-ibt-o">' + st.O.map(function (t){ return '<li class="o">⚠ ' + esc(t) + '</li>'; }).join('') + '</ul>';
         if (!st.B.length && !st.O.length) h += '<div class="w-ok" style="font-size:12px">✔ gotowe do wysłania</div>';
-        if (st.osoba && !st.uid) h += '<div class="tis-mut">Numeru użytkownika ' + esc(st.osoba.nazwa) + ' nie znam — oznaczenie pójdzie bez numeru (mail i tak wyjdzie przy zmianie osoby).</div>';
+        if (st.I && st.I.length) h += st.I.map(function (t){ return '<div class="tis-mut">ℹ ' + esc(t) + '</div>'; }).join('');
+        if (st.osoba && !st.uid) h += '<div class="tis-mut">Numeru użytkownika ' + esc(st.osoba.nazwa) + ' nie znam — oznaczenie pójdzie bez numeru (mail i tak wychodzi przy odbiciu, nie z oznaczenia).</div>';
         return h;
     }
     function htmlIbt(){
@@ -18415,10 +18489,11 @@
         if (I.historia.length){
             h += '<div class="tis-mut" style="margin-top:6px">Wysłane w tej sesji:</div><ul class="tis-ibt-o">'
                + I.historia.slice(0, 8).map(function (w){
-                    var c = w.kom ? (w.reassign === false ? 'o' : '') : 'b';
+                    var c = w.kom ? (w.reassign === false || ibtMailZle(w) ? 'o' : '') : 'b';
+                    var ml = w.mail ? (w.mail.stan === 'tak' ? ' · mail ✔' : w.mail.stan === 'nie' ? ' · mail ✖' : ' · mail ?') : '';
                     return '<li class="' + c + '">' + esc(('0' + w.kiedy.getHours()).slice(-2) + ':' + ('0' + w.kiedy.getMinutes()).slice(-2)) + ' · issue '
                          + '<a href="/react/logs/issue_logs/' + encodeURIComponent(w.id) + '" target="_blank" rel="noopener">' + esc(w.id) + '</a> · ' + esc(w.osoba) + ' · '
-                         + (w.kom ? 'komentarz ✔' : 'komentarz ✖') + (w.kom ? ' · ' + (w.reassign === true ? 'odbicie ✔' : w.reassign === false ? 'odbicie ✖' : 'odbicie bez zmiany') : '')
+                         + (w.kom ? 'komentarz ✔' : 'komentarz ✖') + (w.kom ? ' · ' + (w.reassign === true ? (w.ponowne ? 'odbicie ponowne ✔' : 'odbicie ✔') : w.reassign === false ? 'odbicie ✖' : 'odbicie bez zmiany') + ml : '')
                          + (w.kom && w.screen ? ' · <a href="' + esc(w.screen.link) + '" target="_blank" rel="noopener">screen ✔</a>' : '')
                          + (w.blad ? ' — ' + esc(w.blad) : '') + '</li>';
                  }).join('') + '</ul>';
@@ -39934,6 +40009,9 @@
         // gdyby paczka weszla w calosci jako NOT FOUND, przestaw na 12 („Invoice No"), jak przy OBI CH.
         'Mirakl (XXXLutz) · XXXLutz HR': { bank: '261', booking: '9', acct: '1463' },
         'Mirakl (XXXLutz) · XXXLutz SE': { bank: '', booking: '9', acct: '1536' },
+        // XXXLutz CH (sklep 6346, CHF): import 244 „XXX Lutz CH" — CHF, booking 9, data kol. 3, numer kol. 5, kwota kol. 14,
+        // konto 1379 „XXX Lutz CH Beliani Switzerland GmbH". Odczytane 10.11.2026 z /api/bankSettings/index/244/ (aktywne, bez paczek).
+        'Mirakl (XXXLutz) · XXXLutz CH': { bank: '244', booking: '9', acct: '1379' },
         // Homedeco NL: import 32 „Homedeco NL", konto 1349, booking 9 (Fulfillment No —
         // ordernumber z pliku to numer fulfilmentu). Potwierdzone przez uzytkownika 16.09.2026.
         'Homedeco · Homedeco NL': { bank: '32', booking: '9', acct: '1349' },
@@ -44475,6 +44553,13 @@
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz SI', cur: 'EUR' },
         '7100': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz SE', cur: 'SEK' },
+        // XXXLutz CH dopisane 10.11.2026: wyplata 833.50 z 06.11 (zlecenie „XXXLutz CH, dodane recznie") nie znajdowala rozliczenia,
+        // bo sklepu 6346 nie bylo w mapie, wiec przelot go nie odwiedzal (9 sklepow z mapy, bez CH). Odczyt z panelu 10.11.2026:
+        // /_menu pokazuje 6346 „Beliani CH" (badge „Manual suspension"), shops/current „Beliani CH", cykl 6b02cebf (voucher 000118,
+        // do 20.10, PAID) ma sellerPayableAmount 833.50 w CHF (currencyUnit CHF) — wyplata CH jest w CHF, nie w EUR. Import 244
+        // „XXX Lutz CH" (CHF, konto 1379, booking 9, numer kol. 5, KWOTA kol. 14 — MK_KOL_KWOTA). HU (7163, bez cykli) i SK (7195) dalej nie wpisane.
+        '6346': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CH', cur: 'CHF' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
@@ -45052,7 +45137,10 @@
         // Bricomarché FR (229) i Home&You PL (178) — ustawienia importu czytaja kwote z 14. kolumny (N),
         // a domyslny uklad Mirakla stawia ja w 15. (O). Odczyt ustawien 03.11.2026 (amount_column_number „14",
         // tak samo jak Altex 258 i Leroy). numer zamowienia dalej w 5. kolumnie (c[4]), zgodny z descr/ff col 5.
-        'Mirakl (Bricomarche)': 13, 'Mirakl (Home&You)': 13 };
+        'Mirakl (Bricomarche)': 13, 'Mirakl (Home&You)': 13,
+        // XXXLutz CH — ustawienie 244 czyta kwote z 14. kolumny (N) (odczyt 10.11.2026). Wpis na SKLEP, nie na marketplace:
+        // pozostale sklepy XXXLutz (np. HR 261) czytaja kwote z 15. (O) i zostaja bez zmian.
+        'Mirakl (XXXLutz) · XXXLutz CH': 13 };
     // Nie kazdy Mirakl eksportuje ten sam komplet kolumn. Empik nie ma „Payment reference"
     // ani „Sales channel", wiec jego plik ma 25 kolumn zamiast 27, a „Amount" stoi na 13.
     // Plik do importu budujemy w ukladzie TEGO marketplace'u — ustawienie importu po
@@ -75249,6 +75337,18 @@
                     cycIds = [cyc.id];
                     say('Sklep ' + (shopName || '?') + ' — pobieram '
                       + (j.ref || ('wpłatę ' + f2(j.amount) + ' ' + (j.cur || '') + ' z ' + j.date)) + '…');
+                    }
+                }
+                // WALUTA SKLEPU. Zlecenie reczne albo z arkusza dostaje domyslne EUR, gdy cel nie mial waluty — a XXXLutz CH
+                // wyplaca w CHF (zlecenie 833.50 z 06.11.2026 stalo na liscie jako EUR, cykl 6b02cebf jest w CHF). Gdy rozliczenie
+                // zostalo DOBRANE (numer, kwota albo wskazanie czlowieka) w sklepie z jawna waluta w MK_SHOPID, ta waluta wygrywa:
+                // poprawia tez zlecenia zalozone przed dopisaniem sklepu. Zlecenie z wyciagu ma walute z banku — tej nie ruszamy.
+                if (!manor && j.manual && cycIds.length === 1 && (reczny || byRef || byKwote)){
+                    const wSk = mkWalutaSklepu(host, shopName);
+                    if (wSk && String(j.cur || '').toUpperCase() !== String(wSk).toUpperCase()){
+                        mkLog('mirakl', 'waluta zlecenia ' + (j.cur || '—') + ' → ' + wSk + ' (sklep ' + shopName + ', cykl '
+                              + String(cycIds[0]).slice(0, 8) + ')');
+                        j.cur = wSk;
                     }
                 }
                 try {
@@ -115451,7 +115551,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2827242 · 09.11.2026 13:53';
+    const HUB_BUDOWA = '262c2ab · 10.11.2026 10:21';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
