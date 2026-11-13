@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.10
+// @version      5.63.11
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -41453,10 +41453,22 @@
             // do zrobienia, nie opis. Dlatego: nie ma zwrotow = „Brak" (nie ma co robic),
             // sa zwroty = „Nie" dopoki ich nie zaksiegujesz.
             refunded: nRef ? 'Nie' : 'Brak',
-            dodane: 'Nie',                   // inny arkusz, bez uprawnien — zawsze Nie
+            // Kolumna G to od 13.11.2026 „When booked" — data ksiegowania (dawniej „Dodane do Marketplace
+            // Payments", zawsze „Nie"). Odbiornik wpisuje ja przy „Tak" z tego pola. Kto wysyla wiersz
+            // z Booked „Nie", kasuje je (shBezDaty). „dodane" puste zostaje dla wdrozenia sprzed 2026-11-13.
+            zaksiegowano: shDzisYmd(),
+            dodane: '',
             comments: j.ref
         };
     }
+    // Dzisiejsza data komputera, ktory ksiega (RRRR-MM-DD) — do kolumny „When booked" w arkuszu.
+    // Czas lokalny, nie UTC: ksiegowanie o 00:30 ma byc z tego dnia, a nie z poprzedniego.
+    function shDzisYmd(){
+        const d = new Date();
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    }
+    // Wiersz dopisywany z Booked „Nie" (import, wyciag) — bez daty ksiegowania.
+    function shBezDaty(w){ if (w) { w.booked = 'Nie'; delete w.zaksiegowano; } return w; }
     // Klucz wiersza w arkuszu: data + konto + kwota. Ten sam, ktorego uzywa Apps Script
     // do wykrywania duplikatow, wiec oznaczanie trafia dokladnie w ten sam wiersz.
     function shKey(j, acct){ return { data: j.date, konto: acct || '', kwota: j.amount }; }
@@ -42047,7 +42059,7 @@
     }
     async function shMarkBooked(list){
         return shTodoSet((list || []).map(function (x){
-            return { tab: x.tab, row: x.row, booked: 'Tak' };
+            return { tab: x.tab, row: x.row, booked: 'Tak', zaksiegowano: shDzisYmd() };
         }));
     }
     // Po zaksiegowaniu: zlecenie z arkusza ODHACZAMY, cudze dopisujemy jak dotad.
@@ -42061,7 +42073,9 @@
             // tak samo jak shRow: sa zwroty = „Nie", nie ma = „Brak".
             let nRef = 0;
             try { nRef = refPozycje(j).filter(function (x){ return Math.abs(x.amt) > 0.004; }).length; } catch (e){}
-            const wiersz = { tab: a.tab, row: a.row, booked: 'Tak', refundedJesliPuste: nRef ? 'Nie' : 'Brak' };
+            // „zaksiegowano" — data do kolumny „When booked" (od 13.11.2026); odbiornik nie nadpisuje daty, ktora juz stoi.
+            const wiersz = { tab: a.tab, row: a.row, booked: 'Tak', zaksiegowano: shDzisYmd(),
+                             refundedJesliPuste: nRef ? 'Nie' : 'Brak' };
             // Bez zwrotow „Brak" ma stanac takze tam, gdzie przy zakladaniu wiersza wpisano „Nie" — zespol zaklada wiersze
             // z Booked i Refunded „Nie" (zgloszenie 09.10.2026: Shöpping AT i Gamm vert zaksiegowane, a Refunded zostalo
             // czerwone, czyli „do zrobienia"). Apps Script wpisuje refundedJesliPuste tylko do PUSTEJ komorki, wiec stan
@@ -72996,7 +73010,7 @@
                     let w = null;
                     try { w = shRow(j2, c2); } catch (e){ w = null; }
                     if (!w) return;
-                    w.booked = 'Nie';                                // pozycja DO ZROBIENIA
+                    shBezDaty(w);                                    // pozycja DO ZROBIENIA — bez daty ksiegowania
                     wiersze.push(w);
                 });
                 let dodane = 0;
@@ -83015,8 +83029,7 @@
                         // Na „Tak" przestawi go shAfterBook po „Zaksięguj": arkusz rozpozna
                         // ten sam wiersz po kluczu data + konto + kwota. Dotąd szedł od razu
                         // jako „Tak" i niezaksięgowana paczka wyglądała w arkuszu na zrobioną.
-                        const w = shRow(j, c);
-                        w.booked = 'Nie';
+                        const w = shBezDaty(shRow(j, c));
                         const res = await shPost([w]) || {};
                         const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
                         cur.msg += (res.ok === false) ? (' · ARKUSZ: ' + (res.err || 'nie przyjął wiersza') + ' — wiersz dopisz ręcznie')
@@ -116729,7 +116742,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '95a46a8 · 13.11.2026 09:36';
+    const HUB_BUDOWA = 'c0eeb7f · 13.11.2026 11:55';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
