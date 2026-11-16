@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.12
+// @version      5.63.13
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23563,6 +23563,13 @@
             if (v == null || !isFinite(v)) return '';
             return (Math.round((v + (v < 0 ? -1 : 1) * 1e-9) * 100) / 100).toFixed(2);
         }
+        // Wiersze pod suma listy: { dane: wiersze w ksztalcie pozycji listy (nastepna lista bez naglowka),
+        // notatki: reszta } — kazde z zakresem wierszy, do komunikatu po pobraniu. Nic pod suma → null.
+        function balPoSumie(lista, sumaW){
+            if (!lista.length) return null;
+            function zakres(xs){ return xs.length ? { n: xs.length, od: xs[0].w, do: xs[xs.length - 1].w } : null; }
+            return { suma: sumaW, dane: zakres(lista.filter(function(x){ return x.dane; })), notatki: zakres(lista.filter(function(x){ return !x.dane; })) };
+        }
         function balSheetParse(ws, date, X){
             if (!ws || !ws['!ref']) throw new Error('Brak zakładki CASH INVOICES 2024/25.');
             function cell(c, r){ return ws[c + r] || {}; }
@@ -23575,18 +23582,23 @@
             if (!headers.length) throw new Error('Brak listy BALANCE dla ' + date + '.');
             if (headers.length !== 1) throw new Error('Więcej niż jedna lista dla ' + date + ' — wklej właściwą ręcznie.');
             var start = headers[0], next = all.filter(function(r){ return r > start; })[0] || end + 1;
-            var rows = [], total = null, sum = 0;
+            var rows = [], total = null, sum = 0, sumaW = 0, poSumie = [];
+            // Lista konczy sie na SWOJEJ sumie. Do 5.63.13 granica byla nastepny naglowek daty, a wiersz z danymi
+            // pod suma = blad („Dane ponizej sumy listy"). Od 11.2026 zespol zaczyna nastepna liste zaraz pod
+            // suma, bez naglowka daty (16.11.2026: suma w. 5592, ponizej od w. 5593 lista na kolejny termin) —
+            // i pobranie z Sheets odmawialo. Wiersze pod suma (do nastepnego naglowka) nie naleza do tej listy:
+            // pomijamy je i mowimy o tym w komunikacie, bo mogl to byc tez wiersz dopisany do tej listy pod suma.
             for (var i = start + 1; i < next; i++) {
                 var values = ['C','D','E','F','G','H'].map(function(c){ return txt(c, i); });
                 if (!values.some(Boolean)) continue;
+                // Pod suma bywaja tez notatki (sumy narastajace, „B/NB", liczba w H) — te liczymy osobno.
+                if (total !== null) { poSumie.push({ w: i, dane: !!(values[0] && /^\d{4,7}$/.test(values[3])) }); continue; }
                 // Suma CALEJ listy nie moze trafic do balSplitSums jako suma ostatniego dostawcy.
                 if (!values[0] && !values[1] && !values[2] && !values[3] && !values[5] && values[4]) {
-                    if (total !== null) throw new Error('Wiele sum listy — sprawdź wiersz ' + i + '.');
-                    total = Number(cell('G', i).v);
+                    total = Number(cell('G', i).v); sumaW = i;
                     if (!isFinite(total)) throw new Error('Nieprawidłowa suma w wierszu ' + i + '.');
                     continue;
                 }
-                if (total !== null) throw new Error('Dane poniżej sumy listy — sprawdź wiersz ' + i + '.');
                 if (!values[0] || !/^\d{4,7}$/.test(values[3]) || cell('G', i).t !== 'n' || !isFinite(cell('G', i).v))
                     throw new Error('Niepełny lub nierozpoznany wiersz ' + i + ' — wklej dane ręcznie.');
                 var cells = ['C','D','E','F','G','H'].map(function(c, k){
@@ -23606,7 +23618,8 @@
                 return '<td' + (c.bg ? ' style="background-color:' + c.bg + '"' : '') + '>'
                     + (c.url ? '<a href="' + esc(c.url) + '">' + esc(c.text) + '</a>' : esc(c.text)) + '</td>';
             }).join('') + '</tr>'; }).join('') + '</tbody></table>';
-            return { html: html, count: rows.length, total: total, range: 'C' + (start + 1) + ':H' + (start + rows.length) };
+            return { html: html, count: rows.length, total: total, range: 'C' + (start + 1) + ':H' + (sumaW - 1),
+                sumaW: sumaW, poSumie: balPoSumie(poSumie, sumaW) };
         }
         function balSheetFetch(){
             return new Promise(function(resolve, reject){
@@ -23771,8 +23784,18 @@
         var PC_ADR_GRUPY = ['beneficiary', 'office', 'warehouse', 'factory'];
         // Wartosc pola adresu z karty, ktora nic nie znaczy: „0", „/", „-", „N/A" (16.11.2026: Willsoon Nr „0",
         // Minmetals Nr „/", Ding Sheng County „N/A" — wszystko szlo prosto do StrtNm/BldgNb).
+        // Znaki „pelnej szerokosci" z chinskiej klawiatury: przecinek „，", wyliczeniowy „、", nawiasy,
+        // dwukropek, cyfry i litery z bloku U+FF01–FF5E. Bank ich nie przyjmuje, a painChars wycinal je
+        // PO CICHU — Miles Home (karta 2359, 16.11.2026): „RM 2403，XINHUAXING BLDG" szlo do pliku
+        // jako „RM 2403XINHUAXING BLDG". Zamieniamy je na zwykle odpowiedniki (przecinek ze spacja).
+        function pcSzerokie(v){
+            return String(v == null ? '' : v)
+                .replace(/[，、]\s*/g, ', ')
+                .replace(/[！-～]/g, function (c){ return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+                .replace(/　/g, ' ').replace(/。/g, '.');
+        }
         function pcAdrPole(v){
-            var s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim()
+            var s = pcSzerokie(v).replace(/\s+/g, ' ').trim()
                 .replace(/^["'“”„«»]+|["'“”„«»]+$/g, '').trim();      // cudzyslow z wklejki (Top Grace: „"No.128, …")
             if (/^(?:0+|[\/\-–—.,;:_]+|n\s*\/?\s*a|none|null|nil|brak|same|the same)$/i.test(s)) return '';
             return s;
@@ -23884,12 +23907,15 @@
             // Spacja przed „name=" pilnuje, zeby „name" nie trafilo w data-name="name" ani podobne.
             var mbe = h.match(/\sname="beneficiary_name"[^>]*value="([^"]*)"/); var cardBe = mbe ? pcAttrDecode(mbe[1]).trim() : '';
             var mnz = h.match(/\sname="name"[^>]*value="([^"]*)"/); var cardNz = mnz ? pcAttrDecode(mnz[1]).trim() : '';
+            // Pole „Country" karty (lista wyboru) — zapas dla kraju w tytule przelewu (pcKrajeG).
+            var mkr = h.match(/name="country_code"[^>]*>([\s\S]*?)<\/select>/i), cardKr = '';
+            if (mkr){ var mso = mkr[1].match(/<option[^>]*\bselected\b[^>]*>([^<]*)</i); cardKr = mso ? pcAttrDecode(mso[1]).trim() : ''; }
             if (cardSw || cardBn || acc) _cardBic[c] = { acc: acc, swift: cardSw, bank: cardBn };
             else delete _cardBic[c];
             var adr = pcSupAdres(h);
             if (adr) _adr[c] = adr;
             else if (bezPamieci) delete _adr[c];   // ↻: adres zdjety z karty nie moze zostac ze starego odczytu
-            _sup[c] = { acc: acc, accRaw: accRaw, info: info, conf: pcBankConf(h), docs: pcSupDocs(h), adres: adr, swift: cardSw, bank: cardBn, benef: cardBe, nazwa: cardNz }; return _sup[c];
+            _sup[c] = { acc: acc, accRaw: accRaw, info: info, conf: pcBankConf(h), docs: pcSupDocs(h), adres: adr, swift: cardSw, bank: cardBn, benef: cardBe, nazwa: cardNz, kraj: cardKr }; return _sup[c];
         }
         // Konto ZAWSZE z karty pobranej w tej sesji strony. _acc idzie przez GM_setValue
         // i nie wygasa — do 5.60.03 wystarczylo, ze byl, i karty nie czytalismy wcale:
@@ -25238,15 +25264,27 @@
         // Kraj wyznacza piBankGeo — ta sama droga, co przy pain.001: najpierw ADRES
         // beneficjenta, dopiero potem BIC. Bank beneficjenta bywa w innym kraju niz sam
         // beneficjent, wiec BIC jest ostatecznoscia, a nie pierwszym zrodlem.
+        // Gdy zaden KOMPLETNY blok nie dal kraju — bloki niepelne, a po nich karta dostawcy: jej SWIFT (ten sam,
+        // ktory idzie wtedy do pliku, painBicZKarty) i pole „Country". Paras Industries (zam. 22291, 16.11.2026):
+        // blok P/I bez nazwy i z „SWIFT NO.: 180105" — tytul wychodzil „Deposit 20%" zamiast „Advance payment 20%".
         function pcKrajeG(G){
             var kraje = {};
-            ((G && G.dep) || []).forEach(function(r){
-                var b = (r.pi && (r.pi.piBank || r.pi.bank)) || null;
-                if (!b || !b.ok) return;
-                var g = piBankGeo(b);
-                var k = (g && g.ctry) ? g.ctry : pcSwiftKraj(b.swift);
-                if (k) kraje[k] = 1;
-            });
+            function zBlokow(tylkoPelne){
+                ((G && G.dep) || []).forEach(function(r){
+                    var b = (r.pi && (r.pi.piBank || r.pi.bank)) || (tylkoPelne ? null : (r.pi && r.pi.piBankRaw)) || null;
+                    if (!b || (tylkoPelne && !b.ok)) return;
+                    var g = piBankGeo(b);
+                    var k = (g && g.ctry) ? g.ctry : pcSwiftKraj(b.swift);
+                    if (k) kraje[k] = 1;
+                });
+            }
+            zBlokow(true);
+            if (!Object.keys(kraje).length) zBlokow(false);
+            if (!Object.keys(kraje).length && G && (G.dep || []).length){
+                var sw = painBicZKarty(G, ''), kk = sw ? pcSwiftKraj(sw) : '';
+                if (!kk && G.cid && _sup[G.cid] && _sup[G.cid].kraj) kk = pbFindCtry(_sup[G.cid].kraj);
+                if (kk) kraje[kk] = 1;
+            }
             return Object.keys(kraje);
         }
         function pcAdvance(G){
@@ -25359,7 +25397,7 @@
         function painDia(ch){ return Object.prototype.hasOwnProperty.call(PAIN_DIA, ch) ? PAIN_DIA[ch] : null; }
         // Zwraca oczyszczony tekst + liste znakow, ktore zostaly zamienione lub usuniete.
         function painChars(s, strict){
-            var t = String(s == null ? '' : s), out = '', bad = [], seen = {};
+            var t = pcSzerokie(s), out = '', bad = [], seen = {};   // „，" -> ", " (pcSzerokie), zamiast wypasc po cichu
             function flag(ch){ if (!seen[ch]) { seen[ch] = 1; bad.push(ch); } }
             for (var i = 0; i < t.length; i++){
                 var ch = t.charAt(i), c = t.charCodeAt(i);
@@ -25605,30 +25643,75 @@
         // Postac do porownan czlonow adresu. Skroty sprowadzone do pelnych slow — bez tego „Baishijian Rd."
         // nie bylo powtorzeniem „Baishijian Road" i ulica Willsoona szla do pliku dwa razy (16.11.2026).
         var PAIN_ADR_SKROTY = { RD: 'ROAD', ST: 'STREET', STR: 'STREET', AVE: 'AVENUE', AV: 'AVENUE', BLDG: 'BUILDING',
-                                BLD: 'BUILDING', FL: 'FLOOR', RM: 'ROOM', DIST: 'DISTRICT', IND: 'INDUSTRIAL' };
+                                BLD: 'BUILDING', FL: 'FLOOR', RM: 'ROOM', DIST: 'DISTRICT', IND: 'INDUSTRIAL',
+                                CTR: 'CENTRE', CENTER: 'CENTRE', HWY: 'HIGHWAY', COMM: 'COMMERCIAL', VLG: 'VILLAGE' };
         function painAdrZn(s){
             return pbNorm(s).split(' ').map(function (w){ return PAIN_ADR_SKROTY[w] || w; }).join('');
         }
         function painAdrRe(s){ return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'); }
+        // Skroty pocztowe, gdy adres nie miesci sie w 70 znakach StrtNm (16.11.2026). Do 5.63.12 to, co
+        // nie weszlo, wypadalo (z ostrzezeniem): dzielnica „MONGKOK" (Hongkong TTT), „ANJI COUNTY", „Guangyang
+        // district". Skracamy po kolei, kazde slowo w calym napisie, az sie zmiesci — i tylko wtedy; adres
+        // krotszy niz 70 znakow idzie tak, jak go wpisano. Wielkosc liter skrotu jak w slowie.
+        var PAIN_SKROC = [['STREET', 'ST'], ['ROAD', 'RD'], ['AVENUE', 'AVE'], ['BUILDING', 'BLDG'], ['FLOOR', 'FL'],
+                          ['ROOM', 'RM'], ['DISTRICT', 'DIST'], ['CENTRE', 'CTR'], ['CENTER', 'CTR'], ['COMMERCIAL', 'COMM'],
+                          ['HIGHWAY', 'HWY'], ['INDUSTRIAL', 'IND'], ['VILLAGE', 'VLG']];
+        function painAdrSkroc(s){
+            var t = String(s == null ? '' : s);
+            for (var i = 0; i < PAIN_SKROC.length && painChars(t).txt.length > PAIN_STR_MAX; i++){
+                var dl = PAIN_SKROC[i][0], kr = PAIN_SKROC[i][1];
+                t = t.replace(new RegExp('\\b' + dl + '\\b', 'gi'), function (w){
+                    if (w === w.toUpperCase()) return kr;
+                    if (w === w.toLowerCase()) return kr.toLowerCase();
+                    return kr.charAt(0) + kr.slice(1).toLowerCase();
+                });
+            }
+            return t;
+        }
+        function painAdrRozwin(s){
+            var t = String(s == null ? '' : s);
+            PAIN_SKROC.forEach(function (p){
+                t = t.replace(new RegExp('\\b' + p[1] + '\\b', 'g'), p[0])
+                     .replace(new RegExp('\\b' + p[1].charAt(0) + p[1].slice(1).toLowerCase() + '\\b', 'g'), p[0].charAt(0) + p[0].slice(1).toLowerCase())
+                     .replace(new RegExp('\\b' + p[1].toLowerCase() + '\\b', 'g'), p[0].toLowerCase());
+            });
+            return t;
+        }
         // Czlony po kolei, rozdzielone przecinkiem. Czlon, ktory juz stoi w tekscie (ulica „Aimin" w strefie
-        // „…Aimin Road 159…"), nie wchodzi drugi raz. Pierwszy czlon dluzszy niz 70 znakow tniemy na granicy
+        // „…Aimin Road 159…"), nie wchodzi drugi raz. Gdy kolejny czlon sie nie miesci, najpierw skroty
+        // pocztowe (painAdrSkroc); pierwszy czlon dluzszy niz 70 znakow i po skrotach tniemy na granicy
         // slowa; kazdy, ktory sie nie zmiescil, idzie do „ucieto".
         function painAdrSklej(czlony){
-            var razem = '', ucieto = [];
+            var razem = '', ucieto = [], lista = [];
+            // „No" oddzielone przecinkiem od swojego numeru („11F, Sanshan North Building, No,59, Dong Jie Street" —
+            // Fujian You Trust, karta 1251): sklejamy w „No. 59". Do 5.63.13 samo „No" uchodzilo za powtorzenie
+            // („NO" w „NORTH") i do pliku szlo golym „59".
             (czlony || []).forEach(function (c){
                 var t = String(c == null ? '' : c).replace(/\s+/g, ' ').replace(/^[\s,;]+|[\s,;]+$/g, '');
+                var pop = lista.length ? lista[lista.length - 1] : '';
+                if (pop && /^(?:no|nr|number)\.?$/i.test(pop) && /^\d/.test(t)){ lista[lista.length - 1] = pop.replace(/\.?$/, '.') + ' ' + t; return; }
+                lista.push(t);
+            });
+            lista.forEach(function (t){
                 if (!t) return;
                 var z = painAdrZn(t);
-                if (!z || (razem && painAdrZn(razem).indexOf(z) >= 0)) return;
+                // Krotki czlon (do 3 znakow) to powtorzenie tylko jako CALE slowo — „NO" nie siedzi w „NORTH".
+                var juz = razem && (z.length <= 3 ? painAdrTekstZn(razem).indexOf(' ' + z + ' ') >= 0
+                                                  : painAdrZn(razem).indexOf(z) >= 0);
+                if (!z || juz) return;
                 var nowy = razem ? razem + ', ' + t : t;
                 if (painChars(nowy).txt.length <= PAIN_STR_MAX){ razem = nowy; return; }
+                var skr = painAdrSkroc(nowy);
+                if (painChars(skr).txt.length <= PAIN_STR_MAX){ razem = skr; return; }
                 if (!razem){
+                    t = skr;
                     var cut = -1, i;
                     for (i = PAIN_STR_MAX; i > 20; i--){ if (t.charAt(i) === ',' || t.charAt(i) === ' ') { cut = i; break; } }
                     if (cut < 0) cut = PAIN_STR_MAX;
                     razem = t.slice(0, cut).replace(/[\s,;]+$/, '');
                     var reszta = t.slice(cut).replace(/^[\s,;]+/, '');
-                    if (reszta) ucieto.push(reszta);
+                    // Do ostrzezenia reszta w pelnych slowach („Dist Zhangzhou City" -> „District Zhangzhou City").
+                    if (reszta) ucieto.push(skr !== nowy ? painAdrRozwin(reszta) : reszta);
                     return;
                 }
                 ucieto.push(t);
@@ -25640,18 +25723,85 @@
         // wpisuje sie je tam czasem razem z calym adresem (karta 1261: „…Anci district, Langfang City,
         // Hebei Province"), a maja wlasne elementy. Numer budynku, ktory juz stoi w strefie albo w ulicy,
         // nie idzie drugi raz do BldgNb.
-        function painAdrZKarty(k){
+        // Tekst do porownan slow adresu: wersaliki, skroty rozwiniete, spacje na brzegach (szukamy „ SLOWO ").
+        function painAdrTekstZn(s){ return ' ' + pbNorm(s).split(' ').map(function (w){ return PAIN_ADR_SKROTY[w] || w; }).join(' ') + ' '; }
+        function painAdrMaSlowo(tekstZn, w){ return tekstZn.indexOf(' ' + w + ' ') >= 0 || (w.length >= 5 && tekstZn.replace(/ /g, '').indexOf(w) >= 0); }
+        // Koniec strefy z karty, ktory powtarza miasto, kod, stan albo kraj zapisane bez przecinkow:
+        // Simnani (karta 2005, 16.11.2026) „POORE NOOR ISLAM BHADOHI-221401 U.P INDIA" -> „POORE NOOR ISLAM".
+        // Zdejmujemy wylacznie od KONCA i nigdy calego czlonu. Stan rozpoznajemy po nazwie, po inicjalach
+        // („U.P" = Uttar Pradesh) albo po skrocie z kropka („RAJ." = Rajasthan).
+        function painOgonStrefy(x, k){
+            var tok = String(x || '').split(/\s+/).filter(Boolean);
+            var city = pbNorm(k.city).replace(/\s+(?:CITY|SHI)$/, ''), stan = pbNorm(k.state).replace(/\s+(?:PROVINCE|SHENG|STATE)$/, '');
+            var zip = String(k.zip || '').replace(/\D/g, ''), inic = stan ? stan.split(' ').map(function (w){ return w.charAt(0); }).join('') : '';
+            function kraj(s){ return !!pbFindCtry(s) && !pbStripCtry(s); }
+            function zbedny(s){
+                var n = pbNorm(s), m;
+                if (!n) return true;                                             // sama interpunkcja
+                if (kraj(s)) return true;
+                if (zip && n.replace(/ /g, '') === zip) return true;
+                if ((m = n.match(/^(.+?) ?(\d{4,7})$/)) && zip && m[2] === zip && m[1] === city) return true;   // „BHADOHI-221401"
+                if (city && n === city) return true;
+                if (stan && (n === stan || (inic.length >= 2 && n.replace(/ /g, '') === inic)
+                             || (n.length >= 3 && /\.$/.test(s) && stan.indexOf(n) === 0))) return true;
+                return false;
+            }
+            for (var g = 0; g < 8 && tok.length > 1; g++){
+                if (tok.length > 2 && zbedny(tok.slice(-2).join(' '))){ tok.splice(tok.length - 2, 2); continue; }
+                if (zbedny(tok[tok.length - 1])){ tok.pop(); continue; }
+                break;
+            }
+            return tok.join(' ');
+        }
+        // k — blok karty (pcSupAdres), piAddr — „BENEFICIARY'S ADDRESS" z P/I, nazwy — nazwy beneficjenta i dostawcy.
+        // Gdy blok karty to TEN SAM adres co P/I (painAdrTenSam), P/I sluzy jako kontrola i uzupelnienie (16.11.2026):
+        //  * powiat i „numer" bez cyfr, ktorych P/I nie podaje, nie ida do pliku — Futian (karta 2225): powiat „LUOYUAN"
+        //    przy Dongda Road w Fuzhou (to inny powiat), Simnani: numer „Mustafa Bu" (uciete pole karty);
+        //  * czlony adresu z P/I, ktorych na karcie nie ma wcale, dochodza na koniec ulicy — Kien Lam (karta 2800):
+        //    „WARD 4, TAN BINH DISTRICT" (karta ma sama ulice). Nazwa firmy stojaca w adresie P/I nie dochodzi.
+        function painAdrZKarty(k, piAddr, nazwy){
             if (!k) return null;
             var city = String(k.city || '').trim(), stan = String(k.state || '').trim(), zbedne = {};
             [city, city + ' city', city + ' shi', stan, stan + ' province', stan + ' sheng'].forEach(function (x){
                 var z = painAdrZn(x); if (z && z !== painAdrZn('city') && z !== painAdrZn('province')) zbedne[z] = 1;
             });
-            var strefa = String(k.zone || '').split(/[,;\n]/).map(function (x){ return x.trim(); }).filter(function (x){
+            var stanN = pbNorm(stan).replace(/\s+(?:PROVINCE|SHENG)$/, '');
+            var pi = String(piAddr || '').trim();
+            if (pi && painAdrTenSam(k, pi) !== true) pi = '';           // inny adres niz na P/I — P/I niczego tu nie mowi
+            var piS = pi ? painAdrTekstZn(pi) : '', poprawki = [];
+            function wPI(s){ return painAdrSlowa(s, {}).every(function (w){ return painAdrMaSlowo(piS, w); }); }
+            var strefa = String(k.zone || '').split(/[,;\n]/).map(function (x){ return painOgonStrefy(x.trim(), k); }).filter(function (x){
                 if (!x || /^\d{4,7}$/.test(x.replace(/\s+/g, ''))) return false;
                 if (!pbStripCtry(x)) return false;                 // sam kraj
+                // „ZHEJIANG PR" — prowincja ucieta przez dlugosc pola strefy na karcie (ANJI XINCHENG, karta 2470).
+                var xn = pbNorm(x);
+                if (stanN && xn.length >= 4 && (stanN + ' PROVINCE').indexOf(xn) === 0) return false;
+                // „…, Fujian , Ch" — kraj uciety przez dlugosc pola (Fuzhou Messi, karta 2140).
+                if (/^[A-Z]{1,4}$/.test(xn) && pbNorm(k.country || 'CHINA').indexOf(xn) === 0) return false;
                 return !zbedne[painAdrZn(x)];
             });
             var ulica = String(k.street || '').trim(), nr = String(k.nr || '').trim(), bldg = '', nrDoUlicy = '';
+            if (nr && pi && !/\d/.test(nr) && !wPI(nr)){ poprawki.push('numer „' + nr + '” pominięty (bez cyfr, P/I go nie podaje)'); nr = ''; }
+            // Ulica z pola „Street", ktorej P/I nie zna, gdy P/I podaje INNA ulice — Anji Dazhi (karta 3041): strefa
+            // „…Dipu Street, Anji County…" = P/I, a w „Street" „MEISHUQIAO LOAD" (inna droga). Gdy P/I zadnej ulicy nie
+            // podaje (Anji Lianshang: sam park przemyslowy), ulica z karty jest uzupelnieniem i zostaje.
+            if (ulica && pi && strefa.length && !wPI(ulica) && / (?:ROAD|STREET|AVENUE|LANE|LU|JIE) /.test(piS)){
+                poprawki.push('ulica „' + ulica + '” pominięta (P/I podaje inną ulicę)'); ulica = ''; }
+            var powiat = String(k.county || '').trim();
+            if (powiat && pi && !wPI(powiat)){ poprawki.push('powiat „' + powiat + '” pominięty (P/I go nie podaje)'); powiat = ''; }
+            var dopis = [];
+            if (pi){
+                var kartaS = painAdrTekstZn([k.zone, k.street, k.nr, k.city, k.county, k.state, k.country, k.zip].join(' '));
+                var nazwyS = painAdrTekstZn((nazwy || []).join(' '));
+                painAdrCzlonyPI(pi, city, pbFindCtry(k.country) || '').czl.forEach(function (c){
+                    var w = painAdrSlowa(c, {});
+                    if (!w.length) return;
+                    if (w.some(function (x){ return painAdrMaSlowo(kartaS, x); })) return;
+                    if (w.every(function (x){ return nazwyS.indexOf(' ' + x + ' ') >= 0; })) return;
+                    dopis.push(c);
+                });
+                if (dopis.length) poprawki.push('dopisane z P/I: ' + dopis.join(', '));
+            }
             if (nr){
                 var tlo = strefa.join(' ') + ' ' + ulica;
                 var juz = new RegExp('(^|[^0-9A-Za-z])' + painAdrRe(nr) + '(?![0-9A-Za-z])', 'i').test(tlo);
@@ -25667,13 +25817,39 @@
             // Ulica i dlugi numer dzielone po przecinkach jak strefa — „DONGDA ROAD, 5FL,Jianmin BLDG" (Futian)
             // to trzy czlony, z ktorych kazdy stoi juz w strefie; caly napis naraz nie byl jej fragmentem.
             function czl(s){ return String(s || '').split(/[,;\n]/).map(function (x){ return x.trim(); }).filter(Boolean); }
-            var sk = painAdrSklej(strefa.concat(czl(ulica), czl(nrDoUlicy), [String(k.county || '').trim()]));
-            return { street: sk.txt, bldg: bldg, pstCd: String(k.zip || '').trim(), sub: stan, ucieto: sk.ucieto, src: 'karta' };
+            var sk = painAdrSklej(strefa.concat(czl(ulica), czl(nrDoUlicy), dopis, [powiat]));
+            if (k.przestawione) poprawki.unshift(k.przestawione);
+            return { street: sk.txt, bldg: bldg, pstCd: String(k.zip || '').trim(), sub: stan, ucieto: sk.ucieto, src: 'karta', poprawki: poprawki };
+        }
+        // Pola karty przesuniete o jedno: Longland (karta 1919, 16.11.2026) ma w „City" „XiahuShan" (wies), w „County"
+        // „DalingShan" (miasteczko), a w „Province" „Dongguan" — czyli MIASTO. Do 5.63.12 szlo TwnNm „XiahuShan",
+        // CtrySubDvsn „Dongguan". Przestawiamy tylko przy dowodzie z tabeli kodow: kod (Chiny) jest w tabeli, pole
+        // „Province" nie jest prowincja, a jest dokladnie prefektura (albo miejscowoscia) tego kodu.
+        function painKartaPrzestaw(a){
+            if (!a) return a;
+            var zip = String(a.zip || '').replace(/\s+/g, '');
+            if ((pbFindCtry(a.country) || pbFindCtry(a.city)) !== 'CN' || !/^\d{6}$/.test(zip) || !String(a.state || '').trim()) return a;
+            if (PB_PROV.test(pbNorm(a.state).replace(/\s+(?:PROVINCE|SHENG)$/, ''))) return a;
+            // Cztery cyfry kodu, a gdy tabela ich nie zna — te same trzy cyfry (tak samo sprawdza kod pnaCn; 5238xx Longlanda
+            // jest w tabeli tylko jako 523xxx).
+            var m = pnaMapy(), r = pnaRdzen(a.state);
+            function pasuje(x){ return x && x.prow && r && (r === pnaRdzen(x.pref) || r === pnaRdzen(x.miejsce)); }
+            var e = m.cn[zip.slice(0, 4)];
+            if (!pasuje(e)) e = (m.cnP3[zip.slice(0, 3)] || []).filter(pasuje)[0];
+            if (!pasuje(e)) return a;
+            var o = {};
+            for (var k in a) if (Object.prototype.hasOwnProperty.call(a, k)) o[k] = a[k];
+            o.city = String(a.state).replace(/\s+(?:city|shi)\s*$/i, '').trim();
+            o.state = e.prow;
+            o.county = [a.city, a.county].filter(function (x){ return String(x || '').trim() && pnaRdzen(x) !== pnaRdzen(o.city); }).join(' ');
+            o.przestawione = 'na karcie „Province” to miasto („' + a.state + '”), a „City” („' + a.city + '”) to miejscowość — do pliku: miasto '
+                + o.city + ', prowincja ' + e.prow + ' (z kodu ' + zip + ')';
+            return o;
         }
         // Adres z TEKSTU (blok bankowy P/I) -> StrtNm + PstCd + CtrySubDvsn. Miasto i kraj ida osobno (TwnNm, Ctry),
         // wiec z tekstu znikaja — miasto razem z doklejonym „City", inaczej z „Langfang City" zostaje sierota „City".
         // Kod pocztowy bierzemy, gdy w tekscie stoi DOKLADNIE jeden w ksztalcie kodu danego kraju.
-        var PAIN_PNA_RE = { CN: /\b\d{6}\b/g, IN: /\b\d{3}\s?\d{3}\b/g, VN: /\b\d{6}\b/g, SG: /\b\d{6}\b/g, TR: /\b\d{5}\b/g,
+        var PAIN_PNA_RE = { CN: /\b\d{6}\b/g, IN: /\b\d{3}\s?\d{3}\b/g, VN: /\b\d{5,6}\b/g, SG: /\b\d{6}\b/g, TR: /\b\d{5}\b/g,
                             TH: /\b\d{5}\b/g, MY: /\b\d{5}\b/g, ID: /\b\d{5}\b/g, PK: /\b\d{5}\b/g, KR: /\b\d{5}\b/g,
                             GB: /\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b/g };
         /* ===== Adres beneficjenta: karta czy P/I (16.11.2026) =====
@@ -25739,11 +25915,32 @@
             }
             var m = String(g.town || '').match(/^(.+?)\s+city\s+\S/i);
             if (m) g.town = m[1].trim();
+            // Wielka Brytania: hrabstwo doklejone do miasta („Maldon Essex", Atlas 14239, 16.11.2026) idzie do CtrySubDvsn.
+            if (g.ctry === 'GB' && g.town){ var hr = painHrabstwoGB(g.town); if (hr){ g.town = hr.town; g.sub = hr.sub; } }
             return g;
         }
-        function painAdrZTekstu(addr, town, ctry){
+        var PAIN_GB_HRABSTWA = ['BEDFORDSHIRE', 'BERKSHIRE', 'BUCKINGHAMSHIRE', 'CAMBRIDGESHIRE', 'CHESHIRE', 'CORNWALL', 'CUMBRIA',
+            'DERBYSHIRE', 'DEVON', 'DORSET', 'DURHAM', 'ESSEX', 'GLOUCESTERSHIRE', 'HAMPSHIRE', 'HEREFORDSHIRE', 'HERTFORDSHIRE', 'KENT',
+            'LANCASHIRE', 'LEICESTERSHIRE', 'LINCOLNSHIRE', 'NORFOLK', 'NORTHAMPTONSHIRE', 'NORTHUMBERLAND', 'NOTTINGHAMSHIRE',
+            'OXFORDSHIRE', 'RUTLAND', 'SHROPSHIRE', 'SOMERSET', 'STAFFORDSHIRE', 'SUFFOLK', 'SURREY', 'SUSSEX', 'EAST SUSSEX', 'WEST SUSSEX',
+            'WARWICKSHIRE', 'WILTSHIRE', 'WORCESTERSHIRE', 'YORKSHIRE', 'NORTH YORKSHIRE', 'SOUTH YORKSHIRE', 'WEST YORKSHIRE',
+            'EAST YORKSHIRE', 'EAST RIDING OF YORKSHIRE', 'GREATER LONDON', 'GREATER MANCHESTER', 'MERSEYSIDE', 'TYNE AND WEAR',
+            'WEST MIDLANDS', 'ISLE OF WIGHT', 'MIDDLESEX', 'COUNTY DURHAM'];
+        // -> { town, sub } gdy miasto konczy sie nazwa hrabstwa i cos przed nia zostaje, inaczej null.
+        function painHrabstwoGB(town){
+            var sl = String(town || '').replace(/[,;]/g, ' ').replace(/\s+/g, ' ').trim().split(' ');
+            for (var n = Math.min(4, sl.length - 1); n >= 1; n--){
+                var og = sl.slice(sl.length - n).join(' ');
+                if (PAIN_GB_HRABSTWA.indexOf(pbNorm(og)) >= 0) return { town: sl.slice(0, sl.length - n).join(' '), sub: og };
+            }
+            return null;
+        }
+        // Czlony adresu z tekstu P/I bez miasta, kraju, kodu i prowincji — wspolne dla painAdrZTekstu
+        // i dla uzupelniania adresu z karty (painAdrZKarty). sub0 — prowincja/hrabstwo znane skadinad (painGeoZPI):
+        // czlon rowny jej schodzi z ulicy.
+        function painAdrCzlonyPI(addr, town, ctry, sub0){
             // „ADD.: 10C, INTERNATIONAL BUILDING…" (Minmetals) — podpis pola przyklejony do wartosci.
-            var t = pbStripCtry(String(addr == null ? '' : addr).replace(/\s*\n\s*/g, ', ').replace(/^\s*(?:add|addr|address)\s*[.:]+\s*/i, ''));
+            var t = pbStripCtry(pcSzerokie(addr).replace(/\s*\n\s*/g, ', ').replace(/^\s*(?:add|addr|address)\s*[.:]+\s*/i, ''));
             var re = PAIN_PNA_RE[String(ctry || '').toUpperCase()], pst = '', sub = '';
             if (re){
                 var tr = t.match(re) || [];
@@ -25753,13 +25950,19 @@
                 t = t.replace(new RegExp('(^|[^A-Za-z0-9])' + painAdrRe(String(town).trim()) + '(?:\\s+(?:city|shi))?(?![A-Za-z0-9])', 'gi'), '$1');
             var czl = [];
             t.split(/[,;]/).forEach(function (x){
-                var c = x.replace(/\s+/g, ' ').trim(), n = pbNorm(c).replace(/\s+(?:PROVINCE|SHENG)$/, '');
+                // Myslnik zostajacy po wycietym kodzie („Delhi road Moradabad-244001" -> „Delhi road -").
+                var c = x.replace(/\s+/g, ' ').trim().replace(/(?:\s*[-–—])+$/, '').trim(), n = pbNorm(c).replace(/\s+(?:PROVINCE|SHENG)$/, '');
                 if (!c) return;
                 if (PB_PROV.test(n)){ if (!sub) sub = c.replace(/\s+(?:province|sheng)\s*$/i, '').trim(); return; }
+                if (sub0 && n === pbNorm(sub0)){ if (!sub) sub = c; return; }
                 czl.push(c);
             });
-            var sk = painAdrSklej(czl);
-            return { street: sk.txt, bldg: '', pstCd: pst, sub: sub, ucieto: sk.ucieto, src: 'pi' };
+            if (!sub && sub0) sub = String(sub0).trim();
+            return { czl: czl, pst: pst, sub: sub };
+        }
+        function painAdrZTekstu(addr, town, ctry, sub0){
+            var c = painAdrCzlonyPI(addr, town, ctry, sub0), sk = painAdrSklej(c.czl);
+            return { street: sk.txt, bldg: '', pstCd: c.pst, sub: c.sub, ucieto: sk.ucieto, src: 'pi' };
         }
         // Zleceniodawca: „Ulica i nr" z ustawien -> StrtNm + BldgNb („Haldenstrasse 5" -> Haldenstrasse / 5).
         function painDbtrAdr(cfg, strict){
@@ -25903,6 +26106,13 @@
             if (bank && !painBicOk(bank.swift || '')){
                 var zb = painBicZeZrodel(G);
                 if (zb){ bank.swift = zb.v; bank.swiftBad = false; bicSrc = zb.skad; }
+            }
+            // Na koncu SWIFT z karty dostawcy — gdy konto karty to konto z bloku (Paras, 16.11.2026: w P/I
+            // „SWIFT NO.: 180105", na karcie KKBKINBB wpisany przez PM 20.10). Do 5.63.12 plik byl blokowany.
+            if (bank && !painBicOk(bank.swift || '')){
+                var zk = painBicZKarty(G, bank.acc || '');
+                if (zk){ var byl = String(bank.swift || '').trim(); bank.swift = zk; bank.swiftBad = false;
+                         bicSrc = 'z karty dostawcy' + (byl ? ' (w P/I stoi „' + byl + '” — to nie jest SWIFT)' : ' (w P/I nie ma SWIFT-u)'); }
             }
             if (zRodzica && !bicSrc) bicSrc = 'z P/I zamówień tej samej grupy sprzed rozcięcia';
             if (zUsunietych && !bicSrc) bicSrc = 'z P/I usuniętego wiersza tej samej płatności';
@@ -26116,6 +26326,11 @@
                     var zb = G ? painBicZeZrodel(G) : null;
                     if (zb){ sk.swift = zb.v; sk.swiftBad = false; bs = zb.skad; }
                 }
+                if (sk && !painBicOk(sk.swift || '')){
+                    var zk = painBicZKarty(G, acc);
+                    if (zk){ var byl = String(sk.swift || '').trim(); sk.swift = zk; sk.swiftBad = false;
+                             bs = 'z karty dostawcy' + (byl ? ' (w P/I stoi „' + byl + '” — to nie jest SWIFT)' : ' (w P/I nie ma SWIFT-u)'); }
+                }
                 return { b: sk, pasuje: true, bicSrc: opisGrupy(bs), czesciowy: true };
             }
             // Zaden blok P/I nie opisuje konta przelewu. Gdy to konto jest kontem z KARTY dostawcy,
@@ -26145,6 +26360,49 @@
             var kacc = s.acc || (_cardBic[G.cid] && _cardBic[G.cid].acc) || '';
             if (!kacc || !accTenSam(kacc, acc)) return '';
             return String(s.benef).trim();
+        }
+        // Nazwa, gdy blok bankowy P/I nie ma „BENEFICIARY'S NAME" (Paras Industries, zam. 22291, 16.11.2026 —
+        // HUB blokowal plik „brak nazwy beneficjenta"). Najpierw „Beneficiary's name" z karty (konto karty =
+        // konto przelewu), potem nazwa firmy z naglowka P/I — tylko gdy zaczyna sie tym samym slowem co nazwa
+        // dostawcy w prologistics. Nazwy firmy z prologistics wprost NIE bierzemy: niesie dopiski dzialu
+        // („Paras Industries MDF", „… - BATHROOM", „… - Sofas"), ktorych bank nie zna.
+        function painNazwaZapas(G, b, acc){
+            var nk = painNazwaKarty(G, acc);
+            if (nk) return { name: nk, skad: 'z karty dostawcy (pole „Beneficiary\'s name”)' };
+            var f = String((b && b.firma) || '').replace(/\s+/g, ' ').trim();
+            var kn = String((G && G.cid && _sup[G.cid] && _sup[G.cid].nazwa) || (G && G.sup) || '');
+            var fw = pbNorm(f).split(' ')[0] || '', kw = pbNorm(kn).split(' ')[0] || '';
+            if (f && fw.length >= 3 && fw === kw) return { name: f, skad: 'z nagłówka P/I', karta: kn };
+            return null;
+        }
+        // SWIFT w pliku a SWIFT w P/I grupy (prosba uzytkownika 16.11.2026: „niech informuje, jak SWIFT nie zgadza sie
+        // z P/I, jak w Paras Industries" — P/I „180105", w pliku KKBKINBB z karty). -> { zgodny: true|false|null, pi }
+        // null — w P/I nie ma zadnego SWIFT-u (wtedy mowi o tym uwaga o zrodle SWIFT-u). BIC 8-znakowy = ten sam z „XXX".
+        function painBicWobecPI(G, bic){
+            var surowe = [], widz = {};
+            function dodaj(b){
+                if (!b) return;
+                var s = String(b.swiftRaw || b.swift || '').replace(/\s+/g, ' ').trim();
+                if (s && !widz[painNorm(s)]){ widz[painNorm(s)] = 1; surowe.push(s); }
+            }
+            (G.dep || []).forEach(function (r){ dodaj(r.pi && (r.pi.piBankRaw || r.pi.piBank)); });
+            (G.bal || []).forEach(function (r){ dodaj(r.bpi && (r.bpi.bankRaw || r.bpi.bank)); });
+            var w = painNorm(bic);
+            if (!surowe.length || !w) return { zgodny: null, pi: '' };
+            function tenSam(a){ return a === w || a + 'XXX' === w || a === w + 'XXX'; }
+            var ok = surowe.some(function (s){
+                var kand = [piSwiftPick(s)].concat(String(s).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim().split(' '));
+                return kand.some(function (k){ return k && PI_BIC_RE.test(k) && tenSam(k); });
+            });
+            return { zgodny: ok, pi: surowe.join(' / ').slice(0, 80) };
+        }
+        // SWIFT z karty dostawcy dla konta przelewu (konto karty = konto przelewu, gdy acc podane).
+        function painBicZKarty(G, acc){
+            if (!G || !G.cid) return '';
+            var card = _cardBic[G.cid] || _sup[G.cid] || null;
+            if (!card || (acc && (!card.acc || !accTenSam(card.acc, acc)))) return '';
+            var sw = painNorm(card.swift || '');
+            return painBicOk(sw) ? sw : '';
         }
         // Kopia bloku z nazwa beneficjenta z karty (albo ten sam blok, gdy nie ma czego zmieniac).
         function painNazwaZKarty(G, acc, blok, accP){
@@ -26238,7 +26496,7 @@
                 // w osobnym polu i nie trzeba go zgadywac) — ale tylko blok beneficjenta albo blok, ktory
                 // opisuje to samo miejsce co adres beneficjenta z P/I (painAdrWybierz, 16.11.2026).
                 var adrWyb = painAdrWybierz(G, b);
-                var kartaA = adrWyb.kartaA;
+                var kartaA = painKartaPrzestaw(adrWyb.kartaA);
                 if (!kartaA) geo = painGeoZPI(b);
                 var karta = kartaA ? {
                     town: kartaA.city,
@@ -26249,7 +26507,11 @@
                 // z karty pola rozpisane, z P/I reszta tekstu w StrtNm; kod sprawdzany z tabela GeoNames.
                 var townV = String(V('town', (karta && karta.town) || geo.town || ''));
                 var ctryV = String(V('ctry', (karta && karta.ctry) || geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
-                var adrS = kartaA ? painAdrZKarty(kartaA) : painAdrZTekstu(b.addr || '', townV, ctryV);
+                var adrS = kartaA ? painAdrZKarty(kartaA, b.addr || '', [b.name, G.sup, G.cid && _sup[G.cid] ? _sup[G.cid].nazwa : ''])
+                                  : painAdrZTekstu(b.addr || '', townV, ctryV, geo.sub || '');
+                // Bez nazwy beneficjenta w bloku P/I (Paras, 16.11.2026: blok bez „BENEFICIARY'S NAME") — nazwa z karty
+                // albo z naglowka P/I (painNazwaZapas). Reczna poprawka w oknie dalej wygrywa.
+                var nazwaZ = !String(b.name || '').trim() ? painNazwaZapas(G, b, accV) : null;
                 var pstV = String(V('pstCd', adrS.pstCd || ''));
                 var subV = String(V('sub', adrS.sub || ''));
                 var pnaV = pnaSprawdz(ctryV, pstV, townV, subV);
@@ -26299,7 +26561,8 @@
                     key: G.key, gi: i, sup: G.sup, korzen: G.korzen || G.key,
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
                     title: String(V('title', pcTitleFor(G)) || ''),
-                    name: String(V('name', b.name || '')),
+                    name: String(V('name', b.name || (nazwaZ ? nazwaZ.name : ''))),
+                    nazwaZapas: (ed.name != null && String(ed.name) !== '') ? null : nazwaZ,
                     // Nazwa a karta dostawcy (painNazwaZKarty, 09.11.2026): czy nazwa jest z karty zamiast z P/I,
                     // jaka nazwe mial P/I i jakiego konta dotyczyl, oraz beneficjent karty do porownania.
                     nameRecznie: ed.name != null && String(ed.name) !== '',
@@ -26317,6 +26580,7 @@
                     poprz: poprzG, poprzW: poprzW,
                     kilkaNazw: pcKilkaNazw(G, poprzG, String(V('name', b.name || ''))),
                     bic: painNorm(V('bic', b.swift || '')),
+                    bicPI: painBicWobecPI(G, V('bic', b.swift || '')),
                     // Reczna poprawka > karta dostawcy > wyprowadzenie z P/I.
                     town: townV,
                     ctry: ctryV,
@@ -26327,6 +26591,8 @@
                     pstCd: pstV, pna: pnaV, sub: subV,
                     adrUcieto: (ed.street != null && String(ed.street) !== '') ? [] : (adrS.ucieto || []),
                     adrSrc: adrS.src || '',
+                    // Co HUB poprawil w adresie z karty (pola przestawione, powiat/numer spoza P/I, czlony dopisane z P/I).
+                    adrPoprawki: (ed.street != null && String(ed.street) !== '') ? [] : (adrS.poprawki || []),
                     // Blok karty odrzucony, bo to inny adres niz beneficjent z P/I — do ostrzezenia.
                     adrInny: (!kartaA && adrWyb.inny && !(ed.street != null && String(ed.street) !== ''))
                         ? { grupa: adrWyb.inny.grupa, linia: [adrWyb.inny.linia, adrWyb.inny.zip, adrWyb.inny.city].filter(Boolean).join(', ') } : null,
@@ -26382,7 +26648,11 @@
             }
             // SWIFT spoza P/I. To jedyne pole, ktore modul potrafi dobrac skadinad, wiec
             // ma byc widoczne ZAWSZE — takze gdy wiersz poza tym nie ma zadnej uwagi.
-            if (r.bicSrc) warns.push('SWIFT/BIC „' + r.bic + '” nie pochodzi z tego P/I, tylko '
+            var bicInny = !!(r.bicPI && r.bicPI.zgodny === false && r.bic);
+            if (bicInny) warns.push('⚠ SWIFT w pliku „' + r.bic + '” jest INNY niż w P/I („' + r.bicPI.pi + '”)'
+                + (r.bicSrc ? ' — do pliku idzie SWIFT ' + r.bicSrc : ' — wpisany ręcznie w oknie przelewów')
+                + '; potwierdź, który jest aktualny, przed wysłaniem.');
+            else if (r.bicSrc) warns.push('SWIFT/BIC „' + r.bic + '” nie pochodzi z tego P/I, tylko '
                 + r.bicSrc + ' — potwierdź go przed wysłaniem.');
             // SWIFT ↔ nazwa banku: oba musza mowic o tym samym banku. Ostrzegamy tylko, gdy OBA
             // sa rozpoznane i RÓŻNE (bank spoza mapy nie zapala nic). Konta↔SWIFT sprawdzic sie nie da.
@@ -26394,6 +26664,12 @@
                 warns.push('⚠ SWIFT „' + r.bic + '” to ' + bicBank + ', a bank dostawcy to '
                     + nazwaBank + ' — SWIFT i bank się nie zgadzają, sprawdź numer konta i SWIFT przed wysłaniem.');
             if (!painTxt(r.name, 140, strict)) errs.push('brak nazwy beneficjenta.');
+            else if (r.nazwaZapas) warns.push('w bloku bankowym P/I nie ma nazwy beneficjenta — do pliku idzie „' + r.name + '” '
+                + r.nazwaZapas.skad + (r.nazwaZapas.karta && pbNorm(r.nazwaZapas.karta) !== pbNorm(r.name) ? ' (dostawca w prologistics: „' + r.nazwaZapas.karta + '”)' : '')
+                + '; sprawdź przed wysłaniem.');
+            // Znaki, ktorych bank nie przyjmie, a ktore z adresu wypadaja — dotad bez slowa (tytul i nazwa mialy uwage).
+            var adrZn = painChars([r.street, r.bldg, r.town, r.sub].join(' '), false);   // tylko znaki, ktore WYPADAJA
+            if (adrZn.bad.length) warns.push('w adresie zamieniono/usunięto znaki: ' + adrZn.bad.join(' ') + ' — sprawdź pola adresu.');
             if (!painNorm(r.acc)) errs.push('brak numeru konta beneficjenta'
                 + ((r.accSrc === 'karta' || r.accSrc === 'naglowek')
                     ? (r.zrodlo === 'bal' ? ' — przy balance konto bierzemy wyłącznie od dostawcy, a na karcie go nie ma'
@@ -28444,7 +28720,17 @@
                     // i jedenastoznakowy o tym samym poczatku wskazuja ten sam bank, a
                     // koncowke banki wpisuja niekonsekwentnie. Zielone, nie zolte.
                     var sw = bcSwiftPotw(bank.swift || '', q, bank.swiftRaw || '');
-                    if (bank.swiftBad){
+                    // W P/I zamiast SWIFT-u stoi cos innego („SWIFT NO.: 180105" — Paras 22291, 16.11.2026), a przelew
+                    // poszedl na SWIFT z karty dostawcy (Wprowadzanie bierze go wtedy z karty, decyzja uzytkownika: „taki
+                    // podali"). Zgodnosc potwierdzenia z karta (konto karty = konto przelewu) to uwaga, nie czerwony blad.
+                    var swKarta = (bank.swiftBad && bcSwiftNorm(bank.swift).slice(0, 8) !== bcSwiftNorm(q.bic).slice(0, 8))
+                        ? painBicZKarty({ cid: d.cid }, q.acct || '') : '';
+                    if (swKarta && bcSwiftEq(swKarta, q.bic).ok){
+                        kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
+                            (q.bic || '—') + ' — w P/I to nie jest SWIFT; zgodny ze SWIFT-em z karty dostawcy (' + swKarta + ')', 'uwaga');
+                        w.uwagi.push(o + ': w P/I zamiast SWIFT-u stoi „' + (bank.swift || '—') + '” — przelew poszedł na SWIFT z karty dostawcy '
+                            + swKarta + ', zgodny z potwierdzeniem');
+                    } else if (bank.swiftBad){
                         var poczatek = bcSwiftNorm(bank.swift).slice(0, 8) === bcSwiftNorm(q.bic).slice(0, 8);
                         kon(o, 'SWIFT z P/I ↔ SWIFT na potwierdzeniu', bank.swift || '—',
                             (q.bic || '—') + ' — w P/I zły format (' + bcSwiftNorm(bank.swift).length
@@ -29452,9 +29738,7 @@
         // Nazwa firmy z karty bywa podwojna: „Moen Furniture Tianjin Co., ltd/ TIANJIN KINFUNG …".
         // Ten sam podzial co pcKilkaNazw (Wprowadzanie).
         function bcNazwyKarty(s){
-            return String(s == null ? '' : s).split(/\s*\/\s*|\(|\)/)
-                .map(function (x){ return String(x || '').trim(); })
-                .filter(function (x){ return bcNazwaKlucz(x).length >= 3; });
+            return pcNazwyCzesci(s).filter(function (x){ return bcNazwaKlucz(x).length >= 3; });
         }
         // zr: [{ n, rodzaj: 'ten'|'karta-benef'|'karta-firma'|'pi'|'poprz', et, dop, o, acc, cid }]
         //  -> { grupy: [{ n, zrodla, ten }], kilka, zle: null|{ wlasciciel, cid, acc, skad }, uwaga, blad, porown }
@@ -30113,7 +30397,8 @@
                 if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
                 // Skad wziety adres — zeby nie trzeba bylo zgadywac, czemu miasto jest
                 // takie, a nie inne. „karta" znaczy: rozpisane pola z karty dostawcy.
-                if (r.adrKarta) st += ' <span style="color:#0a7a2f" title="Miasto i adres wzięte z karty dostawcy (blok „' + pcAttr(r.adrKarta) + '”) — pola rozpisane, bez zgadywania">(adres: karta)</span>';
+                if (r.adrKarta) st += ' <span style="color:#0a7a2f" title="' + pcAttr('Miasto i adres wzięte z karty dostawcy (blok „' + r.adrKarta + '”) — pola rozpisane, bez zgadywania'
+                    + ((r.adrPoprawki || []).length ? '. Poprawione według P/I i tabeli kodów: ' + r.adrPoprawki.join('; ') : '')) + '">(adres: karta' + ((r.adrPoprawki || []).length ? ', poprawiony' : '') + ')</span>';
                 else if (r.adrSrc === 'pi') st += ' <span style="color:#c47f00" title="' + pcAttr('Adres beneficjenta z P/I (tekst rozpisany na pola)' + (r.adrInny ? ' — blok „' + r.adrInny.grupa + '” karty to inny adres: ' + r.adrInny.linia : '')) + '">(adres: P/I)</span>';
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
@@ -30136,7 +30421,8 @@
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;text-align:right;vertical-align:top">' + painInp('amount', r.key, r.amount.toFixed(2), 78) + (r.amountEdited ? '<div style="font-size:10px;color:#0a58ca">było ' + r.amountBase.toFixed(2) + '</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('name', r.key, r.name, 210) + painNazwaNote(r) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('acc', r.key, r.acc, 165) + painAccNote(r) + '</td>'
-                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('bic', r.key, r.bic, 95) + (r.bic && !painBicOk(r.bic) ? '<div style="font-size:10px;color:#c00">zły BIC</div>' : '') + '</td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('bic', r.key, r.bic, 95) + (r.bic && !painBicOk(r.bic) ? '<div style="font-size:10px;color:#c00">zły BIC</div>' : '')
+                   + (r.bic && r.bicPI && r.bicPI.zgodny === false ? '<div style="font-size:10px;color:#c47f00;font-weight:600" title="' + pcAttr('SWIFT w pliku jest inny niż w P/I („' + r.bicPI.pi + '”)' + (r.bicSrc ? ' — w pliku: ' + r.bicSrc : '')) + '">≠ P/I: ' + esc(r.bicPI.pi.slice(0, 24)) + '</div>' : '') + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('town', r.key, r.town, 105) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">' + painInp('ctry', r.key, r.ctry, 34) + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;font-size:10px">' + st + '</td>'
@@ -30398,9 +30684,30 @@
         }
         // „Kilka nazw": pole dostawcy bywa „A / B" albo „A (B)", a P/I i poprzedni przelew
         // nosza jeszcze inna. To INFORMACJA — nie blokuje; kotwica i tak jest konto.
+        // Nazwy z pola nazwy firmy w prologistics. „/" rozdziela dwie firmy („Moen Furniture … / TIANJIN KINFUNG …"),
+        // nawias na KONCU — druga nazwe („… CO.,LIMITED (Sanda Industry)"). Do 5.63.13 dzielil kazdy nawias i kazdy
+        // dopisek dzialu byl „nazwa": „Futian (Fuzhou) Arts and Crafts CO.,LTD - BATHROOM" dawalo „Futian", „Fuzhou"
+        // i „Arts and Crafts…", a „… / flower pots", „… OFFICE" — kolejne „nazwy dostawcy" (Sprawdzanie, 16.11.2026).
+        // Dopisek dzialu po myslniku schodzi; czesc bez formy prawnej i krotsza niz 3 slowa nie jest nazwa firmy.
+        var PC_NAZWA_FIRMY = /\b(?:CO|COMPANY|LTD|LIMITED|LLC|INC|CORP|CORPORATION|GMBH|SDN|BHD|PVT|PTE|INDUSTRY|INDUSTRIES|FACTORY|GROUP|TRADING|FURNITURE|HOME|HOLDINGS?|ENTERPRISES?|MANUFACTUR\w*)\b/i;
+        function pcNazwyCzesci(s){
+            var out = [];
+            String(s == null ? '' : s).split(/\s*\/\s*/).forEach(function (cz){
+                var t = String(cz || '').replace(/\s+/g, ' ').trim(), naw = t.match(/^(.*\S)\s*\(([^()]+)\)\s*([A-Za-z]+)?\s*$/);
+                var czesci = naw ? [naw[1], naw[2]] : [t];
+                czesci.forEach(function (x){
+                    x = String(x || '').replace(/\s+-\s*[A-Za-z][A-Za-z &]{0,30}$|\s*-\s*(?:BATHROOM|SOFAS?|TABLES?|CHAIRS?|OFFICE)$/i, '').trim();
+                    if (!x) return;
+                    // Nazwa glowna (pierwsza czesc) zostaje zawsze — „HABITUS" tez jest nazwa. Filtr tylko dla dopiskow.
+                    if (out.length && !PC_NAZWA_FIRMY.test(x) && x.split(' ').length < 3) return;
+                    out.push(x);
+                });
+            });
+            return out;
+        }
         function pcKilkaNazw(G, poprz, nazwaDoPliku){
             var zrodla = [];
-            String((G && G.sup) || '').split(/\s*[\/]\s*|\(|\)/).forEach(function (x){ var n = String(x || '').trim(); if (n) zrodla.push({ n: n, src: 'karta' }); });
+            pcNazwyCzesci((G && G.sup) || '').forEach(function (n){ if (n) zrodla.push({ n: n, src: 'karta' }); });
             // Beneficjent z karty (09.11.2026) — przy Moen to on jest aktualnym posrednikiem.
             var sk0 = (G && G.cid && _sup[G.cid]) || null;
             if (sk0 && sk0.benef) zrodla.push({ n: String(sk0.benef).trim(), src: 'karta: beneficjent' });
@@ -32620,11 +32927,18 @@
         function piSwiftPick(v){
             var s = String(v == null ? '' : v).toUpperCase();
             var noPar = s.replace(/[(（][^)）]*[)）]?/g, ' ');
+            // Kod oddzialu po spacji: „BKCHCNBJ 720" (Fuzhou Home Broad, zam. 21388, 16.11.2026) to BKCHCNBJ720 —
+            // do 5.63.13 brane bylo samo BKCHCNBJ (centrala), a zespol poprawial to recznie. Doklejamy trzy znaki
+            // za 8-znakowym BIC-em, gdy sa cyframi albo „XXX", albo gdy w polu stoja tylko te dwa slowa
+            // („PCBCCNBJ FJX"). Slowo jak „OR" czy „USD" w dluzszym napisie nie jest kodem oddzialu.
             function pick(t){
-                var r = '';
-                t.replace(/[^A-Z0-9]+/g, ' ').trim().split(' ').some(function(w){
-                    if (PI_BIC_RE.test(w)) { r = w; return true; }
-                    return false;
+                var r = '', sl = t.replace(/[^A-Z0-9]+/g, ' ').trim().split(' ');
+                sl.some(function(w, i){
+                    if (!PI_BIC_RE.test(w)) return false;
+                    var nx = sl[i + 1] || '';
+                    if (w.length === 8 && /^[A-Z0-9]{3}$/.test(nx) && (sl.length === 2 || /\d/.test(nx) || nx === 'XXX')
+                        && PI_BIC_RE.test(w + nx)) { r = w + nx; return true; }
+                    r = w; return true;
                 });
                 return r;
             }
@@ -32740,8 +33054,25 @@
             out.accNums = nums;
             out.rawRows = raw;
             out.accRaw = out.acc;
+            // Nazwa firmy z naglowka P/I — zapas dla nazwy beneficjenta, gdy blok jej nie ma (painNazwaZapas).
+            out.firma = piFirmaNaglowek(aoa);
             out.ok = !!(out.name && out.acc && out.swift && !out.swiftBad);
             return out;
+        }
+        // Pierwsza niepusta komorka pierwszych wierszy arkusza — o ile wyglada na nazwe firmy (P/I Parasa: A1
+        // „PARAS INDUSTRIES"). Naglowek „Proforma Invoice", adres, telefon, mail czy „TO: Beliani" — nic nie dajemy.
+        function piFirmaNaglowek(aoa){
+            for (var i = 0; i < Math.min((aoa || []).length, 4); i++){
+                var row = aoa[i] || [];
+                for (var j = 0; j < row.length; j++){
+                    var v = String(row[j] == null ? '' : row[j]).replace(/\s+/g, ' ').trim();
+                    if (!v) continue;
+                    if (!/[A-Za-z]{3,}/.test(v) || v.length > 80 || /\d{3,}/.test(v)) return '';
+                    if (/proforma|invoice|beliani|\bto\s*:|date|tel|fax|e-?mail|www\.|@|http|order|p\s*\/\s*i\b|address|add\s*:/i.test(v)) return '';
+                    return v;
+                }
+            }
+            return '';
         }
         // --- miasto i kraj beneficjenta (TwnNm/Ctry) ---
         // Od 14.11.2026 oba pola sa w pain.001 obowiazkowe, a w P/I nie ma ich osobno —
@@ -34402,7 +34733,12 @@
                     throw new Error('W czasie pobierania zmieniono dane lub rozpoczęto przetwarzanie. Pobierz ponownie.');
                 target.innerHTML = result.html;
                 state.balanceSrc = 'Google Sheets, ' + date + ', ' + result.range + ', pobrano ' + pcNow();
-                status.textContent = 'Pobrano BALANCE: ' + result.count + ' wierszy dla ' + date + ', suma ' + result.total.toFixed(2) + '. Sprawdź dane i kliknij „Przetwórz”.';
+                var ps = result.poSumie;
+                function wiersze(z){ return z.n + ' ' + (z.n === 1 ? 'wiersz' : z.n < 5 ? 'wiersze' : 'wierszy') + ' (' + z.od + (z.do !== z.od ? '–' + z.do : '') + ')'; }
+                status.textContent = 'Pobrano BALANCE: ' + result.count + ' wierszy dla ' + date + ', suma ' + result.total.toFixed(2) + ' (do sumy w wierszu ' + result.sumaW + ').'
+                    + (ps && ps.dane ? ' Pod sumą stoi jeszcze ' + wiersze(ps.dane) + ' bez nagłówka daty — to następna lista, nie wziąłem ich; jeśli należą do tej, wpisz je ręcznie.' : '')
+                    + (ps && ps.notatki ? ' Pominięte notatki pod sumą: ' + wiersze(ps.notatki) + '.' : '')
+                    + ' Sprawdź dane i kliknij „Przetwórz”.';
             } catch(e) { status.textContent = 'BALANCE: ' + e.message + ' Dotychczasowe dane pozostawiono bez zmian.'; }
             finally { btn.disabled = false; }
         };
@@ -36478,7 +36814,9 @@
         var DS_PNA_CN = "0100,223,Hohhot;0101,223,Tumed Left Banner;0102,223,Togtoh County;0103,228,Jungar Banner;0111,234,Erenhot;0112,234,Sonid Right Banner;0113,234,Sonid Left Banner;0115,223,Horinger County;0116,223,Qingshuihe County;0117,223,Wuchuan County;0118,232,Siziwang Banner;0120,232,Ulanqab;0121,232,Fengzhen;0122,232,Chahar Right Front Banner;0123,232,Zhuozi County;0124,232,Chahar Right Back Banner;0132,234,Bordered Yellow Banner;0133,232,Huade County;0134,232,Shangdu County;0135,232,Chahar Right Middle Banner;0136,232,Xinghe County;0137,232,Liangcheng County;0140,224,Baotou;0141,224,Tumed Right Banner;0142,224,Guyang County;0143,228,Dalad Banner;0144,231,Urad Front Banner;0145,224,Darhan Muminggan United Banner;0150,231,Bayannur;0151,231,Wuyuan County;0152,231,Dengkou County;0153,231,Urad Middle Banner;0154,228,Hanggin Rear Banner;0155,231,Urad Rear Banner;0160,225,Wuhai;0161,228,Otog Banner;0162,228,Otog Front Banner;0170,228,Ordos;0172,228,Ejin Horo Banner;0173,228,Uxin Banner;0174,228,Hanggin Banner;0210,229,Hulunbuir;0211,229,Evenk Autonomous Banner;0212,229,New Barag Left Banner;0213,229,New Barag Right Banner;0214,229,Manzhouli;0215,229,Old Barag Banner;0221,229,Yakeshi;0222,229,Ergun City;0223,229,Genhe;0224,229,Oroqen Autonomous Banner;0240,226,Chifeng;0242,226,Ningcheng County;0243,226,Aohan Banner;0244,226,Kharchin Banner;0245,226,Ongniud Banner;0251,226,Baarin Right Banner;0252,226,Linxi County;0253,226,Hexigten Banner;0254,226,Baarin Left Banner;0255,226,Ar Khorchin Banner;0260,234,Xilingol League;0261,234,Abag Banner;0262,234,West Ujimqin Banner;0263,234,East Ujimqin Banner;0270,234,Taibus Banner;0271,234,Plain and Bordered White Banner;0272,234,Plain Blue Banner;0273,234,Duolun County;0280,227,Tongliao;0281,227,Horqin Left Back Banner;0282,227,Hure Banner;0283,227,Naiman Banner;0284,227,Kailu County;0291,227,Jarud Banner;0292,227,Holingol;0293,227,Horqin Left Middle Banner;0300,246,Taiyuan;0301,246,Yangqu County;0302,246,Gujiao;0303,246,Loufan County;0304,246,Qingxu County;0305,256,Jiaocheng County;0306,252,Yuci District;0308,252,Taigu County;0309,252,Qi County;0311,252,Pingyao County;0312,252,Jiexiu;0313,252,Lingshi County;0314,255,Huozhou;0315,255,Fenxi County;0316,255,Hongtong County;0317,252,Shouyang County;0318,252,Yushe County;0321,256,Wenshui County;0322,256,Fenyang;0323,256,Xiaoyi;0324,256,Jiaokou County;0325,256,Shilou County;0326,252,Zuoquan County;0330,256,L\u00fcliang;0331,256,Fangshan County;0332,256,Lin County;0333,256,Liulin County;0334,256,Zhongyang County;0340,254,Xinzhou;0341,254,Yuanping City;0342,254,Dai County;0343,254,Fanshi County;0344,247,Lingqiu County;0351,254,Jingle County;0352,256,Lan County;0353,256,Xing County;0354,254,Dingxiang County;0355,254,Wutai County;0360,251,Shuozhou;0361,254,Shenchi County;0362,254,Wuzhai County;0363,254,Kelan County;0364,254,Pianguan County;0365,254,Hequ County;0366,254,Baode County;0367,254,Ningwu County;0368,251,Pinglu District;0370,247,Datong;0371,247,Zuoyun County;0372,251,Youyu County;0373,247,Datong County;0374,247,Hunyuan County;0375,247,Guangling County;0376,251,Ying County;0381,247,Yanggao County;0382,247,Tianzhen County;0383,252,Huairen County;0384,251,Shanyin County;0400,255,Linfen;0412,255,Pu County;0413,255,Xi County;0414,255,Yonghe County;0415,255,Xiangfen County;0421,255,Xiangning County;0422,255,Ji County;0423,255,Daning County;0424,255,Gu County;0425,255,Anze County;0426,255,Fushan County;0430,255,Houma City;0431,253,Xinjiang County;0432,253,Jishan County;0433,253,Hejin;0434,255,Quwo County;0435,255,Yicheng County;0436,253,Jiang County;0437,253,Yuanqu County;0438,253,Wenxi County;0440,253,Yuncheng;0441,253,Linyi County;0442,253,Wanrong County;0443,251,Pinglu County;0444,253,Xia County;0445,253,Yongji;0446,253,Ruicheng County;0450,248,Yangquan;0451,248,Yu County;0452,248,Pingding County;0453,252,Xiyang County;0460,249,Changzhi;0461,249,Tunliu County;0462,249,Xiangyuan County;0463,249,Wuxiang County;0464,249,Qin County;0465,249,Qinyuan County;0466,249,Zhangzi County;0475,249,Lucheng;0480,250,Jincheng;0481,250,Yangcheng County;0482,250,Qinshui County;0484,250,Gaoping;0500,108,Shijiazhuang;0501,108,Jingxing Mining District;0502,108,Luquan District;0503,108,Jingxing County;0504,108,Pingshan County;0505,108,Lingshou County;0506,108,Xingtang County;0507,108,Xinle;0508,108,Zhengding County;0511,108,Yuanshi County;0512,108,Zanhuang County;0513,108,Gaoyi County;0514,108,Luancheng District;0515,108,Zhao County;0516,112,Ningjin County;0517,112,Xinhe County;0518,112,Nangong;0521,108,Gaocheng District;0522,108,Jinzhou;0523,108,Xinji;0524,108,Wuji County;0525,108,Shenze County;0526,118,Anping County;0527,118,Raoyang County;0528,118,Shenzhou City;0530,118,Hengshui;0531,118,Zaoqiang County;0532,118,Jizhou City;0533,118,Wuqiang County;0534,118,Wuyi County;0535,118,Jing County;0540,112,Xingtai;0541,112,Shahe;0542,112,Neiqiu County;0543,112,Lincheng County;0544,112,Nanhe County;0545,112,Pingxiang County;0546,112,Guangzong County;0547,112,Wei County;0548,112,Qinghe County;0551,112,Ren County;0552,112,Julu County;0553,112,Longyao County;0554,112,Baixiang County;0560,111,Handan;0562,111,Fengfeng Mining District;0563,111,Wuan;0564,111,She County;0565,111,Ci County;0566,111,Linzhang County;0567,111,Chengan County;0568,112,Wei County;0569,111,Daming County;0571,111,Yongnian County;0572,111,Quzhou County;0573,111,Jize County;0574,111,Qiu County;0575,111,Feixiang County;0576,111,Guangping County;0577,111,Guantao County;0578,112,Linxi County;0610,116,Cangzhou;0611,116,Huanghua;0612,116,Haixing County;0613,116,Yanshan County;0614,116,Mengcun Hui Autonomous County;0615,116,Nanpi County;0616,116,Dongguang County;0617,118,Fucheng County;0618,116,Wuqiao County;0621,116,Botou;0622,116,Xian County;0623,116,Suning County;0624,116,Hejian;0625,116,Renqiu;0630,109,Tangshan;0631,109,Guye District;0632,109,Caofeidian District;0633,109,Fengnan District;0635,109,Luannan County;0636,109,Laoting County;0637,109,Luan County;0640,109,Fengrun District;0641,109,Yutian County;0642,109,Zunhua;0644,109,Qianxi County and Qianan;0650,117,Langfang;0660,110,Qinhuangdao;0661,110,Beidaihe District;0662,110,Shanhaiguan District;0663,110,Funing District;0664,110,Lulong County;0665,110,Qinglong Manchu Autonomous County;0666,110,Changli County;0670,115,Chengde;0671,115,Shouwangfen Town;0672,115,Yingshouyingzi Mining District;0673,115,Xinglong County;0674,115,Chengde County;0675,115,Pingquan County;0676,115,Kuancheng Manchu Autonomous County;0681,115,Longhua County;0682,115,Luanping County;0683,115,Fengning Manchu Autonomous County;0684,115,Weichang Manchu and Mongol Autonomous County;0710,113,Baoding;0711,113,Qingyuan District;0712,113,Anguo;0713,113,Boye County;0714,113,Li County;0715,113,Gaoyang County;0716,113,Anxin County;0717,113,Rongcheng County;0718,113,Xiong County;0721,113,Mancheng District;0722,113,Shunping County;0723,113,Tang County;0724,113,Wangdu County;0725,113,Xushui District;0726,113,Dingxing County;0727,113,Zhuozhou;0730,113,Dingzhou;0731,113,Quyang County;0732,113,Fuping County;0740,113,Gaobeidian;0741,113,Laishui County;0742,113,Yi County;0750,114,Zhangjiakou;0751,114,Xuanhua District;0752,114,Pangjiabao Town;0753,114,Xiahuayuan District;0754,114,Huailai County;0755,114,Chicheng County;0756,114,Zhuolu County;0757,114,Yu County;0758,114,Yangyuan County;0761,114,Huaian County;0762,114,Wanquan District;0763,114,Chongli District;0764,114,Zhangbei County;0765,114,Guyuan County;0766,114,Kangbao County;0767,114,Shangyi County;1000,243,Beijing;1011,243,Tongzhou District;1012,243,Pinggu District;1013,243,Shunyi District;1014,243,Huairou District;1015,243,Miyun District;1021,243,Yanqing District;1022,243,Changping District;1023,243,Mentougou District;1024,243,Fangshan District;1026,243,Daxing District;1100,209,Shenyang;1102,209,Liaozhong District;1103,209,Xinmin;1104,209,Faku County;1105,209,Kangping County;1110,218,Liaoyang;1112,218,Liaoyang County;1113,218,Dengta;1120,220,Tieling;1123,220,Kaiyuan;1124,220,Xifeng County;1125,220,Changtu County;1126,220,Tieling County;1127,220,Diaobingshan;1130,212,Fushun;1131,212,Fushun County;1132,212,Xinbin Manchu Autonomous County;1133,212,Qingyuan Manchu Autonomous County;1140,211,Anshan;1141,211,Taian County;1142,211,Haicheng;1143,211,Xiuyan Manchu Autonomous County;1150,216,Yingkou;1151,216,Dashiqiao;1152,216,Gaizhou;1160,210,Dalian;1161,210,Jinzhou District;1162,210,Pulandian District;1163,210,Wafangdian;1164,210,Zhuanghe;1165,210,Changhai County;1170,213,Benxi;1171,213,Benxi Manchu Autonomous County;1172,213,Huanren Manchu Autonomous County;1180,214,Dandong;1181,214,Fengcheng;1182,214,Kuandian Manchu Autonomous County;1183,214,Donggang;1210,210,Jinzhou;1211,215,Yi County;1212,215,Linghai;1213,215,Beizhen;1214,215,Heishan County;1220,221,Chaoyang;1221,221,Beipiao;1223,221,Harqin Left Wing Mongolian Autonomous County;1224,221,Jianping County;1225,221,Lingyuan;1226,221,Chaoyang County;1230,217,Fuxin;1231,217,Fuxin Mongol Autonomous County;1232,217,Zhangwu County;1240,219,Panjin;1241,219,Panshan County;1242,219,Dawa District;1250,222,Huludao;1251,222,Xingcheng;1252,222,Suizhong County;1253,222,Jianchang County;1300,51,Changchun;1302,51,Nongan County;1303,51,Dehui;1304,51,Yushu;1305,51,Jiutai District;1306,51,Shuangyang District;1307,53,Yitong Manchu Autonomous County;1311,57,Qian Gorlos Mongol Autonomous County;1312,57,Fuyu;1313,58,Daan;1314,57,Qianan County;1315,57,Changling County;1320,52,Jilin City;1322,52,Yongji County;1323,52,Panshi;1324,52,Huadian City;1325,52,Jiaohe;1326,52,Shulan;1330,59,Yanbian Korean Autonomous Prefecture;1331,59,Tumen;1332,59,Wangqing County;1333,59,Hunchun;1334,59,Longjing;1335,59,Helong;1336,59,Antu County;1337,59,Dunhua;1340,55,Tonghua;1341,55,Tonghua County;1342,55,Jian;1343,56,Hunjiang District;1344,56,Changbai Korean Autonomous County;1345,56,Fusong County;1346,56,Linjiang;1350,55,Meihekou;1351,55,Huinan County;1352,56,Jingyu County;1360,53,Siping;1361,53,Gongzhuling;1362,54,Liaoyuan;1363,54,Dongfeng County;1364,53,Shuangliao;1365,53,Lishu County;1366,54,Dongliao County;1370,58,Baicheng;1371,58,Taonan;1372,58,Tongyu County;1373,58,Zhenlai County;1374,233,Ulan Hot, Horqin Right Middle Banner;1375,233,Tuquan County, Horqin Right Front Banner;1376,233,Jalaid Banner;1378,233,Arxan;1380,57,Songyuan;1500,78,Harbin;1501,78,Shuangcheng District;1502,78,Wuchang;1503,78,Acheng District;1504,78,Bin County;1505,78,Hulan District;1506,78,Shangzhi;1507,78,Yanshou County;1508,78,Fangzheng County;1509,78,Tonghe County;1511,88,Zhaodong;1512,82,Zhaozhou County;1513,82,Zhaoyuan County;1514,88,Anda;1515,88,Lanxi County;1516,88,Qinggang County;1518,78,Bayan County;1519,78,Mulan County;1520,88,Suihua;1521,88,Wangkui County;1522,88,Suileng County;1523,88,Hailun;1524,88,Qingan County;1525,83,Tieli;1530,83,Yichun;1531,83,Nancha District;1532,83,Jiayin County;1540,84,Jiamusi;1541,80,Hegang;1542,80,Luobei County;1543,84,Huachuan County;1544,84,Huanan County;1545,85,Boli County;1546,85,Qitaihe;1547,84,Tangyuan County;1548,78,Yilan County;1550,81,Shuangyashan;1551,81,Jianshan District;1556,81,Baoqing County;1557,81,Raohe County;1558,81,Youyi County;1559,81,Jixian County;1561,84,Fujin;1562,80,Suibin County;1563,84,Jiansanjiang;1564,84,Tongjiang;1565,84,Fuyuan;1570,86,Mudanjiang;1571,86,Hailin;1572,86,Dongning;1573,86,Suifenhe;1574,86,Ningan;1575,86,Muling;1576,86,Linkou County;1610,79,Qiqihar;1611,79,Longjiang County;1612,79,Fuyu County;1613,79,Nehe;1614,87,Nenjiang County;1615,79,Yian County;1616,79,Keshan County;1617,79,Baiquan County;1618,79,Kedong County;1621,79,Gannan County;1622,82,Dorbod Mongol Autonomous County;1623,82,Lindian County;1624,79,Tailai County;1626,230,Zhalantun;1627,230,Arun Banner;1628,237,Morin Dawa Daur Autonomous Banner;1630,82,Daqing;1640,87,Beian;1641,87,Wudalianchi;1642,87,Sunwu County;1643,87,Aihui District;1644,87,Xunke County;1650,89,Daxinganling Prefecture;1651,89,Huma County;1652,89,Tahe County;1653,89,Mohe County;2000,244,Shanghai;2011,244,Minhang District;2013,245,Nanhui District;2014,244,Fengxian District;2015,244,Jinshan District;2016,244,Songjiang District;2017,244,Qingpu District;2018,244,Jiading District;2021,244,Chongming County;2024,24,Shengsi County;2100,38,Nanjing;2111,38,Jiangning District;2112,38,Lishui District;2113,38,Gaochun District;2114,47,Yizheng;2115,38,Luhe District;2116,45,Jinhu County;2117,45,Xuyi County;2118,38,Jiangpu County;2120,48,Zhenjiang;2121,48,Dantu District;2122,48,Yangzhong;2123,48,Danyang;2124,48,Jurong;2130,41,Changzhou;2131,41,Wujin District;2132,41,Jintan District;2133,41,Liyang;2140,39,Wuxi;2141,39,Huishan District;2142,39,Yixing;2144,39,Jiangyin;2145,49,Jingjiang;2150,42,Suzhou;2151,42,Wuzhong District, Xiangcheng District, parts of Suzhou New District and parts of Suzhou Industrial Park;2152,42,Wujiang District;2153,42,Kunshan;2154,42,Taicang;2155,42,Changshu;2156,42,Zhangjiagang;2210,40,Xuzhou;2211,40,Tongshan District;2212,40,Suining County;2213,40,Pizhou;2214,40,Xinyi;2216,40,Pei County;2217,40,Feng County;2220,44,Lianyungang;2221,44,Ganyu District;2222,44,Guanyun County;2223,44,Donghai County;2230,45,Huaian;2231,45,Hongze County;2232,45,Huaian District;2233,45,Huaiyin District;2234,45,Lianshui County;2235,44,Guannan County;2236,50,Shuyang County;2237,50,Siyang County;2238,50,Suqian;2239,50,Sihong County;2240,46,Yancheng;2241,46,Dafeng District;2242,46,Dongtai;2243,46,Sheyang County;2244,46,Funing County;2245,46,Binhai County;2246,46,Xiangshui County;2247,46,Jianhu County;2250,47,Yangzhou;2251,47,Hanjiang District;2252,47,Jiangdu District;2253,49,Taizhou;2254,49,Taixing;2255,49,Jiangyan District;2256,47,Gaoyou;2257,49,Xinghua;2258,47,Baoying County;2260,43,Nantong;2261,43,Haimen;2262,43,Qidong;2263,43,Tongzhou District;2264,43,Rudong County;2265,43,Rugao;2266,43,Haian County;2300,0,Hefei;2311,0,Changfeng County;2312,0,Feixi County;2313,12,Shucheng County;2314,7,Tongcheng;2315,0,Lujiang County;2316,0,Feidong County;2320,3,Huainan;2321,3,Fengtai County;2322,3,Shou County;2330,2,Bengbu;2331,9,Fengyang County;2332,9,Dingyuan County;2333,2,Wuhe County;2334,2,Huaiyuan County;2335,13,Mengcheng County;2336,13,Guoyang County;2337,2,Guzhen County;2340,11,Suzhou;2342,11,Lingbi County;2343,11,Si County;2350,5,Huaibei;2351,5,Suixi County, Anhui;2352,11,Xiao County;2353,11,Dangshan County;2360,10,Fuyang;2362,11,Yingshang County;2363,10,Funan County;2364,10,Linquan County;2365,10,Jieshou;2366,10,Taihe County;2367,13,Lixin County;2368,13,Qiaocheng District;2370,12,Luan;2372,12,Huoshan County;2373,12,Jinzhai County;2374,12,Huoqiu County;2380,0,Chaohu;2381,4,Hanshan County;2382,4,He County;2390,9,Chuzhou;2392,9,Laian County;2393,9,Tianchang;2394,9,Mingguang;2395,9,Quanjiao County;2410,1,Wuhu;2411,1,Wuhu County;2412,1,Fanchang County;2420,15,Xuancheng;2421,15,Langxi County;2422,15,Guangde County;2423,15,Ningguo;2424,1,Nanling County;2425,15,Jing County;2426,15,Jingde County;2427,8,Huangshan District;2428,14,Qingyang County;2430,4,Maanshan;2431,4,Dangtu County;2440,6,Tongling;2441,7,Yian District;2450,8,Huangshan City;2451,14,Shitai County;2452,8,She County;2453,15,Jixi County;2454,8,Xiuning County;2455,8,Yi County;2456,8,Qimen County;2460,7,Anqing;2461,7,Huaining County;2462,7,Wangjiang County;2463,7,Qianshan County;2464,7,Taihu County;2465,7,Susong County;2466,7,Yuexi County;2467,7,Zongyang County;2471,14,Chizhou;2472,14,Dongzhi County;2500,257,Jinan;2501,257,Licheng District;2502,257,Zhangqiu;2503,257,Changqing District;2504,257,Pingyin County;2511,269,Qihe County;2512,269,Yucheng;2514,257,Jiyang County;2515,269,Linyi County;2516,257,Shanghe County;2517,271,Huimin County;2518,271,Yangxin County;2519,271,Wudi County;2520,270,Liaocheng;2521,270,Chiping County;2522,270,Donge County;2523,270,Yanggu County;2524,270,Shen County;2525,270,Guan County;2526,270,Linqing;2527,270,Gaotang County;2530,269,Dezhou;2531,269,Pingyuan County;2532,269,Xiajin County;2533,269,Wucheng County;2534,269,Ningjin County;2535,269,Lingcheng District;2536,269,Leling;2537,269,Qingyun County;2538,118,Gucheng County;2550,259,Zibo;2551,259,Zichuan District;2552,259,Boshan District;2553,259,Zhoucun District;2554,259,Linzi District;2561,259,Yiyuan County;2562,271,Zouping County;2563,259,Gaoqing County;2564,259,Huantai County;2565,271,Boxing County;2566,271,Binzhou;2568,271,Zhanhua District;2570,261,Dongying;2571,261,Dongying District;2572,261,Hekou District;2573,261,Guangrao County;2574,261,Lijin County;2575,261,Kenli County;2610,263,Weifang;2611,263,Hanting District;2612,263,Fangzi District;2613,263,Changyi;2614,262,Laizhou;2615,263,Gaomi;2621,263,Anqiu;2622,263,Zhucheng;2623,267,Wulian County;2624,263,Changle County;2625,263,Qingzhou;2626,263,Linqu County;2627,263,Shouguang;2640,262,Yantai;2641,262,Muping District;2642,266,Weihai;2643,266,Rongcheng;2644,266,Wendeng District;2645,266,Rushan;2651,262,Haiyang;2652,262,Laiyang;2653,262,Qixia;2654,262,Zhaoyuan City;2655,262,Fushan District;2656,262,Penglai City;2657,262,Longkou;2658,262,Changdao County;2660,258,Qingdao;2661,258,Laoshan District;2662,258,Jimo;2663,258,Jiaozhou;2664,258,Huangdao District;2665,258,Huangdao District;2666,258,Laixi;2667,258,Pingdu;2710,265,Taian;2711,257,Laiwu;2712,265,Xintai;2714,265,Ningyang County;2715,265,Dongping County;2716,265,Feicheng;2720,264,Jining;2721,264,Yanzhou District;2722,264,Jinxiang County;2723,264,Yutai County;2724,264,Jiaxiang County;2725,264,Wenshang County;2726,264,Liangshan County;2731,264,Qufu;2732,264,Sishui County;2733,268,Pingyi County;2734,268,Fei County;2735,264,Zoucheng;2740,272,Heze;2741,272,Dingtao District;2742,272,Chengwu County;2743,272,Shan County;2744,272,Cao County;2745,272,Dongming County;2746,272,Juancheng County;2747,272,Yuncheng County;2749,272,Juye County;2760,269,Linyi;2761,268,Tancheng County;2762,268,Mengyin County;2763,268,Yinan County;2764,268,Yishui County;2765,267,Ju County;2766,268,Junan County;2767,268,Linshu County;2768,267,Rizhao;2770,260,Zaozhuang;2772,260,Shanting District;2773,260,Yicheng District;2774,260,Taierzhuang District;2775,260,Tengzhou;2776,264,Weishan County;2777,268,Lanling County;3000,283,Tianjin Urban;3015,283,Ninghe District;3016,283,Jinghai District;3017,283,Wuqing District;3018,283,Baodi District;3019,283,Ji County;3100,16,Hangzhou;3111,16,Yuhang District;3112,16,Xiaoshan District;3113,16,Linan;3114,16,Fuyang District;3115,16,Tonglu County;3116,16,Jiande;3117,16,Chunan County;3118,21,Zhuji;3120,21,Shaoxing;3123,21,Shangyu District;3124,21,Shengzhou;3125,21,Xinchang County;3130,20,Huzhou;3131,20,Changxing County;3132,20,Deqing County;3133,20,Anji County;3140,19,Jiaxing;3141,19,Jiashan County;3142,19,Pinghu;3143,19,Haiyan County;3144,19,Haining;3145,19,Tongxiang;3150,17,Ningbo;3151,17,Yinzhou District;3152,17,Zhenhai District;3153,17,Cixi City;3154,17,Yuyao;3155,17,Fenghua;3156,17,Ninghai County;3157,17,Xiangshan County;3158,17,Beilun District;3160,24,Zhoushan;3161,24,Putuo District;3162,24,Daishan County;3170,25,Linhai;3171,25,Sanmen County;3172,25,Tiantai County;3173,26,Xianju County;3175,25,Wenling;3176,25,Yuhuan County;3180,25,Taizhou;3210,22,Jinhua;3211,22,Lanxi;3212,22,Wuyi County;3213,22,Yongkang;3214,26,Jinyun County;3220,22,Yiwu;3221,22,Dongyang;3222,22,Pujiang County;3223,22,Panan County;3230,26,Lishui;3233,26,Suichang County;3234,26,Songyang County;3235,26,Jingning She Autonomous County;3236,26,Longquan;3237,26,Yunhe County;3238,26,Qingyuan County;3239,26,Qingtian County;3240,23,Quzhou;3241,23,Jiangshan;3242,23,Changshan County;3243,23,Kaihua County;3244,23,Longyou County;3250,18,Wenzhou;3251,18,Yongjia County;3252,18,Ruian;3253,18,Wencheng County;3254,18,Pingyang County;3255,18,Taishun County;3256,18,Yueqing;3257,18,Dongtou District;3258,18,Cangnan County;3300,27,Nanchang;3301,27,Xinjian District;3302,27,Nanchang County;3303,30,Yongxiu County;3304,30,Dean County;3305,27,Anyi County;3306,35,Jingan County;3307,35,Fengxin County;3308,35,Gaoan;3311,35,Fengcheng;3312,35,Zhangshu;3313,34,Xingan County;3314,34,Xiajiang County;3315,34,Yongfeng County;3316,34,Jishui County;3317,27,Jinxian County;3318,36,Dongxiang County;3320,30,Jiujiang;3321,30,Jiujiang County;3322,30,Ruichang;3323,30,Wuning County;3324,30,Xiushui County;3325,30,Hukou County;3326,30,Duchang County;3327,30,Pengze County;3328,30,Lushan City;3329,30,Lianxi District;3330,28,Jingdezhen;3331,37,Poyang County;3332,37,Wuyuan County;3333,28,Leping;3340,37,Shangrao;3341,37,Shangrao County;3342,37,Dexing;3343,37,Hengfeng County;3344,37,Yiyang County;3345,37,Yanshan County;3346,37,Guangfeng District;3347,37,Yushan County;3350,32,Yingtan;3351,37,Yugan County;3352,32,Yujiang County;3353,36,Zixi County;3354,32,Guixi City;3355,37,Wannian County;3360,35,Yichun;3361,35,Wanzai County;3362,35,Tonggu County;3363,35,Yifeng County;3364,35,Shanggao County;3365,31,Xinyu;3366,31,Fenyi County;3370,29,Pingxiang;3371,29,Lianhua County;3372,29,Luxi County;3410,33,Ganzhou;3411,33,Gan County;3412,33,Shangyou County;3413,33,Chongyi County;3414,33,Nankang District;3415,33,Dayu County;3416,33,Xinfeng County;3417,33,Longnan County;3418,33,Quannan County;3419,33,Dingnan County;3421,33,Anyuan County;3422,33,Xunwu County;3423,33,Yudu County;3424,33,Xingguo County;3425,33,Ruijin;3426,34,Huichang County;3427,33,Shicheng County;3428,33,Ningdu County;3430,34,Jian;3431,34,Jian County;3432,34,Anfu County;3434,34,Yongxin County;3436,34,Jinggangshan City;3437,34,Taihe County;3438,34,Wanan County;3439,34,Suichuan;3440,36,Fuzhou;3441,36,Parts of Linchuan District;3442,36,Chongren County;3443,36,Lean County;3444,36,Yihuang County;3445,36,Nanfeng County;3446,36,Lichuan County;3447,36,Nancheng County;3448,36,Jinxi County;3449,36,Guangchang County;3500,69,Fuzhou;3501,69,Minhou County;3502,69,Changle;3503,69,Fuqing;3504,69,Pingtan County;3505,69,Lianjiang County;3506,69,Luoyuan County;3507,69,Yongtai County;3508,69,Minqing County;3511,71,Putian;3512,71,Xianyou County;3521,77,Ningde;3522,77,Gutian County;3523,77,Pingnan County;3530,75,Nanping;3531,75,Jianou;3532,75,Shunchang County;3533,72,Jiangle County;3534,75,Pucheng County;3535,75,Songxi County;3536,75,Zhenghe County;3540,75,Shaowu;3541,75,Guangze County;3542,75,Jianyang District;3543,75,Wuyishan City;3544,72,Taining County;3545,72,Jianning County;3550,77,Fuan;3551,77,Xiapu County;3552,77,Fuding;3553,77,Zherong County;3554,77,Zhouning County;3555,77,Shouning County;3610,70,Xiamen;3611,70,Tongan District;3620,73,Quanzhou;3621,73,Huian County;3622,73,Jinjiang;3623,73,Nanan;3624,73,Anxi County;3625,73,Dehua County;3626,73,Yongchun County;3630,74,Zhangzhou;3631,74,Longhai City;3632,74,Zhangpu County;3633,74,Yunxiao County;3634,74,Dongshan County;3635,74,Zhaoan County;3636,74,Nanjing County;3637,74,Pinghe County;3638,74,Huaan County;3639,74,Changtai County;3640,76,Longyan;3641,76,Yongding District;3642,76,Shanghang County;3643,76,Wuping County;3644,76,Zhangping City;3650,72,Sanming;3651,72,Youxi County;3652,72,Mingxi County;3653,72,Qingliu County;3654,72,Ninghua County;3655,72,Sha County;3660,72,Yongan;3661,72,Datian County;3662,76,Liancheng County;3663,76,Changting County;4000,361,Chongqing Urban;4011,361,Yubei District;4012,361,Changshou District;4013,361,Banan District;4014,361,Qijiang District;4015,361,Hechuan District;4021,361,Yongchuan District;4022,361,Jiangjin District;4023,361,Dazu District;4024,361,Rongchang District;4025,361,Tongliang District;4026,361,Tongnan District;4027,361,Bishan District;4040,361,Wanzhou District;4043,361,Zhong County;4045,361,Yunyang County;4046,361,Fengjie County;4047,361,Wushan County;4052,361,Liangping County;4054,361,Kai County;4058,361,Wuxi County;4059,361,Chengkou County;4080,361,Fuling District;4083,361,Dianjiang County;4084,361,Nanchuan District;4085,361,Wulong County;4091,361,Shizhu Tujia Autonomous County;4096,361,Pengshui Miao and Tujia Autonomous County;4097,361,Qianjiang District;4098,361,Youyang Tujia and Miao Autonomous County;4099,361,Xiushan Tujia and Miao Autonomous County;4100,119,Changsha;4101,119,Changsha County;4102,119,Wangcheng District;4103,119,Liuyang;4104,124,Pingjiang County;4105,124,Xiangyin County;4106,119,Ningxiang City;4111,121,Xiangtan;4112,121,Xiangtan County;4113,121,Shaoshan;4114,121,Xiangxiang;4120,120,Zhuzhou;4121,120,Zhuzhou County;4122,120,Liling;4123,120,You County;4124,120,Chaling County;4125,120,Yanling County;4130,127,Yiyang;4131,127,Yuanjiang;4132,127,Nan County;4133,127,Taojiang County;4134,127,Anhua County;4140,124,Yueyang;4141,124,Yueyang County;4142,124,Huarong County;4143,124,Linxiang City;4144,124,Miluo City;4150,125,Changde;4151,125,Dingcheng District;4152,125,Linli County;4153,125,Shimen County;4154,125,Jinshi City;4155,125,Li County;4156,125,Anxiang County;4157,125,Taoyuan County;4159,125,Hanshou County;4160,132,Xiangxi Tujia and Miao Autonomous Prefecture;4161,132,Luxi County;4162,132,Fenghuang County;4163,132,Guzhang County;4164,132,Huayuan County;4165,132,Baojing County;4167,132,Yongshun County;4168,132,Longshan County;4170,131,Loudi;4171,131,Lianyuan;4172,131,Lengshuijiang;4175,131,Lengshuijiang;4176,131,Xinhua County;4177,131,Shuangfeng County;4180,130,Huaihua;4182,130,Hongjiang;4183,130,Huitong County;4184,130,Jingzhou Miao and Dong Autonomous County;4185,130,Tongdao Dong Autonomous County;4191,130,Zhijiang Dong Autonomous County;4192,130,Xinhuang Dong Autonomous County;4193,130,Xupu County;4194,130,Mayang Miao Autonomous County;4195,130,Chenxi County;4196,130,Yuanling County;4210,122,Hengyang;4211,122,Hengnan County;4212,122,Hengyang County;4213,122,Hengshan County;4214,122,Hengdong County;4215,122,Changning;4216,122,Qidong County;4218,122,Leiyang;4219,122,Nanyue District;4220,123,Shaoyang;4221,123,Shaoyang County;4222,123,Longhui County;4223,123,Dongkou County;4224,123,Wugang;4225,123,Chengbu Miao Autonomous County;4226,123,Suining County;4227,123,Xinning County;4228,123,Shaodong County;4230,128,Chenzhou;4233,128,Yongxing County;4234,128,Zixing;4235,128,Guidong County;4236,128,Anren County;4241,128,Rucheng County;4242,128,Yizhang County;4243,128,Guiyang County;4244,128,Jiahe County;4250,129,Yongzhou;4251,129,Lengshuitan District;4252,129,Shuangpai County;4254,129,Jiangyong County;4255,129,Jianghua Yao Autonomous County;4256,129,Ningyuan County;4257,129,Xintian County;4258,129,Lanshan County;4259,129,Dongan County;4270,126,Zhangjiajie;4271,126,Sangzhi County;4272,126,Cili County;4300,137,Wuhan;4301,137,Caidian District;4302,137,Jiangxia District;4313,137,Xinzhou District;4317,133,Tianmen;4318,143,Jingshan County;4319,143,Zhongxiang;4320,144,Xiaogan;4321,144,Xiaonan District;4322,137,Huangpi District;4323,144,Hanchuan;4324,144,Yingcheng;4325,144,Yunmeng County;4326,144,Anlu;4327,148,Guangshui;4328,144,Dawu County;4330,135,Xiantao;4331,134,Qianjiang;4332,145,Honghu;4333,145,Jianli County;4340,145,Jingzhou;4341,145,Jiangling County;4342,145,Songzi;4343,145,Gongan County;4344,145,Shishou;4350,138,Huangshi;4351,138,Daye;4352,138,Yangxin County;4353,146,Qichun County;4354,146,Wuxue;4355,146,Huangmei County;4360,142,Ezhou;4370,147,Xianning;4372,147,Jiayu County;4373,147,Chibi;4374,147,Tongcheng County;4375,147,Chongyang County;4376,147,Tongshan County;4380,146,Huanggang;4382,146,Xishui County;4383,146,Macheng;4384,146,Hongan County;4386,146,Luotian County;4387,146,Yingshan County;4410,141,Xiangyang;4411,141,Xiangzhou District;4412,141,Zaoyang City;4413,148,Suizhou;4414,141,Yicheng;4415,141,Nanzhang County;4416,141,Baokang County;4417,141,Gucheng County;4418,141,Laohekou City;4420,139,Shiyan;4421,139,Fang County;4422,139,Zhushan County;4423,139,Zhuxi County;4424,136,Shennongjia;4425,139,Yunyang District;4426,139,Yunxi County;4427,139,Danjiangkou;4430,140,Yichang;4431,140,Yiling District;4432,140,Zhijiang;4434,140,Wufeng Tujia Autonomous County;4435,140,Changyang Tujia Autonomous County;4436,140,Zigui County;4437,140,Xingshan County;4441,140,Dangyang;4442,140,Yuanan County;4443,149,Badong County;4450,149,Enshi Tujia and Miao Autonomous Prefecture;4453,149,Jianshi County;4454,149,Lichuan City;4455,149,Xuanen County;4456,149,Xianfeng County;4457,149,Laifeng County;4458,149,Hefeng County;4480,143,Jingmen;4482,143,Shayang County;4500,91,Zhengzhou;4501,91,Xingyang;4511,91,Xinzheng;4512,91,Gongyi;4513,91,Zhongmu County;4521,92,Weishi County;4522,92,Tongxu County;4523,91,Xinmi;4524,91,Dengfeng;4526,106,Xiangcheng County;4530,97,Xinxiang;4531,97,Weihui;4532,97,Yanjin County;4533,97,Fengqiu County;4534,97,Changyuan County;4536,97,Huixian;4537,97,Xinxiang County;4538,97,Huojia County;4541,98,Jiaozuo;4543,98,Xiuwu County;4544,98,Boai County;4545,98,Qinyang City;4546,90,Jiyuan;4547,98,Mengzhou City;4548,98,Wen County;4549,98,Wuzhi County;4550,95,Anyang;4551,95,Anyang County;4561,95,Tangyin County;4562,96,Xun County;4563,95,Neihuang County;4564,95,Hua County;4565,95,Linzhou City;4566,96,Hebi;4567,96,Qi County;4570,99,Puyang;4571,99,Puyang County;4573,99,Qingfeng County;4574,99,Nanle County;4575,99,Fan County;4576,99,Taiqian County;4610,100,Xuchang;4611,100,Xuchang County;4612,100,Yanling County;4613,106,Fugou County;4615,100,Changge;4616,100,Yuzhou City;4620,101,Luohe;4621,107,Xiping County;4623,101,Yancheng District;4624,101,Wuyang County;4625,94,Wugang;4626,101,Linying County;4630,107,Zhumadian;4631,107,Suiping County;4632,107,Queshan County;4633,107,Runan County;4634,107,Pingyu County;4635,107,Xincai County;4636,107,Zhengyang County;4637,107,Biyang County;4640,105,Xinyang;4642,105,Luoshan County;4643,105,Xi County;4644,105,Huaibin County;4651,105,Huangchuan County;4652,105,Gushi County;4653,105,Shangcheng County;4654,105,Guangshan County;4655,105,Xin County;4660,106,Zhoukou;4661,106,Shangshui County;4662,106,Xiangcheng City;4663,106,Shenqiu County;4666,106,Xihua County;4667,106,Huaiyang County;4670,94,Pingdingshan;4671,94,Jia County;4672,94,Ye County;4673,94,Lushan County;4674,94,Baofeng County;4675,94,Ruzhou;4710,93,Luoyang;4711,93,Mengjin County;4712,93,Ruyang County;4713,93,Yichuan County;4714,93,Song County;4715,93,Luanchuan County;4716,93,Yiyang County;4717,93,Luoning County;4718,93,Xinan County;4719,93,Yanshi;4720,102,Sanmenxia;4721,102,Shanzhou District;4722,102,Lushi County;4723,102,Yima;4724,102,Mianchi County;4725,102,Lingbao;4731,103,Nanyang;4732,103,Fangcheng County;4733,103,Sheqi County;4734,103,Tanghe County;4735,103,Xinye County;4741,103,Dengzhou;4742,103,Zhenping County;4743,103,Neixiang County;4744,103,Xichuan County;4745,103,Xixia County;4746,103,Nanzhao County;4747,103,Tongbai County;4750,92,Kaifeng;4751,92,Xiangfu District;4752,92,Qi County;4753,92,Lankao County;4754,106,Taikang County;4761,104,Shangqiu;4762,104,Zhecheng County;4763,104,Yucheng County;4764,104,Xiayi County;4766,104,Yongcheng;4767,104,Ningling County;4768,104,Minquan County;4769,104,Sui County;4771,106,Dancheng County;4772,106,Luyi County;5100,300,Guangzhou;5108,300,Huadu District;5109,300,Conghua District;5111,301,Xinfeng County;5113,300,Zengcheng District;5114,300,Panyu District and Nansha District;5115,315,Qingyuan;5116,315,Fogang County;5120,301,Shaoguan;5121,301,Qujiang District;5122,301,Lechang;5123,301,Renhua County;5124,301,Nanxiong;5125,301,Shixing County;5126,301,Wengyuan County;5127,315,Ruyuan Yao Autonomous County;5130,315,Yingde;5131,315,Yangshan County;5132,315,Lianshan Zhuang and Yao Autonomous County;5133,315,Liannan Yao Autonomous County;5134,315,Lianzhou;5140,311,Meizhou;5141,311,Jiaoling County;5142,311,Dabu County;5143,311,Fengshun County;5144,311,Wuhua County;5145,311,Xingning;5146,311,Pingyuan County;5150,304,Shantou;5151,304,Chaonan District;5152,319,Huilai County;5153,319,Puning;5154,319,Jiexi County;5155,319,Jiedong District;5156,318,Chaoan District;5157,318,Raoping County;5158,304,Chenghai District;5159,304,Nanao County;5160,310,Huizhou;5161,310,Boluo County;5162,310,Huiyang District;5163,310,Huidong County;5164,312,Haifeng County;5165,312,Lufeng;5166,312,Shanwei;5167,312,Luhe County;5168,310,Longmen County;5170,313,Heyuan;5171,313,Lianping County;5172,313,Heping County;5173,313,Longchuan County;5174,313,Zijin County;5175,313,Dongyuan County;5180,302,Shenzhen;5181,302,Baoan District;5190,303,Zhuhai;5191,303,Doumen District;5210,318,Chaozhou;5220,319,Jieyang;5230,316,Dongguan;5240,307,Zhanjiang;5241,307,Xuwen County;5242,307,Leizhou;5243,307,Suixi County;5244,307,Lianjiang;5245,307,Wuchuan;5250,308,Maoming;5251,308,Huazhou;5252,308,Gaozhou;5253,308,Xinyi;5254,308,Dianbai District;5260,309,Zhaoqing;5261,309,Gaoyao District;5262,309,Sihui;5263,309,Guangning County;5264,309,Huaiji County;5265,309,Fengkai County;5266,309,Deqing County;5270,320,Yunfu;5271,320,Yunan County;5272,320,Luoding;5273,320,Yuncheng District;5274,320,Xinxing County;5275,320,Yunan District;5280,305,Foshan;5281,305,Sanshui District;5282,305,Nanhai District;5283,305,Shunde District;5284,317,Zhongshan;5285,305,Gaoming District;5290,306,Jiangmen;5291,306,Xinhui District;5292,306,Taishan;5293,306,Kaiping;5294,306,Enping;5295,306,Heshan;5296,314,Yangjiang;5297,314,Yangchun;5298,314,Yangxi County;5300,186,Nanning;5301,186,Wuming District;5302,186,Yongning District;5303,186,Heng County;5304,186,Binyang County;5305,186,Shanglin County;5306,186,Mashan County;5307,197,Duan Yao Autonomous County;5308,197,Dahua Yao Autonomous County;5314,195,Pingguo County;5315,195,Tiandong County;5321,199,Fusui County;5322,199,Chongzuo;5323,199,Daxin County;5324,199,Longzhou County;5325,199,Ningming County;5326,199,Pingxiang, Guangxi;5327,186,Longan County;5328,199,Tiandeng County;5330,195,Baise;5331,195,Lingyun County;5332,195,Leye County;5333,195,Tianlin County;5334,195,Longlin Various Nationalities Autonomous County;5335,195,Xilin County;5336,195,Tianyang County;5337,195,Debao County;5338,195,Jingxi;5339,195,Napo County;5350,192,Qinzhou;5353,192,Pubei County;5354,192,Lingshan County;5355,191,Shangsi County;5360,190,Beihai;5361,190,Hepu County;5370,194,Yulin;5371,193,Guigang;5372,193,Guiping;5373,193,Pingnan County;5374,194,Beiliu;5375,194,Rong County;5376,194,Bobai County;5377,194,Luchuan County;5378,194,Xingye County;5380,191,Fangchenggang;5381,191,Dongxing;5410,188,Guilin;5411,188,Lingui District;5412,188,Lingchuan County;5413,189,Xingan County;5414,188,Ziyuan County;5415,188,Quanzhou County;5416,188,Guanyang County;5417,189,Longsheng Various Nationalities Autonomous County;5418,188,Yongfu County;5419,188,Yangshuo County;5424,188,Pingle County;5425,188,Gongcheng Yao Autonomous County;5426,196,Zhongshan County;5427,196,Fuchuan Yao Autonomous County;5428,196,Hezhou;5430,189,Wuzhou;5431,189,Cangwu County;5432,189,Cenxi;5433,189,Teng County;5450,187,Liuzhou;5451,187,Liujiang District;5452,187,Liucheng County;5453,187,Rongshui Miao Autonomous County;5454,187,Rongan County;5455,187,Sanjiang Dong Autonomous County;5456,187,Luzhai County;5457,198,Jinxiu Yao Autonomous County;5458,198,Xiangzhou County;5459,198,Wuxuan County;5461,198,Laibin;5462,198,Xincheng County;5463,197,Yizhou;5464,197,Luocheng Mulao Autonomous County;5465,198,Heshan;5466,188,Lipu County;5467,189,Mengshan County;5468,196,Zhaoping County;5470,197,Hechi;5471,197,Huanjiang Maonan Autonomous County;5472,197,Nandan County;5473,197,Tiane County;5474,197,Donglan County;5475,197,Bama Yao Autonomous County;5500,200,Guiyang;5501,208,Luodian County;5502,200,Xiuwen County;5503,200,Kaiyang County;5504,208,Wengan County;5505,208,Fuquan;5506,208,Huishui County;5507,208,Changshun County;5508,203,Ziyun Miao and Buyei Autonomous County;5511,200,Xifeng County;5512,208,Longli County;5513,208,Guiding County;5514,200,Qingzhen;5515,204,Qianxi County;5516,204,Dafang County;5517,204,Bijie;5521,204,Zhijin County;5522,206,Ceheng County;5523,206,Wangmo County;5524,206,Anlong County;5530,201,Liupanshui;5531,204,Weining Yi, Hui, and Miao Autonomous County;5532,204,Hezhang County;5533,204,Nayong County;5534,201,Liuzhi Special District;5535,201,Pan County;5540,205,Yuping Dong Autonomous County;5541,205,Songtao Miao Autonomous County;5542,205,Wanshan District;5543,205,Bijiang District;5544,205,Jiangkou County;5551,205,Shiqian County;5552,205,Yinjiang Tujia and Miao Autonomous County;5560,207,Qiandongnan Miao and Dong Autonomous Prefecture;5561,207,Huangping County;5562,207,Shibing County;5563,207,Taijiang County;5564,207,Jianhe County;5565,207,Sansui County;5566,207,Tianzhu County;5567,207,Jinping County;5571,207,Leishan County;5572,207,Rongjiang County;5573,207,Liping County;5574,207,Congjiang County;5575,207,Danzhai County;5576,207,Majiang County;5577,207,Zhenyuan County;5580,208,Qiannan Buyei and Miao Autonomous Prefecture;5581,208,Sandu Shui Autonomous County;5582,208,Dushan County;5583,208,Pingtang County;5584,208,Libo County;5610,203,Anshun;5611,203,Pingba County;5612,203,Zhenning Buyei and Miao Autonomous County;5613,203,Guanling Buyei and Miao Autonomous County;5614,206,Qinglong County;5615,206,Puan County;5621,203,Puding County;5622,206,Zhenfeng County;5623,206,Xingren County;5624,206,Xingyi;5630,202,Zunyi;5631,202,Bozhou District;5632,202,Tongzi County;5633,202,Suiyang County;5634,202,Zhengan County;5635,202,Daozhen Gelao and Miao Autonomous County;5641,202,Meitan County;5642,202,Fenggang County;5643,202,Wuchuan Gelao and Miao Autonomous County;5644,202,Yuqing County;5645,202,Renhuai;5646,202,Xishui County;5647,202,Chishui;5651,205,Sinan County;5652,205,Dejiang County;5653,205,Yanhe Tujia Autonomous County;5700,336,Haikou;5711,336,Qiongshan District;5712,329,Dingan County;5713,333,Wenchang;5714,335,Qionghai;5715,334,Wanning;5716,328,Tunchang County;5717,339,Danzhou;5718,325,Lingao County;5719,332,Chengmai County;5720,337,Sanya;5722,321,Wuzhishan City;5723,327,Baoting Li and Miao Autonomous County;5724,326,Lingshui Li Autonomous County;5725,322,Ledong Li Autonomous County;5726,323,Dongfang;5727,324,Changjiang Li Autonomous County;5728,330,Baisha Li Autonomous County;5729,331,Qiongzhong Li and Miao Autonomous County;5731,338,Sansha;5780,339,Yangpu Economic Development Zone;6100,340,Chengdu;6101,340,Longquanyi District;6102,340,Shuangliu District;6103,340,Qingbaijiang District;6104,340,Jintang County;6111,340,Wenjiang District;6112,340,Chongzhou;6113,340,Dayi County;6114,340,Xinjin County;6115,340,Qionglai City;6116,340,Pujiang County;6117,340,Pi County;6118,340,Dujiangyan City;6119,340,Pengzhou;6131,349,Jingyan County;6140,349,Leshan;6141,349,Jiajiang County;6142,349,Emeishan City;6143,349,Ebian Yi Autonomous County;6144,349,Qianwei County;6145,349,Muchuan County;6146,349,Mabian Yi Autonomous County;6147,349,Jinkouhe District;6148,349,Wutongqiao District;6149,349,Shawan District;6150,360,Liangshan Yi Autonomous Prefecture;6151,360,Huili County;6152,360,Huidong County;6153,360,Puge County;6154,360,Ningnan County;6155,360,Dechang County;6156,360,Mianning County;6157,360,Yanyuan County;6158,360,Muli Tibetan Autonomous County;6161,360,Zhaojue County;6162,360,Jinyang County;6163,360,Butuo County;6164,360,Meigu County;6165,360,Leibo County;6166,360,Yuexi County;6167,360,Xide County;6168,360,Ganluo County;6170,342,Panzhihua;6171,342,Yanbian County;6172,342,Miyi County;6180,344,Deyang;6181,344,Zhongjiang County;6182,344,Mianzhu;6183,344,Guanghan;6184,344,Shifang;6185,344,Luojiang County;6200,351,Meishan;6202,351,Danleng County;6203,351,Hongya County;6204,351,Qingshen County;6205,351,Renshou County;6208,351,Pengshan District;6210,345,Mianyang;6211,345,Santai County;6216,345,Yanting County;6217,345,Jiangyou;6221,345,Zitong County;6225,345,Pingwu County;6226,345,Anzhou District;6227,345,Beichuan Qiang Autonomous County;6230,358,Wenchuan County;6231,358,Li County;6232,358,Mao County;6233,358,Songpan County;6234,358,Jiuzhaigou County;6235,358,Heishui County;6240,358,Barkam;6241,358,Jinchuan County;6242,358,Xiaojin County;6243,358,Zamtang County;6244,358,Hongyuan County;6245,358,Zoig\u00ea County;6246,358,Ngawa County;6247,65,Jigzhi County;6250,355,Yaan;6251,355,Mingshan District;6252,355,Yingjing County;6253,355,Hanyuan County;6254,355,Shimian County;6255,355,Tianquan County;6256,355,Lushan County;6257,355,Baoxing County;6260,359,Garz\u00ea Tibetan Autonomous Prefecture;6261,359,Luding County;6262,359,Jiulong County;6263,359,Danba County;6264,359,Dawu County;6265,359,Luhuo County;6266,359,S\u00eartar County;6267,359,Garz\u00ea County;6268,359,Xinlong County;6271,359,Baiy\u00fc County;6272,359,D\u00eag\u00ea County;6273,359,S\u00earx\u00fc County;6274,359,Yajiang County;6275,359,Litang County;6276,359,Batang County;6277,359,Xiangcheng County;6278,359,Daocheng County;6279,359,D\u00earong County;6280,346,Guangyuan;6281,346,Qingchuan County;6282,346,Wangcang County;6283,346,Jiange County;6284,346,Cangxi County;6290,347,Suining;6291,347,Pengxi County;6292,347,Shehong County;6293,347,Daying County;6350,354,Dazhou;6351,354,Dazhu County;6352,354,Qu County;6356,356,Nanjiang County;6361,354,Xuanhan County;6362,354,Kaijiang County;6363,354,Wanyuan;6364,356,Pingchang County;6366,356,Bazhou District;6370,350,Shunqing District;6371,350,Gaoping District;6372,350,Xichong County;6373,350,Nanbu County;6374,350,Langzhong;6375,350,Jialing District;6376,350,Yilong County;6377,350,Yingshan County;6378,350,Pengan County;6380,353,Guangan;6383,353,Yuechi County;6384,353,Wusheng County;6385,353,Linshui County;6386,353,Huaying;6410,348,Neijiang;6411,348,Dongxing District;6412,348,Zizhong County;6413,357,Ziyang;6414,340,Jianyang;6415,357,Lezhi County;6421,348,Longchang County;6423,357,Anyue County;6424,348,Weiyuan County;6430,341,Zigong;6431,341,Rong County;6432,341,Fushun County;6440,352,Yibin;6441,352,Nanxi District;6442,352,Jiangan County;6443,352,Changning County;6444,352,Xingwen County;6445,352,Gong County;6446,352,Yibin County;6451,352,Gao County;6452,352,Junlian County;6453,352,Pingshan County;6460,343,Luzhou;6461,343,Lu County;6462,343,Hejiang County;6463,343,Naxi District;6464,343,Xuyong County;6465,343,Gulin County;6500,285,Kunming;6501,285,Xishan District;6502,285,Guandu District;6503,285,Anning;6504,285,Fumin County;6505,285,Chenggong District;6506,285,Jinning County;6511,287,Yimen County;6512,293,Lufeng County;6513,293,Yuanmou County;6514,293,Yongren County;6515,285,Luquan Yi and Miao Autonomous County;6516,293,Wuding County;6517,285,Songming County;6521,285,Yiliang County;6522,285,Shilin Yi Autonomous County;6523,294,Mile City;6524,294,Luxi County;6525,287,Chengjiang County;6526,287,Jiangchuan District;6527,287,Tonghai County;6528,287,Huaning County;6531,287,Yuxi;6532,287,Eshan Yi Autonomous County;6533,287,Yuanjiang Hani, Yi and Dai Autonomous County;6534,287,Xinping Yi and Dai Autonomous County;6541,285,Dongchuan District;6542,286,Huize County;6543,294,Jianshui County;6544,294,Honghe County;6546,289,Qiaojia County;6548,291,Mojiang Hani Autonomous County;6550,286,Qujing;6551,286,Malong County;6552,285,Xundian Hui and Yi Autonomous County;6554,286,Xuanwei;6555,286,Fuyuan County;6556,286,Luliang County;6557,286,Shizong County;6558,286,Luoping County;6570,289,Zhaotong;6571,289,Ludian County;6573,289,Yongshan County;6574,289,Daguan County;6575,289,Yanjin County;6576,285,Yiliang County;6577,289,Suijiang County;6578,289,Shuifu County;6579,289,Weixin County;6611,294,Mengzi City;6612,294,Pingbian Miao Autonomous County;6613,294,Hekou Yao Autonomous County;6614,294,Gejiu;6615,294,Jinping Miao, Yao and Dai Autonomous County;6616,294,Kaiyuan;6622,294,Shiping County;6624,294,Yuanyang County;6625,294,L\u00fcchun County;6630,295,Wenshan Zhuang and Miao Autonomous Prefecture;6631,295,Yanshan County;6632,295,Qiubei County;6633,295,Guangnan County;6634,295,Funing County;6635,295,Xichou County;6636,295,Malipo County;6710,296,Dali Bai Autonomous Prefecture;6711,287,Yimen County;6712,296,Eryuan County;6713,296,Jianchuan County;6714,298,Lanping Bai and Pumi Autonomous County;6715,296,Heqing County;6721,296,Xiangyun County;6724,296,Weishan Yi and Hui Autonomous County;6725,296,Yangbi Yi Autonomous County;6726,296,Yongping County;6727,296,Yunlong County;6732,298,Lushui;6734,288,Fugong County;6735,298,Gongshan Derung and Nu Autonomous County;6741,290,Lijiang;6742,290,Yongsheng County;6743,290,Ninglang Yi Autonomous County;6744,299,Shangri-La City;6745,299,D\u00eaq\u00ean County;6746,299,Weixi Lisu Autonomous County;6748,290,Huaping County;6750,293,Chuxiong Yi Autonomous Prefecture;6751,293,Shuangbai County;6752,293,Nanhua County;6753,293,Yaoan County;6754,293,Dayao County;6755,293,Mouding County;6756,296,Midu County;6757,296,Nanjian Yi Autonomous County;6758,292,Yun County;6759,292,Fengqing County;6762,284,Jingdong Yi Autonomous County;6770,292,Lincang;6773,292,Shuangjiang Lahu, Va, Blang and Dai Autonomous County;6774,292,Cangyuan Va Autonomous County;6775,292,Gengma Dai and Va Autonomous County;6776,292,Yongde County;6777,292,Zhenkang County;6780,288,Baoshan;6781,288,Changning County;6782,288,Shidian County;6783,288,Longling County;6784,297,Mang City;6785,297,Ruili City;6786,297,Longchuan County;6791,288,Tengchong;6792,297,Lianghe County;6793,297,Yingjiang County;7100,273,Xian;7101,273,Changan District;7102,273,Gaoling District;7103,273,Hu County;7104,273,Zhouzhi County;7105,273,Lantian County;7106,273,Lintong District;7112,276,Chunhua County;7113,276,Xunyi County;7114,282,Zhashui County;7115,282,Zhenan County;7116,281,Ningshan County;7117,277,Fuping County;7120,276,Xianyang;7121,276,Yangling District;7122,276,Wugong County;7131,277,Xingping;7132,276,Liquan County;7133,276,Qian County;7134,276,Yongshou County;7135,276,Bin County;7136,276,Changwu County;7137,276,Jingyang County;7138,276,Sanyuan County;7140,277,Weinan;7141,277,Huazhou District;7142,277,Huayin City;7143,277,Tongguan County;7151,277,Dali County;7152,277,Chengcheng County;7153,277,Heyang County;7154,277,Hancheng City;7155,277,Pucheng County;7156,277,Baishui County;7157,278,Huanglong County;7160,278,Yanan;7161,278,Ganquan County;7166,278,Yichuan County;7171,278,Yanchang County;7172,278,Yanchuan County;7173,278,Zichang County;7174,278,Ansai County;7175,278,Zhidan County;7176,278,Wuqi County;7180,280,Suide County;7181,280,Mizhi County;7182,280,Wubu County;7183,280,Qingjian County;7184,280,Zizhou County;7185,280,Jingbian County;7186,280,Dingbian County;7190,280,Yulin;7191,280,Hengshan District;7192,280,Jia County;7193,280,Shenmu County;7194,280,Fugu County;7210,275,Baoji;7211,275,Qianyang County;7212,275,Long County;7213,275,Chencang District;7214,275,Fengxiang County;7215,275,Linyou County;7216,275,Taibai County;7217,275,Feng County;7222,275,Fufeng County;7223,275,Mei County;7224,275,Qishan County;7230,279,Hanzhong;7231,279,Nanzheng County;7232,279,Chenggu County;7233,279,Yang County;7234,279,Foping County;7235,279,Xixiang County;7236,279,Zhenba County;7241,279,Liuba County;7242,279,Mian County;7243,279,Lueyang County;7244,279,Ningqiang County;7250,281,Ankang;7251,281,Hanyin County;7252,281,Shiquan County;7253,281,Ziyang County;7254,281,Langao County;7255,281,Pingli County;7256,281,Zhenping County;7257,281,Xunyang County;7258,281,Baihe County;7260,282,Shangluo;7261,282,Luonan County;7262,282,Danfeng County;7263,282,Shangnan County;7264,282,Shanyang County;7270,274,Tongchuan;7271,274,Yaozhou District;7272,274,Yijun County;7273,278,Huangling County;7274,278,Luochuan County;7275,278,Fu County;7300,172,Lanzhou;7301,172,Yuzhong County;7302,172,Gaolan County;7303,172,Yongdeng County;7304,175,Jingtai County;7305,182,Lintao County;7306,175,Jingyuan County;7309,175,Baiyin;7311,184,Linxia Hui Autonomous Prefecture;7312,184,Hezheng County;7313,184,Guanghe County;7314,184,Dongxiang Autonomous County;7315,184,Kangle County;7316,184,Yongjing County;7317,184,Jishishan Bonan, Dongxiang and Salar Autonomous County;7318,184,Linxia County;7330,177,Wuwei;7331,177,Gulang County;7332,177,Bairi Tibetan Autonomous County;7333,177,Minqin County;7340,178,Zhangye;7341,178,Shandan County;7342,178,Linze County;7343,178,Gaotai County;7344,178,Sunan Yugur Autonomous County;7345,178,Minle County;7350,180,Jiuquan;7351,173,Jiayuguan;7352,180,Yumen City;7353,180,Jinta County;7354,235,Ejin Banner;7361,180,Guazhou County;7362,180,Dunhuang;7363,180,Subei Mongol Autonomous County;7364,180,Aksai Kazakh Autonomous County;7371,174,Jinchang;7372,174,Yongchang County;7373,235,Alxa Right Banner;7410,176,Tianshui;7411,176,Gangu County;7412,176,Wushan County;7413,176,Qingshui County;7414,176,Zhangjiachuan Hui Autonomous County;7415,176,Qinan County;7416,179,Zhuanglang County;7421,183,Xihe County;7422,183,Li County;7423,183,Hui County;7424,183,Liangdang County;7425,183,Cheng County;7430,182,Dingxi;7432,175,Huining County;7433,182,Tongwei County;7434,179,Jingning County;7440,179,Pingliang;7441,179,Huating County;7442,179,Chongxin County;7443,179,Jingchuan County;7444,179,Lingtai County;7445,181,Zhenyuan County;7450,181,Qingyang;7451,181,Qingcheng County;7452,181,Ning County;7453,181,Zhengning County;7454,181,Heshui County;7456,181,Huachi County;7457,181,Huan County;7460,183,Longnan;7463,185,Zhugqu County;7464,183,Wen County;7465,183,Kang County;7470,185,Gannan Tibetan Autonomous Prefecture;7471,185,Xiahe County;7472,185,Luqu County;7473,185,Maqu County;7474,185,T\u00eawo County;7475,185,Lintan County;7476,185,Jon\u00ea County;7481,182,Longxi County;7482,182,Weiyuan County;7483,182,Zhang County;7484,182,Min County;7485,183,Tanchang County;7500,238,Yinchuan;7501,238,Yongning County;7502,238,Helan County;7503,236,Alxa Left Banner;7511,240,Wuzhong;7513,240,Tongxin County;7514,238,Lingwu City;7515,240,Yanchi County;7516,240,Qingtongxia City;7530,239,Shizuishan;7534,239,Pingluo County;7536,239,Huinong District;7550,242,Zhongwei;7551,242,Zhongning County;7552,242,Haiyuan County;7560,241,Guyuan;7562,241,Xiji County;7563,241,Longde County;7564,241,Jingyuan County;7565,241,Pengyang County;8100,60,Xining;8101,60,Datong Hui and Tu Autonomous County;8103,62,Menyuan Hui Autonomous County;8104,62,Qilian County;8105,61,Huzhu Tu Autonomous County;8106,60,Pingan District;8107,60,Ledu District;8108,61,Minhe Hui and Tu Autonomous County;8109,61,Hualong Hui Autonomous County;8111,61,Xunhua Salar Autonomous County;8112,63,Jainca County;8113,63,Tongren County;8114,63,Z\u00eakog County;8115,63,Henan Mongol Autonomous County;8116,60,Huangzhong County;8118,64,Guide County;8121,60,Huangyuan County;8122,62,Haiyan County;8130,64,Hainan Tibetan Autonomous Prefecture;8132,64,Tongde County;8133,64,Xinghai County;8135,65,Madoi County;8140,65,Golog Tibetan Autonomous Prefecture;8141,65,Gad\u00ea County;8142,65,Darlag County;8143,65,Baima County;8150,66,Yushu Tibetan Autonomous Prefecture;8151,66,Chindu County;8152,66,Nangchen County;8153,66,Zadoi County;8154,66,Zhidoi County;8155,66,Qumarl\u00eab County;8160,67,Golmud;8161,67,Dulan County;8170,67,Haixi Mongol and Tibetan Autonomous Prefecture;8171,67,Ulan County;8172,67,Tianjun County;8173,68,Da Qaidam;8174,67,Lenghu;8175,67,Mangnai;8300,151,\u00dcr\u00fcmqi;8311,154,Changji Hui Autonomous Prefecture;8312,154,Hutubi County;8313,164,Wujiaqu;8315,154,Fukang;8317,154,Jimsar County;8318,154,Qitai County;8319,154,Mori Kazakh Autonomous County;8320,150,Shihezi;8321,162,Shawan County;8322,154,Manas County;8330,162,Wusu;8332,161,Kuytun;8333,155,Jinghe County;8334,155,Bole, Xinjiang;8335,155,Wenquan County;8340,152,Karamay;8344,162,Hoboksar Mongol Autonomous County;8345,162,Toli County;8346,162,Emin County;8347,162,Tacheng;8348,162,Yumin County;8350,161,Ili Kazakh Autonomous Prefecture;8351,161,Yining County;8352,161,Huocheng County;8353,161,Qapqal Xibe Autonomous County;8354,161,Gongliu County;8355,161,Tekes County;8356,161,Zhaosu County;8357,161,Nilka County;8358,161,Xinyuan County;8361,163,Fuyun County;8362,163,Qinggil County;8364,163,Fuhai County;8365,163,Altay;8366,163,Burqin County;8367,163,Habahe County;8368,163,Jeminay County;8390,153,Hami City;8392,153,Bark\u00f6l Kazakh Autonomous County;8393,153,Yiwu County;8410,156,Bayingolin Mongol Autonomous Prefecture;8411,156,Yanqi Hui Autonomous County;8412,156,Hoxud County;8413,156,Hejing County;8414,156,Bohu County;8415,156,Yuli County;8416,156,Luntai County;8418,156,Ruoqiang County;8419,156,Qiemo County;8420,157,Kuqa County;8421,157,Xinhe County;8422,157,Xayar County;8423,157,Baicheng County;8430,157,Aksu Prefecture;8431,157,Wensu County;8432,157,Awat County;8434,157,Uqturpan County;8435,158,Akqi County;8436,157,Kalpin County;8438,159,Maralbexi County;8440,159,Kashgar Prefecture;8441,159,Shufu County;8442,159,Shule County;8443,159,Peyziwat County;8444,159,Yopurga County;8445,159,Yengisar County;8446,159,Makit County;8447,159,Yarkant County;8448,159,Poskam County;8449,159,Kargilik County;8451,160,Pishan County;8452,159,Taxkorgan Tajik Autonomous County;8453,158,Artux;8454,158,Ulugqat County;8455,158,Akto County;8480,160,Hotan Prefecture;8481,160,Karakax County;8482,160,Lop County;8483,160,Qira County;8484,160,Yutian County;8485,160,Minfeng County;8500,165,Lhasa;8501,165,Dagz\u00ea County;8502,165,Maizhokunggar County;8506,165,Q\u00fcx\u00fc County;8507,169,Gonggar County;8508,169,Zhanang County;8511,169,Nagarz\u00ea County;8512,169,Lhozhag County;8514,165,Doilungd\u00eaq\u00ean District;8515,165,Damxung County;8516,165,Ny\u00eamo County and Lh\u00fcnzhub County;8520,170,Nagqu Prefecture;8521,170,Baq\u00ean County;8522,170,Sog County;8523,170,Biru County;8524,170,Lhari County;8525,170,Baingoin County;8531,170,Xainza County;8532,170,Nyima County;8534,170,Amdo County;8535,170,Nyainrong County;8540,167,Chamdo;8541,167,Jomda County;8542,167,Gonjo County;8543,167,Zhagyab County;8544,167,Zogang County;8545,167,Markam County;8546,167,Baxoi County;8547,166,Gamba County;8548,166,Sagya County;8549,166,Dinggy\u00ea County;8554,167,Lhorong County;8555,167,Banbar County;8556,167,Riwoq\u00ea County;8557,167,D\u00eangq\u00ean County;8561,169,Shannan;8562,169,Sangri County;8563,169,Qusum County;8564,169,Gyaca County;8566,169,Lh\u00fcnz\u00ea County;8567,169,Cona County;8568,169,Qonggyai County;8569,169,Comai County;8570,166,Shigatse;8571,166,Namling County;8572,166,Rinbung County;8573,166,Bainang County;8574,166,Gyantse County;8575,166,Kangmar County;8576,166,Yadong County;8577,166,Gamba County;8578,166,Sagya County;8579,166,Dinggy\u00ea County;8581,166,Lhatse County;8582,166,Tingri County;8583,166,Nyalam County;8585,166,Ngamring County;8586,166,Saga County;8587,166,Gyirong County;8588,166,Zhongba County;8589,166,Xaitongmoin County;8590,171,Ngari Prefecture;8591,171,G\u00eagyai County;8592,171,G\u00earz\u00ea County;8593,171,Coq\u00ean County;8595,171,Burang County;8596,171,Zanda County;8597,171,Rutog County;8601,168,Nyingchi;8602,168,Gongbogyamda County;8603,168,Bom\u00ea County;8604,168,Nang County;8605,168,Mainling County;8606,168,Zay\u00fc County;8607,168,M\u00eadog County";
         var DS_PNA_IN = "110,Delhi,Central Delhi/East Delhi/New Delhi/North Delhi/North East Delhi/North West Delhi/South Delhi/South West Delhi/West Delhi;121,Haryana,Faridabad;122,Haryana,Gurgaon;123,Haryana,Gurgaon/Mahendragarh/Rewari;124,Haryana,Jhajjar/Rohtak;125,Haryana,Fatehabad/Hisar/Sirsa;126,Haryana,Jind;127,Haryana,Bhiwani;131,Haryana,Sonipat;132,Haryana,Karnal/Panipat;133,Haryana,Ambala/Panchkula/Yamuna Nagar;134,Haryana,Ambala/Panchkula;135,Haryana,Ambala/Yamuna Nagar;136,Haryana,Kaithal/Kurukshetra;140,Punjab/Chandigarh,Chandigarh/Fatehgarh Sahib/Mohali/Patiala/Ropar/Rupnagar;141,Punjab,Fatehgarh Sahib/Ludhiana/Patiala;142,Punjab,Firozpur/Ludhiana/Moga;143,Punjab,Amritsar/Gurdaspur/Pathankot/Tarn Taran;144,Punjab,Hoshiarpur/Jalandhar/Kapurthala/Nawanshahr;145,Punjab,Gurdaspur/Pathankot;146,Punjab,Hoshiarpur/Nawanshahr;147,Punjab,Fatehgarh Sahib/Patiala;148,Punjab,Barnala/Ludhiana/Sangrur;151,Punjab,Bathinda/Faridkot/Fazilka/Mansa/Moga/Muktsar/Sangrur;152,Punjab,Faridkot/Fazilka/Firozpur/Moga/Muktsar;160,Chandigarh/Punjab,Chandigarh/Mohali/Rupnagar;171,Himachal Pradesh,Shimla/Sirmaur/Solan;172,Himachal Pradesh,Kinnaur/Kullu/Lahul & Spiti/Shimla;173,Himachal Pradesh,Shimla/Sirmaur/Solan;174,Himachal Pradesh,Bilaspur (HP)/Hamirpur(HP)/Solan/Una;175,Himachal Pradesh,Kangra/Kullu/Lahul & Spiti/Mandi;176,Himachal Pradesh,Chamba/Hamirpur(HP)/Kangra/Mandi/Una;177,Himachal Pradesh,Bilaspur (HP)/Hamirpur(HP)/Kangra/Una;180,Jammu & Kashmir,Jammu;181,Jammu & Kashmir,Jammu/Samba;182,Jammu & Kashmir,Doda/Reasi/Udhampur;184,Jammu & Kashmir,Jammu/Kathua/Poonch/Udhampur;185,Jammu & Kashmir,Jammu/Poonch/Rajauri/Reasi/Udhampur;190,Jammu & Kashmir,Budgam/Srinagar;191,Jammu & Kashmir,Ananthnag/Budgam/Ganderbal/Pulwama/Srinagar;192,Jammu & Kashmir,Ananthnag/Baramulla/Budgam/Kulgam/Pulwama/Shopian/Srinagar;193,Jammu & Kashmir,Bandipur/Baramulla/Budgam/Kupwara/Pulwama/Srinagar;194,Jammu & Kashmir,Kargil/Leh;201,Uttar Pradesh,Gautam Buddha Nagar/Ghaziabad;202,Uttar Pradesh,Aligarh/Hathras;203,Uttar Pradesh,Bulandshahr/Gautam Buddha Nagar;204,Uttar Pradesh,Aligarh/Hathras;205,Uttar Pradesh,Firozabad/Mainpuri;206,Uttar Pradesh,Auraiya/Etawah;207,Uttar Pradesh,Etah;208,Uttar Pradesh,Kanpur Dehat/Kanpur Nagar;209,Uttar Pradesh,Farrukhabad/Fatehpur/Kannauj/Kanpur Dehat/Kanpur Nagar/Unnao/Varanasi;210,Uttar Pradesh,Banda/Chitrakoot/Hamirpur/Mahoba;211,Uttar Pradesh,Allahabad/Kaushambi;212,Uttar Pradesh,Allahabad/Fatehpur/Kaushambi;221,Uttar Pradesh,Allahabad/Azamgarh/Ballia/Chandauli/Mau/Sant Ravidas Nagar/Varanasi;222,Uttar Pradesh,Jaunpur/Pratapgarh/Sultanpur;223,Uttar Pradesh,Azamgarh/Jaunpur/Mau;224,Uttar Pradesh,Ambedkar Nagar/Faizabad;225,Uttar Pradesh,Barabanki;226,Uttar Pradesh,Lucknow;227,Uttar Pradesh,Sultanpur;228,Uttar Pradesh,Sultanpur;229,Uttar Pradesh,Allahabad/Pratapgarh/Raebareli;230,Uttar Pradesh,Pratapgarh;231,Uttar Pradesh,Mirzapur/Sonbhadra;232,Uttar Pradesh,Chandauli/Ghazipur/Varanasi;233,Uttar Pradesh,Ghazipur;241,Uttar Pradesh,Hardoi;242,Uttar Pradesh,Budaun/Shahjahanpur;243,Uttar Pradesh,Bareilly/Budaun/Pilibhit;244,Uttar Pradesh/Uttarakhand,Almora/Jyotiba Phule Nagar/Moradabad/Nainital/Rampur/Udham Singh Nagar;245,Uttar Pradesh,Ghaziabad/Hapur/Meerut;246,Uttarakhand/Uttar Pradesh,Bijnor/Chamoli/Haridwar/Pauri Garhwal/Rudraprayag;247,Uttar Pradesh/Uttarakhand,Dehradun/Haridwar/Muzaffarnagar/Saharanpur;248,Uttarakhand,Dehradun;249,Uttarakhand,Dehradun/Haridwar/Pauri Garhwal/Tehri Garhwal/Uttarkashi;250,Uttar Pradesh,Bagpat/Chitrakoot/Meerut/Varanasi;251,Uttar Pradesh,Muzaffarnagar;261,Uttar Pradesh,Kheri/Sitapur;262,Uttar Pradesh/Uttarakhand,Bareilly/Champawat/Kheri/Nainital/Pilibhit/Pithoragarh/Udham Singh Nagar;263,Uttarakhand,Almora/Bageshwar/Nainital/Udham Singh Nagar;271,Uttar Pradesh,Bahraich/Balrampur/Basti/Gonda/Kheri/Shrawasti;272,Uttar Pradesh,Basti/Sant Kabir Nagar/Siddharthnagar;273,Uttar Pradesh,Gorakhpur/Maharajganj;274,Uttar Pradesh,Deoria/Kushinagar;275,Uttar Pradesh,Azamgarh/Ghazipur/Mau;276,Uttar Pradesh,Azamgarh/Mau;277,Uttar Pradesh,Ballia;281,Uttar Pradesh,Azamgarh/Hathras/Mathura;282,Uttar Pradesh,Agra;283,Uttar Pradesh,Agra/Firozabad;284,Uttar Pradesh,Jalaun/Jhansi/Lalitpur;285,Uttar Pradesh,Jalaun/Jhansi;301,Rajasthan,Alwar;302,Rajasthan,Jaipur;303,Rajasthan,Dausa/Jaipur;304,Rajasthan,Tonk;305,Rajasthan,Ajmer/Nagaur/Rajsamand;306,Rajasthan,Pali;307,Rajasthan,Jalor/Sirohi/Udaipur;311,Rajasthan,Bhilwara;312,Rajasthan,Chittorgarh/Udaipur;313,Rajasthan,Rajsamand/Udaipur;314,Rajasthan,Dungarpur/Jaipur;321,Rajasthan,Alwar/Bharatpur/Dausa/Karauli;322,Rajasthan,Dausa/Karauli/Sawai Madhopur;323,Rajasthan,Bundi/Chittorgarh;324,Rajasthan,Kota;325,Rajasthan,Baran/Kota;326,Rajasthan,Chittorgarh/Jhalawar/Kota;327,Rajasthan,Banswara;328,Rajasthan,Dholpur;331,Rajasthan,Bikaner/Churu/Jhujhunu/Sikar;332,Rajasthan,Jhujhunu/Sikar;333,Rajasthan,Jhujhunu/Jodhpur;334,Rajasthan,Bikaner;335,Rajasthan,Ganganagar/Hanumangarh;341,Rajasthan,Nagaur;342,Rajasthan,Jaisalmer/Jodhpur/Nagaur;343,Rajasthan,Jalor;344,Rajasthan,Barmer/Hanumangarh;345,Rajasthan,Jaisalmer/Jodhpur;360,Gujarat,Bhavnagar/Jamnagar/Junagadh/Porbandar/Rajkot/Surendra Nagar;361,Gujarat,Jamnagar;362,Gujarat/Dadra and Nagar Haveli and Daman and Diu,Amreli/Diu/Junagadh/Porbandar;363,Gujarat,Jamnagar/MORBI/Rajkot/Surendra Nagar;364,Gujarat,Amreli/Bhavnagar/Rajkot;365,Gujarat,Amreli/Junagadh/Rajkot;370,Gujarat,Kachchh;380,Gujarat,Ahmedabad/Gandhi Nagar;382,Gujarat,Ahmedabad/Gandhi Nagar/Mahesana/Surendra Nagar;383,Gujarat,Ahmedabad/Sabarkantha;384,Gujarat,Mahesana/Patan;385,Gujarat,Banaskantha/Patan;387,Gujarat,Anand/Kheda;388,Gujarat,Anand/Kheda/Panch Mahals/Vadodara;389,Gujarat,Dahod/Panch Mahals;390,Gujarat,Vadodara;391,Gujarat,Bharuch/Narmada/Vadodara;392,Gujarat,Bharuch/Narmada/Surat/Vadodara;393,Gujarat,Bharuch/Narmada/Surat/Vadodara;394,Gujarat,Bharuch/Narmada/Navsari/Surat/Tapi/The Dangs;395,Gujarat,Surat;396,Gujarat/Dadra and Nagar Haveli and Daman and Diu,Dadra & Nagar Haveli/Daman/Navsari/Surat/Valsad;400,Maharashtra,Mumbai/Raigarh(MH)/Thane;401,Maharashtra,Thane;402,Maharashtra,Raigarh(MH);403,Goa,North Goa/South Goa;410,Maharashtra,Pune/Raigarh(MH);411,Maharashtra,Pune;412,Maharashtra,Pune/Satara;413,Maharashtra,Ahmed Nagar/Beed/Latur/Osmanabad/Pune/Solapur;414,Maharashtra,Ahmed Nagar/Beed;415,Maharashtra,Kolhapur/Raigarh(MH)/Ratnagiri/Sangli/Satara;416,Maharashtra,Kolhapur/Ratnagiri/Sangli/Sindhudurg;421,Maharashtra,Thane;422,Maharashtra,Ahmed Nagar/Nashik;423,Maharashtra,Ahmed Nagar/Aurangabad/Nashik;424,Maharashtra,Dhule/Jalgaon/Nashik;425,Maharashtra,Dhule/Jalgaon/Nandurbar;431,Maharashtra,Aurangabad/Beed/Hingoli/Jalna/Latur/Nanded/Osmanabad/Parbhani;440,Maharashtra,Nagpur;441,Maharashtra,Bhandara/Chandrapur/Gadchiroli/Gondia/Nagpur;442,Maharashtra,Amravati/Chandrapur/Gadchiroli/Wardha;443,Maharashtra,Buldhana;444,Maharashtra,Akola/Amravati/Buldhana/Washim;445,Maharashtra,Yavatmal;450,Madhya Pradesh,Burhanpur/Chhindwara/East Nimar/Khandwa;451,Madhya Pradesh,Barwani/East Nimar/Khargone/West Nimar;452,Madhya Pradesh,Indore;453,Madhya Pradesh,Indore;454,Madhya Pradesh,Dhar;455,Madhya Pradesh,Dewas;456,Madhya Pradesh,Ujjain;457,Madhya Pradesh,Alirajpur/Jhabua/Ratlam;458,Madhya Pradesh,Mandsaur/Neemuch;460,Madhya Pradesh,Betul/Chhindwara;461,Madhya Pradesh,Betul/Harda/Hoshangabad/Narsinghpur;462,Madhya Pradesh,Bhopal/Raisen;463,Madhya Pradesh,Bhopal;464,Madhya Pradesh,Bhopal/Raisen/Sagar/Vidisha;465,Madhya Pradesh,Rajgarh/Sehore/Shajapur;466,Madhya Pradesh,Sehore;470,Madhya Pradesh,Damoh/Sagar;471,Madhya Pradesh,Chhatarpur;472,Madhya Pradesh,Chhatarpur/Tikamgarh;473,Madhya Pradesh,Ashok Nagar/Guna/Shivpuri;474,Madhya Pradesh,Gwalior;475,Madhya Pradesh,Bhind/Datia/Gwalior;476,Madhya Pradesh,Morena/Sheopur;477,Madhya Pradesh,Bhind/Sheopur;480,Madhya Pradesh,Betul/Chhindwara/Seoni;481,Madhya Pradesh,Balaghat/Dindori/Mandla/Seoni;482,Madhya Pradesh,Jabalpur;483,Madhya Pradesh,Jabalpur/Katni;484,Madhya Pradesh,Anuppur/Shahdol/Sidhi/Umaria;485,Madhya Pradesh,Rewa/Satna;486,Madhya Pradesh,Rewa/Shahdol/Sidhi/Singrauli/Umaria;487,Madhya Pradesh,Narsinghpur/Sainkheda;488,Madhya Pradesh,Panna;490,Chhattisgarh,Durg;491,Chhattisgarh,Durg/Kabirdham/Kawardha/Rajnandgaon;492,Chhattisgarh,Mahasamund/Raipur;493,Chhattisgarh,Dhamtari/Gariaband/Mahasamund/Raipur;494,Chhattisgarh,Bastar/Bijapur(CGH)/Dantewada/Kanker/Narayanpur;495,Chhattisgarh,Bilaspur(CGH)/Janjgir-champa/Korba;496,Chhattisgarh,Jashpur/Raigarh;497,Chhattisgarh,Koriya/Surguja;500,Telangana,Hyderabad/K.V.Rangareddy;501,Telangana,Hyderabad/K.V.Rangareddy;502,Telangana,Medak/Siddipet;503,Telangana,Nizamabad;504,Telangana,Adilabad;505,Telangana/Andhra Pradesh,Karim Nagar/Peddapalli/Rajanna Sircilla;506,Telangana,Jayashankar/Mahabubabad/Warangal;507,Telangana,Khammam;508,Telangana,Nalgonda/Suryapet;509,Telangana,K.V.Rangareddy/Mahabub Nagar;515,Andhra Pradesh,Ananthapur/Cuddapah;516,Andhra Pradesh,Cuddapah;517,Andhra Pradesh,Chittoor;518,Andhra Pradesh,Kurnool;520,Andhra Pradesh,Krishna;521,Andhra Pradesh,Krishna;522,Andhra Pradesh,Guntur;523,Andhra Pradesh,Prakasam;524,Andhra Pradesh,Nellore;530,Andhra Pradesh,Visakhapatnam;531,Andhra Pradesh,Visakhapatnam/Vizianagaram;532,Andhra Pradesh,Srikakulam/Vizianagaram;533,Andhra Pradesh/Pondicherry/Telangana,East Godavari/Khammam/Pondicherry;534,Andhra Pradesh,East Godavari/West Godavari;535,Andhra Pradesh,Srikakulam/Visakhapatnam/Vizianagaram;560,Karnataka,Bangalore Rural/Bengaluru;561,Karnataka,Bangalore Rural/Chikkaballapur/Kolar/Ramanagar/Tumakuru;562,Karnataka,Bangalore Rural/Bengaluru/Chikkaballapur/Kolar/Ramanagar;563,Karnataka,Chikkaballapur/Kolar;570,Karnataka,Mysuru;571,Karnataka,Chamrajnagar/Kodagu/Mandya/Mysuru;572,Karnataka,Tumakuru;573,Karnataka,Hassan;574,Karnataka,Dakshina Kannada/Kodagu/Udupi;575,Karnataka,Dakshina Kannada;576,Karnataka,Udupi;577,Karnataka,Chikkamagaluru/Chitradurga/Dakshina Kannada/Davangere/Shivamogga;580,Karnataka,Dharwad;581,Karnataka,Davangere/Dharwad/Haveri/Uttara Kannada;582,Karnataka,Dharwad/Gadag;583,Karnataka,Ballari/Davangere/Gadag/Koppal;584,Karnataka,Raichur;585,Karnataka,Bidar/Kalaburagi/Yadgir;586,Karnataka,Bagalkot/Vijayapura;587,Karnataka,Bagalkot/Vijayapura;590,Karnataka,Belagavi;591,Karnataka,Belagavi;600,Tamil Nadu,Chennai/Kanchipuram/Tiruvallur;601,Tamil Nadu,Kanchipuram/Tiruvallur;602,Tamil Nadu,Kanchipuram/Tiruvallur;603,Tamil Nadu,Kanchipuram;604,Tamil Nadu,Tiruvannamalai/Vellore/Villupuram;605,Tamil Nadu/Pondicherry,Cuddalore/Pondicherry/Tiruvannamalai/Villupuram;606,Tamil Nadu,Cuddalore/Tiruvannamalai/Villupuram;607,Tamil Nadu/Pondicherry,Cuddalore/Pondicherry/Tiruchirappalli/Villupuram;608,Tamil Nadu,Ariyalur/Cuddalore;609,Tamil Nadu/Pondicherry,Karaikal/Nagapattinam/Thanjavur/Tiruvarur;610,Tamil Nadu,Nagapattinam/Tiruvarur;611,Tamil Nadu,Nagapattinam/Tiruvarur;612,Tamil Nadu,Ariyalur/Nagapattinam/Thanjavur/Tiruchirappalli/Tiruvarur;613,Tamil Nadu,Nagapattinam/Pudukkottai/Thanjavur/Tiruvarur;614,Tamil Nadu,Nagapattinam/Pudukkottai/Thanjavur/Tiruvarur;620,Tamil Nadu,Tiruchirappalli;621,Tamil Nadu,Ariyalur/Karur/Namakkal/Perambalur/Pudukkottai/Salem/Sivaganga/Tiruchirappalli;622,Tamil Nadu,Pudukkottai;623,Tamil Nadu,Ramanathapuram/Sivaganga;624,Tamil Nadu,Coimbatore/Dindigul;625,Tamil Nadu,Madurai/Theni;626,Tamil Nadu,Tuticorin/Virudhunagar;627,Tamil Nadu,Tirunelveli/Tuticorin;628,Tamil Nadu,Tirunelveli/Tuticorin;629,Tamil Nadu,Kanyakumari;630,Tamil Nadu,Ramanathapuram/Sivaganga;631,Tamil Nadu,Kanchipuram/Tiruvallur/Tiruvannamalai/Vellore;632,Tamil Nadu,Tiruvannamalai/Vellore;635,Tamil Nadu,Dharmapuri/Krishnagiri/Tiruvannamalai/Vellore;636,Tamil Nadu,Dharmapuri/Krishnagiri/Namakkal/Salem;637,Tamil Nadu,Namakkal/Salem;638,Tamil Nadu,Coimbatore/Erode/Karur/Namakkal;639,Tamil Nadu,Dindigul/Erode/Karur/Tiruchirappalli;641,Tamil Nadu,Coimbatore/Erode/TIRUPPUR;642,Tamil Nadu,Coimbatore/Dindigul/Erode;643,Tamil Nadu,Nilgiris;670,Kerala,Kannur/Kasargod/Wayanad;671,Kerala,Kasargod;673,Kerala/Pondicherry,Kannur/Kozhikode/Mahe/Malappuram/Pondicherry/Wayanad;676,Kerala,Malappuram;678,Kerala,Palakkad;679,Kerala,Malappuram/Palakkad/Thrissur;680,Kerala,Ernakulam/Thrissur;682,Kerala/Lakshadweep,Ernakulam/Lakshadweep;683,Kerala,Ernakulam;685,Kerala,Idukki/Pathanamthitta;686,Kerala,Alappuzha/Ernakulam/Idukki/Kottayam/Pathanamthitta;688,Kerala,Alappuzha;689,Kerala,Alappuzha/Kollam/Pathanamthitta;690,Kerala,Alappuzha/Kollam/Pathanamthitta;691,Kerala,Kollam/Pathanamthitta;695,Kerala,Thiruvananthapuram;700,West Bengal,Kolkata/North 24 Parganas/South 24 Parganas;711,West Bengal,Howrah;712,West Bengal,Hooghly/Howrah/Purba Bardhaman;713,West Bengal,Bankura/Burdwan/Murshidabad/Paschim Bardhaman/Purba Bardhaman;721,West Bengal,East Midnapore/Medinipur/West Midnapore;722,West Bengal,Bankura;723,West Bengal,Purulia;731,West Bengal,Birbhum;732,West Bengal,Malda;733,West Bengal,Malda/North Dinajpur/South Dinajpur;734,West Bengal,Darjiling/Jalpaiguri/Kalimpong;735,West Bengal,Alipurduar/Cooch Behar/Darjiling/Jalpaiguri;736,West Bengal,Alipurduar/Cooch Behar/Jalpaiguri;737,Sikkim,East Sikkim/North Sikkim/South Sikkim/West Sikkim;741,West Bengal,Nadia;742,West Bengal,Murshidabad;743,West Bengal,North 24 Parganas/South 24 Parganas;744,Andaman & Nicobar Islands,Nicobar/North And Middle Andaman/South Andaman;751,Odisha,Khorda;752,Odisha,Cuttack/Khorda/Nayagarh/Puri;753,Odisha,Cuttack;754,Odisha,Cuttack/Jagatsinghapur/Jajapur/Kendrapara/Khorda;755,Odisha,Jajapur/Kendrapara/Kendujhar;756,Odisha,Baleswar/Bhadrak/Kendujhar;757,Odisha,Mayurbhanj;758,Odisha,Jajapur/Kendujhar/Keonjhargarh;759,Odisha,Angul/Dhenkanal;760,Odisha,Ganjam;761,Odisha,Gajapati/Ganjam;762,Odisha,Boudh/Kandhamal;763,Odisha,Koraput;764,Odisha,Koraput/Malkangiri/Nabarangapur/Rayagada;765,Odisha,Koraput/Nabarangapur/Rayagada;766,Odisha,Kalahandi/Nuapada;767,Odisha,Balangir/Sonapur;768,Odisha,Bargarh/Debagarh/Jharsuguda/Sambalpur;769,Odisha,Sundergarh;770,Odisha,Sundergarh;781,Assam,Barpeta/Kamrup/Nalbari;782,Assam,Kamrup/Karbi Anglong/Marigaon/Nagaon;783,Assam/Meghalaya,Bongaigaon/Dhubri/East Garo Hills/Goalpara/Kokrajhar;784,Assam,Darrang/Lakhimpur/Sonitpur;785,Assam,Dibrugarh/Golaghat/Jorhat/Nagaon/Sibsagar;786,Assam,Dibrugarh/Tinsukia;787,Assam,Dhemaji/Lakhimpur;788,Assam,Cachar/Hailakandi/Karimganj/North Cachar Hills;790,Arunachal Pradesh,East Kameng/Papum Pare/Tawang/West Kameng;791,Arunachal Pradesh,East Siang/Kurung Kumey/Lower Subansiri/Papum Pare/Upper Siang/Upper Subansiri/West Siang;792,Arunachal Pradesh,Changlang/Dibang Valley/Lohit/Longding/Lower Dibang Valley/Namsai/Papum Pare/Tirap;793,Meghalaya,East Garo Hills/East Khasi Hills/Jaintia Hills/Ri Bhoi/West Khasi Hills;794,Meghalaya,East Garo Hills/South Garo Hills/West Garo Hills;795,Manipur,Bishnupur/Chandel/Churachandpur/Imphal East/Imphal West/Jaribam/Kakching/Kangpokpi/Senapati/Tamenglong/Tengnoupal/Thoubal/Ukhrul;796,Mizoram,Aizawl/Champhai/Kolasib/Lawngtlai/Lunglei/Mammit/Saiha/Serchhip;797,Nagaland,Dimapur/Kohima/Peren/Phek/Wokha/Zunhebotto;798,Nagaland,Kiphire/Longleng/Mokokchung/Mon/Tuensang/Zunhebotto;799,Tripura,Dhalai/Gomti/Khowai/North Tripura/Sepahijala/South Tripura/West Tripura;800,Bihar,Patna;801,Bihar,Nalanda/Patna;802,Bihar,Bhojpur/Buxar/Kaimur (Bhabua)/Rohtas;803,Bihar,Nalanda/Nawada/Patna;804,Bihar,Arwal/Gaya/Jehanabad/Patna;805,Bihar,Gaya/Nalanda/Nawada;811,Bihar,Banka/Begusarai/Bhagalpur/Jamui/Khagaria/Lakhisarai/Munger/Nalanda/Patna/Sheikhpura;812,Bihar,Bhagalpur;813,Bihar/Jharkhand,Banka/Bhagalpur/Godda/Madhepura/Munger/Sahibganj;814,Jharkhand/Bihar,Banka/Bokaro/Deoghar/Dumka/Godda/Jamtara/Pakur;815,Jharkhand,Deoghar/Giridh/Godda/Jamtara;816,Jharkhand,Dumka/Godda/Pakur/Sahibganj;821,Bihar,Kaimur (Bhabua)/Rohtas;822,Jharkhand,Garhwa/Latehar/Palamau;823,Bihar,Gaya;824,Bihar,Arwal/Aurangabad(BH)/Gaya/Jehanabad;825,Jharkhand,Bokaro/Chatra/Giridh/Hazaribag/Koderma/Ramgarh;826,Jharkhand,Dhanbad;827,Jharkhand,Bokaro/Dhanbad;828,Jharkhand,Bokaro/Dhanbad;829,Jharkhand,Bokaro/Chatra/Garhwa/Hazaribag/Latehar/Palamau/Ramgarh/Ranchi;831,Jharkhand,East Singhbhum/Seraikela-kharsawan;832,Jharkhand,East Singhbhum/Seraikela-kharsawan;833,Jharkhand,East Singhbhum/Seraikela-kharsawan/West Singhbhum;834,Jharkhand,Lohardaga/Ranchi;835,Jharkhand,Gumla/Khunti/Lohardaga/Ranchi/Simdega/West Singhbhum;841,Bihar,Bhojpur/Gopalganj/Saran/Siwan;842,Bihar,Muzaffarpur;843,Bihar,Muzaffarpur/Sheohar/Sitamarhi/Vaishali;844,Bihar,Muzaffarpur/Samastipur/Vaishali;845,Bihar,East Champaran/West Champaran;846,Bihar,Darbhanga;847,Bihar,Darbhanga/Madhubani/Muzaffarpur/Samastipur/Sitamarhi/Supaul;848,Bihar,Begusarai/Darbhanga/Khagaria/Samastipur;851,Bihar,Begusarai/Khagaria;852,Bihar,Darbhanga/Khagaria/Madhepura/Saharsa/Supaul;853,Bihar,Bhagalpur/Katihar/Khagaria/Madhepura/Munger/Purnia;854,Bihar,Araria/Katihar/Purnia/Supaul;855,Bihar,Katihar/Kishanganj";
         // ---------- kody pocztowe ----------
-        var DS_PNA_FORMAT = { CN: /^\d{6}$/, IN: /^\d{6}$/, VN: /^\d{6}$/, SG: /^\d{6}$/, TR: /^\d{5}$/, TH: /^\d{5}$/,
+        // Wietnam: od 01.01.2018 kody maja 5 cyfr (Ho Chi Minh 70000–76000), stare 6-cyfrowe bywaja dalej w uzyciu.
+        // Do 5.63.12 „70000" Kien Lam (karta 2800) byl „zlym kodem" i nie szedl do pliku.
+        var DS_PNA_FORMAT = { CN: /^\d{6}$/, IN: /^\d{6}$/, VN: /^\d{5,6}$/, SG: /^\d{6}$/, TR: /^\d{5}$/, TH: /^\d{5}$/,
                               MY: /^\d{5}$/, ID: /^\d{5}$/, PK: /^\d{5}$/, KR: /^\d{5}$/, LK: /^\d{5}$/, KH: /^\d{5,6}$/,
                               BD: /^\d{4}$/, PH: /^\d{4}$/, TW: /^\d{3}(?:\d{2,3})?$/, JP: /^\d{3}-?\d{4}$/ };
         var DS_PNA_BEZ = { HK: 'Hongkong', MO: 'Makau' };
@@ -117312,7 +117650,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'b25df09 · 16.11.2026 07:33';
+    const HUB_BUDOWA = '4eb13b3 · 16.11.2026 09:44';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
