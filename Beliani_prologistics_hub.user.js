@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.13
+// @version      5.63.14
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11410,7 +11410,12 @@
         if (hi < 0) return [];
         const h = Array.from(rows[hi].children).map(c => nsp(c.textContent).toLowerCase());
         const col = p => h.findIndex(x => x.indexOf(p) === 0);
-        const ci = { id: col('import id'), pm: col('payment method'), bk: col('bank name'), st: col('state'), cu: col('customer name'), ib: col('iban'), am: col('refund amount'), co: col('company name'), ms: col('message') };
+        const ci = { id: col('import id'), pm: col('payment method'), bk: col('bank name'), st: col('state'), cu: col('customer name'), am: col('refund amount'), co: col('company name'), ms: col('message') };
+        // Kolumny „IBAN/Account number" sa DWIE (data-field-name „IBAN/Account number " ze spacja i bez):
+        // request z Unicredit HU ma numer w pierwszej, z HVB UniCredit — tylko w ostatniej, a pierwsza pusta
+        // (ticket 598127, 16.11.2026). Czytajac sama pierwsza, HUB nie widzial IBAN-u nowego, zatwierdzonego
+        // requestu i dopasowywal plik do starego, zdezaktywowanego. Bierzemy numery z KAZDEJ kolumny „iban…".
+        const ibCols = h.map((x, i) => (x.indexOf('iban') === 0 ? i : -1)).filter(i => i >= 0);
         const out = [];
         rows.slice(hi + 1).forEach(tr => {
             const c = Array.from(tr.children);
@@ -11418,7 +11423,8 @@
             const id = cell(ci.id);
             if (!/^\d{5,}$/.test(id)) return;
             const sel = (ci.st >= 0 && c[ci.st]) ? c[ci.st].querySelector('select.state-select option[selected]') : null;
-            out.push({ id: id, pm: cell(ci.pm), bk: cell(ci.bk), st: sel ? nsp(sel.textContent) : '', iban: cell(ci.ib), kwota: numOf(cell(ci.am)), cu: cell(ci.cu), co: cell(ci.co), ms: cell(ci.ms) });
+            const ibany = ibCols.map(cell).filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
+            out.push({ id: id, pm: cell(ci.pm), bk: cell(ci.bk), st: sel ? nsp(sel.textContent) : '', iban: ibany[0] || '', ibany: ibany, kwota: numOf(cell(ci.am)), cu: cell(ci.cu), co: cell(ci.co), ms: cell(ci.ms) });
         });
         return out;
     }
@@ -11613,7 +11619,9 @@
         // a nie pierwszym numerem z pola, ktorego odczyt mogl sie nie udac.
         if (aufA) aufNr = aufA;
         const nr = cleanupIban(r.iban), kw = centsOf(r.amt);
-        const exact = () => reqs.filter(x => nr && !isNaN(kw) && cleanupIban(x.iban) === nr && Math.round(x.kwota * 100) === kw);
+        // Request niesie numery ze wszystkich kolumn „IBAN/Account number" (ibany); zgodny = ktorykolwiek z nich.
+        const maIban = x => !!nr && (x.ibany && x.ibany.length ? x.ibany : [x.iban]).some(v => cleanupIban(v) === nr);
+        const exact = () => reqs.filter(x => maIban(x) && !isNaN(kw) && Math.round(x.kwota * 100) === kw);
         // Request z ticketu auftrag nie pokazuje: bez pasujacego na auftragu czytamy jego tickety.
         if (A && !exact().length) A.tix.forEach(t => { const e = get('T:' + t); if (e) add(e, 'ticket ' + t); });
         if (pend) { c.pend = true; c.notes = [['i', 'sprawdzam w prologistics...']]; return c; }
@@ -11626,7 +11634,7 @@
         } else if (!nr || isNaN(kw)) {
             c.notes.push(['i', 'IBAN albo kwota puste - nie porownuje z requestem']);
         } else if (!ex.length) {
-            const zIban = reqs.filter(x => cleanupIban(x.iban) === nr), zKw = reqs.filter(x => Math.round(x.kwota * 100) === kw);
+            const zIban = reqs.filter(maIban), zKw = reqs.filter(x => Math.round(x.kwota * 100) === kw);
             const opis = x => 'request ' + x.id + ' (' + x.z + ')';
             if (zIban.length) c.notes.push(['e', 'IBAN pasuje do ' + opis(zIban[0]) + ', ale kwota w pliku ' + fmt2(kw) + ' rozni sie od kwoty w requescie ' + (isNaN(zIban[0].kwota) ? '?' : zIban[0].kwota.toFixed(2))]);
             else if (zKw.length) c.notes.push(['e', 'kwota pasuje do ' + opis(zKw[0]) + ', ale IBAN w pliku ...' + nr.slice(-6) + ' rozni sie od IBAN-u w requescie ...' + cleanupIban(zKw[0].iban).slice(-6)]);
@@ -44916,6 +44924,103 @@
         });
         return poz.length ? { poz: poz, blad: '' } : null;
     }
+    // ---------- Limango: roznica przelewu wobec wyplaty Mirakla objasniona dokumentami cyklu (16.11.2026) ----------
+    // Zgloszenie: wplata 7833.37 z 13.11.2026 = cykl c5f4d1ff (30.09), a Mirakl liczy 7689.32. Roznica 144.05 to DOKLADNIE nota
+    // CN2077A-5 (VAT 0), ktorej Limango w przelewie nie potracilo: przelew = IN2077A-5 9464.21 − CN2077A-6 1601.84 − abonament
+    // 29.00. Limango placi wedlug dokumentow, a te bywaja z VAT-em innym niz 19% (CN2077A-4: 541.13 zamiast 599.95). Dlatego
+    // HUB nie dobiera Limanga sam (swiadomie nie ma go w MK_BEZ_KWOTY) — tu tylko mowi, CO tlumaczy roznice. Skladniki: nota
+    // niepotracona (+brutto), nota potracona z VAT 19% zamiast z dokumentu, faktura zaplacona z VAT 19% albo niezaplacona.
+    // Szukamy zestawu do 3 skladnikow (rozne dokumenty) o sumie = roznica co do grosza. Jeden najmniejszy zestaw = objasnienie,
+    // kilka = „kilka możliwości", zaden = „dokumenty cyklu tego nie tłumaczą". Niczego nie zmienia w zleceniu ani w imporcie.
+    let mkLimDokKl = '', mkLimDokLista = null;
+    async function mkLimDokumenty(){
+        const kl = MK_PRZELOT + '|' + mkHost();
+        if (mkLimDokKl === kl && mkLimDokLista) return mkLimDokLista;
+        const l = mkArr(await mkApi(MK_LIM_FV_DOK + '?limit=50&sort=dateCreated%2CDESC'));
+        mkLimDokKl = kl; mkLimDokLista = l;
+        return l;
+    }
+    function mkLimRozSkladniki(docs){
+        const out = [];
+        (docs || []).forEach(function (d){
+            const nr = String((d && d.number) || '');
+            const netto = Math.abs(Number(d && d.totalAmountExcludingTaxes));
+            const brutto = Math.abs(Number(d && d.totalAmountIncludingTaxes));
+            if (!nr || !isFinite(netto) || !isFinite(brutto) || !(brutto > 0)) return;
+            const b19 = r2(netto * MK_LIM_VAT), vat = r2(brutto - netto);
+            if (/^CN/i.test(nr)){
+                out.push({ nr: nr, gr: Math.round(brutto * 100),
+                           opis: 'nota ' + nr + ' ' + f2(brutto) + ' (VAT ' + f2(vat) + ') — Limango jej nie potrąciło' });
+                if (Math.abs(b19 - brutto) >= 0.005)
+                    out.push({ nr: nr, gr: -Math.round((b19 - brutto) * 100),
+                               opis: 'nota ' + nr + ' potrącona z VAT 19%: ' + f2(b19) + ' zamiast ' + f2(brutto) + ' z dokumentu' });
+            } else if (/^IN/i.test(nr)){
+                out.push({ nr: nr, gr: -Math.round(brutto * 100), opis: 'faktura ' + nr + ' ' + f2(brutto) + ' niezapłacona' });
+                if (Math.abs(b19 - brutto) >= 0.005)
+                    out.push({ nr: nr, gr: Math.round((b19 - brutto) * 100),
+                               opis: 'faktura ' + nr + ' zapłacona z VAT 19%: ' + f2(b19) + ' zamiast ' + f2(brutto) + ' z dokumentu' });
+            }
+        });
+        return out;
+    }
+    // Objasnienie roznicy przelew − wyplata Mirakla dokumentami cykli cycIds. null, gdy roznicy nie ma albo brak danych.
+    function mkLimRozWyj(docs, cycIds, przelew, wyplata){
+        if (przelew == null || wyplata == null || !isFinite(Number(przelew)) || !isFinite(Number(wyplata))) return null;
+        const D = Math.round((Number(przelew) - Number(wyplata)) * 100);
+        if (!D) return null;
+        const chce = {};
+        (cycIds || []).forEach(function (c){ if (c) chce[String(c)] = 1; });
+        const dCyklu = (docs || []).filter(function (d){ return d && chce[String(d.shopBillingCycleId || '')]; });
+        const sk = mkLimRozSkladniki(dCyklu);
+        const roz = f2(D / 100);
+        // Termin platnosci dokumentow cyklu („Due date" na stronie „For the operator") — Limango placi w jego okolicy
+        // (cykl 30.09: termin 15.11, wplata 13.11; cykl 31.08: termin 16.10, wplata 20.10). Najwczesniejszy z dokumentow cyklu.
+        const terminy = dCyklu.map(function (d){ return String(d.dueDate || '').slice(0, 10); })
+                              .filter(function (t){ return /^\d{4}-\d{2}-\d{2}$/.test(t); }).sort();
+        const termin = terminy[0] || '';
+        if (!sk.length) return { ok: false, termin: termin, tekst: 'różnica ' + roz + ': w panelu nie widzę dokumentów tego cyklu' };
+        let traf = [];
+        for (let n = 1; n <= 3 && !traf.length; n++){
+            const idz = function (od, wyb, suma){
+                if (wyb.length === n){ if (suma === D) traf.push(wyb.slice()); return; }
+                for (let i = od; i < sk.length; i++){
+                    if (wyb.some(function (x){ return x.nr === sk[i].nr; })) continue;    // dwa skladniki jednego dokumentu sie wykluczaja
+                    wyb.push(sk[i]); idz(i + 1, wyb, suma + sk[i].gr); wyb.pop();
+                }
+            };
+            idz(0, [], 0);
+        }
+        if (!traf.length)
+            return { ok: false, termin: termin, tekst: 'różnicy ' + roz + ' nie tłumaczą dokumenty tego cyklu ('
+                                       + sk.filter(function (x, i, a){ return a.findIndex(function (y){ return y.nr === x.nr; }) === i; })
+                                           .map(function (x){ return x.nr; }).join(', ') + ') — sprawdź przelew i dokumenty w panelu' };
+        const zdanie = function (z){ return z.map(function (x){ return x.opis; }).join(' + '); };
+        if (traf.length === 1) return { ok: true, termin: termin, tekst: 'różnica ' + roz + ' = ' + zdanie(traf[0]) };
+        return { ok: false, termin: termin, tekst: 'różnicę ' + roz + ' tłumaczy kilka zestawów dokumentów — sprawdź, który: '
+                                   + traf.slice(0, 3).map(zdanie).join('  |  ') };
+    }
+    // Termin platnosci dokumentow cyklu w oknie wokol daty wplaty — warunek SAMOCZYNNEGO dopasowania (mkPass). Okno 21 dni:
+    // najpozniejsza zmierzona wplata przyszla 17 dni po terminie (cykl 30.06: termin 15.08, wplata 01.09). Bez terminu — nie.
+    const MK_LIM_TERMIN_DNI = 21;
+    function mkLimTerminBlisko(termin, data){
+        const t = mkDay(termin), d = mkDay(data);
+        return t != null && d != null && Math.abs(t - d) <= MK_LIM_TERMIN_DNI * 86400000;
+    }
+    // Kandydaci z listy „Które to rozliczenie?" przy zleceniu Limango: przy kazdym objasnienie roznicy. Objasnione co do grosza
+    // ida na poczatek listy. Blad odczytu dokumentow — lista bez objasnien (jak dotad).
+    async function mkLimKandWyj(j, kd){
+        if (!mkLimCzy(j) || !(kd || []).length) return kd;
+        let docs = null;
+        try { docs = await mkLimDokumenty(); }
+        catch (e){ mkLog('przelot', '  Limango: dokumentów cyklu nie odczytałem — ' + ((e && e.message) || e)); return kd; }
+        kd.forEach(function (x){
+            if (x.kwota == null) return;
+            const w = mkLimRozWyj(docs, [x.id], j.amount, x.kwota);
+            if (w){ x.wyj = w.tekst; x.wyjOk = w.ok; x.termin = w.termin || ''; }
+        });
+        kd.sort(function (a, b){ return (b.wyjOk ? 1 : 0) - (a.wyjOk ? 1 : 0); });    // stabilnie: reszta w dotychczasowej kolejnosci
+        return kd;
+    }
     // Jedno zdanie do adnotacji zlecenia. Osobno opis kazdego dokumentu — w wierszu listy (mkLimFvHtml).
     function mkLimFvNota(fv){
         if (!fv || !fv.poz || !fv.poz.length) return '';
@@ -45566,7 +45671,12 @@
         // Wskazanego RECZNIE nie odrzucamy: czlowiek wybral to rozliczenie swiadomie,
         // wlasnie dlatego, ze kwota sie nie zgadza. Zlecenie i tak nie przejdzie dalej —
         // nizej ta sama niezgodnosc trafia do „bad", czyli na „wymaga sprawdzenia".
-        if (!reczny && !byRef && !bezKwoty && a.pay != null && !eq(net, j.amount))
+        // Limango (16.11.2026): roznica przelewu wobec wyplaty Mirakla wyjasniona CO DO GROSZA jednym zestawem dokumentow cyklu
+        // (mkLimRozWyj — np. nota z VAT 0, ktorej Limango nie potracilo) to dowod, nie poszlaka: cyklu nie odrzucamy, a roznice
+        // przyjmujemy sami (nizej, netAkc z „auto"). Uzytkownik: „jak dopasowuje i wskazuje poprawny, to nie może od razu dopasować?".
+        const limRozW = (o.limDok && !eq(net, j.amount)) ? mkLimRozWyj(o.limDok, cycIds, j.amount, net) : null;
+        const limDowod = !!(limRozW && limRozW.ok && mkLimCzy(j) && a.pay != null);
+        if (!reczny && !byRef && !bezKwoty && !limDowod && a.pay != null && !eq(net, j.amount))
             return { odrzuc: true };
         // Cykl dobrany SAMA POSZLAKA („jedyny w oknie"), bez wiersza wyplaty — kwota niczego tu nie rozstrzyga. Na panelu
         // z kilkoma sklepami (MK_SHOPID: Hobbybox FI/SE/DK, XXXL Group, Brico Depot) to najpewniej cykl INNEGO sklepu, wiec
@@ -45590,6 +45700,7 @@
                    ord: a.ord, ref: a.ref, refExtra: refExtra, reczne: a.reczne,
                    unknown: a.unknown, skipped: a.skipped, full: full,
                    limFv: o.limFv || null,
+                   limRoz: limRozW,
                    both: both, pays: a.pays.length, split: split,
                    rows: tx.list.length, total: tx.total, pages: tx.pages, how: tx.how };
         // e-Price: numery dokumentow Mirakla — numer z tytulu przelewu to numer dokumentu cyklu (epcDokZgodny).
@@ -45652,6 +45763,12 @@
                 j.data.netAkc = akc;
                 j.note = (j.note ? j.note + '; ' : '') + 'różnica ' + f2(r2(net - j.amount)) + ' zaakceptowana ręcznie ('
                        + akc.kiedy + ' UTC)';
+            } else if (limDowod){
+                // Limango: roznice tlumaczy dokument cyklu co do grosza — przyjeta sama, z opisem (bez „↶ cofnij": dowod, nie decyzja).
+                if (akc) delete j.akcRoznica;
+                j.data.netAkc = { cyc: cycIds.join(', '), net: net, kwota: j.amount, roz: r2(net - j.amount),
+                                  kiedy: new Date().toISOString().slice(0, 16).replace('T', ' '), auto: true, tekst: limRozW.tekst };
+                j.note = (j.note ? j.note + '; ' : '') + 'Limango: ' + limRozW.tekst + ' — różnicę przyjąłem sam';
             } else {
                 if (akc) delete j.akcRoznica;
                 bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
@@ -64299,7 +64416,8 @@
     let MK_PRZELOT = 0;                    // numer biezacego przelotu; podbija go guzik pobierania
     function mkKandZapisz(j, kd, shopName, sklepId){
         const nowa = (kd || []).length ? kd.map(function (x){
-            return { id: x.id, data: x.data, kwota: x.kwota, roz: x.roz, powod: x.powod };
+            return { id: x.id, data: x.data, kwota: x.kwota, roz: x.roz, powod: x.powod,
+                     wyj: x.wyj || '', wyjOk: !!x.wyjOk, termin: x.termin || '' };   // Limango: objasnienie roznicy (mkLimKandWyj)
         }) : null;
         const sklep = String(shopName || '');
         const id = String(sklepId || '') || sklep;      // bez numeru zostaje dawne porownanie po nazwie
@@ -66303,7 +66421,11 @@
                       +   (x.roz == null ? '' : (' · różnica ' + f2(x.roz)))
                       +   (x.powod ? ('<span style="color:#b91c1c;font-weight:700"> · ' + esc(x.powod) + '</span>') : '')
                       +   ' <span style="color:#999">[' + esc(String(x.id).slice(0, 8)) + ']</span>'
-                      + '</span></div>';
+                      + '</span></div>'
+                      // Limango: co tlumaczy roznice — dokumenty tego cyklu (mkLimKandWyj).
+                      + (x.wyj ? ('<div style="margin:1px 0 0 74px;font-size:10px;color:' + (x.wyjOk ? '#0a7a2f' : '#6b7280') + '">'
+                                  + (x.wyjOk ? '✓ ' : '') + esc(x.wyj)
+                                  + (x.termin ? (' · termin płatności dokumentów ' + esc(x.termin.slice(8, 10) + '.' + x.termin.slice(5, 7) + '.' + x.termin.slice(0, 4))) : '') + '</div>') : '');
                }).join('')
              + '</div>';
     }
@@ -67069,7 +67191,10 @@
                               ? ('<b>' + esc(j.data.netWhy) + '</b>')
                               : ('wypłata z rozliczenia <b>' + f2(j.data.net) + '</b> · kwoty nie kontroluję — Empik nie przelewa pobrań'))
                           : ('kontrola netto ' + (j.data.netOk ? '<b style="color:#0a7a2f">✓</b>'
-                              : (j.data.netAkc
+                              : (j.data.netAkc && j.data.netAkc.auto
+                                  ? ('<b style="color:#0a7a2f">✓ ' + f2(j.data.net) + ' — różnica ' + f2(r2(j.data.net - j.amount)) + ' '
+                                     + esc(j.cur || '') + ' przyjęta sama: tłumaczy ją dokument Limango (niżej)</b>')
+                                  : j.data.netAkc
                                   ? ('<b style="color:#b45309">✗ ' + f2(j.data.net) + ' — różnica ' + f2(r2(j.data.net - j.amount)) + ' '
                                      + esc(j.cur || '') + ' zaakceptowana ręcznie ' + esc(mkCzasLok(j.data.netAkc.kiedy)) + '</b>'
                                      + (st !== 'done' ? (' <a href="#" class="mk-akcroz" data-co="cofnij" data-k="' + esc(mkKlucz(j))
@@ -67186,6 +67311,10 @@
                          + '</div><div style="color:#b45309;font-size:11px">Kwoty na auftragach liczę z pozycji '
                          + '(netto × 1,19), więc są prawidłowe — nie zgadza się podsumowanie na dokumencie. '
                          + 'Przekaż to ' + esc(MK_LIM_FV_OSOBA_KOMU) + ', żeby poprawiła w Sage.</div>';
+                // Limango: co tlumaczy roznice przelewu wobec wyplaty Mirakla (dokumenty cyklu) — przy akceptacji roznicy pod reka.
+                if (j.data.limRoz && j.data.limRoz.tekst && !j.data.netOk)
+                    det += '<div style="color:' + (j.data.limRoz.ok ? '#0a7a2f' : '#b45309') + ';font-size:11px;margin-top:3px">'
+                         + (j.data.limRoz.ok ? '✓ ' : '? ') + 'Limango: ' + esc(j.data.limRoz.tekst) + '</div>';
                 if (lfv && lfv.blad)
                     det += '<div style="color:#888;font-size:10px">nie sprawdziłem dokumentów Limanga: ' + esc(lfv.blad) + '</div>';
                 const sh = mkSheet[mkJobId(j)];
@@ -70337,8 +70466,36 @@
     }
     // Zwrot rowny wplacie z tego samego rozliczenia. Sam w sobie niczego nie zalatwia — „znosi sie"
     // dopiero razem z auftragiem Deleted, bo wtedy ANI wplata (import: NOT FOUND), ANI zwrot nie wchodza.
+    // r.d6 — Allegro: ile wierszy wplaty stracilo 6 zl za dostawe (alleDost6, liczone w refGroups).
     function mkZnosiSie(r){
-        return !!r && r.wpl != null && Math.abs(r.wpl - Math.abs(r.amt)) < 0.005;
+        return !!r && r.wpl != null && mkZwrotRownyWplacie(r.wpl, r.amt, r.d6 || 0);
+    }
+    // Allegro (16.11.2026): wplata w imporcie jest PO regule 6 zl (mkParseAlle odejmuje doliczona przez Allegro oplate za
+    // dostawe — w wierszu importu „Odjęto 6" w kolumnie K), a zwrot przychodzi PELNY, razem z ta oplata. Zgloszenie: paczka
+    // 2332354 (1071, 15.11.2026) — 5558ce80… wplata 495 → 489, zwrot 495, auftrag Deleted; 2ce40530… 245 → 239, auftragu brak.
+    // HUB porownywal 489 z 495, para nie „znosila sie", zostawala w „Do wyjaśnienia" i nie szla do arkusza „allegro anulacje".
+    // Tu: ile wierszy wplaty tego zamowienia stracilo 6 zl (tylko „Odjęto 6" — przy Paczkomacie 6 zl zostaje w wplacie).
+    // Dane biora sie z j.data.alle.wOrd, ktore zlecenie Allegro trzyma od wczytania — dziala tez dla zlecen sprzed zmiany.
+    function alleDost6(j, id){
+        const p = (j && j.kind === 'alle' && j.data && j.data.alle) || null;
+        if (!p || !id) return 0;
+        return (p.wOrd || []).filter(function (x){
+            return x && x.nr === id && String((x.r || [])[10] == null ? '' : x.r[10]).trim() === 'Odjęto 6';
+        }).length;
+    }
+    // Zwrot pelny wobec wplaty: rowny co do grosza ALBO (Allegro) wiekszy DOKLADNIE o odjete 6 zl za dostawe — po 6 zl na
+    // kazdy wiersz wplaty z „Odjęto 6" (d6). Zwrot mniejszy od wplaty albo roznica bez odjetej dostawy to nie zwrot pelny.
+    function mkZwrotRownyWplacie(wpl, zwr, d6){
+        if (wpl == null || zwr == null || !isFinite(Number(wpl)) || !isFinite(Number(zwr))) return false;
+        const gr = Math.round((Math.abs(Number(zwr)) - Math.abs(Number(wpl))) * 100);
+        if (gr === 0) return true;
+        return (d6 || 0) > 0 && gr > 0 && gr % 600 === 0 && gr / 600 <= d6;
+    }
+    // Dopisek do opisu pary, ktora znosi sie dopiero po doliczeniu dostawy: „(zwrot o 6.00 wyższy — …)". Pusty przy rownych kwotach.
+    function mkZwrotDost6Opis(wpl, zwr){
+        if (wpl == null || zwr == null) return '';
+        const roz = r2(Math.abs(Number(zwr)) - Math.abs(Number(wpl)));
+        return roz > 0.005 ? (' (zwrot o ' + f2(roz) + ' wyższy — Allegro oddało opłatę za dostawę, którą reguła 6 zł odjęła od wpłaty)') : '';
     }
     function refGroups(){
         const g = {}, sets = setLoad(), acc = mkAcctLoad();
@@ -70398,6 +70555,7 @@
                 // nie widac, czego zwrot dotyczyl. kind = rodzaj marketplace: bez niego nie
                 // da sie powiedziec, czy temu opisowi wolno trafic do ticketu (MK_KOM_MP).
                 g[key].rows.push({ id: x.id, amt: x.amt, ref: j.ref, kind: j.kind, kj: kj, wpl: mkWplataWCyklu(j, x),
+                                   d6: x.rodzaj ? 0 : alleDost6(j, x.id),
                                    note: x.note, rodzaj: x.rodzaj, cnRodzaj: x.cnRodzaj || '',
                                    data: x.data || '', typ: x.typ || '' });
                 g[key].sum = r2(g[key].sum + x.amt);
@@ -70599,11 +70757,11 @@
     // Zamowienia zlecenia, przy ktorych wplata i zwrot z TEGO SAMEGO rozliczenia znosza sie, a auftrag jest
     // Deleted (slad „del" grupy zwrotow = modul ticketa pominal zwrot). Takiej wplaty import nie znajduje
     // (NOT FOUND), a widok paczki mowi przy niej „nic nie księguję" — nie jest wiec pozycja, ktora „nie weszla".
-    // Zwrot CALEJ kwoty wplaty w tym samym rozliczeniu.
+    // Zwrot CALEJ kwoty wplaty w tym samym rozliczeniu (Allegro: takze z oddana oplata za dostawe — mkZwrotRownyWplacie).
     function mkPelnyZwrot(j, id){
         const ord = (j && j.data && j.data.ord) || {}, ref = (j && j.data && j.data.ref) || {};
         return ord[id] != null && ref[id] != null
-            && Math.abs(Math.abs(Number(ord[id])) - Math.abs(Number(ref[id]))) < 0.005;
+            && mkZwrotRownyWplacie(ord[id], ref[id], alleDost6(j, id));
     }
     // Zwrot tego numeru JEST juz zaksiegowany: mowi to trwaly zapis modulu ticketa (numer + kwota) albo slad
     // grupy, o ile nie byl odhaczony reka. Wtedy nic sie nie znosi — zwrot wszedl, wplata nie — i wplate trzeba
@@ -70735,7 +70893,13 @@
         return { id: id, konto: String(p.konto || ''), data: alleDmy((p.dataOrd || {})[id]),
                  kwota: r2(Math.abs(Number((j.data.ord || {})[id]))), login: alleLogin(p, id),
                  opis: 'Allegro ' + (p.konto || '?') + ' · rozliczenie ' + (p.od || '?') + ' – ' + (p.doo || '?')
-                     + ' · wpłata i zwrot znoszą się (HUB)',
+                     + ' · wpłata i zwrot znoszą się (HUB)'
+                     + (function (){
+                         // Zwrot pelny z oplata za dostawe (regula 6 zl przy wplacie) — w notatce obie kwoty, w arkuszu wplata jak w imporcie.
+                         const zw = Math.abs(Number((j.data.ref || {})[id])), wp = Math.abs(Number((j.data.ord || {})[id]));
+                         return (isFinite(zw) && isFinite(wp) && zw - wp > 0.005)
+                             ? (' · zwrot ' + f2(zw) + ' = wpłata ' + f2(wp) + ' + oddana opłata za dostawę ' + f2(r2(zw - wp))) : '';
+                     })(),
                  kj: mkKlucz(j) };
     }
     function alleAnulBrak(w){
@@ -71537,6 +71701,7 @@
                         if (potw){
                             zielone = true;
                             t = '✔ <b>' + esc(r.id) + '</b> — wpłata ' + f2(r.wpl) + ' i zwrot ' + f2(Math.abs(r.amt))
+                              + esc(mkZwrotDost6Opis(r.wpl, r.amt))
                               + ' są w tym samym rozliczeniu i znoszą się: wpłata nie weszła (NOT FOUND w paczce), auftrag jest Deleted'
                               + (r.kind === 'alle' ? ' albo go nie ma' : '')
                               + ' — nie księguje się ani jedno, ani drugie.'
@@ -76782,8 +76947,29 @@
                         say('Sklep ' + (shopName || '?') + ' — pobieram wskazane rozliczenie '
                           + String(w.id).slice(0, 8) + '…');
                     } else {
-                    const cyc = bezKwoty ? mkCycleByDate(cycles, j.date, j.tried)
-                                         : mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried, mkWstecz(MK_DOPASUJ_WSTECZ, j, host));
+                    let cyc = bezKwoty ? mkCycleByDate(cycles, j.date, j.tried)
+                                       : mkMatchCycle(cycles, j.ref, j.date, j.amount, j.tried, mkWstecz(MK_DOPASUJ_WSTECZ, j, host));
+                    // Limango (16.11.2026): przelew rzadko rowna sie wyplacie Mirakla (Limango placi wedlug dokumentow). Gdy
+                    // DOKLADNIE JEDEN kandydat ma roznice wyjasniona co do grosza dokumentami cyklu (mkLimKandWyj) i nie jest to cykl
+                    // innego zlecenia — bierzemy go. Kilka takich albo zaden — lista do wyboru jak dotad.
+                    let kdLim = null;
+                    if (!cyc && !bezKwoty && mkLimCzy(j)){
+                        kdLim = await mkLimKandWyj(j, mkKandydaci(cycles, j).slice(0, 5));
+                        const zajete = {};
+                        Object.keys(jobs).forEach(function (k){
+                            const o2 = jobs[k];
+                            if (!o2 || o2 === j || !o2.data || !o2.data.cycle) return;
+                            String(o2.data.cycle).split(',').forEach(function (c){ zajete[String(c).trim()] = 1; });
+                        });
+                        const pewne = kdLim.filter(function (x){
+                            return x.wyjOk && mkLimTerminBlisko(x.termin, j.date) && (j.tried || []).indexOf(x.id) < 0 && !zajete[x.id];
+                        });
+                        if (pewne.length === 1){
+                            cyc = (cycles || []).filter(function (c){ return String(c && c.id) === pewne[0].id; })[0] || null;
+                            if (cyc) mkLog('przelot', '  ' + mkPrzelotKto(j) + ': Limango — cykl ' + String(cyc.id).slice(0, 8)
+                                                    + ' dobrany po dokumentach: ' + pewne[0].wyj);
+                        }
+                    }
                     if (!cyc){
                         // Slad przelotu: bez niego po „Sprawdziłem N sklepów" nie bylo widac, co sie stalo w KTORYM sklepie
                         // (XXXLutz CH, 10.11.2026). Idzie do „📄 Log" i do arkusza „HUB Log" (hubDz) — same daty, kwoty i numery cykli.
@@ -76804,7 +76990,7 @@
                         // bez warunku nadpisac. Zasady stoja przy mkKandZapisz.
                         // Numer sklepu razem z hostem — dwa panele moga miec sklep o tym
                         // samym numerze, a etykieta bywa wspolna dla dwoch numerow.
-                        mkKandZapisz(j, mkKandydaci(cycles, j).slice(0, 5), shopName,
+                        mkKandZapisz(j, kdLim || await mkLimKandWyj(j, mkKandydaci(cycles, j).slice(0, 5)), shopName,
                                      String(host || '') + '|' + String(shopId || ''));
                         jobsSave(jobs); render();
                         continue;
@@ -76874,6 +77060,9 @@
                     // Limango: czy dokumenty zgadzaja sie same ze soba (VAT wobec wlasnego netto).
                     // Informacyjnie — nie blokuje importu, patrz mkLimKontrolaFv.
                     const limFv = await mkLimKontrolaFv(j, cycIds, list);
+                    // Limango: dokumenty cyklu do objasnienia roznicy przelewu wobec wyplaty Mirakla (mkLimRozWyj, w mkZlozZlecenie).
+                    let limDok = null;
+                    if (mkLimCzy(j)){ try { limDok = await mkLimDokumenty(); } catch (e){ limDok = null; } }
                     // Empik: ktore zwroty dotycza zamowien za pobraniem (te nie ida na liste zwrotow — MK_COD_MP).
                     const cod = mkCodMp(j) ? await mkCodUstal(list, function (n, z){
                         say((j.short || 'Empik') + ' — zwroty: sprawdzam w panelu, czy zamówienie jest za pobraniem (' + n + ' z ' + z + ')…');
@@ -76882,7 +77071,7 @@
                     const wynik = mkZlozZlecenie(j, tx, {
                         manor: manor, bezKwoty: bezKwoty, byRef: byRef, byKwote: byKwote,
                         cycIds: cycIds, shopName: shopName, docs: docs, docSum: docSum, docSumImp: docSumImp,
-                        reczny: reczny, limFv: limFv, cod: cod });
+                        reczny: reczny, limFv: limFv, limDok: limDok, cod: cod });
                     // Cykl dobrany po dacie, ktorego kwota nie pasuje — nie jest nasz.
                     // Dopisujemy go do sprawdzonych i szukamy dalej, inaczej przelot po
                     // sklepach wracalby w kolko do tego samego, blednego kandydata.
@@ -76895,7 +77084,7 @@
                         j.msg = (shopName ? ('Sklep ' + shopName + ': ') : '')
                               + 'rozliczenie ' + String(cycIds[0]).slice(0, 8)
                               + ' nie zgadza się z kwotą z wyciągu — szukam dalej.';
-                        mkKandZapisz(j, mkKandydaci(cycles, j).slice(0, 5), shopName,
+                        mkKandZapisz(j, await mkLimKandWyj(j, mkKandydaci(cycles, j).slice(0, 5)), shopName,
                                      String(host || '') + '|' + String(shopId || ''));
                         jobsSave(jobs);
                         continue;
@@ -80630,10 +80819,12 @@
         if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(mkCzasLok(st.zaks)) + '</span>';
         if (st.err)  return '<span style="color:#c00">' + esc(st.err) + '</span>';
         // Allegro: anulowane przed eksportem — brak auftragu i zwrot calej kwoty w tym cyklu to „znosi się" (mkNfBrakAuf).
-        if (st.stan === 'brak' && rv != null && kwota != null && Math.abs(rv - kwota) < 0.005
+        if (st.stan === 'brak' && rv != null && kwota != null && mkZwrotRownyWplacie(kwota, rv, alleDost6(job, ff))
             && mkNfBrakAuf(ff, job) && !mkZwrotWszedl(job, ff))
-            return '<span style="color:#0a7a2f">nie ma auftragu · zwrot w tym cyklu ' + f2(rv) + ' <span style="color:#888">— nic nie księguję</span></span>';
-        if (st.stan === 'brak') return '<span style="color:#c00">nie ma auftragu o tym numerze fulfilmentu</span>';
+            return '<span style="color:#0a7a2f">nie ma auftragu · zwrot w tym cyklu ' + f2(rv) + esc(mkZwrotDost6Opis(kwota, rv))
+                 + ' <span style="color:#888">— nic nie księguję</span></span>';
+        if (st.stan === 'brak') return '<span style="color:#c00">nie ma auftragu o tym numerze fulfilmentu'
+                                     + (rv != null ? (' · zwrot w tym cyklu ' + f2(rv)) : '') + '</span>';
         // Furniture 1: zaden kandydat nie ma numeru fulfilmentu dokladnie rownego Reference — nie ksiegujemy.
         if (st.f1Blokuj) return '<span style="color:#c47f00">' + esc(st.f1Blokuj) + '</span>';
         const k = st.kand || [];
@@ -80696,7 +80887,8 @@
         // Auftrag skasowany. Zwrot w tym samym cyklu znaczy, ze wplata i tak sie znosi
         // i nie ma czego ksiegowac — guzik pokazujemy WYLACZNIE gdy zwrotu nie ma.
         const opis = '<span style="color:#0a7a2f">auftrag ' + lnk(c.num) + ' <b>DELETED</b> · '
-                   + (rv == null ? 'brak zwrotu w tym cyklu' : ('zwrot w tym cyklu ' + f2(rv)))
+                   + (rv == null ? 'brak zwrotu w tym cyklu' : ('zwrot w tym cyklu ' + f2(rv)
+                      + (kwota != null && mkZwrotRownyWplacie(kwota, rv, alleDost6(job, ff)) ? esc(mkZwrotDost6Opis(kwota, rv)) : '')))
                    + '</span>';
         // …chyba ze zwrot JUZ wszedl (auftrag skasowano po nim): wtedy nic sie nie znosi i wplate trzeba zaksiegowac.
         if (rv != null && !mkZwrotWszedl(job, ff)) return opis + ' <span style="color:#888">— nic nie księguję</span>';
@@ -81062,7 +81254,9 @@
                 const a = impNum(x.amount);
                 const dt = impDataWiersza(job, x, nfOrdMap);
                 const rv = (id && refs[id] != null) ? Math.abs(refs[id]) : null;
-                const full = (rv != null && a != null && Math.abs(rv - a) < 0.005);
+                // Allegro: zwrot wiekszy dokladnie o 6 zl odjete od wpłaty za dostawe tez jest pelny (mkZwrotRownyWplacie).
+                const full = (rv != null && a != null && mkZwrotRownyWplacie(a, rv, alleDost6(job, id)));
+                const d6o = full ? mkZwrotDost6Opis(a, rv) : '';
                 const au = impAuction(x);
                 let msg, colr;
                 // „Znosi sie" TYLKO przy auftragu Deleted (ustalenie uzytkownika, 02.10.2026): wtedy nie wchodzi ani
@@ -81091,11 +81285,11 @@
                     msg = 'wyszukiwarka znalazła tylko auftrag z innym numerem fulfilmentu — zobacz obok'; colr = '#c47f00';
                 }
                 else if (full && mkNfDeleted(id, job) && !mkZwrotWszedl(job, id)){
-                    msg = 'auftrag Deleted, a zwrot całej kwoty jest w tym samym rozliczeniu — wpłata i zwrot znoszą się, nic do księgowania';
+                    msg = 'auftrag Deleted, a zwrot całej kwoty jest w tym samym rozliczeniu' + d6o + ' — wpłata i zwrot znoszą się, nic do księgowania';
                     colr = '#0a7a2f';
                 }
                 else if (full && mkNfBrakAuf(id, job) && !mkZwrotWszedl(job, id)){
-                    msg = 'auftragu w prologistics nie ma (zamówienie anulowane), a zwrot całej kwoty jest w tym samym rozliczeniu — '
+                    msg = 'auftragu w prologistics nie ma (zamówienie anulowane), a zwrot całej kwoty jest w tym samym rozliczeniu' + d6o + ' — '
                         + 'wpłata i zwrot znoszą się, nic do księgowania';
                     colr = '#0a7a2f';
                 }
@@ -82325,6 +82519,21 @@
         else return;
         jobsSave(jobs);
     }
+    // Wplaty NOT FOUND, ktore po sprawdzeniu auftragu znosza sie ze zwrotem (16.11.2026): potwierdzamy je tak samo jak przy
+    // otwarciu paczki (mkZnosiPotwierdz — slad „net", Allegro: wpis do arkusza „allegro anulacje"). Do 16.11 lista liczyla
+    // „znosi się" z pamieci strony (impNfZostajeRows) i pozycja znikala z niej, ale potwierdzenia — a z nim wpisu w arkuszu —
+    // nie bylo, dopoki ktos nie otworzyl paczki. Notatka „zostały w paczce" liczy sie od nowa.
+    function mkProbZnosiPotwierdz(p){
+        if (!p || p.err || !p.rows || !p.rows.length) return [];
+        let ids = [];
+        try { ids = mkZnosiPotwierdz(mkKoncJob(jobsLoad(), p).j || p.j, p.rows) || []; }
+        catch (e){ mkLog('notfound', '    (znoszenia z listy „Do wyjaśnienia” nie potwierdziłem: ' + ((e && e.message) || e) + ')'); return []; }
+        if (ids.length){
+            mkLog('notfound', '    paczka ' + p.j.impId + ': wpłaty NOT FOUND zniesione zwrotem (z listy „Do wyjaśnienia”) — ' + ids.join(', '));
+            try { mkProbNotatka(p, p.rows); } catch (e){}
+        }
+        return ids;
+    }
     async function mkProbSkanuj(gotowe, tylkoGdyJest){
         const lista = mkProbPaczki();
         const tol = tolGet();
@@ -82340,6 +82549,8 @@
             pakiety.push({ k: mkKlucz(j), j: j, rows: rows, err: err });
         }
         mkProbPorzadek(pakiety);
+        // Wynik sprawdzenia auftragow (pamiec strony) moze juz rozstrzygac „znosi się" — potwierdzamy przy odczycie listy.
+        pakiety.forEach(function (p){ mkProbZnosiPotwierdz(p); });
         // Zlecenia po porzadkowaniu sladow (probWisi) — lista rysuje sie ze swiezych obiektow.
         const jb = jobsLoad();
         pakiety.forEach(function (p){ const z = mkKoncJob(jb, p).j; if (z) p.j = z; });
@@ -82385,7 +82596,11 @@
         if (!st) return '<span style="color:#6b7280">niesprawdzony — „🔍 sprawdź auftrag" (przycisk obok) szuka go po numerze</span>';
         if (st.zaks) return '✔ zaksięgowane ' + esc(mkCzasLok(st.zaks));
         if (st.err) return esc(st.err);
-        if (st.stan === 'brak') return 'nie ma auftragu o tym numerze fulfilmentu';
+        // Kwota zwrotu przy braku auftragu tez — do 16.11.2026 widac ja bylo tylko przy auftragu Deleted.
+        if (st.stan === 'brak'){
+            const rvB = (j.data && j.data.ref && j.data.ref[ff] != null) ? Math.abs(j.data.ref[ff]) : null;
+            return 'nie ma auftragu o tym numerze fulfilmentu' + (rvB != null ? (' · zwrot w tym cyklu ' + f2(rvB)) : ' · brak zwrotu w tym cyklu');
+        }
         if (st.f1Blokuj) return esc(st.f1Blokuj);
         const k = st.kand || [];
         if (st.stan !== 'sprawdzone' || !k.length) return '<span style="color:#6b7280">sprawdzam…</span>';
@@ -82441,7 +82656,7 @@
             // Zwrot tego zamowienia w tym cyklu, ale NIE na cala wplate (zwrot czesciowy): nie wiadomo, czy wplata ma wejsc
             // na skasowany auftrag — decyzja reczna. Zwrot rowny wplacie, ktory juz wszedl, zostaje na guziku z widoku paczki.
             const rv = (j.data && j.data.ref && j.data.ref[ff] != null) ? Math.abs(j.data.ref[ff]) : null;
-            if (rv != null && rv > 0.005 && Math.abs(rv - kw) > 0.005) return '';
+            if (rv != null && rv > 0.005 && !mkZwrotRownyWplacie(kw, rv, alleDost6(j, ff))) return '';
             pow.push('DELETED');
         } else {
             if (c.open == null) pow.push('open nieznany');
@@ -82786,6 +83001,7 @@
                 g.disabled = true;
                 try { await nfSprawdz(p.j, [ff], null, null); }
                 catch (e){ say('Sprawdzanie auftragu: ' + ((e && e.message) || e), '#c00'); }
+                mkProbZnosiPotwierdz(p);
                 mkProbRysuj();
             };
         });
@@ -82804,7 +83020,7 @@
                     const lista = w.nf.map(nfNumer).filter(function (id, n, a){
                         return id && a.indexOf(id) === n && !mkNfaSlad(p.j)[id] && (!mkNfState[id] || mkNfNieudane(mkNfState[id])) && !mkNfChroniony(mkNfState[id]);
                     });
-                    if (lista.length) await nfSprawdz(p.j, lista, nsa, null);
+                    if (lista.length){ await nfSprawdz(p.j, lista, nsa, null); mkProbZnosiPotwierdz(p); }
                 }
             } catch (e){ say('Sprawdzanie auftragów NOT FOUND: ' + ((e && e.message) || e), '#c00'); }
             mkProbNfSprBieg = false;
@@ -117650,7 +117866,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '4eb13b3 · 16.11.2026 09:44';
+    const HUB_BUDOWA = '53a02bf · 16.11.2026 12:51';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
