@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.11
+// @version      5.63.12
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -23769,26 +23769,62 @@
         // Kolejnosc blokow: nazwany wprost BENEFICIARY, potem biuro, magazyn, fabryka.
         // Blok bez MIASTA pomijamy — nie wnosi tego, po co go czytamy.
         var PC_ADR_GRUPY = ['beneficiary', 'office', 'warehouse', 'factory'];
+        // Wartosc pola adresu z karty, ktora nic nie znaczy: „0", „/", „-", „N/A" (16.11.2026: Willsoon Nr „0",
+        // Minmetals Nr „/", Ding Sheng County „N/A" — wszystko szlo prosto do StrtNm/BldgNb).
+        function pcAdrPole(v){
+            var s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim()
+                .replace(/^["'“”„«»]+|["'“”„«»]+$/g, '').trim();      // cudzyslow z wklejki (Top Grace: „"No.128, …")
+            if (/^(?:0+|[\/\-–—.,;:_]+|n\s*\/?\s*a|none|null|nil|brak|same|the same)$/i.test(s)) return '';
+            return s;
+        }
+        // Pole „City" bywa wypelnione cala reszta adresu: „ANJI COUNTY, HUZHOU CITY, ZHEJIANG" (Guotai),
+        // „Fuzhou, Fujian Province" (Lili 3045), „Futian District," (Sunwell). Miasto to czlon z „City"
+        // (bez tego slowa), a bez niego — pierwszy czlon, ktory nie jest prowincja ani powiatem.
+        // Prowincja idzie do „state" (gdy puste), powiat/dzielnica do „county" (gdy puste).
+        function pcAdrMiasto(city, county, state){
+            var czl = String(city || '').split(/[,;]/).map(function (x){ return x.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+            var out = { city: '', county: county || '', state: state || '' };
+            if (czl.length <= 1){ out.city = (czl[0] || '').replace(/[\s,.;:]+$/, ''); return out; }
+            var zCity = czl.filter(function (x){ return /\s+city$/i.test(x); })[0];
+            czl.forEach(function (x){
+                var n = pbNorm(x).replace(/\s+(?:PROVINCE|SHENG)$/, '');
+                if (zCity && x === zCity){ out.city = x.replace(/\s+city$/i, '').trim(); return; }
+                if (PB_PROV.test(n)){ if (!out.state) out.state = x.replace(/\s+(?:province|sheng)\s*$/i, '').trim(); return; }
+                if (/\b(?:COUNTY|DISTRICT)$/.test(n)){ if (!out.county) out.county = x; else if (!zCity && !out.city) out.city = x; return; }
+                if (!out.city && !zCity) out.city = x;
+            });
+            if (!out.city) out.city = czl[0];
+            return out;
+        }
         function pcSupAdres(html){
             var h = String(html == null ? '' : html), pola = {};
             var re = /name="place_addresses\[([a-z_]+)\]\[(\d+)\]\[([a-z_]+)\]"[^>]*value="([^"]*)"/gi, m;
             while ((m = re.exec(h)) !== null){
                 var g = String(m[1]).toLowerCase();
-                (pola[g] = pola[g] || {})[String(m[3]).toLowerCase()] = pcTxt(m[4]);
+                // Wartosc atrybutu ODKODOWANA (pcAttrDecode) — sam pcTxt nie zna „&#34;" i do 5.63.11
+                // ulica Top Grace szla do pliku jako „&#34, No.128, Xinyuan Road…".
+                (pola[g] = pola[g] || {})[String(m[3]).toLowerCase()] = pcAdrPole(pcTxt(pcAttrDecode(m[4])));
             }
             for (var i = 0; i < PC_ADR_GRUPY.length; i++){
                 var p = pola[PC_ADR_GRUPY[i]];
-                if (!p || !String(p.city || '').trim()) continue;
+                // Miasto musi miec litery: „350100" w polu City (Home Broad, blok office) to kod pocztowy.
+                if (!p || !/[A-Za-z]/.test(String(p.city || ''))) continue;
+                var mc = pcAdrMiasto(p.city, p.county, p.state);
+                var kraj = String(p.country || '').trim();
+                // Powiat rowny krajowi („INDIA" u Lumi Art) albo miastu nic nie wnosi.
+                var powiat = String(mc.county || '').trim();
+                if (powiat && !pbStripCtry(powiat)) powiat = '';         // caly „powiat" to nazwa kraju
+                if (powiat && pbNorm(powiat) === pbNorm(mc.city)) powiat = '';
                 // Ulica z numerem, a przed nia strefa/dzielnica — tak samo, jak stoi
                 // to na kopercie. Puste pola po prostu wypadaja.
                 var ulica = [String(p.street || '').trim(), String(p.house_number || '').trim()]
                             .filter(Boolean).join(' ');
                 var linia = [String(p.zone || '').trim(), ulica,
-                             String(p.county || '').trim(), String(p.state || '').trim()]
+                             powiat, String(mc.state || '').trim()]
                             .filter(Boolean).join(', ');
                 return { grupa: PC_ADR_GRUPY[i], zone: p.zone || '', street: p.street || '',
-                         nr: p.house_number || '', zip: p.zip || '', city: String(p.city).trim(),
-                         county: p.county || '', state: p.state || '', country: p.country || '',
+                         nr: p.house_number || '', zip: p.zip || '', city: mc.city,
+                         county: powiat, state: mc.state || '', country: kraj,
                          linia: linia };
             }
             return null;
@@ -25566,7 +25602,13 @@
             if (ogon) linie.push(ogon);
             return { linie: linie, ucieto: ucieto };
         }
-        function painAdrZn(s){ return pbNorm(s).replace(/\s+/g, ''); }
+        // Postac do porownan czlonow adresu. Skroty sprowadzone do pelnych slow — bez tego „Baishijian Rd."
+        // nie bylo powtorzeniem „Baishijian Road" i ulica Willsoona szla do pliku dwa razy (16.11.2026).
+        var PAIN_ADR_SKROTY = { RD: 'ROAD', ST: 'STREET', STR: 'STREET', AVE: 'AVENUE', AV: 'AVENUE', BLDG: 'BUILDING',
+                                BLD: 'BUILDING', FL: 'FLOOR', RM: 'ROOM', DIST: 'DISTRICT', IND: 'INDUSTRIAL' };
+        function painAdrZn(s){
+            return pbNorm(s).split(' ').map(function (w){ return PAIN_ADR_SKROTY[w] || w; }).join('');
+        }
         function painAdrRe(s){ return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'); }
         // Czlony po kolei, rozdzielone przecinkiem. Czlon, ktory juz stoi w tekscie (ulica „Aimin" w strefie
         // „…Aimin Road 159…"), nie wchodzi drugi raz. Pierwszy czlon dluzszy niz 70 znakow tniemy na granicy
@@ -25609,24 +25651,99 @@
                 if (!pbStripCtry(x)) return false;                 // sam kraj
                 return !zbedne[painAdrZn(x)];
             });
-            var ulica = String(k.street || '').trim(), nr = String(k.nr || '').trim(), bldg = '';
+            var ulica = String(k.street || '').trim(), nr = String(k.nr || '').trim(), bldg = '', nrDoUlicy = '';
             if (nr){
-                var juz = new RegExp('(^|[^0-9A-Za-z])' + painAdrRe(nr) + '(?![0-9A-Za-z])', 'i').test(strefa.join(' ') + ' ' + ulica);
+                var tlo = strefa.join(' ') + ' ' + ulica;
+                var juz = new RegExp('(^|[^0-9A-Za-z])' + painAdrRe(nr) + '(?![0-9A-Za-z])', 'i').test(tlo);
+                // „NO.88" przy strefie „…BLDG.NO.:88…" (Futian) — inny zapis tego samego numeru. Porownanie
+                // bez znakow, ale tylko dla numeru z litera i min. 3 znakami, zeby „1" nie trafialo wszedzie.
+                var nz = painAdrZn(nr);
+                if (!juz && nz.length >= 3 && /[A-Z]/.test(nz) && /\d/.test(nz) && painAdrZn(tlo).indexOf(nz) >= 0) juz = true;
                 if (!juz){
                     if (painChars(nr).txt.length <= PAIN_BLDG_MAX) bldg = nr;
-                    else ulica = (ulica ? ulica + ' ' : '') + nr;
+                    else nrDoUlicy = nr;          // za dlugi na BldgNb — idzie do StrtNm osobnymi czlonami
                 }
             }
-            var sk = painAdrSklej(strefa.concat([ulica, String(k.county || '').trim()]));
+            // Ulica i dlugi numer dzielone po przecinkach jak strefa — „DONGDA ROAD, 5FL,Jianmin BLDG" (Futian)
+            // to trzy czlony, z ktorych kazdy stoi juz w strefie; caly napis naraz nie byl jej fragmentem.
+            function czl(s){ return String(s || '').split(/[,;\n]/).map(function (x){ return x.trim(); }).filter(Boolean); }
+            var sk = painAdrSklej(strefa.concat(czl(ulica), czl(nrDoUlicy), [String(k.county || '').trim()]));
             return { street: sk.txt, bldg: bldg, pstCd: String(k.zip || '').trim(), sub: stan, ucieto: sk.ucieto, src: 'karta' };
         }
         // Adres z TEKSTU (blok bankowy P/I) -> StrtNm + PstCd + CtrySubDvsn. Miasto i kraj ida osobno (TwnNm, Ctry),
         // wiec z tekstu znikaja — miasto razem z doklejonym „City", inaczej z „Langfang City" zostaje sierota „City".
         // Kod pocztowy bierzemy, gdy w tekscie stoi DOKLADNIE jeden w ksztalcie kodu danego kraju.
         var PAIN_PNA_RE = { CN: /\b\d{6}\b/g, IN: /\b\d{3}\s?\d{3}\b/g, VN: /\b\d{6}\b/g, SG: /\b\d{6}\b/g, TR: /\b\d{5}\b/g,
-                            TH: /\b\d{5}\b/g, MY: /\b\d{5}\b/g, ID: /\b\d{5}\b/g, PK: /\b\d{5}\b/g, KR: /\b\d{5}\b/g };
+                            TH: /\b\d{5}\b/g, MY: /\b\d{5}\b/g, ID: /\b\d{5}\b/g, PK: /\b\d{5}\b/g, KR: /\b\d{5}\b/g,
+                            GB: /\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b/g };
+        /* ===== Adres beneficjenta: karta czy P/I (16.11.2026) =====
+           Do 5.63.11 adres z karty mial bezwzgledne pierwszenstwo, a karta bez bloku „beneficiary" dawala
+           pierwszy blok z miastem — office, magazyn, fabryka. To czesto adres INNEJ firmy niz beneficjent:
+           Atlas (UK, konto Wise) dostawal biuro w Shenzhen i kraj CN, HK Home Fashion — biuro Gstar w Foshan,
+           Sunwell (HK, konto NRA) — Shenzhen, Minmetals — fabryke Sanda, Bazhou Dashi — biuro Hebei Lejiang.
+           Teraz: blok „beneficiary" z KTOREJKOLWIEK karty grupy (Fujian Lili: dwie karty, blok tylko na 3045);
+           inny blok karty tylko wtedy, gdy opisuje to samo miejsce co „BENEFICIARY'S ADDRESS" z P/I;
+           inaczej adres z P/I (i ostrzezenie, zeby uzupelnic karte). */
+        var PAIN_ADR_OGOLNE = /^(?:ROAD|STREET|AVENUE|LANE|DISTRICT|CITY|COUNTY|PROVINCE|SHENG|TOWN|VILLAGE|ZONE|PARK|INDUSTRIAL|INDUSTRY|BUILDING|FLOOR|ROOM|UNIT|AREA|CHINA|NORTH|SOUTH|EAST|WEST|MIDDLE|CENTRAL|ECONOMIC|DEVELOPMENT|TECHNOLOGICAL|TECHNOLOGY|BLOCK|PLAZA|CENTER|CENTRE|TOWER|COMMUNITY|NEAR|SECTION|PART|SECTOR|PLOT|HOUSE|BRANCH|NUMBER)$/;
+        function painAdrSlowa(s, pomin){
+            var out = [];
+            pbNorm(s).split(' ').forEach(function (w){
+                w = PAIN_ADR_SKROTY[w] || w;
+                if (!w || pomin[w]) return;
+                if (/^\d+$/.test(w)){ if (w.length >= 2 && w.length <= 5) out.push(w); return; }   // numery domow; kody pocztowe nie
+                if (w.length < 4 || PAIN_ADR_OGOLNE.test(w)) return;
+                out.push(w);
+            });
+            return out;
+        }
+        // -> true (to samo miejsce), false (inne), null (nie ma z czym porownac)
+        function painAdrTenSam(kartaA, piAddr){
+            if (!kartaA || !String(piAddr || '').trim()) return null;
+            var pomin = {};
+            [kartaA.city, kartaA.county, kartaA.state, kartaA.country].forEach(function (x){ pbNorm(x).split(' ').forEach(function (w){ if (w) pomin[w] = 1; }); });
+            var k = painAdrSlowa([kartaA.zone, kartaA.street, kartaA.nr].join(' '), pomin);
+            if (!k.length) return null;
+            var piS = ' ' + pbNorm(piAddr).split(' ').map(function (w){ return PAIN_ADR_SKROTY[w] || w; }).join(' ') + ' ';
+            var zwarty = piS.replace(/ /g, '');
+            var traf = k.filter(function (w){ return piS.indexOf(' ' + w + ' ') >= 0 || (w.length >= 5 && zwarty.indexOf(w) >= 0); });
+            return traf.length * 2 >= k.length;
+        }
+        // -> { kartaA, adrPI, inny }: kartaA — blok karty do pliku (null = adres z tekstu P/I),
+        //    inny — blok karty odrzucony, bo to inny adres niz na P/I (do ostrzezenia).
+        function painAdrWybierz(G, b){
+            var ben = null, pierwszy = null;
+            pcKartyGrupy(G).forEach(function (c){
+                var a = pcAdrOf(c);
+                if (!a) return;
+                if (!pierwszy) pierwszy = a;
+                if (!ben && a.grupa === 'beneficiary') ben = a;
+            });
+            if (ben) return { kartaA: ben, adrPI: false, inny: null };
+            if (pierwszy && painAdrTenSam(pierwszy, b && b.addr) === false) return { kartaA: null, adrPI: true, inny: pierwszy };
+            return { kartaA: pierwszy, adrPI: false, inny: null };
+        }
+        // Miasto i kraj z tekstu adresu P/I. To samo co piBankGeo, plus:
+        //  * Hongkong: „…, Hong Kong, China" to kraj HK, nie CN (ostatnie slowo wygrywalo w pbFindCtry);
+        //  * miasto-panstwo (HK, SG, MO) — miastem jest nazwa kraju, a nie „Unit1003" z pierwszego czlonu;
+        //  * kod pocztowy zdejmowany przed szukaniem miasta (Atlas: „Maldon Essex England CM98LZ");
+        //  * „Bazhou City Langfang City" — miastem jest pierwszy czlon z „City".
+        function painGeoZPI(b){
+            var g = piBankGeo(b), addr = String((b && b.addr) || '');
+            var t = ' ' + pbNorm(addr) + ' ';
+            if (/ HONG ?KONG | HK /.test(t)) { g.ctry = 'HK'; g.src = 'addr'; g.weak = false; }
+            if (PB_CITYSTATE[g.ctry]) { g.town = PB_CITYSTATE[g.ctry] === 'HONG KONG' ? 'Hong Kong' : PB_CITYSTATE[g.ctry].charAt(0) + PB_CITYSTATE[g.ctry].slice(1).toLowerCase(); return g; }
+            var re = PAIN_PNA_RE[g.ctry];
+            if (re){
+                var a2 = pbStripCtry(addr.replace(/\s*\n\s*/g, ', ')), tr = a2.toUpperCase().match(re) || [];
+                if (tr.length === 1){ var ix = a2.toUpperCase().indexOf(tr[0]); a2 = a2.slice(0, ix) + ' ' + a2.slice(ix + tr[0].length); g.town = pbTown(a2); }
+            }
+            var m = String(g.town || '').match(/^(.+?)\s+city\s+\S/i);
+            if (m) g.town = m[1].trim();
+            return g;
+        }
         function painAdrZTekstu(addr, town, ctry){
-            var t = pbStripCtry(String(addr == null ? '' : addr).replace(/\s*\n\s*/g, ', '));
+            // „ADD.: 10C, INTERNATIONAL BUILDING…" (Minmetals) — podpis pola przyklejony do wartosci.
+            var t = pbStripCtry(String(addr == null ? '' : addr).replace(/\s*\n\s*/g, ', ').replace(/^\s*(?:add|addr|address)\s*[.:]+\s*/i, ''));
             var re = PAIN_PNA_RE[String(ctry || '').toUpperCase()], pst = '', sub = '';
             if (re){
                 var tr = t.match(re) || [];
@@ -26061,9 +26178,12 @@
         }
         function painAccSrcTxt(r){
             if (r.accSrc === 'reczne') return 'wpisane ręcznie w oknie przelewów';
-            if (r.accSrc === 'pi') return 'z P/I depozytu';
+            // Wybrany zapis numeru (↹) z innego zrodla niz regula — rachunek ten sam, ale do pliku idzie ten zapis.
+            // Do 5.63.11 pod polem stalo samo „z karty dostawcy (balance)", choc w polu i w pliku byl zapis z P/I.
+            var zap = (r.accWarSrc && r.accWarSrc !== r.accSrc) ? (', zapis numeru: ' + (PAIN_WAR_SRC[r.accWarSrc] || r.accWarSrc) + ' (wybrany ↹)') : '';
+            if (r.accSrc === 'pi') return 'z P/I depozytu' + zap;
             var skad = r.accSrc === 'naglowek' ? 'z nagłówka dostawcy (poprawka ręczna)' : 'z karty dostawcy';
-            return r.accSrcWhy ? (skad + ' — P/I depozytu nie dało numeru') : (skad + (r.zrodlo === 'bal' ? ' (balance)' : ''));
+            return (r.accSrcWhy ? (skad + ' — P/I depozytu nie dało numeru') : (skad + (r.zrodlo === 'bal' ? ' (balance)' : ''))) + zap;
         }
         // Jeden wiersz = jeden przelew (jeden dostawca). Poprawki reczne trzymamy w state.painEdit[key].
         // Skad wzieta jest platnosc: laczona (depozyt + balance), sam depozyt albo sam balance.
@@ -26114,9 +26234,12 @@
                 // Przy koncie wpisanym recznie w oknie przelewow — jak dotad bez uwagi (decyzja czlowieka).
                 var blokInne = accSrc !== 'reczne' && b.acc && accV && !accTenSam(b.acc, accV)
                     && !(ed.bic != null && String(ed.bic) !== '') ? String(b.acc) : '';
-                // Adres z KARTY DOSTAWCY ma pierwszenstwo przed wyprowadzaniem z P/I:
-                // tam miasto stoi w osobnym polu i nie trzeba go zgadywac.
-                var kartaA = pcAdrOf(G.cid);
+                // Adres z KARTY DOSTAWCY ma pierwszenstwo przed wyprowadzaniem z P/I (tam miasto stoi
+                // w osobnym polu i nie trzeba go zgadywac) — ale tylko blok beneficjenta albo blok, ktory
+                // opisuje to samo miejsce co adres beneficjenta z P/I (painAdrWybierz, 16.11.2026).
+                var adrWyb = painAdrWybierz(G, b);
+                var kartaA = adrWyb.kartaA;
+                if (!kartaA) geo = painGeoZPI(b);
                 var karta = kartaA ? {
                     town: kartaA.city,
                     ctry: pbFindCtry(kartaA.country) || pbFindCtry(kartaA.city) || '',
@@ -26153,6 +26276,9 @@
                     if (_cf && (_cf.st === 'chg' || _cf.st === 'old') && !(poprzW && poprzW.suppressChg)) kontoChg = _cf.st;
                 }
                 var hintBad = !!(hint && hint.accs && hint.accs.length && !pcHintMatches(hint, accV));
+                // Balans, ktory wyglada na juz zaplacony (pcJuzZaplacone) — na poczatek listy powodow, jak rozjazd konta.
+                var juzZapl = (G.bal || []).length ? pcJuzZaplacone(G) : [];
+                if (juzZapl.length) st.why = ['balans wygląda na już zapłacony — ' + pcJuzZaplaconeTxt(juzZapl)].concat(st.why || []);
                 // Rozjazd z komentarzem idzie na POCZATEK listy powodow — to on ma byc widoczny
                 // w dymku statusu i w ostrzezeniach, a nie ginac pod uwagami o P/I.
                 if (hintBad) st.why = ['komentarz z ' + (hint.date || '?') + (hint.author ? ' (' + hint.author + ')' : '')
@@ -26168,7 +26294,7 @@
                 });
                 ordy.sort(function (a, b){ return Number(a) - Number(b); });
                 out.push({
-                    acctHint: hint, acctHintBad: hintBad,
+                    acctHint: hint, acctHintBad: hintBad, juzZapl: juzZapl,
                     orders: ordy,
                     key: G.key, gi: i, sup: G.sup, korzen: G.korzen || G.key,
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
@@ -26201,6 +26327,9 @@
                     pstCd: pstV, pna: pnaV, sub: subV,
                     adrUcieto: (ed.street != null && String(ed.street) !== '') ? [] : (adrS.ucieto || []),
                     adrSrc: adrS.src || '',
+                    // Blok karty odrzucony, bo to inny adres niz beneficjent z P/I — do ostrzezenia.
+                    adrInny: (!kartaA && adrWyb.inny && !(ed.street != null && String(ed.street) !== ''))
+                        ? { grupa: adrWyb.inny.grupa, linia: [adrWyb.inny.linia, adrWyb.inny.zip, adrWyb.inny.city].filter(Boolean).join(', ') } : null,
                     infoUwaga: dsInfoOAdresie(pcInfoG(G)), infoPelny: dsInfoTekst(pcInfoG(G)),
                     adrKarta: karta ? kartaA.grupa : '',
                     bankName: String(V('bankName', b.bankName || '')), bankAddr: b.bankAddr || '',
@@ -26220,7 +26349,7 @@
                     hasBank: bk.n > 0, bankWhy: bk.why || '', conflict: bk.conflict, nBank: bk.n,
                     czescBank: !!bk.czesciowy || !!wb.czesciowy,
                     bicSrc: wb.bicSrc || (wb.b === bk.bank ? (bk.bicSrc || '') : ''),
-                    verified: st.ok && !hintBad, why: st.why,
+                    verified: st.ok && !hintBad && !juzZapl.length, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
                     sumDep: ds || 0, sumBal: bs || 0, zrodlo: W.zr,
                     e2e: painFirstOrder(G)
@@ -26280,7 +26409,9 @@
             if (accOut.length > 34) errs.push('numer konta ma ' + accOut.length
                 + ' znaków, a do pain.001 wchodzi najwyżej 34 — popraw zapis konta.');
             if (!painBicOk(r.bic)) errs.push('BIC „' + r.bic + '” niepoprawny.');
-            if (r.acctHintBad) warns.push('⛔ ' + (r.why[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
+            if (r.acctHintBad) warns.push('⛔ ' + (r.why.filter(function (w){ return /^komentarz z /.test(w); })[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
+            if (r.juzZapl && r.juzZapl.length) warns.push('⛔ balans wygląda na JUŻ ZAPŁACONY: ' + pcJuzZaplaconeTxt(r.juzZapl)
+                + ' — nie wysyłaj, dopóki nie sprawdzisz, że to inna płatność (usuń wiersz 🗑, jeśli to ten sam balans).');
             if (!painTxt(r.town, 35, strict)) errs.push(ustr ? 'brak miasta beneficjenta — w adresie niestrukturalnym stoi w drugiej linii AdrLine; bez niego adres jest niepełny.'
                                                              : 'brak miasta beneficjenta — TwnNm jest obowiązkowe w adresie strukturalnym (PostFinance od 14.11.2026).');
             if (!/^[A-Z]{2}$/.test(r.ctry)) errs.push(ustr ? 'brak kraju beneficjenta — Ctry idzie do pliku także w adresie niestrukturalnym.'
@@ -26294,6 +26425,9 @@
             }
             else if (strT.length > PAIN_STR_MAX) errs.push('ulica (StrtNm) ma ' + strT.length + ' znaków, a wchodzi najwyżej ' + PAIN_STR_MAX + ' — skróć ją w polu „Ulica”.');
             if (!strT) warns.push('brak ulicy — do banku pójdą tylko ' + (r.pna && r.pna.doPliku ? 'kod, ' : '') + 'miasto i kraj; uzupełnij pole „Ulica” albo adres beneficjenta na karcie dostawcy.');
+            if (r.adrInny) warns.push('adres beneficjenta wziąłem z P/I — karta dostawcy nie ma bloku „beneficiary”, a jej blok „'
+                + r.adrInny.grupa + '” to inny adres („' + String(r.adrInny.linia).slice(0, 120) + '”). Sprawdź ulicę, miasto i kraj'
+                + ' w polach wiersza, a na karcie uzupełnij adres beneficjenta.');
             if (!ustr && painChars(r.bldg, strict).txt.length > PAIN_BLDG_MAX) errs.push('numer budynku (BldgNb) ma ponad ' + PAIN_BLDG_MAX + ' znaków — przenieś go do pola „Ulica”.');
             if (!ustr && painChars(r.sub, strict).txt.length > 35) errs.push('prowincja (CtrySubDvsn) ma ponad 35 znaków — skróć ją.');
             if (r.adrUcieto && r.adrUcieto.length) warns.push('adres dłuższy niż ' + PAIN_STR_MAX + ' znaków — do pliku nie weszło: „'
@@ -29948,7 +30082,7 @@
                        + (ag.zazn !== ag.n ? ('<span style="color:#c47f00"> · zaznaczonych ' + ag.zazn + '</span>') : '')
                        + '</span></td></tr>';
                 }
-                if (r.acctHintBad) bg = on ? '#FDECEC' : '#FFF5F5';
+                if (r.acctHintBad || (r.juzZapl && r.juzZapl.length)) bg = on ? '#FDECEC' : '#FFF5F5';
                 // Zielone znaczy: BEZ ZADNEJ UWAGI, mozna isc do przelewu. Samo
                 // „dostawca sprawdzony" nie wystarcza — wiersz z pustym miastem
                 // beneficjenta stal na zielono, a pliku z niego nie da sie zlozyc.
@@ -29975,10 +30109,12 @@
                 // Rozjazd z komentarzem stoi NAD reszta statusu — to jedyna uwaga, ktora moze
                 // skonczyc sie wyslaniem pieniedzy pod zly numer.
                 if (r.acctHintBad) st = '<span style="color:#a10000;font-weight:700" title="' + pcAttr(r.why[0] || '') + '">⛔ komentarz: konto ' + esc(r.acctHint.accs.join(' / ')) + (r.acctHint.old ? ' (STARE)' : '') + '</span><br>' + st;
+                if (r.juzZapl && r.juzZapl.length) st = '<span style="color:#a10000;font-weight:700" title="' + pcAttr(pcJuzZaplaconeTxt(r.juzZapl)) + '">⛔ balans już zapłacony?</span><br>' + st;
                 if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
                 // Skad wziety adres — zeby nie trzeba bylo zgadywac, czemu miasto jest
                 // takie, a nie inne. „karta" znaczy: rozpisane pola z karty dostawcy.
                 if (r.adrKarta) st += ' <span style="color:#0a7a2f" title="Miasto i adres wzięte z karty dostawcy (blok „' + pcAttr(r.adrKarta) + '”) — pola rozpisane, bez zgadywania">(adres: karta)</span>';
+                else if (r.adrSrc === 'pi') st += ' <span style="color:#c47f00" title="' + pcAttr('Adres beneficjenta z P/I (tekst rozpisany na pola)' + (r.adrInny ? ' — blok „' + r.adrInny.grupa + '” karty to inny adres: ' + r.adrInny.linia : '')) + '">(adres: P/I)</span>';
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top"><input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '></td>'
@@ -30092,6 +30228,20 @@
                 chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chFrom = ''; out.chTo = '';
                 out.chSrc = chg.src || 'komentarz'; out.chText = chg.text || '';
             }
+            // Komentarz z numerem konta STARSZY niz pozniejsza zmiana danych bankowych albo nowsze potwierdzenie
+            // konta jest nieaktualny. Stallion 18957 (16.11.2026): komentarz z 2023 „Nisheel Creations ICICI
+            // A/c 017405502586", a bank zmieniony 03.07.2026 i potwierdzony TOMATO 27.07.2026 — HUB dawal ⛔
+            // i odznaczal wiersz. Taki komentarz nie znika: idzie do out.hintStary (szara plakietka), ale nie
+            // alarmuje. Komentarz NOWSZY od zmiany i potwierdzenia dalej dziala jak dotad.
+            if (hint && isFinite(hint.ts)){
+                var hZm = isFinite(chTs) && pcNewer(chTs, hint.ts);
+                var hPotw = !!(conf && pcNewer(conf.ts, hint.ts));
+                if (hZm || hPotw){
+                    out.hintStary = { h: hint, why: hZm ? ('późniejsza zmiana danych bankowych (' + (out.chDate || '?') + ')')
+                                                       : ('późniejsze potwierdzenie konta (' + (conf.date || '?') + ')') };
+                    out.hint = null;
+                }
+            }
             // DEPO wymaga potwierdzenia konta — to pierwszy przelew do tego dostawcy w tej
             // sprawie. BALANCE juz nie: skoro depozyt na to konto przeszedl, konto jest
             // sprawdzone w praktyce. Przy samym balance patrzymy WYLACZNIE na to, czy numer
@@ -30144,6 +30294,12 @@
         // „gdzie te pieniadze faktycznie maja pojsc".
         function pcHintBadge(cf, accUsed){
             var h = cf && cf.hint;
+            var hs = cf && cf.hintStary && cf.hintStary.h;
+            if ((!h || !h.accs || !h.accs.length) && hs && hs.accs && hs.accs.length && !pcHintMatches(hs, accUsed))
+                return pcConfPill('komentarz z innym kontem — nieaktualny', '#888',
+                    'Komentarz z ' + (hs.date || '?') + (hs.author ? ' (' + hs.author + ')' : '') + (hs.src ? ' [' + hs.src + ']' : '')
+                    + ' wskazuje konto: ' + hs.accs.join(', ') + '\n\n„' + (hs.text || '') + '"'
+                    + '\n\nNie alarmuję: po nim jest ' + cf.hintStary.why + '.\nPrzelew jest złożony na konto: ' + (accUsed || '—'));
             if (!h || !h.accs || !h.accs.length) return '';
             var zgodne = pcHintMatches(h, accUsed);
             var opis = 'Komentarz z ' + (h.date || '?') + (h.author ? ' (' + h.author + ')' : '') + (h.src ? ' [' + h.src + ']' : '')
@@ -30170,6 +30326,45 @@
                 if (p && p.dzien && (!best || p.dzien > best.dzien)) best = p;
             });
             return best;
+        }
+        /* ===== Balans juz zaplacony? (16.11.2026) =====
+           Yancheng 20078: balans 33 930,40 (HDMU4960402) zaplacony 13.11 — kwota w komentarzu, potwierdzenie
+           przelewu, „ok" — a 16.11 znowu na liscie. „Poprzedni przelew" wzial potwierdzenie tego BALANSU za
+           depozyt i pokazal zielone „✓ konto = depozyt". Ostatnie potwierdzenie zamowienia, ktorego tytul
+           wymienia TO zamowienie i KONTENER wiersza, to zaplata tego samego balansu. Kontener porownujemy
+           po cyfrach — w tytule bywa bez przedrostka (HDMU/MAGU wycina pcContForTitle).
+           Depozyt (bez kontenera) i laczony przelew innego kontenera tego nie zapalaja. */
+        function pcTytulOrdery(t){
+            var s = String(t == null ? '' : t), out = {}, m, re = /(^|[^0-9])(\d{4,6})\s*-\s*(\d{4,6})(?![0-9])/g;
+            while ((m = re.exec(s)) !== null){
+                var a = +m[2], z = +m[3];
+                if (z >= a && z - a <= 200) for (var x = a; x <= z; x++) out[String(x)] = 1;
+            }
+            (s.match(/(^|[^0-9])\d{4,6}(?![0-9])/g) || []).forEach(function (x){ out[x.replace(/\D/g, '')] = 1; });
+            return out;
+        }
+        function pcJuzZaplacone(G){
+            var out = [];
+            (G && G.bal || []).forEach(function (r){
+                var p = _poprz[String(r && r.order)];
+                if (!p || p.blad) return;
+                var txt = String(p.tytul || '') + ' ' + String(p.plik || '');
+                var cont = String((r && r.container) || '').toUpperCase().match(/[A-Z]{4}\s?\d{7}/g) || [];
+                var traf = cont.filter(function (c){
+                    return new RegExp('(^|[^0-9])' + c.replace(/\D/g, '') + '(?![0-9])').test(txt);
+                });
+                if (!traf.length || !pcTytulOrdery(txt)[String(r.order)]) return;
+                out.push({ order: String(r.order), cont: traf.join(', '), dzien: p.dzien || '', plik: p.plik || '',
+                           tytul: p.tytul || '', kwota: p.kwota });
+            });
+            return out;
+        }
+        function pcJuzZaplaconeTxt(lst){
+            return (lst || []).map(function (z){
+                return 'zamówienie ' + z.order + ' (' + z.cont + ') — potwierdzenie z ' + (z.dzien || '?')
+                    + (z.kwota != null && isFinite(z.kwota) ? ', ' + Number(z.kwota).toFixed(2) : '')
+                    + ': „' + (z.tytul || z.plik || '') + '”';
+            }).join('; ');
         }
         // -> { lv: 'ok'|'info'|'warn'|'brak', txt, suppressChg }
         function pcPoprzWerdykt(poprz, accPay, cf){
@@ -30222,6 +30417,11 @@
         // Plakietka w naglowku grupy: konto balance wobec poprzedniego przelewu (depozytu).
         function pcPoprzBadge(G, accUsed){
             if (!G || !(G.bal || []).length) return '';
+            var juz = pcJuzZaplacone(G);
+            if (juz.length) return pcConfPill('⛔ balans już zapłacony?', '#a10000',
+                'Ostatnie potwierdzenie przelewu w zamówieniu wymienia to zamówienie i ten sam kontener:\n'
+                + pcJuzZaplaconeTxt(juz).split('; ').join('\n')
+                + '\n\nTo wygląda na zapłatę TEGO SAMEGO balansu. Sprawdź, zanim wyślesz — wiersz w oknie przelewów ma ⛔.');
             var poprz = pcPoprzDlaGrupy(G);
             if (!poprz) return '';
             var w = pcPoprzWerdykt(poprz, accUsed, pcConfEval(G));
@@ -30435,6 +30635,7 @@
             var reczne = !!(state.pcAccEdit && state.pcAccEdit[G.key] != null);
             var accShown = reczne ? state.pcAccEdit[G.key] : (G.cid ? (_acc[G.cid] || '') : '');
             if (cf && cf.hint && cf.hint.accs && cf.hint.accs.length && !pcHintMatches(cf.hint, accShown)) why.push('komentarz wskazuje inne konto');
+            if ((G.bal || []).length && pcJuzZaplacone(G).length) why.push('balans wygląda na już zapłacony');
             var cz = G.cid ? _accCz[G.cid] : null;
             if (cz && !cz.czytelne && !reczne) why.push('dopisek w numerze konta');
             G.dep.concat(G.bal).forEach(function (r){ if (r._odsw && r._odsw.blad) why.push(r.order + ': nie odświeżono'); });
@@ -31537,6 +31738,10 @@
             // Czytelny numer: kazde slowo niesie cyfre i sklada sie z cyfr i separatorow
             // („809-048630-838"); litery tylko w ksztalcie IBAN-u, zwartym albo grupami
             // („DE35 7935 …", „BR86…C1"). Litery gdzie indziej („1234567890USD") to dopisek.
+            // Konto NRA (Non-Resident Account w Chinach) — przedrostek „NRA" jest CZESCIA numeru, nie dopiskiem.
+            // Depozyty Sunwell (24.07.2026) i Minmetals (18.05.2026) poszly z „NRA…", a recznie poprawiony plik
+            // z 06.11 (KISSOFA) ma <Id>NRA7220038747</Id>. Do 5.63.11 HUB blokowal plik i proponowal numer bez NRA.
+            if (/^NRA[\s\-]?\d[\d\s.\/\-–—]{5,}\d$/i.test(s)){ out.acc = 'NRA' + s.slice(3).replace(/^[\s\-]+/, ''); return out; }
             var slowa = s ? s.split(' ') : [], zwarty = s.replace(/[\s.\/\-–—]+/g, '');
             var ksztIban = /^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/i.test(zwarty);
             if (slowa.length && slowa.every(function(w){ return /\d/.test(w) && /^[A-Za-z0-9.\/\-–—]+$/.test(w); })
@@ -36375,6 +36580,8 @@
                 return out;
             }
             out.doPliku = k;
+            // Kod brytyjski ma spacje przed ostatnimi trzema znakami („CM9 8LZ") — tak go pisze poczta i bank.
+            if (cc === 'GB') out.doPliku = k.toUpperCase().replace(/^(.+)(\d[A-Z]{2})$/, '$1 $2');
             var p = cc === 'CN' ? pnaCn(k, town, sub) : cc === 'IN' ? pnaIn(k, town, sub) : null;
             if (p){ out.ok = p.ok; out.txt = p.txt; out.opis = p.opis; }
             return out;
@@ -55106,6 +55313,18 @@
     //
     // Stawki NIE wpisujemy na sztywno — wyprowadzamy ja z danych i sprawdzamy na kazdym
     // wierszu, bo inny miesiac moze miec inna, a rozne kategorie moga miec rozne.
+    //
+    // ZWROT Z POLOWA PROWIZJI (13.11.2026). Przy srednim odsetku zwrotow Brico Bravo nie oddaje
+    // calej prowizji od zwrotu ani nie zatrzymuje jej calej, tylko POLOWE: wiersz zwrotu
+    // („Rimborsato", „Rimborsato parz.") ma prowizje −6,75% zamiast −13,5%, a „Rimborsato
+    // (non evaso)" ma +6,75%. Zmierzone na 7 zestawieniach 04–10.2026 z ich fakturami:
+    // pol stawki w czerwcu, maju, sierpniu i pazdzierniku, pelna albo zero w kwietniu, lipcu
+    // i wrzesniu. Faktura liczy wtedy prowizje od sumy tak samo, tylko wiersz z polowa wchodzi
+    // do podstawy POLOWA kwoty (pazdziernik: 13,5% × 15105,585 = 2039,25 = „Fees" fattura 1/2682,
+    // a suma zaokraglonych z arkusza 2039,17). Do 13.11.2026 HUB bral taki miesiac za „rozne stawki"
+    // i wstrzymywal import, chociaz przelew zgadzal sie z faktura co do grosza.
+    // Polowa wolno tylko przy wierszu ujemnym (zwrot / non evaso). Sprzedaz z inna stawka dalej
+    // blokuje — to by byla naprawde inna kategoria albo inna umowa.
     function bbProcent(kwota, stawka){
         // Na liczbach calkowitych (grosze × setne punktu procentowego), zeby zaokraglenie
         // „pol grosza w gore" nie zalezalo od zapisu binarnego ulamka.
@@ -55113,28 +55332,47 @@
         const w = Math.floor((gr * pb + 5000) / 10000) / 100;
         return (kwota < 0) ? -w : w;
     }
+    // Polowa stawki od kwoty, tez na liczbach calkowitych (stawka 13,5% → 6,75%, ale przy
+    // stawce o czterech miejscach polowa miewa piec — dlatego nie bbProcent(kwota, stawka / 2)).
+    function bbProcentPol(kwota, stawka){
+        const gr = Math.round(Math.abs(kwota) * 100), pb = Math.round(stawka * 10000);
+        return Math.floor((gr * pb + 10000) / 20000) / 100;
+    }
     function bbLicz(p){
         const s = p.sumy || {};
         // Stawka z wiersza o najwiekszej kwocie — tam zaokraglenie przeklamuje ja najmniej.
-        let wz = null;
+        // Bierzemy ja ze SPRZEDAZY (kwota i prowizja dodatnie): zwrot i non evaso bywaja
+        // z polowa stawki, wiec z nich wyszlaby stawka o polowe za niska.
+        let wz = null, wzSprz = null;
         p.poz.forEach(function (x){
             if (!x.kwota || !x.prow) return;
             if (!wz || Math.abs(x.kwota) > Math.abs(wz.kwota)) wz = x;
+            if (x.kwota > 0 && x.prow > 0 && (!wzSprz || x.kwota > wzSprz.kwota)) wzSprz = x;
         });
+        if (wzSprz) wz = wzSprz;
         // Zaokraglamy do czwartego miejsca: 13.5% zapisane jako 0.13499998 to ta sama stawka.
         const stawka = wz ? Math.round(Math.abs(wz.prow) / Math.abs(wz.kwota) * 10000) / 10000 : null;
-        // Kazdy wiersz z prowizja musi miec prowizje = jego kwota × stawka, zaokraglone (grosz
-        // zapasu na inny sposob zaokraglania). Przy rozjezdzie stawek nie mamy prawa liczyc
-        // prowizji „od sumy" — zostaje suma zaokraglonych z arkusza.
-        let zgodna = true, baza = 0, nProw = 0;
+        // Kazdy wiersz z prowizja musi miec prowizje = jego kwota × stawka (wiersz ujemny: albo
+        // × polowa stawki), zaokraglone (grosz zapasu na inny sposob zaokraglania). Przy rozjezdzie
+        // stawek nie mamy prawa liczyc prowizji „od sumy" — zostaje suma zaokraglonych z arkusza.
+        // Podstawe trzymamy w POLGROSZACH (pol kwoty wiersza z polowa stawki bywa pol grosza).
+        let zgodna = true, pol2 = 0, nProw = 0, nPol = 0;
         p.poz.forEach(function (x){
             if (!x.prow) return;
             nProw++;
-            baza = r2(baza + (x.prow > 0 ? 1 : -1) * Math.abs(x.kwota));
-            if (stawka !== null && Math.abs(Math.abs(x.prow) - bbProcent(Math.abs(x.kwota), stawka)) > 0.0101)
-                zgodna = false;
+            const gr = Math.round(Math.abs(x.kwota) * 100);
+            let ile = 2;   // ile polowek kwoty wchodzi do podstawy
+            if (stawka !== null && Math.abs(Math.abs(x.prow) - bbProcent(Math.abs(x.kwota), stawka)) > 0.0101){
+                if (x.kwota < 0 && Math.abs(Math.abs(x.prow) - bbProcentPol(x.kwota, stawka)) <= 0.0101){
+                    ile = 1; nPol++;
+                } else zgodna = false;
+            }
+            pol2 += (x.prow > 0 ? 1 : -1) * ile * gr;
         });
-        const prowOdSumy = (stawka !== null && zgodna) ? bbProcent(baza, stawka) : null;
+        const baza = pol2 / 200;
+        const prowOdSumy = (stawka !== null && zgodna)
+            ? (pol2 < 0 ? -1 : 1) * Math.floor((Math.abs(pol2) * Math.round(stawka * 10000) + 10000) / 20000) / 100
+            : null;
         const prow = (prowOdSumy !== null) ? prowOdSumy : p.prowZaokr;
         // Reszta faktury: abonament, reklamacje, „altri" (oplata skarbowa), reklama.
         const potrPozostale = r2((s.abon || 0) + (s.rekl || 0) + (s.inne || 0)
@@ -55152,7 +55390,7 @@
             poz: p.poz, ord: p.ord, ref: p.ref, refNote: p.refNote, dataOrd: p.dataOrd,
             brutto: p.brutto, nOrd: p.nOrd, nZwr: p.nZwr, zwrotSum: p.zwrotSum,
             nieEwN: p.nieEwN || 0, nieEwSum: p.nieEwSum || 0, nieEwProw: p.nieEwProw || 0,
-            stawka: stawka, stawkaZgodna: zgodna, baza: baza, nProw: nProw,
+            stawka: stawka, stawkaZgodna: zgodna, baza: baza, nProw: nProw, nPol: nPol,
             prowZaokr: p.prowZaokr, prowOdSumy: prowOdSumy, prow: prow,
             potr: potrPozostale, wstrz: wstrz, sumy: s,
             wyplata: wyplata, wgArkusza: wgArkusza, wPliku: wPliku,
@@ -55207,7 +55445,8 @@
             bad.push('suma pozycji (bez „Rimborsato (non evaso)") ' + f2(p.brutto)
                      + ' ≠ wiersz „Ordini evasi" ' + f2(p.sumy.evasi));
         if (!p.stawkaZgodna)
-            bad.push('wiersze mają RÓŻNE stawki prowizji — prowizję wziąłem z sumy zaokrąglonych, sprawdź fakturę');
+            bad.push('wiersze mają RÓŻNE stawki prowizji (inne niż ' + ((p.stawka !== null) ? ((Math.round(p.stawka * 10000) / 100) + '%') : 'stawka sprzedaży')
+                     + ', a przy zwrocie także inne niż jej połowa) — prowizję wziąłem z sumy zaokrąglonych, sprawdź fakturę');
         j.status = bad.length ? 'partial' : 'ready';
         j.msg = bad.join(' · ');
         const s = p.sumy || {};
@@ -55215,7 +55454,11 @@
         j.note = 'Ordini evasi ' + f2(p.brutto) + ' EUR (sprzedaży ' + p.nOrd + ')'
                + ' · prowizja ' + f2(p.prow)
                + ((p.prowOdSumy !== null)
-                    ? (' (' + pct + ' od ' + f2(p.baza) + ' — od sumy, tak jak na fakturze Brico Bravo)')
+                    ? (' (' + pct + ' od ' + ((Math.round(p.baza * 1000) % 10) ? p.baza.toFixed(3) : f2(p.baza))
+                       + ' — od sumy, tak jak na fakturze Brico Bravo'
+                       + (p.nPol ? ('; ' + p.nPol + ' wierszy zwrotów / „non evaso" ma połowę stawki — '
+                                    + 'Brico Bravo oddaje albo pobiera przy nich połowę prowizji, więc wchodzą do podstawy połową kwoty') : '')
+                       + ')')
                     : (pct ? (' (' + pct + ', suma z wierszy)') : ''))
                + (s.perf ? (', w tym zatrzymana za zwroty ' + f2(s.perf)) : '')
                + ' · abonament, reklamacje i opłaty ' + f2(p.potr)
@@ -65988,6 +66231,8 @@
         // w „✔ Zakończone", a pozycje widac w ramce (rdPominiete).
         // Kaufland: zwroty i storna z ostatniego pobrania kraju zlecenia (sekcja #mk-kfl) — dopoki cos czeka, zlecenie zostaje w ⑤.
         if (j.kind === 'kfl' && kflZostalo(kflKrajJob(j))) return true;
+        // Empik: wplaty COD jeszcze nie stoja w arkuszu „CODy Marketplace Empik" (ecodBox) albo po wpisie zmienilo sie rozliczenie.
+        if (ecodZostalo(j)) return true;
         const tf = shTrafienie(j, mkSheet[mkJobId(j)]);            // cudzy zaksiegowany wiersz w arkuszu = mozliwy dubel
         if (tf && tf.zaks && !tf.wlasny) return true;
         return false;
@@ -66633,6 +66878,7 @@
                 det += rdBox(j);
                 det += vivBox(j);
                 det += kflBox(j);
+                det += ecodBox(j);
                 det += obiChKontrolaHtml(j);
                 det += obiChRefBox(j);
                 det += obiChPotrBox(j);
@@ -67390,6 +67636,10 @@
                 say('Zlecenie Robert Dyas na ' + f2(j.amount) + ' wróciło do pobrania — wgraj awizo albo kliknij „⬇ Pobierz zestawienia”.', '#0a7a2f');
             };
         });
+        // Empik COD — arkusz „CODy Marketplace Empik" (ecodBox): zapis jeszcze raz, teraz.
+        out.querySelectorAll('.mk-ecod-ponow').forEach(function (b){
+            b.onclick = function (ev){ if (ev) ev.preventDefault(); ecodDopilnuj(true); };
+        });
         // Numer dokumentu od Manora → PDF z panelu.
         out.querySelectorAll('.mk-mpdf').forEach(function (b){
             b.onclick = async function(){
@@ -67421,6 +67671,8 @@
         mkWid.cicho = true;
         try { renderRef(); renderCr(); renderKfl(); renderJoy(); renderEpc(); } finally { mkWid.cicho = false; }
         krokiRysuj(jobs);
+        // Empik: wplaty COD do arkusza „CODy Marketplace Empik" — w tle, najwyzej co 3 s (ecodDopilnuj).
+        if (onProlo) setTimeout(function (){ ecodDopilnuj(false); }, 0);
     }
 
     // ---------- Salda: miesieczne zestawienie ----------
@@ -70263,6 +70515,302 @@
         } finally {
             alleAnulBieg = false;
             try { renderRef(); } catch (e){}
+        }
+    }
+
+    // ---------- Empik: wplaty za pobraniem (COD) do arkusza „CODy Marketplace Empik" (16.11.2026) ----------
+    // Zamowienia Empiku za pobraniem prologistics daje w paczce importu jako NOT FOUND, a na koncie marketplace'u ich nie
+    // ksiegujemy (MK_COD_MP) — ksieguja je osoby z innej spolki, z arkusza „CODy Marketplace Empik" (zakladki „EMPIK <rok>").
+    // Uklad (od 08.2026): blok na wplate — naglowek: A data wplywu TEKSTEM „2.11.2026", C kwota przelewu, D „Empik PL";
+    // pod nim wiersz na zamowienie: A link do auftragu, H kwota wplaty; w pierwszym wierszu I =SUM(H…) na zielonym tle.
+    // Dotad przepisywane recznie. Zmierzone 16.11.2026 na panelu Empiku i w paczkach banku 51: bloki 1.10, 16.10 i 2.11 to
+    // co do zamowienia i grosza zamowienia ze znacznikiem COURIER_POD przy sprzedazy w cyklach 4309b47b / adc011d8 / 617b645f
+    // (11 na 8188.89, 12 na 5315.86, 19 na 20541.52), a kwota w H = kwota wiersza paczki, czyli j.data.ord.
+    // Decyzja uzytkownika 16.11.2026: wpis PO POBRANIU ZESTAWIENIA (zlecenie „gotowe do importu" albo dalej), tylko wplaty —
+    // zwroty COD nie. Zapis idzie przez Apps Script „HUB Log i zmiany" (akcja „empikCod"), ktory pilnuje dubli: blok
+    // z notatka „HUB <klucz>" albo wpisany recznie z ta sama data i kwota — wtedy tylko uzupelnia brakujace kwoty i wiersze.
+    // Przy Empiku kontrola kwoty jest wylaczona (cykl dobierany po dacie): gdy po wpisie zlecenie dostanie INNE rozliczenie,
+    // HUB bloku nie cofa — zostawia ostrzezenie przy zleceniu.
+    const MK_ECOD_KEY = 'mkt_empik_cod_ark';
+    const MK_ECOD_OD = '2026-11-01';            // wczesniejsze wplaty zespol wpisal recznie (i nie maja codZam)
+    const MK_ECOD_ARKUSZ = 'https://docs.google.com/spreadsheets/d/1a39qSTD93OFnQGL8mihSvXZ7yIPEIY5e4bUq3CFh1lU/edit';
+    const MK_ECOD_PRZERWY = [1, 5, 15, 60];     // minuty do kolejnej samoczynnej proby po bledzie
+    const MK_ECOD_KAND = 4;                     // ilu kandydatow z wyszukiwarki czytamy, gdy numer trafia w kilka auftragow
+    let ecodBieg = false, ecodOst = 0;
+    function ecodLoad(){ try { return JSON.parse(GM_getValue(MK_ECOD_KEY, '{}')) || {}; } catch (e){ return {}; } }
+    function ecodSave(o){
+        const cut = Date.now() - 200 * 86400000;
+        Object.keys(o).forEach(function (k){ if (o[k] && o[k].zal && o[k].zal < cut) delete o[k]; });
+        try { GM_setValue(MK_ECOD_KEY, JSON.stringify(o)); } catch (e){}
+    }
+    // „2026-11-02" -> „2.11.2026" — tak stoi w arkuszu (dzien bez zera, miesiac z zerem).
+    function ecodDzien(d){
+        const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return m ? (Number(m[3]) + '.' + m[2] + '.' + m[1]) : '';
+    }
+    // Zlecenie do arkusza: Empik z lista COD z pobrania (codZam), od MK_ECOD_OD, gotowe do importu albo dalej.
+    // Zlecenia pobrane przed 04.11.2026 codZam nie maja (mkCodNieWiem) — HUB nie wie, ktore wplaty sa COD.
+    function ecodCzy(j){
+        return !!(j && mkCodMp(j) && j.data && Array.isArray(j.data.codZam) && String(j.date || '') >= MK_ECOD_OD
+                  && (j.status === 'ready' || j.status === 'done'));
+    }
+    // Wplaty COD rozliczenia: zamowienia za pobraniem, ktore maja w nim sprzedaz. Same zwroty COD (refCod) — nie.
+    function ecodWplaty(j){
+        const ord = (j && j.data && j.data.ord) || {};
+        return ((j && j.data && j.data.codZam) || []).filter(function (id){ return Number(ord[id]) > 0; }).sort()
+            .map(function (id){ return { nr: String(id), kwota: r2(Number(ord[id])) }; });
+    }
+    // Odcisk tego, co poszloby do arkusza — inny odcisk po wpisie = zlecenie dostalo inne rozliczenie (cykl, data, kwota).
+    function ecodOdcisk(j, w){
+        return String((j.data && j.data.cycle) || '') + '|' + f2(j.amount) + '|' + String(j.date || '') + '|'
+             + w.map(function (x){ return x.nr + ':' + f2(x.kwota); }).join(',');
+    }
+    function ecodNowy(j, w, e0){
+        return { st: 'szuk', data: ecodDzien(j.date), kwota: r2(Number(j.amount)), opis: 'Empik PL',
+                 rows: w.map(function (x){ return { nr: x.nr, kwota: x.kwota }; }), odcisk: ecodOdcisk(j, w),
+                 zal: (e0 && e0.zal) || Date.now(), prob: 0 };
+    }
+    // Uwaga do kolumny F przy wierszu, ktorego auftrag jest skasowany albo nieustalony (wtedy w A stoi numer zamowienia).
+    function ecodUwaga(r){
+        if (r.usun) return 'auftrag skasowany (HUB)';
+        if (r.brak) return 'HUB: ' + r.brak + ' — w kol. A numer zamówienia Empiku';
+        return '';
+    }
+    // Auftrag zamowienia. Wyszukiwarka po numerze fulfilmentu szuka CZESCI numeru (40102412520287-A oddaje tez 15912909
+    // z „…-A-1", PULAPKI), wiec bierzemy auftrag z DOKLADNIE tym numerem: przy jednym trafieniu sprawdzamy go na stronie,
+    // na ktora wyszukiwarka przekierowala (bez drugiego odczytu 3 MB), przy kilku — czytamy kandydatow. Zywy ma
+    // pierwszenstwo; sam skasowany tez idzie do arkusza (zespol wpisywal takie z dopiskiem „deleted cod"), z uwaga w F.
+    // Zwraca { auf, usun } albo { brak: powod } (do arkusza idzie wtedy numer zamowienia) albo { err } (ponowimy).
+    async function ecodAuftrag(nr){
+        let res = null, html = '';
+        try {
+            res = await fetch('/search.php?what=ff_number&ff_number=' + encodeURIComponent(nr), { credentials: 'same-origin' });
+            html = await res.text();
+        } catch (e){ return { err: 'brak połączenia z prologistics' }; }
+        if (/<input[^>]+type=["']?password/i.test(html)) return { err: 'prologistics pokazał stronę logowania — zaloguj się', sesja: true };
+        const m = String((res && res.url) || '').match(/auction\.php\?number=(\d+)/i);
+        if (m){
+            const d = new DOMParser().parseFromString(html, 'text/html');
+            const ffy = Array.prototype.slice.call(d.querySelectorAll('input[name="ff_number"]'))
+                .map(function (p){ return String(p.getAttribute('value') || p.value || '').trim(); }).filter(Boolean);
+            if (!ffy.length) return { err: 'na stronie auftragu ' + m[1] + ' nie widzę numeru zamówienia' };
+            if (ffy.indexOf(nr) < 0) return { brak: 'jedyny auftrag z wyszukiwarki (' + m[1] + ') ma inny numer zamówienia (' + ffy[0] + ')' };
+            return { auf: m[1], usun: auftUsuniety(d, html) };
+        }
+        if (res && res.ok === false) return { err: 'wyszukiwarka prologistics odpowiedziała HTTP ' + res.status };
+        const d = new DOMParser().parseFromString(html, 'text/html'), nums = [];
+        d.querySelectorAll('a[href*="auction.php?number="]').forEach(function (a){
+            const h = a.getAttribute('href') || '';
+            if (h.indexOf('shipping_auction.php') >= 0) return;
+            const mm = h.match(/number=(\d+)/);
+            if (mm && nums.indexOf(mm[1]) < 0) nums.push(mm[1]);
+        });
+        if (!nums.length) return { brak: 'w prologistics nie ma auftragu z tym numerem zamówienia' };
+        const zgodne = [];
+        for (let i = 0; i < nums.length && i < MK_ECOD_KAND; i++){
+            const rr = await crRead(nums[i]);
+            if (!rr || (!rr.ok && !(rr.ffy || []).length)) return { err: (rr && rr.err) || ('nie odczytałem auftragu ' + nums[i]) };
+            if ((rr.ffy || []).indexOf(nr) >= 0) zgodne.push({ num: nums[i], usun: !!rr.deleted });
+        }
+        const zywe = zgodne.filter(function (z){ return !z.usun; });
+        if (zywe.length === 1) return { auf: zywe[0].num, usun: false };
+        if (zywe.length > 1) return { brak: 'kilka żywych auftragów z tym numerem: ' + zywe.map(function (z){ return z.num; }).join(', ') };
+        if (zgodne.length === 1) return { auf: zgodne[0].num, usun: true };
+        if (zgodne.length > 1) return { brak: 'kilka skasowanych auftragów z tym numerem: ' + zgodne.map(function (z){ return z.num; }).join(', ') };
+        return { brak: 'żaden auftrag z wyszukiwarki (' + nums.slice(0, MK_ECOD_KAND).join(', ') + ') nie ma dokładnie tego numeru zamówienia' };
+    }
+    // Zlecenie Empiku z wplatami COD, ktorych wpis jeszcze nie jest potwierdzony — zostaje w grupie ⑤ (mkUwagaPo).
+    function ecodZostalo(j){
+        if (!ecodCzy(j) || !ecodWplaty(j).length) return false;
+        const e = ecodLoad()[mkKlucz(j)];
+        return !e || e.st !== 'ok' || !!e.zmiana || !!(e.wynik && e.wynik.inna);
+    }
+    // Ramka przy zleceniu Empiku: co z wplatami COD w arkuszu.
+    function ecodBox(j){
+        if (!onProlo || !ecodCzy(j)) return '';
+        const w = ecodWplaty(j), e = ecodLoad()[mkKlucz(j)];
+        const lk = '<a href="' + MK_ECOD_ARKUSZ + '" target="_blank">„CODy Marketplace Empik”</a>';
+        if (!w.length) return '<div style="color:#888">arkusz ' + lk + ': w tym rozliczeniu nie ma wpłat za pobraniem (COD)</div>';
+        const suma = r2(w.reduce(function (s, x){ return s + x.kwota; }, 0));
+        const ile = w.length + ' wpł. COD na ' + f2(suma);
+        const ponow = function (t){ return ' <button class="mk-ecod-ponow mk-lnk">' + t + '</button>'; };
+        const godz = function (ms){ const d = new Date(ms); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); };
+        let h = '';
+        if (!e) h = '<span style="color:#5b21b6">⏳ zapiszę zaraz</span>';
+        else if (e.st === 'szuk')
+            h = e.err ? ('<span style="color:#c47f00">✖ ' + esc(e.err) + (e.nast > Date.now() ? (' · ponowię sam o ' + godz(e.nast)) : '') + '</span>' + ponow('↻ ponów teraz'))
+                      : '<span style="color:#5b21b6">⏳ szukam auftragów…</span>';
+        else if (e.st === 'czeka' || e.st === 'wysl') h = '<span style="color:#5b21b6">⏳ zapisuję…</span>';
+        else if (e.st === 'blad')
+            h = '<span style="color:#c47f00">✖ nie zapisane — ' + esc(e.err || '?') + (e.nast > Date.now() ? (' · ponowię sam o ' + godz(e.nast)) : '') + '</span>'
+              + ponow('↻ ponów teraz');
+        else if (e.st === 'odrz') h = '<span style="color:#c00">✖ arkusz odrzucił: ' + esc(e.err || '?') + '</span>' + ponow('↻ sprawdź jeszcze raz');
+        else if (e.st === 'ok'){
+            const x = e.wynik || {}, zakr = (x.od && x.do) ? (' (wiersze ' + x.od + '–' + x.do + (x.zakladka ? (', „' + esc(x.zakladka) + '”') : '') + ')') : '';
+            h = '<span style="color:#0a7a2f">✔ '
+              + (x.st === 'dopisane' ? ('dopisane ' + (x.dop || 0) + ' poz.')
+                : (x.st === 'uzupelnione' ? ('blok był już w arkuszu' + (x.reczny ? ' (wpisany ręcznie)' : '') + ' — uzupełnione kwoty: ' + (x.uzu || 0) + ', dopisane wiersze: ' + (x.dop || 0))
+                : 'był już w arkuszu'))
+              + zakr + (e.at ? (' ' + esc(mkCzasLok(e.at))) : '') + '</span>';
+            const bez = (e.rows || []).filter(function (r){ return !r.auf; }).length, usun = (e.rows || []).filter(function (r){ return r.usun; }).length;
+            if (bez) h += ' <span style="color:#c47f00">· bez auftragu: ' + bez + ' (w kol. A numer zamówienia, powód w F)</span>';
+            if (usun) h += ' <span style="color:#c47f00">· skasowany auftrag: ' + usun + '</span>';
+            if (x.gdzieIndziej) h += ' <span style="color:#888">· już w innym bloku: ' + x.gdzieIndziej + '</span>';
+            if (x.inna) h += ' <span style="color:#c47f00">· ⚠ przy ' + x.inna + ' poz. w kol. H stoi inna kwota niż w rozliczeniu — HUB jej nie zmienia</span>';
+        }
+        let out = '<div>arkusz ' + lk + ': ' + ile + ' — ' + h + '</div>';
+        if (e && e.zmiana)
+            out += '<div style="color:#c47f00">⚠ po wpisie do arkusza zlecenie dostało inne rozliczenie (cykl, data albo kwota) — sprawdź blok z '
+                 + esc(e.data || '?') + ' w arkuszu; HUB go nie poprawia</div>';
+        return out;
+    }
+    // Dopisuje do kolejki zlecenia Empiku z wplatami COD, ustala auftragi i wysyla do arkusza. Wolane po kazdym przerysowaniu
+    // listy (najwyzej co 3 s, nie w trakcie przelotu, importu ani ksiegowania) i guzikiem „ponów" (reczne).
+    async function ecodDopilnuj(reczne){
+        if (!onProlo) return;
+        const teraz = Date.now();
+        if (!reczne && teraz - ecodOst < 3000) return;
+        if (ecodBieg) return;
+        if (!reczne && (mkPrzelotTrwa() || mkImpBieg || mkKsiegBieg)) return;
+        ecodOst = teraz;
+        const o = ecodLoad();
+        let zm = false;
+        jobList().forEach(function (j){
+            if (!ecodCzy(j)) return;
+            const w = ecodWplaty(j), k = mkKlucz(j);
+            if (!k || !w.length) return;
+            const e0 = o[k], od = ecodOdcisk(j, w);
+            if (!e0){ o[k] = ecodNowy(j, w, null); zm = true; return; }
+            if (e0.odcisk === od){ if (e0.zmiana){ delete e0.zmiana; zm = true; } return; }
+            // Rozliczenie zlecenia zmienilo sie. Niezapisane liczymy od nowa; zapisanego bloku HUB nie cofa — ostrzezenie.
+            if (e0.st === 'ok' || e0.st === 'wysl'){ if (!e0.zmiana){ e0.zmiana = true; zm = true; } return; }
+            o[k] = ecodNowy(j, w, e0); zm = true;
+        });
+        if (reczne) Object.keys(o).forEach(function (k){
+            const e = o[k];
+            if (!e) return;
+            if (e.st === 'blad' || e.st === 'szuk'){ e.nast = 0; zm = true; }
+            if (e.st === 'odrz'){ e.st = 'czeka'; e.err = ''; zm = true; }
+        });
+        if (zm) ecodSave(o);
+        const gotowy = function (e, t){
+            if (!e) return false;
+            if (e.st === 'czeka') return true;
+            if (e.st === 'blad') return !(e.nast > t);
+            if (e.st === 'wysl') return t - (e.wysl || 0) > 180000;   // karta zamknieta w trakcie — skrypt nie zrobi dubla
+            return false;
+        };
+        const doSzuk = Object.keys(o).filter(function (k){ return o[k] && o[k].st === 'szuk' && !(o[k].nast > teraz); });
+        if (!doSzuk.length && !Object.keys(o).some(function (k){ return gotowy(o[k], teraz); })){
+            if (zm) setTimeout(render, 0);
+            return;
+        }
+        ecodBieg = true;
+        let rysuj = zm;
+        try {
+            for (let a = 0; a < doSzuk.length; a++){
+                const k = doSzuk[a], e = ecodLoad()[k];
+                if (!e || e.st !== 'szuk') continue;
+                const rows = (e.rows || []).map(function (r){ return Object.assign({}, r); });
+                const kolejka = rows.filter(function (r){ return !r.auf && !r.brak; });
+                let sesja = '';
+                const robotnik = async function (){
+                    while (kolejka.length && !sesja){
+                        const r = kolejka.shift();
+                        const f = await ecodAuftrag(r.nr);
+                        if (f.err){ r.err = f.err; if (f.sesja) sesja = f.err; continue; }
+                        delete r.err;
+                        if (f.auf){ r.auf = f.auf; r.usun = !!f.usun; } else r.brak = f.brak;
+                    }
+                };
+                await Promise.all([robotnik(), robotnik(), robotnik()]);
+                const o2 = ecodLoad(), e2 = o2[k];                     // na swiezo — po await
+                if (!e2 || e2.st !== 'szuk' || e2.odcisk !== e.odcisk) continue;
+                e2.rows = rows;
+                const zle = rows.filter(function (r){ return r.err || (!r.auf && !r.brak); });
+                if (zle.length){
+                    e2.prob = (e2.prob || 0) + 1;
+                    // Po trzech probach (bez wygaslej sesji) wiersz idzie do arkusza z numerem zamowienia i powodem w F.
+                    if (e2.prob >= 3 && !sesja){
+                        zle.forEach(function (r){ r.brak = 'nie ustaliłem auftragu: ' + (r.err || '?'); delete r.err; });
+                        e2.st = 'czeka'; e2.err = '';
+                    } else {
+                        e2.err = 'auftragi: nie ustalone ' + zle.length + ' z ' + rows.length + ' — ' + (sesja || (zle[0].err || '?'));
+                        e2.nast = Date.now() + MK_ECOD_PRZERWY[Math.min(e2.prob, MK_ECOD_PRZERWY.length) - 1] * 60000;
+                    }
+                } else { e2.st = 'czeka'; e2.err = ''; e2.prob = 0; }
+                ecodSave(o2);
+                rysuj = true;
+                mkLog('empikcod', 'Empik ' + e2.data + ' ' + f2(e2.kwota) + ': auftragi wpłat COD — '
+                      + rows.map(function (r){ return r.nr + ' → ' + (r.auf ? (r.auf + (r.usun ? ' (skasowany)' : '')) : (r.brak ? ('brak: ' + r.brak) : ('? ' + (r.err || '')))); }).join('; '));
+            }
+            const o3 = ecodLoad(), t3 = Date.now();
+            const wys = Object.keys(o3).filter(function (k){ return gotowy(o3[k], t3); }).slice(0, 10);
+            if (!wys.length) return;
+            const bloki = wys.map(function (k){
+                const e = o3[k];
+                return { id: k, data: e.data, kwota: e.kwota, opis: e.opis,
+                         rows: (e.rows || []).map(function (r){ return { nr: r.nr, kwota: r.kwota, auf: r.auf || '', uwaga: ecodUwaga(r) }; }) };
+            });
+            wys.forEach(function (k){ o3[k].st = 'wysl'; o3[k].wysl = t3; });
+            ecodSave(o3);
+            rysuj = true;
+            mkLog('empikcod', '▶ arkusz „CODy Marketplace Empik": wysyłam ' + bloki.length + ' blok(i): '
+                  + bloki.map(function (b){ return b.data + ' ' + f2(b.kwota) + ' (' + b.rows.length + ' wpł.)'; }).join(', '));
+            let wynik = null, blad = '';
+            try {
+                const url = hubUrl('dz'), klucz = hubKlucz();
+                if (!url) throw new Error('brak adresu skryptu „Dziennik i Changelog” — ⚙ Ustawienia → Połączenia');
+                if (!klucz) throw new Error('brak klucza — wpisz go w ⚙ Ustawienia → Połączenia');
+                wynik = await shReq('POST', url, JSON.stringify({ secret: klucz, action: 'empikCod', bloki: bloki }));
+                if (!wynik || !Array.isArray(wynik.wyniki))
+                    throw new Error((wynik && wynik.err) ? String(wynik.err) : ('Apps Script odpowiedział bez listy wyników: ' + JSON.stringify(wynik).slice(0, 160)));
+            } catch (e){
+                blad = (e && e.message) || String(e);
+                if (/nieznana akcja/i.test(blad))
+                    blad = 'wdrożony Apps Script „HUB Log i zmiany” nie zna akcji „empikCod” — trzeba wdrożyć jego nową wersję';
+            }
+            const o4 = ecodLoad();                                        // na swiezo — po await
+            const kiedy = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            const naBlad = function (e, tekst){
+                e.prob = (e.prob || 0) + 1; e.st = 'blad'; e.err = tekst;
+                e.nast = Date.now() + MK_ECOD_PRZERWY[Math.min(e.prob, MK_ECOD_PRZERWY.length) - 1] * 60000;
+            };
+            let zle = 0;
+            if (blad){
+                wys.forEach(function (k){ if (o4[k]) naBlad(o4[k], blad); });
+                mkLog('empikcod', '✖ arkusz „CODy Marketplace Empik": ' + blad);
+            } else {
+                const poId = {};
+                wynik.wyniki.forEach(function (w){ if (w && w.id) poId[w.id] = w; });
+                wys.forEach(function (k){
+                    const e = o4[k], w = poId[k];
+                    if (!e) return;
+                    if (!w){ naBlad(e, 'Apps Script nie odpowiedział o tym bloku'); zle++; return; }
+                    if (w.st === 'dopisane' || w.st === 'uzupelnione' || w.st === 'jest'){
+                        e.st = 'ok'; e.err = ''; e.prob = 0; e.at = kiedy;
+                        e.wynik = { st: w.st, od: w.od || '', do: w.do || '', dop: w.dop || 0, uzu: w.uzu || 0, jest: w.jest || 0,
+                                    inna: w.inna || 0, gdzieIndziej: w.gdzieIndziej || 0, reczny: !!w.reczny,
+                                    zakladka: w.zakladka || '', nowaZakladka: !!w.nowaZakladka };
+                    } else { e.st = 'odrz'; e.err = String(w.err || w.st || '?'); zle++; }
+                });
+                mkLog('empikcod', '✔ arkusz „CODy Marketplace Empik": ' + wys.map(function (k){
+                    const w = poId[k] || {};
+                    return (o4[k] ? o4[k].data : k) + ' — ' + (w.st || '?') + (w.od ? (' w. ' + w.od + '–' + w.do) : '')
+                         + (w.dop ? (', dopisane ' + w.dop) : '') + (w.uzu ? (', uzupełnione ' + w.uzu) : '')
+                         + (w.inna ? (', inna kwota w H: ' + w.inna) : '') + (w.err ? (', ' + w.err) : '');
+                }).join('; '));
+            }
+            ecodSave(o4);
+            if (reczne || blad || zle){
+                say('Arkusz „CODy Marketplace Empik”: ' + (blad ? ('nie zapisałem — ' + blad)
+                    : (zle ? ('✖ nie zapisane bloki: ' + zle + ' — powód przy zleceniu') : 'zapisane')), (blad || zle) ? '#c47f00' : '#0a7a2f');
+            }
+        } catch (e){
+            mkLog('empikcod', '✖ arkusz „CODy Marketplace Empik": wyjątek — ' + ((e && e.message) || e));
+        } finally {
+            ecodBieg = false;
+            if (rysuj) setTimeout(render, 0);
         }
     }
 
@@ -83127,6 +83675,28 @@
         } catch (e){}
         // Oddane potracenia mogly byc odhaczone wczesniej — wtedy zlecenie zamyka sie od razu.
         wfbPoSladzie('');
+    }
+    // 13.11.2026: Brico Bravo — zwrot i „non evaso" z polowa stawki prowizji przestaly byc „roznymi stawkami".
+    // Zlecenia wstrzymane starsza wersja liczymy jeszcze raz z TYCH SAMYCH pozycji (j.data.brico), bez pobierania.
+    // Tylko 'partial' z tym jednym powodem i tylko gdy teraz stawki sie zgadzaja; zaimportowanych nie ruszamy.
+    if (onProlo){
+        try {
+            const stare = jobsLoad();
+            let ile = 0;
+            Object.keys(stare).forEach(function (k){
+                const j = stare[k];
+                if (!j || j.kind !== 'brico' || j.status !== 'partial' || j.booked || !j.data || !j.data.brico) return;
+                if (!/RÓŻNE stawki prowizji/.test(String(j.msg || '')) || !(j.data.brico.poz || []).length) return;
+                const p = bbLicz(j.data.brico);
+                if (!p.stawkaZgodna) return;
+                bbZastosuj(j, p, j.data.how || 'ponowna ocena (połowa prowizji przy zwrotach)');
+                if (j.status === 'ready') ile++;
+            });
+            if (ile){
+                jobsSaveScal(stare);
+                mkLog('brico', 'zestawienia ze zwrotami z połową prowizji przeliczone jeszcze raz: ' + ile);
+            }
+        } catch (e){}
     }
     render();
 })();
@@ -116742,7 +117312,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'c0eeb7f · 13.11.2026 11:55';
+    const HUB_BUDOWA = 'b25df09 · 16.11.2026 07:33';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
