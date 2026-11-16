@@ -44949,15 +44949,17 @@
             if (!nr || !isFinite(netto) || !isFinite(brutto) || !(brutto > 0)) return;
             const b19 = r2(netto * MK_LIM_VAT), vat = r2(brutto - netto);
             if (/^CN/i.test(nr)){
-                out.push({ nr: nr, gr: Math.round(brutto * 100),
-                           opis: 'nota ' + nr + ' ' + f2(brutto) + ' (VAT ' + f2(vat) + ') — Limango jej nie potrąciło' });
+                // Nota, ktorej NIE MA w przelewie. Nie zakladamy przeoczenia: CN2077A-5 (cykl 30.09) to zwrot reklamacyjny zamowienia
+                // sprzedanego w lipcu (IN2077A-3) — do cyklu trafil data zwrotu, a Limango rozlicza go poza ta wplata (uzytkownik 16.11).
+                out.push({ nr: nr, gr: Math.round(brutto * 100), rodzaj: 'cn-brak',
+                           opis: 'nota ' + nr + ' ' + f2(brutto) + ' (VAT ' + f2(vat) + ') — nie ma jej w tym przelewie' });
                 if (Math.abs(b19 - brutto) >= 0.005)
-                    out.push({ nr: nr, gr: -Math.round((b19 - brutto) * 100),
+                    out.push({ nr: nr, gr: -Math.round((b19 - brutto) * 100), rodzaj: 'cn-19',
                                opis: 'nota ' + nr + ' potrącona z VAT 19%: ' + f2(b19) + ' zamiast ' + f2(brutto) + ' z dokumentu' });
             } else if (/^IN/i.test(nr)){
-                out.push({ nr: nr, gr: -Math.round(brutto * 100), opis: 'faktura ' + nr + ' ' + f2(brutto) + ' niezapłacona' });
+                out.push({ nr: nr, gr: -Math.round(brutto * 100), rodzaj: 'in-brak', opis: 'faktura ' + nr + ' ' + f2(brutto) + ' niezapłacona' });
                 if (Math.abs(b19 - brutto) >= 0.005)
-                    out.push({ nr: nr, gr: Math.round((b19 - brutto) * 100),
+                    out.push({ nr: nr, gr: Math.round((b19 - brutto) * 100), rodzaj: 'in-19',
                                opis: 'faktura ' + nr + ' zapłacona z VAT 19%: ' + f2(b19) + ' zamiast ' + f2(brutto) + ' z dokumentu' });
             }
         });
@@ -44995,7 +44997,9 @@
                                        + sk.filter(function (x, i, a){ return a.findIndex(function (y){ return y.nr === x.nr; }) === i; })
                                            .map(function (x){ return x.nr; }).join(', ') + ') — sprawdź przelew i dokumenty w panelu' };
         const zdanie = function (z){ return z.map(function (x){ return x.opis; }).join(' + '); };
-        if (traf.length === 1) return { ok: true, termin: termin, tekst: 'różnica ' + roz + ' = ' + zdanie(traf[0]) };
+        if (traf.length === 1)
+            return { ok: true, termin: termin, tekst: 'różnica ' + roz + ' = ' + zdanie(traf[0]),
+                     bezNot: traf[0].filter(function (x){ return x.rodzaj === 'cn-brak'; }).map(function (x){ return x.nr; }) };
         return { ok: false, termin: termin, tekst: 'różnicę ' + roz + ' tłumaczy kilka zestawów dokumentów — sprawdź, który: '
                                    + traf.slice(0, 3).map(zdanie).join('  |  ') };
     }
@@ -45683,6 +45687,23 @@
         // szukamy dalej. Na panelu z jednym sklepem zostaje jak dotad: brak wiersza wyplaty nizej idzie do „bad".
         if (!reczny && !byRef && !byKwote && !bezKwoty && !manor && a.pay == null && mkSklepyPanelu(j.host).length > 1)
             return { odrzuc: true };
+        // Limango (16.11.2026, uzytkownik: „zdejmij"): nota, ktorej brak w przelewie tlumaczy roznice, nie nalezy do tej wplaty —
+        // jej zwroty schodza z listy zwrotow TEGO zlecenia (przeliczone z pozycji bez tej noty, wiec zamowienie z kilkoma notami
+        // traci tylko jej czesc). Zostaja przy zleceniu do pokazania (limZdjete); zaksiegowac je trzeba, gdy Limango je rozliczy.
+        let limZdjete = [];
+        if (limDowod && (limRozW.bezNot || []).length){
+            const wyl = {};
+            limRozW.bezNot.forEach(function (n){ wyl[String(n)] = 1; });
+            const aB = mkLimPrzelicz(a, uzyte.filter(function (x){ return !wyl[String((x && x.documentNumber) || '')]; }));
+            Object.keys(a.ref).forEach(function (id){
+                const zost = aB.ref[id] || 0, roznica = r2(Math.abs(a.ref[id]) - Math.abs(zost));
+                if (roznica > 0.005) limZdjete.push({ id: id, kw: roznica });
+            });
+            if (limZdjete.length){
+                a = Object.assign({}, a, { ref: aB.ref });
+                refund = 0; Object.keys(a.ref).forEach(function (k){ refund = r2(refund + Math.abs(a.ref[k])); });
+            }
+        }
         // Kontrola spojnosci: skladniki + WSZYSTKIE wyplaty musza dac zero.
         const selfOk = !a.pays.length || eq(r2(a.comp + a.payAll), 0);
         // Zamowienie rozliczone i zwrocone w tym samym cyklu — pieniadze sie
@@ -45701,6 +45722,7 @@
                    unknown: a.unknown, skipped: a.skipped, full: full,
                    limFv: o.limFv || null,
                    limRoz: limRozW,
+                   limZdjete: limZdjete.length ? { noty: limRozW.bezNot.slice(), poz: limZdjete } : null,
                    both: both, pays: a.pays.length, split: split,
                    rows: tx.list.length, total: tx.total, pages: tx.pages, how: tx.how };
         // e-Price: numery dokumentow Mirakla — numer z tytulu przelewu to numer dokumentu cyklu (epcDokZgodny).
@@ -45769,6 +45791,9 @@
                 j.data.netAkc = { cyc: cycIds.join(', '), net: net, kwota: j.amount, roz: r2(net - j.amount),
                                   kiedy: new Date().toISOString().slice(0, 16).replace('T', ' '), auto: true, tekst: limRozW.tekst };
                 j.note = (j.note ? j.note + '; ' : '') + 'Limango: ' + limRozW.tekst + ' — różnicę przyjąłem sam';
+                if (limZdjete.length)
+                    j.note += '; zwroty z noty ' + limRozW.bezNot.join(', ') + ' zdjęte z listy zwrotów tej wpłaty ('
+                            + limZdjete.map(function (x){ return x.id + ' ' + f2(x.kw); }).join(', ') + ')';
             } else {
                 if (akc) delete j.akcRoznica;
                 bad.push('netto z rozliczenia ' + f2(net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
@@ -67315,6 +67340,11 @@
                 if (j.data.limRoz && j.data.limRoz.tekst && !j.data.netOk)
                     det += '<div style="color:' + (j.data.limRoz.ok ? '#0a7a2f' : '#b45309') + ';font-size:11px;margin-top:3px">'
                          + (j.data.limRoz.ok ? '✓ ' : '? ') + 'Limango: ' + esc(j.data.limRoz.tekst) + '</div>';
+                if (j.data.limZdjete && (j.data.limZdjete.poz || []).length)
+                    det += '<div style="color:#475569;font-size:11px">Zwroty z noty ' + esc(j.data.limZdjete.noty.join(', '))
+                         + ' zdjęte z listy zwrotów tej wpłaty (nota nie wchodzi do przelewu): '
+                         + esc(j.data.limZdjete.poz.map(function (x){ return x.id + ' ' + f2(x.kw); }).join(', '))
+                         + ' — zaksięguj je, gdy Limango tę notę rozliczy.</div>';
                 if (lfv && lfv.blad)
                     det += '<div style="color:#888;font-size:10px">nie sprawdziłem dokumentów Limanga: ' + esc(lfv.blad) + '</div>';
                 const sh = mkSheet[mkJobId(j)];
@@ -117866,7 +117896,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '53a02bf · 16.11.2026 12:51';
+    const HUB_BUDOWA = '0b2e8fa · 16.11.2026 13:01';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
