@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.15
+// @version      5.63.16
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -9318,12 +9318,17 @@
 
     // Kwota ze znakiem z tekstu z waluta („Ft -114,190.00", „€ -79.99", „CHF 1'234.50").
     // parseMoney zdejmuje znak i nie zna CHF/PLN/Lei/kr — tu bierzemy same cyfry i separatory.
+    // Liczba od PIERWSZEJ cyfry, minus sprzed niej. Do 5.63.15 wycinano z napisu wszystko poza
+    // cyframi, kropka i przecinkiem, wiec kropka ze skrotu „kr." (DKK) zostawala przed liczba:
+    // „kr. -759.00" → „.759.00" → 0,76, a „kr. -1,578.00" → 0,10 (16274184, 16128460 — 17.11.2026).
+    // Kazdy auftrag w DKK dostawal przez to falszywe „open amount sie nie zgadza".
     function kwotaZeZnakiem(txt) {
-        const s = String(txt == null ? '' : txt).replace(/−/g, '-').replace(/[^\d.,'\-]/g, '');
-        if (!/\d/.test(s)) return null;
-        const v = parseMoney(s.replace(/-/g, ''));
+        const t = String(txt == null ? '' : txt).replace(/−/g, '-');
+        const m = /\d[\d.,'\s]*/.exec(t);
+        if (!m) return null;
+        const v = parseMoney(m[0].replace(/[.,\s]+$/, ''));
         if (v === null) return null;
-        return s.indexOf('-') >= 0 ? -v : v;
+        return t.slice(0, m.index).indexOf('-') >= 0 ? -v : v;
     }
 
     // Open ze STOPKI tabeli Payments („Auftrag value - Total of Payments : € 0.00"), ze znakiem.
@@ -10130,6 +10135,26 @@
     // w dokumencie z DOMParsera bez zaznaczenia oddaje pierwsza opcje, czyli „OK".
     // Kto zatwierdzil — z a.log-info („changed by X on 2026-09-14 09:58:40"); pierwsza
     // litera „changed" bywa cyrylicka, wiec celujemy w „by … on", jak modul Zwroty.
+    // Kwota w tabeli Refund request to SUROWY zapis z pola requestu: kropka zawsze oddziela
+    // grosze, separatora tysiecy nie ma (2009, 759.00, 191220, 1569.98 — odczyt 17.11.2026).
+    // parseMoney czytal „1.325" jako tysiace (1325), a prologistics bierze 1,325: ticket 734247
+    // mial na liscie importow „1.33 Kč", choc chodzilo o 1 325 Kč. Czytamy wiec jak prologistics;
+    // inny zapis (przecinek, spacja) zostaje dla parseMoney.
+    function kwotaRequestu(raw) {
+        const s = normalizeText(raw).replace(/\s+/g, '');
+        if (/^-?\d+(\.\d+)?$/.test(s)) return Math.abs(parseFloat(s));
+        return parseMoney(raw);
+    }
+    // Wiecej niz dwie cyfry po kropce to niemal na pewno tysiace wpisane z kropka („1.325").
+    // Zwrot poszedlby na ulamek kwoty, wiec to zarzut, nie notatka.
+    function zlaKwotaRequestu(w) {
+        const s = normalizeText(w && w.kwotaZapis).replace(/\s+/g, '');
+        const m = /^(\d+)\.(\d{3,})$/.exec(s);
+        if (!m) return null;
+        return `import ${w.importId}: kwota requestu wpisana jako „${s}" — prologistics czyta kropkę jako grosze, więc zwrot to ${s}, nie ${m[1] + m[2]}; `
+            + `jeśli chodziło o ${m[1] + m[2]}, popraw kwotę w requeście`;
+    }
+
     function refundRequestWiersze(doc) {
         let t = doc.querySelector('table[data-simple-nav="Refund request"]') || doc.getElementById('refundTable');
         if (!t) {
@@ -10154,10 +10179,11 @@
             out.push({
                 importId: String((sel && sel.getAttribute('data-log-id')) || kol('import id')),
                 stan: opt ? normalizeText(opt.textContent) : '',
-                kwota: parseMoney(kol('refund amount')),
+                kwota: kwotaRequestu(kol('refund amount')),
+                kwotaZapis: kol('refund amount'),
                 // Paid amount to NIE cala wplata, tylko to, co z niej zostalo do zwrotu
                 // w chwili zakladania requestu — patrz sprawdzTransakcje.
-                paid: parseMoney(kol('paid amount')),
+                paid: kwotaRequestu(kol('paid amount')),
                 // Bank i metoda mowia, CZYM zwrot poszedl („Saferpay - automatic booking").
                 // Po tym kontrola ksiegowan wie, na ktorym koncie z Payments szukac wplaty.
                 bank: kol('bank name'),
@@ -10503,6 +10529,10 @@
             moje.forEach(w => {
                 if (!/^refund approved$/i.test(w.stan))
                     problemy.push(`import ${w.importId} ma stan „${w.stan || 'nieustalony'}", nie „Refund approved"`);
+                else {
+                    const z = zlaKwotaRequestu(w);
+                    if (z) problemy.push(z);
+                }
             });
 
             // Status i requesty auftragu tego ticketu — jedno wejscie na auction.php.
@@ -10715,7 +10745,7 @@
                         const _txId = (txColIdx >= 0 && cells[txColIdx]) ? (cells[txColIdx].textContent || '').trim() : '';
 
                         if (cells[colIdx]) {
-                            const amt = parseMoney(cells[colIdx].textContent);
+                            const amt = kwotaRequestu(cells[colIdx].textContent);
 
                             if (amt !== null && amt > 0) {
                                 approvedAmounts.push(amt);
@@ -10860,6 +10890,9 @@
             approvedReq.forEach(w => zwrotyNiewyjasnione(w, auto, wierszeReq).forEach(r =>
                 wyslane.push(`import ${w.importId} (${formatAmount(w.kwota)}): zwrot już wysłany — ${opisZwrotuAuto(r)}; nie wysyłaj drugi raz`)));
             dodatkowe.push(...wyslane);
+            // 3a. Kwota requestu z trzema cyframi po kropce — tysiace wpisane z kropka.
+            wierszeReq.filter(w => /^refund approved$/i.test(w.stan))
+                .forEach(w => { const z = zlaKwotaRequestu(w); if (z) dodatkowe.push(z); });
 
             let ok = isMatch && internalDuplicates.length === 0 && !klZle && !dodatkowe.length;
             // 4. Co juz stoi w Payments: ujemne ksiegowanie kwoty requestu od dnia jego zalozenia.
@@ -14321,6 +14354,28 @@
     // szukamy: /paid/i albo /amount/i trafiają w inne pola.
     var F = { SPOLKA: '555', COMPANY: '556', COUNTRY: '557', FV: '558', AMOUNT: '559',
               APPROVAL: '560', PAID: '561', CURRENCY: '562', COMMENT: '588' };
+    // Inne układy pól faktur (odczyt 17.11.2026, issue z maili „Please answer Issue”, 251 issue):
+    //  • „Marketing Invoice Payment” — 731 Issuer, 732 Payer, 733 Invoice No., 734 Invoice Value („5648.25 CHF” — kwota RAZEM
+    //    z walutą, osobnego pola waluty nie ma), 735 Approval („YES - Transfer Needed”), 736 Paid;
+    //  • „Sea Logistics Invoice Payment” — 717 Issuer („USD - HECNY” — waluta w nazwie przewoźnika), 718 Payer, 719 numery
+    //    w osobnych liniach, 720 TOTAL Value (27 z 27 = kwota przelewu), 721 Approval, 722 Paid.
+    // Opcje tych pól to INNA przestrzeń numerów niż 555/556 — r.spolkaOpcja / r.companyOpcja dostają przedrostek, żeby nie
+    // trafić w TIS_SPOLKA_ARKUSZ, w TIS_DANE_NABYWCY ani w klucz przewoźnika z pola 556.
+    var F_MKT = { uklad: 'mkt', ISSUER: '731', PAYER: '732', FV: '733', VALUE: '734', APPROVAL: '735', PAID: '736',
+                  et: { sp: 'Invoice Payer', co: 'Invoice Issuer', fv: 'Invoice No.', am: 'Invoice Value', wal: 'waluta w Invoice Value' } };
+    var F_SEA = { uklad: 'sea', ISSUER: '717', PAYER: '718', FV: '719', VALUE: '720', APPROVAL: '721', PAID: '722',
+                  et: { sp: 'Invoice(s) Payer', co: 'Invoice(s) Issuer', fv: 'Invoice(s) No.', am: 'Invoice(s) TOTAL Value', wal: 'waluta w Invoice(s) Issuer' } };
+    var F_ET = { sp: 'Spółka', co: 'Company (przewoźnik)', fv: 'Invoices no.', am: 'Amount', wal: 'Currency' };
+    // Waluta przy kwocie albo w temacie: „1888.70CHF”, „CHF814,299.51”, „Beliani Switzerland GmbH- SRS - CHF”.
+    // \b nie wystarcza (cyfra tuż przy literach). Dwie różne waluty w tekście = żadna.
+    function walutaZTekstu(t){
+        var o = [], re = /(?<![A-Za-z])(CHF|EUR|PLN|USD|GBP|CAD|HUF|SEK|DKK|CZK|NOK|RON)(?![A-Za-z])/gi, m, s = String(t || '');
+        while ((m = re.exec(s))){ var w = m[1].toUpperCase(); if (o.indexOf(w) < 0) o.push(w); }
+        return o.length === 1 ? o[0] : '';
+    }
+    // Approval: pola 555–562 i Sea Logistics mają „Yes”, Marketing — „YES - Transfer Needed” (inne „YES - …” to nie przelew).
+    function approvalOk(t){ var s = String(t || '').trim(); return /^yes$/i.test(s) || /^yes\s*-\s*transfer\s+needed$/i.test(s); }
+    function etPola(r){ return r && r.uklad === 'mkt' ? F_MKT.et : r && r.uklad === 'sea' ? F_SEA.et : F_ET; }
     // Opcja pola „Spółka” (555) → nazwa spółki w zakładce „CH & DE”. Opcji spoza tej
     // listy (spółki polskie, osoby) zakładka nie zna — nabywca wychodzi wtedy jako „?”.
     var TIS_SPOLKA_ARKUSZ = {
@@ -14416,6 +14471,15 @@
     }
     function bezOgonkow(s){ return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ł/g, 'l').replace(/Ł/g, 'L').replace(/ø/g, 'o').replace(/Ø/g, 'O').replace(/ß/g, 'ss'); }
     function kw(n){ return (Math.round(n * 100) / 100).toFixed(2); }
+    // Log przebiegów w zakładce „HUB Log” (prośba 17.11.2026: „jak jest wysyłane do Clauda, niech zostają logi”). IBAN-y maskuje
+    // nadajnik. Na stanowisku testowym hubDz nie ma — wtedy cisza.
+    function tisLog(faza, tekst){ try { if (typeof hubDz === 'function') hubDz('TEST Issue', faza, tekst); } catch (e){} }
+    // Jeden blok odczytu Claude w jednej linii logu (bez rachunków — liczymy tylko, ile ich było).
+    function tisOdczytLog(b){
+        return [b.PLIK, b.DOKUMENT, b.NUMER ? 'nr ' + b.NUMER : '', b.SUMA_DO_ZAPLATY ? 'suma ' + b.SUMA_DO_ZAPLATY + ' ' + (b.WALUTA || '') : '',
+                b.ODLICZENIE ? 'odliczenie ' + b.ODLICZENIE : '', (b.IBAN || []).length ? 'rachunków ' + b.IBAN.length : '',
+                b.WATPLIWOSCI ? 'wątpliwość: ' + String(b.WATPLIWOSCI).slice(0, 200) : ''].filter(Boolean).join(' · ');
+    }
     function rowne(a, b){ return Math.abs(Math.round(a * 100) - Math.round(b * 100)) <= 1; }
     function zalogowany(){
         try {
@@ -14506,7 +14570,9 @@
     function fvIssue(r){
         var l = fvLista(r && r.fv);
         if (l.length) return l;
-        return (r && r.fvZFaktury && r.fvZFaktury.nr) ? [r.fvZFaktury.nr] : [];
+        if (r && r.fvZFaktury && r.fvZFaktury.nr) return [r.fvZFaktury.nr];
+        // Płatność ręczna, issue bez pola numeru: numery z polecenia zapłaty („Please pay Re 30049136…”).
+        return (r && r.reczne && r.polecenie && r.polecenie.numery.length) ? r.polecenie.numery.slice() : [];
     }
     function fvZbior(linie){
         var z = Object.create(null);
@@ -14673,7 +14739,7 @@
     // Wiersz listy. Surowego issue NIE trzymamy (pobranie po numerze niesie ~2 MB).
     function wiersz(it){
         var amountTxt = poleTxt(it, F.AMOUNT);
-        return {
+        var r = {
             id: String(it.id), temat: String(it.issue || ''), status: String(it.status || ''), zamkniete: String(it.closed) === '1' || it.status === 'close',
             typ: (it.issue_type || []).map(function (t){ return String(t.name || '').trim(); }).join(' | '),
             spolka: poleTxt(it, F.SPOLKA), spolkaOpcja: poleOpcja(it, F.SPOLKA),
@@ -14683,11 +14749,32 @@
             uwaga: poleTxt(it, F.COMMENT), resp: it.resp_username || '', solv: it.solving_resp_username || '',
             wczytane: Date.now(), wynik: null
         };
+        // „ship” = pola 555–562 (warunek ten sam, co dotąd w wyszukiwarce: pole FV albo Spółka). Wyszukiwarka i finanse
+        // zagraniczne dalej patrzą tylko na ten układ — Marketing i Sea Logistics wchodzą wklejką numerów.
+        r.uklad = (r.fv !== null || r.spolka !== null) ? 'ship' : '';
+        r.walutaTemat = walutaZTekstu(r.temat);
+        if (!r.uklad){
+            var U = (pole(it, F_MKT.PAYER) || pole(it, F_MKT.ISSUER)) ? F_MKT : (pole(it, F_SEA.PAYER) || pole(it, F_SEA.ISSUER)) ? F_SEA : null;
+            if (U){
+                var iss = poleTxt(it, U.ISSUER), walIss = '', mi = iss ? /^\s*([A-Za-z]{3})\s*-\s*(\S.*)$/.exec(iss) : null;
+                if (U === F_SEA && mi && walutaZTekstu(mi[1])){ walIss = mi[1].toUpperCase(); iss = mi[2].trim(); }
+                var op = function (v){ return v ? U.uklad + ':' + v : v; };
+                r.uklad = U.uklad;
+                r.spolka = poleTxt(it, U.PAYER); r.spolkaOpcja = op(poleOpcja(it, U.PAYER));
+                r.company = iss; r.companyOpcja = op(poleOpcja(it, U.ISSUER));
+                r.fv = poleTxt(it, U.FV); r.amountTxt = poleTxt(it, U.VALUE); r.amount = kwota(r.amountTxt, true);
+                r.approval = poleTxt(it, U.APPROVAL); r.paid = poleTxt(it, U.PAID);
+                r.waluta = walutaZTekstu(r.amountTxt) || walIss || r.walutaTemat || '';
+            } else r.uklad = (r.amountTxt !== null || r.approval !== null || r.company !== null) ? 'czesc' : 'brak';
+        }
+        return r;
     }
     function issueZNumeru(id, wlasne){
         return api(API + '/list/?page_id=' + encodeURIComponent(id) + '&show_with_inactive=1', wlasne).then(function (j){
             var it = (j.issue_list || [])[0];
             // Panel potrafi oddać inne issue niż pytane (nieistniejący numer) — tylko dokładne.
+            // „Access denied” (issue z ograniczonym dostępem — 12 z 263 w odczycie 17.11.2026) mówimy wprost, nie „nie ma issue”.
+            if (!it && j && j.error) throw new Error('issue ' + id + ': ' + j.error + (/access\s+denied/i.test(j.error) ? ' — to konto nie ma dostępu do tego issue' : ''));
             if (!it || String(it.id) !== String(id)) throw new Error('nie ma issue ' + id);
             return it;
         });
@@ -15068,7 +15155,8 @@
         while (p1 > 0 && !/\d/.test(s.charAt(p1 - 1))) p1--;
         return { poz: Math.max(0, p0), kon: p1 };
     }
-    var QR_KOTWICA = /(Zahlteil|Empfangsschein|Annahmestelle|Payment\s+part|Acceptance\s+point|Section\s+paiement|R[ée]c[ée]piss[ée]|Point\s+de\s+d[ée]p[ôo]t|Sezione\s+pagamento|Ricevuta|Punto\s+di\s+accettazione)/i;
+    // „Zahlungsabschnitt” / „Konto / Zahlbar an” (SRS 17.11.2026: część płatnicza podpisana „Beleg / Zahlungsabschnitt”).
+    var QR_KOTWICA = /(Zahlteil|Empfangsschein|Zahlungsabschnitt|Konto\s*\/\s*Zahlbar\s+an|Annahmestelle|Payment\s+part|Acceptance\s+point|Section\s+paiement|R[ée]c[ée]piss[ée]|Point\s+de\s+d[ée]p[ôo]t|Sezione\s+pagamento|Ricevuta|Punto\s+di\s+accettazione)/i;
     var QR_NAGL = /(W(?:ä|ae)hrung|Monnaie|Valuta|Currency)\s+(Betrag|Montant|Importo|Amount)/i;
     // Jedna liczba całkowita za etykietą (kwoty HUF bez groszy). Za nią najwyżej waluta, nawias albo kropka;
     // daty („2026. 10. 05.”), procenty i „1/1” odpadają. Dwie liczby albo żadna → null (wtedy „?”, nie zgadujemy).
@@ -15321,40 +15409,219 @@
         var p = [];
         function zle(t){ p.push({ w: 'zle', t: t }); } function spr(t){ p.push({ w: 'spr', t: t }); }
         function stan(w, t){ p.push(powodStatusu(r, w, t)); }
+        // Płatność ręczna (17.11.2026): polecenie zapłaty jest warunkiem; komentarze sprzed niego to poprzednie cykle.
+        var pol = r.reczne ? r.polecenie : null;
+        if (r.reczne){
+            if (/internal\s+bank\s+transfer/i.test(r.typ || '')) spr('przelew wewnętrzny (Internal Bank Transfer) — zlecasz go przez „🏦 Zlecenie przelewu wewnętrznego”, nie przez listę do płatności');
+            if (!pol) spr('brak polecenia zapłaty w komentarzach („please pay from …”) — finanse jeszcze nie odbiły issue do płatności');
+            else p.push({ w: 'info', t: '💳 polecenie zapłaty: ' + polOpis(pol) + (pol.pozniej ? ' · potem: „' + pol.pozniej.tekst + '” (' + pol.pozniej.kto + ', ' + pol.pozniej.kiedy.slice(0, 16) + ')' : '')
+                + (pol.bankZ ? ' · bank z wcześniejszego polecenia (' + pol.bankZ.slice(0, 10) + ')' : '') });
+        }
         var maPola = [r.spolka, r.company, r.fv, r.amountTxt, r.waluta, r.approval].some(function (x){ return x !== null; });
-        if (!maPola){ spr('inny typ issue (' + (r.typ || 'bez typu') + ') — bez pól faktury; sprawdź ręcznie, jak dziś'); return p; }
+        if (!maPola && !r.reczne){ spr('inny typ issue (' + (r.typ || 'bez typu') + ') — bez pól faktury; sprawdź ręcznie, jak dziś'); return p; }
+        if (!maPola) p.push({ w: 'info', t: 'issue bez pól faktury (' + (r.typ || 'bez typu') + ') — kwota i numer z polecenia zapłaty albo z faktury' });
         if (r.zamkniete) stan('spr', 'issue jest zamknięte — do płatności idą tylko otwarte; sprawdź, czy nie anulowane albo już zapłacone');
         if (r.odbite && r.test) stan('info', 'issue już odbite (' + r.odbite.kiedy + ', ' + r.odbite.kto + ') — czytam fakturę mimo to');
-        if (!/^yes$/i.test(r.approval || '')) zle('Approval = ' + (r.approval || 'puste') + ' (do płatności tylko Yes)');
-        if (/^yes$/i.test(r.paid || '')) stan('zle', 'PAID - Finance = Yes — już zapłacone');
-        if (!r.spolka) zle('puste pole Spółka');
-        if (!r.company) zle('puste pole Company (przewoźnik)');
-        if (!r.fv || !fvLista(r.fv).length){
-            if (r.fvZFaktury && r.fvZFaktury.nr) p.push({ w: 'info', t: 'pole Invoices no. w issue jest puste — numer „' + r.fvZFaktury.nr
-                + '” wzięty z faktury (' + r.fvZFaktury.plik + '), potwierdzony ręcznie' + (r.fvZFaktury.kto ? ' (' + r.fvZFaktury.kto + ')' : '')
-                + '. Numer idzie do tytułu przelewu; w issue nic nie zmieniam. UWAGA: numer pochodzi z tego samego dokumentu, który sprawdzamy, więc nie potwierdza, że to faktura z tego issue.' });
-            else zle('puste pole Invoices no.');
+        if (maPola) ocenPolaFaktury(r, p, zle, stan);
+        if (pol){
+            if (pol.kwoty.length > 1) spr('w poleceniu zapłaty kilka kwot (' + pol.kwoty.map(kw).join(' / ') + ') — kwotę przelewu weź z polecenia sam');
+            else if (isFinite(pol.kwota) && isFinite(r.amount) && !rowne(Math.abs(pol.kwota), Math.abs(r.amount)))
+                spr('kwota: w poleceniu zapłaty ' + kw(pol.kwota) + ', w issue ' + r.amountTxt + ' — na liście kwota z polecenia (decyzja finansów); sprawdź');
+            var wi = r.waluta || r.walutaTemat;
+            if (pol.waluta && wi && pol.waluta !== wi) spr('waluta: w poleceniu ' + pol.waluta + ', w issue ' + wi);
         }
-        if (!r.amountTxt) zle('puste pole Amount'); else if (!isFinite(r.amount)) zle('kwota w polu Amount nieczytelna: „' + r.amountTxt + '”');
-        if (!r.waluta) zle('puste pole Currency'); else if (/\+/.test(r.waluta)) zle('Currency = ' + r.waluta + ' — dwie waluty w jednym issue; płatność ręczna');
         if (r.company && TIS_NIE_PLACIMY.test(r.company)) zle('przewoźnik z listy „nie płacimy” (' + r.company + ')');
         if (r.uwaga && TIS_STOP.test(r.uwaga)) spr('pole Comment: „' + r.uwaga.slice(0, 120) + '”');
         (kom || []).forEach(function (c){
             if (systemowy(c)) return;
+            if (pol && c.kiedy <= pol.kiedy) return;
             var t = c.tekst, gdzie = ' (' + c.kto + ', ' + c.kiedy.slice(0, 10) + ')';
-            if (TIS_PPF.test(t)) return;
+            if (TIS_PPF.test(t) || (r.reczne && TIS_POL_KOM.test(t))) return;
             if (TIS_IN_BANK.test(t)) stan('zle', 'w komentarzu stoi „In bank file”' + gdzie + ' — już w pliku do banku');
-            else if (TIS_PAID_CALY.test(t)) stan('zle', 'komentarz „' + t + '”' + gdzie + ' — już zapłacone');
+            else if (TIS_PAID_CALY.test(t)) stan('zle', 'komentarz „' + t + '”' + gdzie + (pol ? ' po poleceniu zapłaty' : '') + ' — już zapłacone');
             else if (TIS_PAID_SLOWO.test(t)) stan('spr', 'komentarz o zapłacie: „' + t.slice(0, 120) + '”' + gdzie);
             if (TIS_W_TOKU.test(t)) stan('spr', 'płatność w toku? komentarz „' + t.slice(0, 100) + '”' + gdzie);
             if (TIS_STOP.test(t)) spr('komentarz wstrzymujący: „' + t.slice(0, 140) + '”' + gdzie);
         });
         return p;
     }
+    // Pola faktury (wydzielone 17.11.2026, żeby tryb płatności ręcznej mógł je pominąć przy issue bez pól).
+    function ocenPolaFaktury(r, p, zle, stan){
+        var E = etPola(r);
+        var zleP = zle;
+        // Płatność ręczna z poleceniem zapłaty: puste pola Spółka / Company / FV / Amount to norma w issue „Declaration” (MWST:
+        // 492843, 529263) — rachunek, kwota i numery idą z polecenia. „?” zamiast „✖”, żeby trafiły na listę z uwagą.
+        if (r.reczne && r.polecenie) zleP = function (t){ p.push({ w: 'spr', t: t + ' — płatność ręczna: według polecenia zapłaty' }); };
+        if (!approvalOk(r.approval)) zle('Approval = ' + (r.approval || 'puste') + (r.uklad === 'mkt' ? ' (do przelewu tylko „YES - Transfer Needed”)' : ' (do płatności tylko Yes)'));
+        if (/^yes$/i.test(r.paid || '')) stan('zle', (r.uklad === 'mkt' || r.uklad === 'sea' ? 'Paid (Finance)' : 'PAID - Finance') + ' = Yes — już zapłacone');
+        if (!r.spolka) zleP('puste pole ' + E.sp);
+        if (!r.company) zleP('puste pole ' + E.co);
+        if (!r.fv || !fvLista(r.fv).length){
+            if (r.fvZFaktury && r.fvZFaktury.nr) p.push({ w: 'info', t: 'pole ' + E.fv + ' w issue jest puste — numer „' + r.fvZFaktury.nr
+                + '” wzięty z faktury (' + r.fvZFaktury.plik + '), potwierdzony ręcznie' + (r.fvZFaktury.kto ? ' (' + r.fvZFaktury.kto + ')' : '')
+                + '. Numer idzie do tytułu przelewu; w issue nic nie zmieniam. UWAGA: numer pochodzi z tego samego dokumentu, który sprawdzamy, więc nie potwierdza, że to faktura z tego issue.' });
+            else if (r.reczne && r.polecenie && r.polecenie.numery.length) p.push({ w: 'info', t: 'pole ' + E.fv + ' w issue jest puste — numery z polecenia zapłaty: ' + r.polecenie.numery.join(', ') });
+            else zleP('puste pole ' + E.fv);
+        }
+        if (!r.amountTxt) zleP('puste pole ' + E.am); else if (!isFinite(r.amount)) zle('kwota w polu ' + E.am + ' nieczytelna: „' + r.amountTxt + '”');
+        if (!r.waluta) zleP(r.uklad === 'mkt' || r.uklad === 'sea' ? 'waluty nie widać (' + E.wal + ' ani temat issue)' : 'puste pole Currency');
+        else if (/\+/.test(r.waluta)) zle('Currency = ' + r.waluta + ' — dwie waluty w jednym issue; płatność ręczna');
+    }
     function ostatnieOdbicie(kom){
         var o = null;
         (kom || []).forEach(function (c){ if (!systemowy(c) && TIS_PPF.test(c.tekst)) o = c; });
         return o;
+    }
+
+    // ================= PŁATNOŚĆ RĘCZNA — polecenie zapłaty (17.11.2026) =================
+    // Prośba: issue z maili „Please answer Issue” — finanse już napisały „Please pay from <rachunek>”, a płaci się ręcznie
+    // w e-bankingu (PostFinance, UBS, HSBC…). Zamiast pliku do banku — lista: z jakiego rachunku, komu, na jaki rachunek,
+    // ile, z jakim tytułem. Reguły zmierzone 17.11.2026 na 251 issue z trzech list maili i na wydrukach przelewów z tych issue
+    // (wydruk = prawda o tym, co poszło do banku).
+    // W tym trybie polecenie zapłaty to WARUNEK, a nie „↪ już odbite”. Liczy się to, co stoi PO ostatnim poleceniu
+    // (paid / Confirmed / wydruk przelewu = już zapłacone). Starsze „paid” to poprzednie cykle issue cyklicznych (SRS co miesiąc,
+    // MWST, Galaxus, Primeo) — dotąd blokowały je na zawsze.
+    // Polecenie bywa bez „from” („Please pay Postfinance BI in NOK”), po polsku („Proszę o płatność … z CS banku z Real Home”),
+    // z kwotą („amount 457.50 chf”, „UBS BI 3157.54 CHF” — decyzja finansów, np. Google po potrąceniu nadpłaty), z plikami
+    // („please pay from bs postfinance chf: 6655170851.pdf, 6655185198.pdf”), z datą („Please pay on Friday 23.10.2026”)
+    // i z prośbą o osobne przelewy („preferably in separate bank transfers”).
+    var TIS_RECZNE_KEY = 'tis_reczne';
+    var TIS_POL_KOM = /(\bpl(?:ease|s)p?\s+pay\b|prosz[eę]\s+(?:o\s+)?(?:do\s+)?(?:p[łl]atno|zap[łl]at|za[łl]at))/i;
+    var TIS_POL_BANKI = [
+        // „Postfinace”, „Postfinanse”, „Post Finance” — wszystkie trzy stoją w komentarzach (460511: „Postfinace DKK”).
+        ['PostFinance', /post\s*-?\s*fin\w{0,3}[cs]e\b|\bPF\b/i], ['UBS', /\bUBS\b/i], ['HSBC', /\bHSBC\b/i], ['Credit Suisse', /[Cc]redit\s*[Ss]uisse|\bCS\b/],
+        ['CIC', /\bCIC\b/i], ['DNB', /\bDNB\b/i], ['Revolut', /\brevolut\b/i], ['HypoVereinsbank', /\bHVB\b|hypo\s*verein|uni\s*credit/i],
+        ['Raiffeisen', /raiffeisen/i], ['BNP Paribas', /\bBNP\b/i]
+    ];
+    // Skróty spółek w komentarzach finansów. Nazwy z arkusza „CH & DE” (Storedock, Real Home, Wikipiki…) łapie polSpolka.
+    var TIS_POL_ALIASY = [
+        [/\bBI\b|beliani\s*\(?\s*int(?:ernational)?\b/i, 'Beliani (International) GmbH'],
+        [/\bBS\b|\bswitzerland\b|beliani\s*\(?\s*ch\b/i, 'Beliani (Switzerland) GmbH'],
+        [/\bglobal\b/i, 'Global eCommerce GmbH'],
+        [/beliani\s*\(?\s*uk\b|\bUK\b/, 'Beliani (UK) GmbH'],
+        [/beliani\s*\(?\s*de\b/i, 'Beliani (DE) GmbH'],
+        [/beliani\s+group/i, 'Beliani Group AG']
+    ];
+    var TIS_POL_WAL = /(?<![A-Za-z])(CHF|EUR|PLN|USD|GBP|SEK|DKK|NOK|RON|CZK|HUF|CAD)(?![A-Za-z])/gi;
+    // Potwierdzenie zapłaty od payments: „paid”, „Paid.”, „CONFIRMED”, „202639146 - 22,00 Confirmed”, „PAID, 809469.23”, „68 ch paid”.
+    var TIS_POTWIERDZENIE_KOM = /(^\s*(paid|paiid|confirmed|zap[łl]acone|bezahlt)\b|\b(paid|confirmed|zap[łl]acone|bezahlt)\.?\s*$)/i;
+    var TIS_POL_NR = /\b(?:re|rechnung(?:s?-?nr)?|invoices?(?:\s+(?:no|nr|number))?|inv|bills?|faktur\w*|policen-?nr)\b\.?\s*[:#]?\s*((?:[A-Z]{0,8}[-\/]?\d[\w\-\/]*(?:\s*(?:,|\band\b|\bi\b|\bund\b)\s*)?)+)/gi;
+    // Plik z wydrukiem przelewu w nazwie zaczyna się datą („29.04.2026CH Regionalmedien AG-14403,3 chf.pdf”, „20260902, Destiny…”).
+    // Faktury wgrywane z datą i podkreślnikiem („08102026_ Kanton Zug.pdf”, „03012024_Datum…pdf”) to NIE wydruki — stąd bez „_”.
+    var TIS_WYDRUK_NAZWA = /^\s*(?:\d{1,2}[.,]\s?\d{1,2}[.,]\s?\d{4}|\d{8}[\s,]|\d{4}[.\-]\d{2}[.\-]\d{2})/;
+    function polNorm(s){ return ' ' + bezOgonkow(String(s || '')).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() + ' '; }
+    // Część „skąd” polecenia: od „from” / „z” do „to” / „na konto” / „for” („please pay 8.1 CHF from Yssuelog UBS … to Beliani
+    // International UBS”). Bez „from” — cały tekst.
+    function polZrodlo(t){
+        var s = String(t || ''), k = s.search(/\bpl(?:ease|s)p?\s+pay\b|p[łl]atno|zap[łl]at|za[łl]at/i), po = k >= 0 ? s.slice(k) : s;
+        var m = /(?:\bfrom\b|\sze?\s)/i.exec(po);
+        if (!m) return s;
+        var fr = po.slice(m.index + m[0].length), c = fr.search(/\s(?:to|na\s+konto|for)\s/i);
+        return c > 0 ? fr.slice(0, c) : fr;
+    }
+    function polKlucz(nazwa){
+        return nazwaNorm(String(nazwa || '').split(/\s\/\s|\(\s*previous/i)[0]).replace(/ beliani /g, ' ').replace(/ in liquidation /g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    function polSpolka(fr, r){
+        var n = polNorm(fr);
+        var lista = (S.spolki.lista || []).map(function (sp){ return { sp: sp, k: polKlucz(sp.nazwa) }; })
+            .filter(function (x){ return x.k.length >= 5; }).sort(function (a, b){ return b.k.length - a.k.length; });
+        for (var i = 0; i < lista.length; i++) if (n.indexOf(' ' + lista[i].k + ' ') >= 0) return { nazwa: lista[i].sp.nazwa.split('\n')[0].trim(), sp: lista[i].sp, skad: 'polecenie' };
+        for (var j = 0; j < TIS_POL_ALIASY.length; j++) if (TIS_POL_ALIASY[j][0].test(fr)){
+            var nz = TIS_POL_ALIASY[j][1], kz = nazwaNorm(nz);
+            var sp = (S.spolki.lista || []).filter(function (x){ return x.nazwa.split('\n')[0].trim().toLowerCase() === nz.toLowerCase(); })[0]
+                  || (S.spolki.lista || []).filter(function (x){ return x.klucz === kz; })[0] || null;
+            return { nazwa: nz, sp: sp, skad: 'polecenie' };
+        }
+        var si = spolkaIssue(r.spolkaOpcja, r.spolka);
+        if (si) return { nazwa: si.nazwa, sp: si, skad: 'issue' };
+        return r.spolka ? { nazwa: r.spolka, sp: null, skad: 'issue' } : null;
+    }
+    function polWaluty(t){ var o = [], m; TIS_POL_WAL.lastIndex = 0; while ((m = TIS_POL_WAL.exec(String(t || '')))){ var w = m[1].toUpperCase(); if (o.indexOf(w) < 0) o.push(w); } return o; }
+    // Kwoty polecenia: przy słowie „amount / kwota” albo tuż przy walucie („457.50 chf”, „CHF 26.20”, „8'600 chf”).
+    function polKwoty(t){
+        var s = String(t || '').replace(/[  ]/g, ' '), o = [], m;
+        var LICZ = "(\\d{1,3}(?:[ '’]\\d{3})+(?:[.,]\\d{1,2})?|\\d[\\d'’.,]*\\d|\\d)";
+        var res = [new RegExp('(?:amount|kwota|kwot[ęe]|betrag)\\s*(?:of\\s*)?:?\\s*(?:(?:CHF|EUR|PLN|USD|GBP|SEK|DKK|NOK|RON)\\s*)?' + LICZ, 'gi'),
+                   new RegExp(LICZ + '\\s?(?:CHF|EUR|PLN|USD|GBP|SEK|DKK|NOK|RON|CZK|HUF)(?![A-Za-z])', 'gi'),
+                   new RegExp('(?<![A-Za-z])(?:CHF|EUR|PLN|USD|GBP|SEK|DKK|NOK|RON|CZK|HUF)\\s?' + LICZ, 'gi')];
+        res.forEach(function (re){ while ((m = re.exec(s))){ var v = kwota(m[1], true); if (isFinite(v) && v > 0 && !o.some(function (x){ return rowne(x, v); })) o.push(v); } });
+        return o;
+    }
+    function polNumery(t){
+        var o = [], m; TIS_POL_NR.lastIndex = 0;
+        var s = String(t || '').replace(/[\w\-.()\[\]' ,]*?\.pdf\b/gi, ' ');   // nazwy plików to pliki, nie numery
+        while ((m = TIS_POL_NR.exec(s))) m[1].split(/\s*(?:,|\band\b|\bi\b|\bund\b)\s*/i).forEach(function (x){
+            x = x.trim().replace(/[.\-\/]+$/, '');
+            if ((x.match(/\d/g) || []).length >= 4 && o.indexOf(x) < 0) o.push(x);
+        });
+        return o;
+    }
+    function polRozbierz(r, c){
+        var t = c.tekst, fr = polZrodlo(t), tn = polNorm(t);
+        var bank = '';
+        [fr, t].some(function (x){ for (var i = 0; i < TIS_POL_BANKI.length; i++) if (TIS_POL_BANKI[i][1].test(x)){ bank = TIS_POL_BANKI[i][0]; return true; } return false; });
+        var walFr = polWaluty(fr), walT = polWaluty(t);
+        var waluta = walFr.length === 1 ? walFr[0] : walT.length === 1 ? walT[0] : '';
+        var kwoty = polKwoty(t);
+        var pliki = (r.pliki || []).filter(function (f){ var n = polNorm(f.nazwa); return n.length > 6 && tn.indexOf(n) >= 0; }).map(function (f){ return f.id; });
+        var md = /\b(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})\b/.exec(t);
+        var termin = md ? ('0' + md[1]).slice(-2) + '.' + ('0' + md[2]).slice(-2) + '.' + md[3] : (/\b(tomorrow|jutro)\b/i.test(t) ? 'następny dzień (polecenie z ' + c.kiedy.slice(0, 10) + ')' : '');
+        var o = { c: c, kto: c.ktoPelny || c.kto, kiedy: c.kiedy, tekst: t, bank: bank, spolka: polSpolka(fr, r), waluta: waluta,
+                  kwoty: kwoty, kwota: kwoty.length === 1 ? kwoty[0] : NaN, pliki: pliki, numery: polNumery(t), termin: termin,
+                  osobno: /\bsep[ae]rate|osobn|oddzieln/i.test(t) };   // „seperate” — tak stoi w 308470
+        // „Re 30040652, 30040526, 30040527, 3 * 67 chf each” (308470): kwota za KAŻDĄ fakturę — przelew to kwota × liczba numerów.
+        if (kwoty.length === 1 && o.numery.length > 1 && /\beach\b|ka[żz]d/i.test(t)){ o.kwotaKazda = kwoty[0]; o.kwota = Math.round(kwoty[0] * o.numery.length * 100) / 100; }
+        o.tresc = !!(bank || kwoty.length || pliki.length || o.numery.length);
+        return o;
+    }
+    // Ostatnie polecenie z treścią („Please pay tomorrow.” po poleceniu z kwotą to tylko termin).
+    function polecenieZaplaty(r, kom){
+        var lista = (kom || []).filter(function (c){ return !systemowy(c) && TIS_POL_KOM.test(c.tekst); });
+        if (!lista.length) return null;
+        var ost = lista[lista.length - 1], o = null;
+        for (var i = lista.length - 1; i >= 0 && !o; i--){ var p = polRozbierz(r, lista[i]); if (p.tresc) o = p; }
+        if (!o) o = polRozbierz(r, ost);
+        if (ost !== o.c){
+            o.pozniej = { kiedy: ost.kiedy, kto: ost.kto, tekst: ost.tekst.slice(0, 160) };
+            if (!o.termin && /\b(tomorrow|jutro)\b/i.test(ost.tekst)) o.termin = 'następny dzień (polecenie z ' + ost.kiedy.slice(0, 10) + ')';
+        }
+        // Issue cykliczne: rachunek podany raz („please pay from postfinance switzerland chf”), potem tylko „Please pay Invoice 54364984”.
+        // Bank, spółkę i walutę bierzemy wtedy z najnowszego wcześniejszego polecenia, które je podaje — ze śladem, skąd.
+        if (!o.bank) for (var k = lista.indexOf(o.c) - 1; k >= 0; k--){
+            var w = polRozbierz(r, lista[k]);
+            if (!w.bank) continue;
+            o.bank = w.bank; o.bankZ = w.kiedy;
+            if (!o.waluta) o.waluta = w.waluta;
+            if (!o.spolka || o.spolka.skad !== 'polecenie') o.spolka = w.spolka;
+            break;
+        }
+        // Poprzedni cykl: ostatnie „paid” / „Confirmed” PRZED poleceniem — pliki starsze niż ta chwila to już zapłacone faktury.
+        // Tylko krótkie potwierdzenie, nie pytanie: „Is invoice 54341482 paid? It was replaced by…” (408015) przesuwało granicę
+        // za nową fakturę i ta wypadała z odczytu.
+        o.granica = '';
+        (kom || []).forEach(function (c){ if (!systemowy(c) && c.kiedy < o.kiedy && TIS_POTWIERDZENIE_KOM.test(c.tekst) && !/\?/.test(c.tekst) && c.tekst.length < 160) o.granica = c.kiedy; });
+        return o;
+    }
+    function polPlikNumer(pol, nazwa){
+        var n = polNorm(nazwa).replace(/\s+/g, '');
+        return (pol.numery || []).some(function (x){ var q = polNorm(x).replace(/\s+/g, ''); return q.length >= 5 && n.indexOf(q) >= 0; });
+    }
+    function polOpis(p){
+        return (p.kto || '?') + ', ' + String(p.kiedy || '').slice(0, 16) + ': „' + String(p.tekst || '').replace(/\s+/g, ' ').slice(0, 220) + '”';
+    }
+    // Pliki do odczytu w trybie płatności ręcznej: wymienione w poleceniu; wgrane po poprzednim cyklu (faktury tej płatności
+    // i ewentualne wydruki przelewu po poleceniu); jeden ostatni wydruk sprzed polecenia — z niego rachunek odbiorcy jako podpowiedź.
+    function plikiReczne(r, pliki){
+        var pol = r.polecenie, pdf = (pliki || []).filter(function (f){ return /\.pdf$/i.test(f.nazwa); })
+            .slice().sort(function (a, b){ return a.kiedy < b.kiedy ? -1 : a.kiedy > b.kiedy ? 1 : 0; });
+        var g = pol.granica || '';
+        // Plik z numerem z polecenia w nazwie („Kunde402528 Rechnungsnummer54364984.pdf” przy „Please pay Invoice 54364984”) liczy się
+        // jak wskazany — bez względu na granicę cyklu.
+        var wybor = pdf.filter(function (f){ return pol.pliki.indexOf(f.id) >= 0 || polPlikNumer(pol, f.nazwa) || !g || f.kiedy > g; });
+        var stare = pdf.filter(function (f){ return wybor.indexOf(f) < 0 && f.kiedy <= pol.kiedy && (TIS_POTW.test(f.nazwa) || TIS_WYDRUK_NAZWA.test(f.nazwa)); });
+        if (stare.length) wybor.push(stare[stare.length - 1]);
+        return wybor;
     }
     // Ocena faktury: r.faktura = { docs:[…], skan, pominiete } albo { brakPdf }.
     function ocenFakture(r){
@@ -15513,7 +15780,7 @@
         if (r.bladDubel) p.unshift({ w: 'spr', t: r.bladDubel });
         if (r.bladTech) p.unshift({ w: 'spr', t: r.bladTech });
         r.powody = p;
-        if (r.odbite && !r.test) { r.wynik = 'odbite'; return; }
+        if (r.odbite && !r.test && !r.reczne) { r.wynik = 'odbite'; return; }
         if (p.some(function (x){ return x.w === 'zle'; })) r.wynik = 'zle';
         else if (r.bladTech || r.bladDubel) r.wynik = 'blad';
         else if (p.some(function (x){ return x.w === 'spr'; })) r.wynik = 'spr';
@@ -15585,8 +15852,9 @@
     // „execution date”, „Transfer amount” bywają też na fakturach (EN 16931, „Delivery/Execution date”) — są słabe
     // (przegląd 14.10.2026; wszystkie 20 wydruków z korpusu i próbki dalej rozpoznane). Dokument z sumą do zapłaty
     // uznajemy za wydruk dopiero przy dwóch mocnych.
-    var PRZELEW_MOCNE = /(Direct\s+print-?out\s+from\s+e-?finance|Credit\s+Transfer\s+Details|Batch[_\s-]?Details|Status:?\s*(?:Entered|To\s+be\s+approved|Not\/partially\s+approved|Confirmed\s+by\s+bank)|UBS\s+e-banking|Payment\s+ingested\s+or\s+registered|SpectraNet\s+Plusz|Spectra\s+unique\s+ID)/gi;
-    var PRZELEW_SLABE = /(Debit\s+account|From\s+account|Remitter|Beneficiary|Recipient'?s\s+account|Message\s+to\s+beneficiary|Payment\s+details|Remittance\s+information|(?:Requested\s+)?execution\s+date|Transfer\s+amount)/gi;
+    // HSBC UK „Make a bill payment | Step 4 of 4” (wydruki Beliani UK, 17.11.2026) — dotąd niewidoczny jako wydruk przelewu.
+    var PRZELEW_MOCNE = /(Direct\s+print-?out\s+from\s+e-?finance|Credit\s+Transfer\s+Details|Batch[_\s-]?Details|Status:?\s*(?:Entered|To\s+be\s+approved|Not\/partially\s+approved|Confirmed\s+by\s+bank)|UBS\s+e-banking|Payment\s+ingested\s+or\s+registered|SpectraNet\s+Plusz|Spectra\s+unique\s+ID|Make\s+a\s+bill\s+payment)/gi;
+    var PRZELEW_SLABE = /(Debit\s+account|From\s+account|Remitter|Beneficiary|Recipient'?s\s+account|Message\s+to\s+beneficiary|Payment\s+details|Remittance\s+information|(?:Requested\s+)?execution\s+date|Transfer\s+amount|requires\s+authori[sz]ation|Authori[sz]ed\s+by)/gi;
     // Bank spoza listy (drugi przegląd 14.10.2026): fraza zlecenia razem ze stroną obciążenia („Remitter”, „Debit account”)
     // liczy się jak jeden mocny znacznik — faktura z blokiem płatności strony obciążenia nie ma.
     var PRZELEW_ZLECENIE = /(Remittance\s+information|execution\s+date|Transfer\s+amount)/i, PRZELEW_OBCIAZENIE = /(Debit\s+account|From\s+account|Remitter)/i;
@@ -15594,6 +15862,90 @@
         var zn = function (re){ var o = {}; (String(strona1).match(re) || []).forEach(function (s){ o[s.toLowerCase().replace(/\s+/g, ' ')] = 1; }); return Object.keys(o).length; };
         var mocne = zn(PRZELEW_MOCNE) + (PRZELEW_ZLECENIE.test(strona1) && PRZELEW_OBCIAZENIE.test(strona1) ? 1 : 0);
         return mocne >= (sumaOk ? 2 : 1) && mocne + zn(PRZELEW_SLABE) >= 2;
+    }
+    // ---------- rachunek odbiorcy: QR-rachunek, UK, bez IBAN, wydruk przelewu (17.11.2026) ----------
+    // Zmierzone na wydrukach przelewów 251 issue: przy szwajcarskiej QR-fakturze zapłacono na konto z części płatniczej
+    // („Konto / Zahlbar an”) — 80 z 80 — a NIE na IBAN ze stopki (CH Media: stopka CH36 0076…, zapłacone CH58 3076… QR-IBAN).
+    // Do QR-IBAN-u (IID 30000–31999) bank wymaga referencji QR („Referenz”) — bez niej przelewu nie przyjmie.
+    var QR_KONTO_ET = /(Konto\s*\/\s*Zahlbar\s+an|Account\s*\/\s*Payable\s+to|Compte\s*\/\s*Payable\s+[àa]|Conto\s*\/\s*Pagabile\s+a)/i;
+    var QR_REF_ET = /(Referenz|Reference|R[ée]f[ée]rence|Riferimento)/i;
+    // Referencja QR (27 cyfr, modulo 10 rekurencyjnie) albo SCOR („RF…”, ISO 11649 — modulo 97).
+    function qrRefOk(s){
+        s = String(s || '').replace(/\s+/g, '').toUpperCase();
+        if (/^\d{27}$/.test(s)){
+            var T = [0, 9, 4, 6, 8, 2, 7, 1, 3, 5], c = 0;
+            for (var i = 0; i < 26; i++) c = T[(c + +s[i]) % 10];
+            return (10 - c) % 10 === +s[26];
+        }
+        if (/^RF\d{2}[A-Z0-9]{1,21}$/.test(s)){
+            var x = s.slice(4) + s.slice(0, 4), r = 0;
+            for (var k = 0; k < x.length; k++){ var v = /[A-Z]/.test(x[k]) ? String(x.charCodeAt(k) - 55) : x[k]; for (var j = 0; j < v.length; j++) r = (r * 10 + +v[j]) % 97; }
+            return r === 1;
+        }
+        return false;
+    }
+    function qrRefFormat(s){
+        s = String(s || '');
+        return /^\d{27}$/.test(s) ? s.slice(0, 2) + ' ' + s.slice(2).replace(/(\d{5})(?=\d)/g, '$1 ') : s.replace(/(.{4})(?=.)/g, '$1 ');
+    }
+    function qrCzesc(linie){
+        var t = (linie || []).map(function (l){ return l.t; }), o = { konto: '', ref: '', nazwa: '', poz: -1 };
+        for (var i = 0; i < t.length && !o.konto; i++){
+            if (!QR_KONTO_ET.test(t[i])) continue;
+            for (var j = i; j < Math.min(t.length, i + 5); j++){
+                var ib = ibanyZTekstu(t[j]).filter(function (x){ return /^(CH|LI)/.test(x.n); })[0];
+                if (!ib) continue;
+                o.konto = ib.n; o.poz = j;
+                // Nazwa odbiorcy: z następnej linii; część płatnicza stoi z prawej obok pokwitowania — bierzemy ostatnią komórkę.
+                var nl = linie[j + 1], kom = nl && nl.k && nl.k.length ? nl.k[nl.k.length - 1].s : (t[j + 1] || '');
+                kom = String(kom).replace(/\b(?:CH|LI)\d{2}(?:\s?[A-Z0-9]{4}){4}\s?[A-Z0-9]\b/g, ' ').replace(/\s+/g, ' ').replace(/^[\s,;]+|[\s,;]+$/g, '');
+                if (/\p{L}{3}/u.test(kom) && !QR_REF_ET.test(kom) && !QR_KONTO_ET.test(kom)) o.nazwa = kom.slice(0, 70);
+                break;
+            }
+        }
+        if (!o.konto) return null;
+        for (var k = o.poz; k < Math.min(t.length, o.poz + 14) && !o.ref; k++){
+            if (!QR_REF_ET.test(t[k])) continue;
+            var okno = t.slice(k, k + 3).join(' '), re = /\b(\d{2}(?:\s?\d{5}){5})\b|\b(RF\d{2}(?:\s?[A-Z0-9]{1,4}){1,6})\b/g, m;
+            while ((m = re.exec(okno))){ var c = (m[1] || m[2]).replace(/\s+/g, ''); if (qrRefOk(c)){ o.ref = c; break; } }
+        }
+        o.qrIban = /^(CH|LI)\d{2}3[01]\d{3}/.test(o.konto);
+        return o;
+    }
+    // GBP z HSBC UK idzie przelewem krajowym: sort code + numer konta (z faktury albo z IBAN-u GB: bank 4 litery, sort 6 cyfr, konto 8).
+    function kontoUK(t){
+        var m = /Sort\s*code\s*:?\s*(\d{2})[\s-]?(\d{2})[\s-]?(\d{2})[\s\S]{0,160}?Account\s*(?:number|no\.?|nr)\s*:?\s*(\d{8})\b/i.exec(String(t || ''));
+        return m ? { sort: m[1] + '-' + m[2] + '-' + m[3], konto: m[4] } : null;
+    }
+    function ukZIban(n){ n = String(n || ''); return /^GB\d{2}[A-Z]{4}\d{14}$/.test(n) ? { sort: n.slice(8, 10) + '-' + n.slice(10, 12) + '-' + n.slice(12, 14), konto: n.slice(14) } : null; }
+    // Rachunek bez IBAN („Account Number: 6289193, SWIFT / BIC: SURBSPAXXX” — freelancer z Surinamu; na fakturze była literówka
+    // w BIC, w banku poszło SURBSRPAXXX). Takiego numeru nie da się sprawdzić sumą kontrolną — zawsze do przepisania ręcznie.
+    function kontoBezIban(t){
+        var s = String(t || ''), m = /(?:Account\s*(?:Number|No\.?|nr)|Kontonummer|Konto-?Nr\.?)\s*:?\s*(\d[\d\-. ]{3,24}\d)/i.exec(s);
+        if (!m) return null;
+        // 8–11 znaków: na fakturze freelancera stał 10-znakowy „SURBSPAXXX” (literówka) — pokazujemy go, żeby człowiek go poprawił.
+        var b = /\b(?:SWIFT|BIC)(?:\s*\/\s*(?:BIC|SWIFT))?(?:\s*code)?\s*:?\s*([A-Z]{6}[A-Z0-9]{2,5})\b/.exec(s);
+        return { konto: m[1].replace(/\s+/g, ' ').trim(), bic: b ? b[1] : '' };
+    }
+    // Rachunek odbiorcy z wydruku przelewu (PostFinance „Direct print-out from e-finance”, UBS e-banking, HSBC „Make a bill payment”).
+    function kontoZWydruku(linie){
+        var t = (linie || []).map(function (l){ return l.t; }), nasze = ibtArkusz();
+        function obce(s){ return ibanyZTekstu(s).filter(function (x){ return !nasze[x.n]; }); }
+        for (var i = 0; i < t.length; i++){
+            var m = /^Payment\s+(\S.*)$/i.exec(t[i]);
+            if (!m) continue;
+            var ib = obce(m[1])[0];
+            if (ib) return { n: ib.n };
+            var v = m[1].trim(), b = /^([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/.exec(t[i + 1] || '');
+            if (/^[0-9][0-9\-\/ .]{3,}$/.test(v)) return { tekst: v, bic: b ? b[1] : '' };
+            break;
+        }
+        for (var j = 0; j < t.length; j++) if (/IBAN\s*\(account\s+no\.?\)/i.test(t[j])){ var u = obce(t.slice(j, j + 3).join('\n'))[0]; if (u) return { n: u.n }; }
+        var hs = null;
+        t.forEach(function (x){ var mm = /(\d{2}-\d{2}-\d{2})\s+(\d{6,8})\b/.exec(x); if (mm) hs = mm; });
+        if (hs && /bill\s+payment/i.test(t.join(' '))) return { tekst: 'sort code ' + hs[1] + ' · konto ' + hs[2], uk: { sort: hs[1], konto: hs[2] } };
+        var ob = obce(t.join('\n'));
+        return ob.length === 1 ? { n: ob[0].n } : null;
     }
     // Wiersze ról przesyłki (nadawca / odbiorca towaru) to nie nabywca — ani „nasz”, ani „inna spółka”
     // (Hellmann „E:BELIANI DE GMBH”, Sieber „Von Beliani (Switzerland) GmbH”, DSV „Delivery address”).
@@ -15691,7 +16043,9 @@
             vat23: /\b23\s?%/.test(tekst) && /\b(VAT|PTU)\b/i.test(tekst), vatStawka: stawkaVat(tekst),
             skonto: /(?<!\p{L})(skonto|vorfinanzierung|finanzierungskosten)|financing\s+costs?/iu.test(tekst),
             odliczenia: kosztyFinansowania(linie, tekst),
-            polecenie: TIS_POLECENIE.test(tekst)
+            polecenie: TIS_POLECENIE.test(tekst),
+            // Rachunek odbiorcy poza zwykłym IBAN-em (17.11.2026): część płatnicza QR, UK, numer bez IBAN.
+            qr: qrCzesc(linie), uk: kontoUK(tekst), kontoInne: kontoBezIban(tekst), qrKotwica: QR_KONTO_ET.test(tekst)
         };
     }
     // Dokument z odczytu Claude albo ręcznego → ta sama postać.
@@ -15730,11 +16084,15 @@
         msg: null, postep: '', otwarte: {}, ustOtw: false, kto: '', ibtOtw: false, testOdczytu: false,
         ibt: { stan: 'nic', issue: [], osoby: [], blad: '', gen: 0, szcz: {}, uid: {}, wynik: null, historia: [], wysylam: false, mimoO: null, screen: null, scrInfo: '' },
         pbOtw: false, pb: { plan: null, konta: {}, tekst: '', postep: '', pracuje: false },
-        wsad: null, grupuj: true, grupaOtw: {}, usuniete: []
+        wsad: null, grupuj: true, grupaOtw: {}, usuniete: [],
+        // Płatność ręczna (17.11.2026) — zapamiętana na tym komputerze: osoba z payments używa jej zawsze.
+        reczne: (function (){ try { return GM_getValue(TIS_RECZNE_KEY, '0') === '1'; } catch (e){ return false; } })(),
+        ls: { platnicy: {}, konta: {} }
     };
     function sprawdzJedno(r){
         r.bladTech = ''; r.bladDubel = ''; r.odbite = null; r.powodyPola = null; r.powodyPliki = []; r.powodyFaktura = []; r.powodyDubel = [];
         r.faktura = null; r.zrodlo = 'hub'; r.vat23Hub = false; r.plikiFaktury = []; r.kontaHub = null;
+        r.polecenie = null; r.kontaPoprzednie = [];
         // Do „📄 Log odczytu” (15.10.2026): co HUB zrobił z każdym PDF-em. Linie PDF trzymamy tylko do oceny — zostają przy
         // issue (r.diag) wyłącznie wtedy, gdy odczyt faktury nie przeszedł bez uwag (diagZostaw).
         var diag = []; r.diag = null;
@@ -15750,15 +16108,31 @@
             r.kom = kom;
             var o = ostatnieOdbicie(kom);
             if (o){ r.odbite = { kto: o.kto, kiedy: o.kiedy.slice(0, 10), tekst: o.tekst.replace(/[\s\S]*?please\s+pay\s+from/i, 'please pay from').slice(0, 80) }; }
-            r.powodyPola = ocenPola(r, kom);
-            if (r.odbite && !r.test) return null;
-            return plikiIssue(r.id);
+            if (!r.reczne){
+                r.powodyPola = ocenPola(r, kom);
+                if (r.odbite && !r.test) return null;
+                return plikiIssue(r.id);
+            }
+            // Płatność ręczna: pliki PRZED oceną pól — polecenie zapłaty wskazuje pliki po nazwie.
+            return plikiIssue(r.id).then(function (pliki){
+                r.pliki = pliki;
+                r.polecenie = polecenieZaplaty(r, kom);
+                r.powodyPola = ocenPola(r, kom);
+                return pliki;
+            });
         }).then(function (pliki){
             if (!pliki) return;
             r.pliki = pliki; r.plikiPrzebieg = S.przebieg;
-            // Potwierdzenie / zlecenie przelewu w issue (po nazwie pliku): płatność w toku albo zrobiona.
-            pliki.forEach(function (f){ if (TIS_POTW.test(f.nazwa)) r.powodyPliki.push(powodStatusu(r, 'spr', 'w issue jest potwierdzenie / zlecenie przelewu („' + f.nazwa + '”) — płatność w toku albo już zrobiona?')); });
-            var pdfy = pliki.filter(function (f){ return /\.pdf$/i.test(f.nazwa) && !TIS_POTW.test(f.nazwa); });
+            var pol = r.reczne ? r.polecenie : null;
+            // Potwierdzenie / zlecenie przelewu w issue (po nazwie pliku): płatność w toku albo zrobiona. W płatności ręcznej liczy się
+            // tylko wgrane PO poleceniu zapłaty (= już zapłacone); starsze to poprzednie cykle — z nich bierzemy tylko rachunek (niżej).
+            pliki.forEach(function (f){
+                if (!TIS_POTW.test(f.nazwa)) return;
+                if (!pol) r.powodyPliki.push(powodStatusu(r, 'spr', 'w issue jest potwierdzenie / zlecenie przelewu („' + f.nazwa + '”) — płatność w toku albo już zrobiona?'));
+                else if (f.kiedy > pol.kiedy) r.powodyPliki.push(powodStatusu(r, 'zle', 'potwierdzenie przelewu „' + f.nazwa + '” wgrane ' + f.kiedy.slice(0, 16) + ', po poleceniu zapłaty — już zapłacone'));
+            });
+            var pdfy = pol ? plikiReczne(r, pliki).filter(function (f){ return !(TIS_POTW.test(f.nazwa) && f.kiedy > pol.kiedy); })
+                           : pliki.filter(function (f){ return /\.pdf$/i.test(f.nazwa) && !TIS_POTW.test(f.nazwa); });
             if (!pdfy.length){ r.faktura = { brakPdf: true }; return; }
             var docs = [], skany = [], bledy = [], pominiete = [];
             return pdfy.reduce(function (p, f){
@@ -15774,6 +16148,28 @@
                             var d = docZLinii(f, cz, r);
                             wpis.d = d;
                             if (d.przypomnienie){ pominiete.push(f.nazwa + ' (przypomnienie)'); wpis.stan = 'pominięty: przypomnienie'; return; }
+                            // Płatność ręczna: wydruk przelewu po poleceniu = już zapłacone; sprzed polecenia = poprzedni cykl — rachunek
+                            // odbiorcy z niego idzie jako podpowiedź (HECNY: rachunku w Hongkongu nie ma na żadnej fakturze, tylko na wydrukach).
+                            if (pol && d.nieFaktura && (d.przelew || d.potwTyt)){
+                                var poPol = f.kiedy > pol.kiedy, kp = kontoZWydruku(cz.linie);
+                                wpis.stan = 'pominięty: wydruk przelewu ' + (poPol ? 'po poleceniu zapłaty' : 'sprzed polecenia (poprzedni cykl)');
+                                if (poPol) r.powodyPliki.push(powodStatusu(r, 'zle', 'wydruk przelewu „' + f.nazwa + '” wgrany ' + f.kiedy.slice(0, 16) + ', po poleceniu zapłaty — już zapłacone'));
+                                else {
+                                    if (kp) r.kontaPoprzednie.push({ n: kp.n || '', tekst: kp.tekst || '', bic: kp.bic || '', kiedy: f.kiedy, plik: f.nazwa });
+                                    r.powodyPliki.push({ w: 'info', t: 'wydruk poprzedniego przelewu „' + f.nazwa + '” (' + f.kiedy.slice(0, 10) + ')'
+                                        + (kp ? ' — zapłacono wtedy na ' + (kp.n ? ibanFormat(kp.n) : kp.tekst) : '') });
+                                }
+                                return;
+                            }
+                            // Płatność ręczna: faktury tej płatności — wymienione w poleceniu albo z bieżącego cyklu (między poprzednią
+                            // zapłatą a poleceniem). Wgrane po poleceniu to już następny cykl.
+                            if (pol && !d.nieFaktura){
+                                var naz = pol.pliki.length, zNr = polPlikNumer(pol, f.nazwa);
+                                var pomin = naz && pol.pliki.indexOf(f.id) < 0 ? 'nie ma go w poleceniu zapłaty'
+                                          : !naz && f.kiedy > pol.kiedy ? 'wgrany po poleceniu zapłaty — następny cykl?'
+                                          : !naz && !zNr && pol.granica && f.kiedy <= pol.granica ? 'sprzed poprzedniej zapłaty' : '';
+                                if (pomin){ pominiete.push(f.nazwa + ' (' + pomin + ')'); wpis.stan = 'pominięty: ' + pomin; return; }
+                            }
                             if (d.nieFaktura){
                                 pominiete.push(f.nazwa + (d.przelew ? ' (wydruk przelewu z banku)' : d.potwTyt ? ' (potwierdzenie przelewu)' : ' (to nie faktura)'));
                                 wpis.stan = 'pominięty: ' + (d.przelew ? 'wydruk przelewu z banku' : d.potwTyt ? 'potwierdzenie przelewu (tytuł)' : 'to nie faktura (tytuł)');
@@ -15794,9 +16190,17 @@
                 if (bledy.length) r.faktura.bledy = bledy;
             });
         }).then(function (){
-            if (!r.odbite || r.test){
+            if (!r.odbite || r.test || r.reczne){
                 r.powodyFaktura = ocenFakture(r);
                 if (r.faktura && r.faktura.bledy) r.powodyFaktura.push({ w: 'spr', t: 'nie przeczytałem: ' + r.faktura.bledy.join('; ') });
+                // Płatność ręczna, issue bez pola kwoty (SRS, MWST, Galaxus, Primeo…): kwotę porównujemy z poleceniem; bez kwoty
+                // w poleceniu zostaje kwota z faktury — do sprawdzenia, bo nie ma jej z czym porównać.
+                if (r.reczne && r.polecenie && !isFinite(r.amount) && !(r.faktura && r.faktura.brakPdf)){
+                    var pk = r.polecenie.kwota, sf = lsSumaFaktur(r);
+                    if (isFinite(pk) && isFinite(sf) && !rowne(Math.abs(pk), Math.abs(sf))) r.powodyFaktura.push({ w: 'spr', t: 'kwota: w poleceniu zapłaty ' + kw(pk) + ', na fakturach ' + kw(sf) + ' — na liście kwota z polecenia; sprawdź' });
+                    else if (!isFinite(pk) && isFinite(sf)) r.powodyFaktura.push({ w: 'spr', t: 'kwota ' + kw(sf) + ' tylko z faktury — issue nie ma pola kwoty, a polecenie zapłaty jej nie podaje; sprawdź z fakturą' });
+                    else if (!isFinite(pk) && !isFinite(sf)) r.powodyFaktura.push({ w: 'spr', t: 'brak kwoty — ani w issue, ani w poleceniu zapłaty, ani odczytanej z faktury' });
+                }
                 r.vat23Hub = r.powodyFaktura.some(function (x){ return /VAT 23%/.test(x.t); });
                 // Pliki, które są fakturą tego issue (do dubla po MD5).
                 var surowe = fvIssue(r), nn = surowe.map(fvNorm);
@@ -15922,15 +16326,18 @@
     function issuePrzewoznika(opcja){
         if (cachePrzew[opcja]) return cachePrzew[opcja];
         var wynik = { lista: [], ucieteZamk: 0, ucieteOtw: 0 };
+        // Marketing / Sea Logistics: opcja z przedrostkiem („mkt:1161”) — szukamy po ich polu Issuer, numery i kwoty z ich pól.
+        var mU = /^(mkt|sea):(.+)$/.exec(String(opcja)), U = mU ? (mU[1] === 'mkt' ? F_MKT : F_SEA) : null;
+        var poleCo = U ? U.ISSUER : F.COMPANY, idCo = mU ? mU[2] : opcja, poleFv = U ? U.FV : F.FV, poleKw = U ? U.VALUE : F.AMOUNT;
         function strony(status, max){
             var p = Promise.resolve(), stop = false;
             for (var n = 1; n <= max; n++) (function (n){
                 p = p.then(function (){
                     if (stop) return;
                     if (S.przerwij) throw new Error('przerwane');
-                    return api(API + '/list/?status=' + status + '&view_type=list&setting_view=93&addition[' + F.COMPANY + '][]=' + encodeURIComponent(opcja) + '&page=' + n + '&per_page=50').then(function (j){
+                    return api(API + '/list/?status=' + status + '&view_type=list&setting_view=93&addition[' + poleCo + '][]=' + encodeURIComponent(idCo) + '&page=' + n + '&per_page=50').then(function (j){
                         var l = j.issue_list || [], tot = +(j.issue_pagination && j.issue_pagination.total) || 0;
-                        l.forEach(function (it){ wynik.lista.push({ id: String(it.id), fv: poleTxt(it, F.FV), amount: kwota(poleTxt(it, F.AMOUNT), true), status: status }); });
+                        l.forEach(function (it){ wynik.lista.push({ id: String(it.id), fv: poleTxt(it, poleFv), amount: kwota(poleTxt(it, poleKw), true), status: status }); });
                         if (n * 50 >= tot || !l.length) stop = true;
                         else if (n === max) wynik[status === 'close' ? 'ucieteZamk' : 'ucieteOtw'] = tot;
                     });
@@ -16006,8 +16413,9 @@
         // dojdzie (przerwanie), zostaje „niesprawdzone”, a nie ze starym ✔.
         // Tryb „🧪 test odczytu” zapamiętany przy issue w chwili sprawdzania — przełącznik ruszony później nie zmienia
         // znaczenia wyników już na ekranie (każdy niesie znaczek „🧪 test”).
-        var test = !!S.testOdczytu;
-        doSpr.forEach(function (r){ r.wynik = null; r.powody = []; r.sprPrzebieg = 0; r.test = test; });
+        var test = !!S.testOdczytu, reczne = !!S.reczne;
+        doSpr.forEach(function (r){ r.wynik = null; r.powody = []; r.sprPrzebieg = 0; r.test = test; r.reczne = reczne; });
+        tisLog('start', 'Sprawdź faktury: ' + doSpr.length + ' issue' + (reczne ? ' · 💳 płatność ręczna' : '') + (test ? ' · 🧪 test odczytu' : ''));
         S.otwarte = {};
         // Poza stronami React login nie stoi w DOM — bierzemy go ze strony pierwszego issue (odczyt).
         if (S.kto === '?') zapytanie('/react/logs/issue_logs/' + encodeURIComponent(doSpr[0].id), TIS_API_MS)
@@ -16022,18 +16430,27 @@
         }).then(function (){
             if (S.przerwij) return;
             S.postep = 'Szukam dubli (lista + otwarte i zamknięte issue przewoźników)…'; rysujStan();
-            var zrobione = doSpr.filter(function (r){ return r.sprPrzebieg === przebieg && (!r.odbite || r.test) && !r.bladTech; });
+            var zrobione = doSpr.filter(function (r){ return r.sprPrzebieg === przebieg && (!r.odbite || r.test || r.reczne) && !r.bladTech; });
             return sprawdzDuble(zrobione, doSpr).then(function (){ dubleZrobione = !S.przerwij; });
         }).then(function (){
             doSpr.forEach(function (r){
                 if (r.sprPrzebieg !== przebieg){ r.wynik = null; r.powody = []; return; }
-                if (!dubleZrobione && (!r.odbite || r.test) && !r.bladTech) r.bladDubel = 'dubla nie sprawdziłem — przerwane; kliknij „Sprawdź faktury” jeszcze raz';
+                if (!dubleZrobione && (!r.odbite || r.test || r.reczne) && !r.bladTech) r.bladDubel = 'dubla nie sprawdziłem — przerwane; kliknij „Sprawdź faktury” jeszcze raz';
                 zlozWynik(r);
             });
             var l = licz();
+            var podsum = (S.przerwij ? 'Przerwane. ' : 'Sprawdzone. ') + '✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ↪ już odbite ' + l.odbite + (l.nie ? ' · niesprawdzone ' + l.nie : '');
+            // Bez trybu płatności ręcznej, a issue mają już polecenie zapłaty (panel 17.11.2026: lista maili „Please answer Issue”
+            // sprawdzona bez „💳” dała „inny typ issue” i „↪ już odbite”) — mówimy wprost, co zaznaczyć.
+            var zPol = reczne ? [] : doSpr.filter(function (r){ return (r.kom || []).some(function (c){ return !systemowy(c) && TIS_POL_KOM.test(c.tekst); }); });
             say((test ? '🧪 TEST ODCZYTU (status zapłaty pominięty — wyniki nie są zgodą na płatność). ' : '')
-                + (S.przerwij ? 'Przerwane. ' : 'Sprawdzone. ') + '✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ↪ już odbite ' + l.odbite + (l.nie ? ' · niesprawdzone ' + l.nie : ''), l.zle || l.spr || l.blad || l.nie ? 'warn' : 'ok');
-        }).catch(function (e){ say('Błąd: ' + (e.message || e), 'err'); })
+                + (reczne ? '💳 Płatność ręczna — lista w „🏦 Płatność”. ' : '') + podsum
+                + (zPol.length ? ' · ' + zPol.length + ' z ' + doSpr.length + ' issue ma już polecenie zapłaty („please pay …”): jeśli płacisz je Ty, zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz.' : ''),
+                l.zle || l.spr || l.blad || l.nie || zPol.length ? 'warn' : 'ok');
+            doSpr.forEach(function (r){ if (r.wynik) tisLog('issue', r.id + ' ' + ({ ok: '✔', zle: '✖', spr: '?', blad: '? techniczne', odbite: '↪' }[r.wynik] || r.wynik) + ' · ' + (r.company || r.temat || '').slice(0, 50)
+                + ' · ' + (r.amountTxt || '—') + ' ' + (r.waluta || r.walutaTemat || '') + ' · ' + (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 600)); });
+            tisLog('koniec', podsum);
+        }).catch(function (e){ say('Błąd: ' + (e.message || e), 'err'); tisLog('koniec', '✖ wyjątek przy sprawdzaniu: ' + (e.message || e)); })
           .then(function (){ S.praca = false; S.moznaPrzerwac = false; S.postep = ''; rysuj(); });
     }
     function licz(){
@@ -16375,7 +16792,8 @@
     function szEtykieta(k, id){ var o = szListaOpcji(k).filter(function (x){ return x[0] === String(id); })[0]; return o ? o[1] : String(id); }
     // Po stronie HUB-a — na wierszu z wiersz(it).
     function szFiltrHub(f, r){
-        if (f.tylkoFaktury && r.fv === null && r.spolka === null) return false;
+        // Tylko układ pól 555–562 (jak dotąd: pole FV albo Spółka). Marketing i Sea Logistics wchodzą wklejką numerów.
+        if (f.tylkoFaktury && (r.uklad ? r.uklad !== 'ship' : (r.fv === null && r.spolka === null))) return false;
         // Stałe wykluczenie przewoźników, których nie płacimy przelewem — po NAZWIE, bo numerów
         // opcji Company nie znamy przy każdym wyszukaniu. Nie zależy od „Wyczyść filtry”.
         if (SZ.niePlacimy && niePlacimyKto(r.company).length) return false;
@@ -16772,6 +17190,8 @@
         pobierzPlik(f.url).then(function (b){
             if (!toPdf(b)) throw new Error('plik nie jest PDF-em');
             zapiszDoPobranych(b, nazwa);
+            tisLog('start', '🤖 Claude — jedna faktura: issue ' + r.id + ' · ' + String(r.company || r.temat || '').slice(0, 50) + ' · plik „' + f.nazwa + '” → ' + nazwa);
+            tisLog('koniec', 'zapisane w Pobranych — czeka na odpowiedź Claude · dlaczego: ' + ((r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 500) || '—'));
             // Link do aplikacji jest zwykłym odnośnikiem do kliknięcia: przeglądarka otwiera
             // aplikację tylko po kliknięciu człowieka, nie z kodu po pobraniu pliku.
             S.otwarte[r.id] = { tryb: 'claude', plik: nazwa, link: linkClaude(nazwa) };
@@ -16795,6 +17215,8 @@
         if (p.odrzucone.length) r.powodyFaktura.push({ w: 'info', t: 'pominąłem linie spoza formatu: ' + p.odrzucone.slice(0, 3).join(' | ').slice(0, 160) });
         zlozWynik(r);
         var nauka = naukaZapisz(r, docs, 'claude');
+        tisLog('start', '🤖 Odpowiedź Claude: issue ' + r.id + ' · ' + docs.map(tisOdczytLog).join(' ‖ '));
+        tisLog('koniec', r.id + ' → ' + (OPIS_WYNIKU[r.wynik] || r.wynik) + ' · ' + (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 500));
         delete S.otwarte[r.id];
         say('Issue ' + r.id + ': odczyt Claude porównany z issue — ' + OPIS_WYNIKU[r.wynik] + '.' + naukaOpis([nauka]), r.wynik === 'ok' ? 'ok' : 'warn');
         rysuj();
@@ -16892,6 +17314,11 @@
     function wsadPlikiIssue(r){
         var ids = ((r.faktura && r.faktura.docs) || []).map(function (d){ return d.plikId; }).filter(Boolean);
         var pdfy = (r.pliki || []).filter(function (f){ return /\.pdf$/i.test(f.nazwa) && !TIS_POTW.test(f.nazwa); });
+        // Płatność ręczna: tylko pliki tej płatności (issue cykliczne mają setki starszych faktur — MWST 339831: 228 plików).
+        if (r.reczne && r.polecenie){
+            var wyb = plikiReczne(r, r.pliki || []).map(function (f){ return f.id; }), pk = r.polecenie.kiedy;
+            pdfy = pdfy.filter(function (f){ return wyb.indexOf(f.id) >= 0 && !(f.kiedy > pk) && !TIS_WYDRUK_NAZWA.test(f.nazwa); });
+        }
         var wybrane = ids.length ? pdfy.filter(function (f){ return ids.indexOf(f.id) >= 0; }) : [];
         return wybrane.length ? wybrane : pdfy;
     }
@@ -16909,6 +17336,9 @@
         return pf.every(function (x){ return x.w === 'info' || TIS_WSAD_NIE_ODCZYT.test(x.t); });
     }
     function wsadDoOdczytu(r){
+        // Issue bez pól faktury poza płatnością ręczną: nie ma z czym porównać odczytu, a pliki to cała historia
+        // (Paytrail 211586: 76 PDF-ów z trzech lat) — nie idzie do paczki.
+        if (!r.reczne && r.uklad && r.uklad !== 'ship' && r.uklad !== 'mkt' && r.uklad !== 'sea') return false;
         return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && !wpisDozwolony(r) && wsadPlikiIssue(r).length > 0;
     }
     function wsadKandydat(r){ return wsadDoOdczytu(r) && !wsadOdczytKompletny(r); }
@@ -17055,6 +17485,15 @@
             poz.forEach(function (p){ delete p.pliki; });
             S.wsad = { stan: 'gotowe', poz: poz, blad: bledy.join('; '), polecenie: pol, link: wsadLink(nazwaZip), wynik: '',
                        zip: { nazwa: nazwaZip, sciezka: zip.sciezka, mb: wsadMb(bajty.length), pdf: ilePdf, duzy: duzy } };
+            // Log (prośba 17.11.2026): co poszło do Claude i dlaczego — zostaje, nawet gdy odpowiedź nigdy nie wróci do HUB-a.
+            tisLog('start', '🤖 Paczka do Claude: ' + nazwaZip + ' · ' + poz.length + ' spraw · ' + ilePdf + ' PDF · ' + wsadMb(bajty.length));
+            poz.forEach(function (p){
+                tisLog('claude', p.r.id + ' · ' + String(p.r.company || p.r.temat || '').slice(0, 50) + ' · ' + (p.r.amountTxt || '—') + ' ' + (p.r.waluta || '')
+                    + ' · pliki: ' + p.nazwy.join(', ') + ' · dlaczego: ' + ((p.r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 500) || '—'));
+            });
+            if (bledy.length) tisLog('claude', '✖ nie pobrałem: ' + bledy.join('; '));
+            if (pomin.length) tisLog('claude', 'pominięte (nowy odczyt nie rozstrzygnie): ' + pomin.map(function (r){ return r.id; }).join(', '));
+            tisLog('koniec', '🤖 ZIP w Pobranych — czeka na odpowiedź Claude');
             say('Zapisałem w Pobranych jeden plik ZIP „' + nazwaZip + '” (' + wsadMb(bajty.length) + ': ' + ilePdf + ' PDF z ' + poz.length + ' spraw, POLECENIE.txt i spis plików).'
                 + ' Teraz „② Otwórz w Claude”, tam „Wyślij”, a całą odpowiedź wklej w pole pod spodem.'
                 + (ust().pobrane.trim() ? '' : ' UWAGA: w „⚙ Ustawienia” nie ma folderu Pobranych — ZIP dołączysz w aplikacji ręcznie.')
@@ -17118,6 +17557,10 @@
             + (bezOdczytu.length ? ' · bez odczytu: ' + bezOdczytu.join(', ') : '')
             + (bezPliku.length ? ' · bloki o nieznanym pliku: ' + bezPliku.slice(0, 3).join(', ') : '')
             + (pominiete.length ? ' · pominięte: ' + pominiete.join('; ') : '');
+        tisLog('start', '🤖 Odpowiedź Claude do paczki ' + ((S.wsad.zip && S.wsad.zip.nazwa) || '') + ': bloków odczytu ' + odczyty.length + ', uwag ' + uwagi.length);
+        Object.keys(wg).forEach(function (id){ tisLog('claude', id + ' odczyt: ' + wg[id].map(tisOdczytLog).join(' ‖ ')); });
+        Object.keys(poId).forEach(function (id){ var r = poId[id]; if (r.wynik) tisLog('claude', id + ' → ' + (OPIS_WYNIKU[r.wynik] || r.wynik) + ' · ' + (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 500)); });
+        tisLog('koniec', S.wsad.wynik);
         say(S.wsad.wynik + naukaOpis(nauka), zrobione ? (bezOdczytu.length || pominiete.length || bezPliku.length ? 'warn' : 'ok') : 'err');
         rysuj();
     }
@@ -18080,7 +18523,7 @@
     // Rachunki własnych spółek i właścicieli odpadają.
     function pbKontaZDocs(docs){
         return (docs || []).filter(function (d){ return d.linieT; }).map(function (d){
-            return { plik: d.plik, plikId: d.plikId || '', zrodlo: 'hub',
+            return { plik: d.plik, plikId: d.plikId || '', zrodlo: 'hub', korekta: !!d.korekta, qr: d.qr || null, uk: d.uk || null, inne: d.kontoInne || null,
                      ibany: ibanyZTekstu(d.linieT.join('\n')).map(function (x){ return { n: x.n, przed: x.przed, linia: x.linia }; }) };
         });
     }
@@ -18088,11 +18531,11 @@
         var nasze = ibtArkusz(), docs = (r.faktura && r.faktura.docs) || [], out = [];
         var zLinii = docs.filter(function (d){ return d.linieT; });
         (zLinii.length ? pbKontaZDocs(zLinii) : (r.kontaHub || [])).forEach(function (x){
-            out.push({ plik: x.plik, plikId: x.plikId, zrodlo: x.zrodlo, ibany: x.ibany.slice() });
+            out.push({ plik: x.plik, plikId: x.plikId, zrodlo: x.zrodlo, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, ibany: x.ibany.slice() });
         });
         docs.forEach(function (d){
             if (!d.linieT && (d.ibany || []).length)
-                out.push({ plik: d.plik || 'odczyt Claude', plikId: d.plikId || '', zrodlo: 'claude', ibany: d.ibany.map(function (n){ return { n: n, przed: 'odczyt Claude', linia: '' }; }) });
+                out.push({ plik: d.plik || 'odczyt Claude', plikId: d.plikId || '', zrodlo: 'claude', korekta: !!d.korekta, ibany: d.ibany.map(function (n){ return { n: n, przed: 'odczyt Claude', linia: '' }; }) });
         });
         out.forEach(function (x){ x.ibany = x.ibany.filter(function (k){ return !nasze[k.n]; }); });
         return out;
@@ -18120,7 +18563,8 @@
     var TIS_MIMO_TWARDE = /(już zapłacone|In bank file|issue jest zamknięte|komentarz o zapłacie|płatność w toku|potwierdzenie \/ zlecenie przelewu|^dubel:)/;
     function mimoUwagi(r){ return (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }); }
     function mimoKlucz(r){ return naukaHash(r.wynik + '|' + mimoUwagi(r).join('\n')); }
-    function mimoMozna(r){ return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && !r.bladTech && !!r.powodyPola && isFinite(r.amount); }
+    // Płatność ręczna: issue bez pola kwoty (MWST, SRS…) też da się dodać mimo uwag, gdy kwota jest z polecenia albo z faktury.
+    function mimoMozna(r){ return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && !r.bladTech && !!r.powodyPola && (isFinite(r.amount) || (!!r.reczne && isFinite(lsKwota(r)))); }
     function mimoWazne(r){ return !!(r.mimo && mimoMozna(r) && r.mimo.klucz === mimoKlucz(r)); }
     function doPlatnosci(r){ return r.wynik === 'ok' || mimoWazne(r); }
 
@@ -18129,15 +18573,17 @@
     // odejmujemy wszystkie. Inaczej bierzemy korekty od największej tak, żeby przelew został DODATNI i jak najmniejszy
     // (decyzja użytkownika 04.11.2026: „najmniej, ale > 0,00”); nieodliczone przechodzą na następny przebieg. Same korekty
     // bez faktury — dostawca pominięty, korekty do pliku „korekty odlozone”.
-    function pbDobierzKorekty(lista){
-        var fakt = lista.filter(function (r){ return pbGr(r.amount) >= 0; }), kor = lista.filter(function (r){ return pbGr(r.amount) < 0; });
-        var F = fakt.reduce(function (s, r){ return s + pbGr(r.amount); }, 0), K = kor.reduce(function (s, r){ return s - pbGr(r.amount); }, 0);
+    // kwF — kwota issue (plik do banku: Amount; lista do płatności: kwota z polecenia albo z faktury, gdy issue nie ma pola).
+    function pbDobierzKorekty(lista, kwF){
+        var A = function (r){ return pbGr(kwF ? kwF(r) : r.amount); };
+        var fakt = lista.filter(function (r){ return A(r) >= 0; }), kor = lista.filter(function (r){ return A(r) < 0; });
+        var F = fakt.reduce(function (s, r){ return s + A(r); }, 0), K = kor.reduce(function (s, r){ return s - A(r); }, 0);
         if (!kor.length) return { issue: lista, odlozone: [], tryb: '' };
         if (!fakt.length || F <= 0) return { issue: [], odlozone: kor, tryb: 'same' };
         if (K < F) return { issue: lista, odlozone: [], tryb: '' };
         var wziete = [], odl = [], zostaje = F;
-        kor.slice().sort(function (a, b){ return pbGr(a.amount) - pbGr(b.amount) || (a.id < b.id ? -1 : 1); }).forEach(function (r){
-            var c = -pbGr(r.amount);
+        kor.slice().sort(function (a, b){ return A(a) - A(b) || (a.id < b.id ? -1 : 1); }).forEach(function (r){
+            var c = -A(r);
             if (zostaje - c > 0){ wziete.push(r); zostaje -= c; } else odl.push(r);
         });
         return { issue: lista.filter(function (r){ return fakt.indexOf(r) >= 0 || wziete.indexOf(r) >= 0; }), odlozone: odl, tryb: 'dobor', zostaje: zostaje };
@@ -18154,9 +18600,116 @@
         if (tak.length !== 1) return null;
         return kand.every(function (k, i){ return k === tak[0] || (opis[i].length && opis[i].indexOf(waluta) < 0); }) ? tak[0] : null;
     }
+    // Jedna grupa = jeden odbiorca (17.11.2026 wydzielone z pbPlan: plik do banku i lista do płatności liczą przelew TĄ SAMĄ funkcją,
+    // więc nie mogą się rozjechać). Ustawia g.issue, g.gr, g.numery, rachunek (pbRachunekGrupy) i g.powod, gdy przelewu nie ma.
+    function pbGrupaLicz(g, waluta, kwF){
+        var A = kwF || function (r){ return r.amount; };
+        var dob = pbDobierzKorekty(g.wszystkie, kwF);
+        g.issue = dob.issue; g.odlozoneKor = dob.odlozone; g.trybKor = dob.tryb; g.powod = '';
+        if (dob.tryb === 'same'){
+            g.issue = g.wszystkie; g.konta = []; g.dok = []; g.gr = 0; g.numery = [];
+            g.powod = 'same korekty, bez faktury — dostawca pominięty, korekty w pliku „korekty odlozone”';
+            return g;
+        }
+        g.konta = []; g.dok = []; g.polecenie = false;
+        g.issue.forEach(function (r){
+            if (pbPolecenie(r)) g.polecenie = true;
+            var fakt = r.plikiFaktury || [];
+            pbKontaDok(r).forEach(function (x){
+                // Do zgodności rachunków liczą się dokumenty TEGO issue (z jego numerem FV); RIB i inne załączniki dają tylko kandydatów.
+                if (x.zrodlo === 'claude' || !fakt.length || fakt.indexOf(x.plikId) >= 0)
+                    g.dok.push({ issue: r.id, plik: x.plik, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, ibany: x.ibany.map(function (q){ return q.n; }) });
+                x.ibany.forEach(function (q){ if (!g.konta.some(function (y){ return y.n === q.n; })) g.konta.push({ n: q.n, przed: q.przed, linia: q.linia, plik: x.plik }); });
+            });
+        });
+        // Issue bez kwoty (NaN) — cała grupa bez kwoty; pbGr(NaN) dałby 0, a „0,00” na liście wyglądałoby jak kwota.
+        g.gr = g.issue.reduce(function (s, r){ var v = A(r); return isFinite(v) ? s + pbGr(v) : NaN; }, 0);
+        g.numery = [];
+        g.issue.forEach(function (r){ fvIssue(r).forEach(function (n){ if (g.numery.indexOf(n) < 0) g.numery.push(n); }); });
+        pbRachunekGrupy(g, waluta);
+        var powod = '';
+        if (g.polecenie) powod = 'nie płać przelewem — faktura mówi o poleceniu zapłaty; zapytaj finanse';
+        else if (!isFinite(g.gr)) powod = '';
+        else if (g.gr <= 0) powod = g.gr === 0 ? 'nie płać — faktury i korekty znoszą się do zera' : 'nie płać — korekty większe niż faktury (' + pbKwPok(g.gr) + ')';
+        if (!powod && !g.iban && !g.kontoInne && !(g.uk && waluta === 'GBP')){
+            if (g.rozneQr) powod = 'faktury tego dostawcy podają różne konta QR (' + g.rozneQr.map(ibanFormat).join(' / ') + ') — sprawdź i wskaż rachunek';
+            else if (g.rozne) powod = 'dokumenty tego dostawcy podają różne rachunki — ' + g.zIban.map(function (d){ return d.plik + ': ' + d.ibany.map(ibanFormat).join(' / '); }).join('; ') + ' — sprawdź i wskaż rachunek';
+            else powod = g.konta.length ? 'wskaż rachunek — faktury tego przewoźnika podają ' + g.konta.length + ' różne' : 'brak rachunku na fakturze — wpisz go ręcznie';
+        } else if (!powod && g.iban && !ibanOk(g.iban)) powod = 'numer rachunku ' + ibanFormat(g.iban) + ' nie przechodzi sumy kontrolnej';
+        g.powod = powod;
+        return g;
+    }
+    // Rachunek odbiorcy grupy: wskazanie człowieka → konto z części płatniczej QR → wspólny IBAN dokumentów → jeden kandydat →
+    // waluta przy numerze → tabela HUB-a → (płatność ręczna) rachunek z poprzedniego wydruku przelewu. Noty kredytowe nie decydują,
+    // gdy w grupie jest faktura z rachunkiem: DPD, Sieber, DHL (17.11.2026) — nota podaje zwykły IBAN, a przelew razem z fakturą
+    // poszedł na QR-IBAN faktury.
+    var TIS_KRAJ_WALUTY = { NOK: ['NO'], SEK: ['SE'], DKK: ['DK'], GBP: ['GB'], CHF: ['CH', 'LI'], PLN: ['PL'], CZK: ['CZ'], HUF: ['HU'], RON: ['RO'] };
+    function pbRachunekGrupy(g, waluta){
+        g.zKraju = false;
+        var fakDok = g.dok.filter(function (d){ return !d.korekta && d.ibany.length; });
+        var zIban = fakDok.length ? fakDok : g.dok.filter(function (d){ return d.ibany.length; });
+        g.zIban = zIban;
+        g.bezIban = g.dok.filter(function (d){ return !d.ibany.length; });
+        var wspolne = zIban.length ? zIban[0].ibany.filter(function (n){ return zIban.every(function (d){ return d.ibany.indexOf(n) >= 0; }); }) : [];
+        g.rozne = zIban.length > 1 && !wspolne.length;
+        var qrs = [];
+        g.dok.forEach(function (d){ if (!d.korekta && d.qr && d.qr.konto && qrs.indexOf(d.qr.konto) < 0) qrs.push(d.qr.konto); });
+        var wyb = S.pb.konta[g.klucz];
+        g.wybrany = !!wyb; g.zWaluty = false; g.zQr = false; g.rozneQr = null; g.zTabeli = null; g.zPoprzedniego = null; g.innyNizPoprzednio = null; g.kontoInne = null;
+        if (wyb) g.iban = wyb;
+        else if (qrs.length === 1){ g.iban = qrs[0]; g.zQr = true; }
+        else if (qrs.length > 1){ g.iban = ''; g.rozneQr = qrs; }
+        else if (g.rozne) g.iban = '';
+        else if (wspolne.length === 1) g.iban = wspolne[0];
+        else if (g.konta.length === 1) g.iban = g.konta[0].n;
+        else {
+            var kand = wspolne.length ? g.konta.filter(function (x){ return wspolne.indexOf(x.n) >= 0; }) : g.konta;
+            var wz = pbRachunekWaluty(kand, waluta);
+            // Kraj IBAN-u = kraj waluty (DSV Road: NO57… dla NOK obok SE25… dla SEK — wydruki 17.11.2026: zapłacono na NO). Tylko gdy
+            // dokładnie jeden kandydat jest z kraju waluty płatności.
+            if (!wz && TIS_KRAJ_WALUTY[waluta]){
+                var zk = kand.filter(function (x){ return TIS_KRAJ_WALUTY[waluta].indexOf(x.n.slice(0, 2)) >= 0; });
+                if (zk.length === 1){ wz = zk[0]; g.zKraju = true; }
+            }
+            g.iban = wz ? wz.n : '';
+            g.zWaluty = !!wz && !g.zKraju;
+        }
+        // Żadnego numeru z dokumentów — sięgamy po rachunek wpisany na stałe (TIS_RACHUNKI).
+        // Wskazanie człowieka i numer z faktury mają pierwszeństwo, bo stoją wyżej.
+        if (!g.iban && !g.konta.length){
+            var zt = pbRachunekZTabeli(g.issue[0]);
+            if (zt){ g.iban = zt.iban; g.zTabeli = zt; }
+        }
+        // Rachunek bez IBAN z faktury (konto + SWIFT) i UK (sort code + konto).
+        if (!g.iban && !g.konta.length) g.dok.forEach(function (d){ if (!g.kontoInne && !d.korekta && d.inne) g.kontoInne = d.inne; });
+        g.uk = null;
+        if (waluta === 'GBP'){
+            g.uk = ukZIban(g.iban);
+            if (!g.uk) g.dok.forEach(function (d){ if (!g.uk && !d.korekta && d.uk) g.uk = d.uk; });
+        }
+        // Poprzedni przelew do tego odbiorcy (wydruk w issue, tryb płatności ręcznej): podpowiedź, gdy z dokumentów nic,
+        // i ostrzeżenie, gdy dokumenty podają inny rachunek (BFT zmienił rachunek 09.2026 — starsze faktury dalej miały stary).
+        var pop = null;
+        g.issue.forEach(function (r){ (r.kontaPoprzednie || []).forEach(function (k){ if (!pop || k.kiedy > pop.kiedy) pop = k; }); });
+        if (pop){
+            if (!g.iban && !g.kontoInne && !(g.uk && waluta === 'GBP')){
+                if (pop.n){ g.iban = pop.n; g.zPoprzedniego = pop; }
+                else if (pop.tekst){ g.kontoInne = { konto: pop.tekst, bic: pop.bic || '' }; g.zPoprzedniego = pop; }
+            } else if (g.iban && pop.n && pop.n !== g.iban) g.innyNizPoprzednio = pop;
+        }
+        g.qr = null;
+        if (g.iban){
+            var zRef = g.dok.filter(function (d){ return !d.korekta && d.qr && d.qr.konto === g.iban && d.qr.ref; });
+            if (zRef.length) g.qr = { ref: zRef[0].qr.ref, plik: zRef[0].plik, ile: zRef.length };
+        }
+        g.qrIban = !!g.iban && /^(CH|LI)\d{2}3[01]\d{3}/.test(g.iban);
+        g.reczny = !!g.iban && !g.zTabeli && !g.zPoprzedniego && !g.konta.some(function (x){ return x.n === g.iban; }) && qrs.indexOf(g.iban) < 0;
+        g.brakNaDok = g.iban ? zIban.filter(function (d){ return d.ibany.indexOf(g.iban) < 0; }) : [];
+    }
     // Jeden odbiorca + kilka issue = jeden przelew, razem z korektami (decyzja 09.10.2026).
     function pbPlan(){
-        var ok = S.lista.filter(doPlatnosci);
+        // Plik do banku płaci kwotę z pola Amount — issue bez niej (płatność ręczna: MWST, SRS…) idą tylko listą do płatności.
+        var ok = S.lista.filter(function (r){ return doPlatnosci(r) && isFinite(r.amount); });
         var plan = { grupy: [], poza: [], odlozone: [], platnik: null, blad: '', data: pbDataWykonania(), waluta: '' };
         if (!ok.length){ plan.blad = 'nie ma issue z ✔ ani dodanych do płatności mimo uwag — najpierw „Sprawdź faktury”'; return plan; }
         // Jeden plik = jeden rachunek płatnika, czyli jedna spółka i jedna waluta.
@@ -18186,65 +18739,14 @@
         var uzyte = {}, numeryWPliku = {};
         kolej.forEach(function (k){
             var g = grupy[k];
-            var dob = pbDobierzKorekty(g.wszystkie);
-            g.issue = dob.issue; g.odlozoneKor = dob.odlozone; g.trybKor = dob.tryb;
-            dob.odlozone.forEach(function (r){
-                plan.odlozone.push({ r: r, nazwa: g.nazwa, powod: dob.tryb === 'same'
+            pbGrupaLicz(g, plan.waluta, null);
+            g.odlozoneKor.forEach(function (r){
+                plan.odlozone.push({ r: r, nazwa: g.nazwa, powod: g.trybKor === 'same'
                     ? 'same korekty, bez faktury tego dostawcy — pomijam dostawcę'
                     : 'korekty większe niż faktury — ta nie zmieściła się tak, żeby przelew został dodatni; przechodzi na następny przebieg' });
             });
-            if (dob.tryb === 'same'){
-                g.issue = g.wszystkie; g.konta = []; g.dok = []; g.gr = 0; g.numery = [];
-                g.powod = 'same korekty, bez faktury — dostawca pominięty, korekty w pliku „korekty odlozone”';
-                plan.poza.push(g); return;
-            }
-            g.konta = []; g.dok = []; g.polecenie = false;
-            g.issue.forEach(function (r){
-                if (pbPolecenie(r)) g.polecenie = true;
-                var fakt = r.plikiFaktury || [];
-                pbKontaDok(r).forEach(function (x){
-                    // Do zgodności rachunków liczą się dokumenty TEGO issue (z jego numerem FV); RIB i inne załączniki dają tylko kandydatów.
-                    if (x.zrodlo === 'claude' || !fakt.length || fakt.indexOf(x.plikId) >= 0) g.dok.push({ issue: r.id, plik: x.plik, ibany: x.ibany.map(function (q){ return q.n; }) });
-                    x.ibany.forEach(function (q){ if (!g.konta.some(function (y){ return y.n === q.n; })) g.konta.push({ n: q.n, przed: q.przed, linia: q.linia, plik: x.plik }); });
-                });
-            });
-            g.gr = g.issue.reduce(function (s, r){ return s + pbGr(r.amount); }, 0);
-            g.numery = [];
-            g.issue.forEach(function (r){ fvIssue(r).forEach(function (n){ if (g.numery.indexOf(n) < 0) g.numery.push(n); }); });
-            // Zgodność: rachunek wspólny dla wszystkich dokumentów, które w ogóle podają rachunek.
-            var zIban = g.dok.filter(function (d){ return d.ibany.length; });
-            g.bezIban = g.dok.filter(function (d){ return !d.ibany.length; });
-            var wspolne = zIban.length ? zIban[0].ibany.filter(function (n){ return zIban.every(function (d){ return d.ibany.indexOf(n) >= 0; }); }) : [];
-            g.rozne = zIban.length > 1 && !wspolne.length;
-            // wybór rachunku: wskazanie człowieka; jeden wspólny; jeden kandydat; waluta przy numerze; tabela HUB-a
-            var wyb = S.pb.konta[k];
-            g.wybrany = !!wyb;
-            g.zWaluty = false;
-            if (wyb) g.iban = wyb;
-            else if (g.rozne) g.iban = '';
-            else if (wspolne.length === 1) g.iban = wspolne[0];
-            else if (g.konta.length === 1) g.iban = g.konta[0].n;
-            else {
-                var kand = wspolne.length ? g.konta.filter(function (x){ return wspolne.indexOf(x.n) >= 0; }) : g.konta;
-                var wz = pbRachunekWaluty(kand, plan.waluta);
-                g.iban = wz ? wz.n : '';
-                g.zWaluty = !!wz;
-            }
-            // Żadnego numeru z dokumentów — sięgamy po rachunek wpisany na stałe (TIS_RACHUNKI).
-            // Wskazanie człowieka i numer z faktury mają pierwszeństwo, bo stoją wyżej.
-            if (!g.iban && !g.konta.length){
-                var zt = pbRachunekZTabeli(g.issue[0]);
-                if (zt){ g.iban = zt.iban; g.zTabeli = zt; }
-            }
-            g.reczny = !!g.iban && !g.zTabeli && !g.konta.some(function (x){ return x.n === g.iban; });
-            g.brakNaDok = g.iban ? zIban.filter(function (d){ return d.ibany.indexOf(g.iban) < 0; }) : [];
-            var powod = '';
-            if (g.polecenie) powod = 'nie płać przelewem — faktura mówi o poleceniu zapłaty; zapytaj finanse';
-            else if (g.gr <= 0) powod = g.gr === 0 ? 'nie płać — faktury i korekty znoszą się do zera' : 'nie płać — korekty większe niż faktury (' + pbKwPok(g.gr) + ')';
-            else if (!g.iban && g.rozne) powod = 'dokumenty tego dostawcy podają różne rachunki — ' + zIban.map(function (d){ return d.plik + ': ' + d.ibany.map(ibanFormat).join(' / '); }).join('; ') + ' — sprawdź i wskaż rachunek';
-            else if (!g.iban) powod = g.konta.length ? 'wskaż rachunek — faktury tego przewoźnika podają ' + g.konta.length + ' różne' : 'brak rachunku na fakturze — wpisz go ręcznie';
-            else if (!ibanOk(g.iban)) powod = 'numer rachunku ' + ibanFormat(g.iban) + ' nie przechodzi sumy kontrolnej';
-            if (powod){ g.powod = powod; plan.poza.push(g); return; }
+            if (!g.powod && g.kontoInne && !g.iban) g.powod = 'rachunek bez IBAN (' + g.kontoInne.konto + (g.kontoInne.bic ? ', BIC ' + g.kontoInne.bic : '') + ') — tego nie zapłacisz plikiem SEPA; użyj listy do płatności';
+            if (g.powod){ plan.poza.push(g); return; }
             g.zFaktury = g.issue.filter(function (r){ return r.fvZFaktury && !fvLista(r.fv).length; })
                 .map(function (r){ return r.id + ': ' + r.fvZFaktury.nr; });
             g.mimo = g.issue.filter(mimoWazne);
@@ -18793,7 +19295,277 @@
         if (wyb) h += ' <a href="#" data-akcja="pb-iban-cofnij" data-k="' + k + '">↶ cofnij wybór</a>';
         return h + '</details>';
     }
+    // „🏦 Płatność”: dwa wyjścia z tego samego planu przelewów (pytanie użytkownika 17.11.2026: „czy lista do płatności będzie
+    // opcją dla pliku do banku?”). Lista — zawsze, dla każdego rachunku płatnika i waluty; plik pain.001 — jak dotąd HVB w EUR.
     function pbHtml(){
+        var w = S.pb.widok || (S.reczne ? 'lista' : 'pain');
+        var b = function (k, t){ return '<button type="button" class="tis-btn' + (w === k ? '' : ' tis-btn2') + '" data-akcja="pb-widok" data-w="' + k + '">' + t + '</button>'; };
+        return '<div style="margin:8px 0 2px"><b>🏦 Płatność:</b> ' + b('lista', '📋 Lista do płatności (ręcznie w e-bankingu)') + b('pain', '⬇ Plik do banku (pain.001, HVB EUR)') + '</div>'
+             + (w === 'lista' ? lsHtml() : pbHtmlPain());
+    }
+
+    // ================= LISTA DO PŁATNOŚCI (17.11.2026) =================
+    // Prośba: „nie musi generować pliku do banku, ale chciałbym podsumowanie: jakie konto, jaki dostawca, jaka kwota i numery FV
+    // w opisie — aby ułatwić wprowadzanie”. Jeden wiersz = jeden przelew (dostawca + rachunek płatnika, faktury i noty razem —
+    // 64 z 64 przelewów na wydrukach z 17.11.2026 równe sumie issue co do grosza). Kwota: z polecenia zapłaty (decyzja finansów),
+    // inaczej z pola issue, a przy issue bez pól — z faktury. Do listy idą ✔ i „?” (z uwagami), ✖ tylko „➕ mimo uwag”.
+    var TIS_LS_PLATNICY_KEY = 'tis_ls_platnicy';
+    function lsPlatnicyOdczyt(){ try { var o = JSON.parse(GM_getValue(TIS_LS_PLATNICY_KEY, '{}') || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e){ return {}; } }
+    function lsPlatnicyZapisz(o){ try { GM_setValue(TIS_LS_PLATNICY_KEY, JSON.stringify(o || {})); } catch (e){} }
+    function lsKwota(r){
+        var p = r.reczne ? r.polecenie : null;
+        if (p && isFinite(p.kwota) && !(r.amount < 0)) return p.kwota;
+        if (isFinite(r.amount)) return r.amount;
+        // Suma faktur tylko w płatności ręcznej z poleceniem — wtedy pliki są zawężone do tej płatności. Bez tego issue cykliczne
+        // sumowało faktury z trzech lat (panel 17.11.2026: Paytrail 211586 jako przelew na 4 484,00 EUR).
+        return r.reczne && r.polecenie ? lsSumaFaktur(r) : NaN;
+    }
+    // Suma faktur tego issue (nota na minus, po kosztach finansowania) — przy issue bez pola kwoty.
+    function lsSumaFaktur(r){
+        var docs = (r.faktura && r.faktura.docs) || [], s = 0, ok = false, zle = false, pf = r.plikiFaktury || [];
+        // Gdy numery z polecenia wskazały dokumenty — tylko one (SaferPay 408015: obok faktury z polecenia leżą inne dokumenty).
+        if (pf.length) docs = docs.filter(function (d){ return pf.indexOf(d.plikId) >= 0; });
+        docs.forEach(function (d){
+            if (!d.suma || d.suma.stan !== 'ok'){ zle = true; return; }
+            ok = true;
+            var v = Math.abs(d.suma.v) - (d.korekta ? 0 : (d.odliczenia || 0));
+            s += d.korekta ? -v : v;
+        });
+        return ok && !zle ? Math.round(s * 100) / 100 : NaN;
+    }
+    function lsKwotaSkad(r){
+        var p = r.reczne ? r.polecenie : null;
+        if (p && isFinite(p.kwota) && !(r.amount < 0)) return isFinite(r.amount) && rowne(Math.abs(p.kwota), Math.abs(r.amount)) ? '' : 'z polecenia zapłaty';
+        if (isFinite(r.amount)) return '';
+        return isFinite(lsKwota(r)) ? 'z faktury (issue nie ma pola kwoty)' : 'brak kwoty';
+    }
+    function lsPowodPoza(r){
+        if (!r.wynik) return 'niesprawdzone';
+        if (r.bladTech) return 'nie sprawdzone: ' + r.bladTech;
+        if (r.wynik === 'odbite') return 'już odbite do payments — jeśli płacisz je Ty, zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz';
+        if (/internal\s+bank\s+transfer/i.test(r.typ || '')) return 'przelew wewnętrzny — przez „🏦 Zlecenie przelewu wewnętrznego”';
+        if (r.reczne && !r.polecenie) return 'brak polecenia zapłaty („please pay from …”)';
+        // Issue bez pól faktury (Invoice, Finance-…, Declaration) — kwotę, numery i pliki tej płatności daje tylko polecenie zapłaty.
+        if (!r.reczne && r.uklad !== 'ship' && r.uklad !== 'mkt' && r.uklad !== 'sea')
+            return 'issue bez pól faktury — kwotę i faktury tej płatności wskaże dopiero polecenie zapłaty: zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz';
+        if (r.wynik === 'zle' && !mimoWazne(r)) return '✖ ' + (r.powody || []).filter(function (x){ return x.w === 'zle'; }).map(function (x){ return x.t; }).slice(0, 2).join('; ');
+        return '';
+    }
+    function lsBankPasuje(x, bank){
+        var b = ibanBank(x.n);
+        if (b) return b === bank;
+        var e = TIS_POL_BANKI.filter(function (q){ return q[0] === bank; })[0];
+        return !!e && e[1].test(String(x.przed || '') + ' ' + String(x.linia || ''));
+    }
+    // Rachunek płatnika: spółka + bank + waluta z polecenia (BI/BS/Global/UK, PostFinance/UBS/HSBC…), numer z arkusza „CH & DE”.
+    // Na 172 wydrukach z 17.11.2026 fraza polecenia wskazywała rachunek jednoznacznie. Wpis ręczny pamiętamy (ten komputer).
+    function lsPlatnik(r){
+        var p = r.reczne ? r.polecenie : null, wal = (p && p.waluta) || r.waluta || r.walutaTemat || '';
+        var sp = p && p.spolka ? p.spolka : null;
+        if (!sp){ var si = spolkaIssue(r.spolkaOpcja, r.spolka); sp = si ? { nazwa: si.nazwa, sp: si, skad: 'issue' } : (r.spolka ? { nazwa: r.spolka, sp: null, skad: 'issue' } : null); }
+        var bank = p ? p.bank : (wal === 'EUR' && sp && sp.sp && /international/i.test(sp.nazwa) ? 'HypoVereinsbank' : '');
+        var o = { spolka: sp ? sp.nazwa : '', bank: bank, waluta: wal, iban: '', blad: '', kand: [] };
+        o.klucz = [o.spolka || '?', bank || '?', wal || '?'].join(' | ');
+        var wpis = lsPlatnicyOdczyt()[o.klucz];
+        if (wpis && ibanOk(wpis)){ o.iban = wpis; o.reczny = true; return o; }
+        if (!sp || !sp.sp){ o.blad = 'spółki płacącej nie znam (' + (o.spolka || 'brak w poleceniu i w issue') + ') — wpisz rachunek'; return o; }
+        if (!wal){ o.blad = 'waluty płatności nie znam — wpisz rachunek'; return o; }
+        var pole = (sp.sp.konta || {})[wal];
+        if (!pole){ o.blad = 'w arkuszu „CH & DE” spółka ' + o.spolka + ' nie ma rachunku w ' + wal + ' — wpisz rachunek'; return o; }
+        var nasze = ibanyZTekstu(pole).filter(function (x){ return !/salar/i.test(x.linia); });
+        var kand = bank ? nasze.filter(function (x){ return lsBankPasuje(x, bank); }) : nasze;
+        o.kand = kand.map(function (x){ return x.n; });
+        if (kand.length === 1){ o.iban = kand[0].n; return o; }
+        o.blad = !kand.length
+            ? 'w arkuszu nie ma rachunku ' + (bank ? bank + ' ' : '') + wal + ' spółki ' + o.spolka + ' (są: ' + (nasze.map(function (x){ return (ibanBank(x.n) || '?') + ' ' + ibanFormat(x.n); }).join(', ') || 'nic') + ') — wpisz rachunek'
+            : (bank ? 'w arkuszu są ' + kand.length + ' rachunki ' + bank + ' w ' + wal : 'polecenie nie mówi, z którego banku płacić') + ' — wybierz';
+        return o;
+    }
+    function lsNazwa(g){
+        var r = g.wszystkie[0];
+        if (r.company) return r.company;
+        var q = ((r.faktura && r.faktura.docs) || []).filter(function (d){ return d.qr && d.qr.nazwa; })[0];
+        return q ? q.qr.nazwa : String(r.temat || '').replace(/\s+/g, ' ').slice(0, 60);
+    }
+    function lsPlan(){
+        var plan = { koszyki: [], poza: [], ile: 0 };
+        var spr = S.lista.filter(function (r){ return r.wynik || r.bladTech; });
+        var kosz = {}, kol = [];
+        spr.forEach(function (r){
+            var pw = lsPowodPoza(r);
+            if (pw){ plan.poza.push({ r: r, powod: pw }); return; }
+            var pl = lsPlatnik(r), kk = pl.iban || ('?' + pl.klucz);
+            if (!kosz[kk]){ kosz[kk] = { klucz: kk, platnik: pl, grupy: {}, kolej: [] }; kol.push(kk); }
+            var b = kosz[kk], wal = pl.waluta || r.waluta || r.walutaTemat || '';
+            var gk = pbKlucz(r) === '?' ? '#' + r.id : pbKlucz(r);
+            if (r.reczne && r.polecenie && r.polecenie.osobno) gk += '#' + r.id;   // „preferably in separate bank transfers”
+            gk += ' | ' + wal;
+            if (!b.grupy[gk]){ b.grupy[gk] = { klucz: gk, wszystkie: [], waluta: wal }; b.kolej.push(gk); }
+            b.grupy[gk].wszystkie.push(r);
+        });
+        kol.forEach(function (kk){
+            var b = kosz[kk]; b.lista = []; b.poza = []; b.sumy = {};
+            b.kolej.forEach(function (gk){
+                var g = b.grupy[gk];
+                g.nazwa = lsNazwa(g);
+                pbGrupaLicz(g, g.waluta, lsKwota);
+                var term = [];
+                g.issue.forEach(function (r){ var t = r.reczne && r.polecenie && r.polecenie.termin; if (t && term.indexOf(t) < 0) term.push(t); });
+                g.termin = term.join(' / ');
+                if (g.trybKor === 'same' || (isFinite(g.gr) && g.gr <= 0)){ b.poza.push(g); return; }
+                b.lista.push(g);
+                if (isFinite(g.gr)) b.sumy[g.waluta || '?'] = (b.sumy[g.waluta || '?'] || 0) + g.gr;
+            });
+            plan.ile += b.lista.length;
+            plan.koszyki.push(b);
+        });
+        return plan;
+    }
+    // Uwagi przelewu: wszystko, co człowiek ma zobaczyć, zanim wpisze przelew.
+    function lsUwagi(g){
+        var u = [];
+        if (g.powod && !(g.gr <= 0)) u.push(g.powod);
+        if (g.zQr && g.qrIban && !g.qr) u.push('QR-IBAN bez odczytanej referencji — przepisz „Referenz” z części płatniczej faktury');
+        // Kanton Zug 308470: część płatnicza QR jest, ale nieczytelna — lista wzięła zwykły IBAN ze stopki, a bank zapłacił na QR-IBAN.
+        if (!g.zQr && g.issue.some(function (r){ return ((r.faktura && r.faktura.docs) || []).some(function (d){ return d.qrKotwica && !d.qr && !d.korekta; }); }))
+            u.push('faktura ma część płatniczą QR, ale konta z niej nie odczytałem — sprawdź konto i referencję na fakturze');
+        if (g.qr && g.qr.ile > 1) u.push('kilka QR-faktur w jednym przelewie: referencja pierwszej (' + g.qr.plik + '), numery wszystkich w wiadomości');
+        if (g.zPoprzedniego) u.push('rachunek z poprzedniego przelewu (' + String(g.zPoprzedniego.kiedy).slice(0, 10) + ', ' + g.zPoprzedniego.plik + '), nie z faktury');
+        if (g.innyNizPoprzednio) u.push('poprzedni przelew poszedł na ' + ibanFormat(g.innyNizPoprzednio.n) + ' (' + String(g.innyNizPoprzednio.kiedy).slice(0, 10) + ') — sprawdź zmianę rachunku');
+        if (g.zTabeli) u.push('rachunek z tabeli HUB-a, nie z faktury');
+        if (g.zKraju) u.push('na fakturze kilka rachunków — wybrany ten z kraju waluty ' + g.waluta + '; sprawdź');
+        if (g.zWaluty) u.push('na fakturze kilka rachunków — wybrany ten opisany walutą ' + g.waluta);
+        if (g.issue.some(function (r){ return r.reczne && r.polecenie && r.polecenie.osobno; })) u.push('polecenie prosi o osobne przelewy (każda faktura osobno)');
+        g.issue.forEach(function (r){ var p = r.reczne && r.polecenie; if (p && p.kwotaKazda) u.push(r.id + ': w poleceniu ' + kw(p.kwotaKazda) + ' za każdą z ' + p.numery.length + ' faktur'); });
+        if (g.reczny) u.push('rachunek wpisany ręcznie');
+        if (g.kontoInne && !g.iban) u.push('rachunek bez IBAN — przepisz z faktury i sprawdź BIC');
+        if ((g.brakNaDok || []).length) u.push('rachunku nie ma na ' + g.brakNaDok.length + ' dok.');
+        if (!isFinite(g.gr)) u.push('brak kwoty — wpisz z faktury');
+        g.issue.forEach(function (r){
+            var s = lsKwotaSkad(r);
+            if (s && s !== 'brak kwoty') u.push(r.id + ': kwota ' + s);
+            (r.powody || []).filter(function (x){ return x.w !== 'info'; }).forEach(function (x){ var t = r.id + ': ' + x.t; if (u.indexOf(t) < 0) u.push(t); });
+            if (mimoWazne(r)) u.push(r.id + ': ➕ dodane mimo uwag');
+        });
+        if ((g.odlozoneKor || []).length) u.push('noty odłożone (większe niż faktury): ' + g.odlozoneKor.map(function (r){ return r.id; }).join(', '));
+        return u;
+    }
+    function lsRachunekTxt(g){
+        if (g.uk && g.waluta === 'GBP') return 'sort code ' + g.uk.sort + ' · konto ' + g.uk.konto + (g.iban ? ' (IBAN ' + ibanFormat(g.iban) + ')' : '');
+        if (g.iban) return ibanFormat(g.iban) + (g.qrIban ? ' (QR-IBAN)' : '');
+        if (g.kontoInne) return 'konto ' + g.kontoInne.konto + (g.kontoInne.bic ? ' · BIC ' + g.kontoInne.bic : '');
+        return '';
+    }
+    function lsKop(v, tytul){ return v ? ' <button type="button" class="tis-btn tis-btn2" style="padding:0 4px;margin:0 2px" data-akcja="ls-kop" data-v="' + esc(v) + '" title="Kopiuj: ' + esc(tytul || v) + '">📋</button>' : ''; }
+    function lsKoszykHtml(b){
+        var pl = b.platnik, h = '<div style="margin-top:10px;border-top:1px solid #cbd5e1;padding-top:6px">';
+        h += '<div><b>Z rachunku:</b> ' + esc(pl.spolka || '?') + ' · ' + esc(pl.bank || 'bank ?') + ' · ' + esc(pl.waluta || '?') + ' · '
+           + (pl.iban ? '<span style="font-family:ui-monospace,monospace">' + esc(ibanFormat(pl.iban)) + '</span>' + lsKop(pl.iban, 'rachunek płatnika')
+                + (pl.reczny ? ' <span class="tis-spr">(wpisany ręcznie)</span> <a href="#" data-akcja="ls-platnik-cofnij" data-k="' + esc(pl.klucz) + '">↶ z arkusza</a>' : '')
+              : '<span class="tis-zle">' + esc(pl.blad) + '</span>') + '</div>';
+        if (!pl.iban){
+            h += '<div>' + (pl.kand.length ? '<select class="tis-ls-platnik-sel" data-k="' + esc(pl.klucz) + '"><option value="">— wybierz rachunek —</option>'
+                    + pl.kand.map(function (n){ return '<option value="' + esc(n) + '">' + esc(ibanFormat(n)) + '</option>'; }).join('') + '</select> ' : '')
+               + '<input class="tis-ls-platnik" data-k="' + esc(pl.klucz) + '" placeholder="IBAN płatnika" style="width:260px;font-family:ui-monospace,monospace">'
+               + ' <button type="button" class="tis-btn tis-btn2" data-akcja="ls-platnik" data-k="' + esc(pl.klucz) + '">Użyj</button>'
+               + ' <span class="tis-mut">zapamiętam dla „' + esc(pl.klucz) + '” na tym komputerze</span></div>';
+        }
+        if (b.lista.length){
+            h += '<table class="tis-t" style="margin-top:4px"><thead><tr><th>Odbiorca</th><th>Rachunek odbiorcy</th><th>Referencja QR</th><th>Tytuł (numery FV)</th>'
+               + '<th style="text-align:right">Kwota</th><th>Termin</th><th>Issue</th><th>Uwagi</th></tr></thead><tbody>';
+            b.lista.forEach(function (g){
+                var rach = lsRachunekTxt(g), u = lsUwagi(g), tyt = g.numery.join(', ');
+                var kopRach = g.uk && g.waluta === 'GBP' ? lsKop(g.uk.sort, 'sort code') + lsKop(g.uk.konto, 'numer konta') : g.iban ? lsKop(g.iban, 'IBAN odbiorcy') : g.kontoInne ? lsKop(g.kontoInne.konto, 'numer konta') + lsKop(g.kontoInne.bic, 'BIC') : '';
+                h += '<tr><td>' + esc(g.nazwa) + lsKop(g.nazwa, 'odbiorca') + '</td>'
+                   + '<td style="font-family:ui-monospace,monospace;font-size:11px">' + (rach ? esc(rach) + kopRach : '<span class="tis-zle">brak rachunku</span>') + pbKontoForm(g, !rach) + '</td>'
+                   + '<td style="font-family:ui-monospace,monospace;font-size:11px">' + (g.qr ? esc(qrRefFormat(g.qr.ref)) + lsKop(g.qr.ref, 'referencja QR') : (g.qrIban ? '<span class="tis-zle">wymagana — przepisz z faktury</span>' : '<span class="tis-mut">—</span>')) + '</td>'
+                   + '<td style="font-size:11px">' + (tyt ? esc(tyt) + lsKop(tyt, 'tytuł') : '<span class="tis-spr">brak numerów</span>') + '</td>'
+                   + '<td style="text-align:right;white-space:nowrap">' + (isFinite(g.gr) ? '<b>' + esc(pbKwPok(g.gr)) + '</b> ' + esc(g.waluta) + lsKop(pbKw(g.gr), 'kwota') : '<span class="tis-zle">brak</span>') + '</td>'
+                   + '<td style="font-size:11px">' + esc(g.termin || '—') + '</td>'
+                   + '<td style="font-size:11px">' + g.issue.map(function (r){ return '<a href="/react/logs/issue_logs/' + encodeURIComponent(r.id) + '" target="_blank" rel="noopener">' + esc(r.id) + '</a>' + (r.wynik === 'ok' ? '' : ' <span class="tis-spr">' + (r.wynik === 'zle' ? '✖' : '?') + '</span>'); }).join(', ') + '</td>'
+                   + '<td style="font-size:11px">' + (u.length ? '<ul style="margin:0;padding-left:14px">' + u.map(function (x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' : '<span class="w-ok">✔</span>') + '</td></tr>';
+            });
+            var sumy = Object.keys(b.sumy).map(function (w){ return pbKwPok(b.sumy[w]) + ' ' + w; }).join(' + ');
+            h += '<tr style="font-weight:bold;border-top:2px solid #94a3b8"><td colspan="4">RAZEM: ' + b.lista.length + (b.lista.length === 1 ? ' przelew' : ' przelewów') + '</td><td style="text-align:right;white-space:nowrap">' + esc(sumy || '—') + '</td><td colspan="3"></td></tr>';
+            h += '</tbody></table>';
+        }
+        if (b.poza.length) h += '<div class="tis-mut" style="margin-top:4px">Bez przelewu: ' + b.poza.map(function (g){ return esc(g.nazwa) + ' (' + g.issue.map(function (r){ return esc(r.id); }).join(', ') + ') — ' + esc(g.powod || (g.gr === 0 ? 'faktury i noty znoszą się do zera' : 'noty większe niż faktury')); }).join('; ') + '</div>';
+        return h + '</div>';
+    }
+    function lsHtml(){
+        var plan = S.ls.plan = lsPlan();
+        var h = '<div class="tis-ibt" style="border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:4px 0 8px;background:#f8fafc">';
+        h += '<div style="font-weight:bold;margin-bottom:4px">📋 Lista do płatności — do wpisania w e-bankingu</div>';
+        h += '<div class="tis-mut">Jeden wiersz = jeden przelew: dostawca + rachunek płatnika, faktury i noty razem (noty na minus). Pola kopiujesz guzikiem 📋. '
+           + (S.reczne ? 'Rachunek płatnika z polecenia zapłaty („please pay from …”) i arkusza „CH & DE”.' : 'Płacisz po „please pay from …”? Włącz „💳 płatność ręczna” i sprawdź jeszcze raz.')
+           + ' Do listy idą ✔ i „?” (z uwagami); ✖ tylko dodane „➕ mimo uwag”. W prologistics nic się nie zapisuje.</div>';
+        if (!plan.koszyki.length && !plan.poza.length) return h + '<div class="tis-mut" style="margin-top:6px">Najpierw „🔍 Sprawdź faktury”.</div></div>';
+        // Lista policzona bez „💳”, a issue mają polecenie zapłaty — ostrzeżenie na górze, zanim ktoś przepisze z niej przelew.
+        var bezTrybu = S.lista.filter(function (r){ return r.wynik && !r.reczne && (r.kom || []).some(function (c){ return !systemowy(c) && TIS_POL_KOM.test(c.tekst); }); });
+        if (bezTrybu.length) h += '<div class="tis-msg warn" style="margin-top:6px">⚠ Lista policzona BEZ trybu „💳 płatność ręczna”, a ' + bezTrybu.length + ' issue ma już polecenie zapłaty („please pay …”: '
+            + bezTrybu.slice(0, 8).map(function (r){ return esc(r.id); }).join(', ') + (bezTrybu.length > 8 ? ', …' : '') + '). Jeśli płacisz je Ty — zaznacz „💳 płatność ręczna” i kliknij „🔍 Sprawdź faktury” jeszcze raz: '
+            + 'dopiero wtedy liczy się polecenie (rachunek płatnika, kwota, pliki tej płatności), a nie cała historia issue.</div>';
+        plan.koszyki.forEach(function (b){ h += lsKoszykHtml(b); });
+        if (plan.poza.length) h += '<div style="margin-top:8px"><b>Poza listą (' + plan.poza.length + '):</b><ul style="margin:4px 0 0 16px;padding:0">'
+            + plan.poza.map(function (x){ return '<li>' + esc(x.r.id) + ' ' + esc(String(x.r.company || x.r.temat || '').slice(0, 50)) + ' — ' + esc(x.powod) + '</li>'; }).join('') + '</ul></div>';
+        h += '<div style="margin-top:8px"><button type="button" class="tis-btn" data-akcja="ls-kopiuj"' + (plan.ile ? '' : ' disabled') + '>📋 Kopiuj całą listę</button>'
+           + '<button type="button" class="tis-btn tis-btn2" data-akcja="ls-xlsx"' + (plan.ile ? '' : ' disabled') + '>⬇ Lista do Excela</button>'
+           + ' <span class="tis-mut">Kopia i plik zostawiają wpis w „HUB Log” (rachunki maskowane).</span></div>';
+        return h + '</div>';
+    }
+    function lsWiersze(plan){
+        var o = [];
+        plan.koszyki.forEach(function (b){
+            b.lista.forEach(function (g){
+                o.push({ platnik: b.platnik, g: g, rach: lsRachunekTxt(g), ref: g.qr ? qrRefFormat(g.qr.ref) : (g.qrIban ? 'WYMAGANA — z faktury' : ''),
+                         tytul: g.numery.join(', '), kwota: isFinite(g.gr) ? pbKwPok(g.gr) : '', waluta: g.waluta, uwagi: lsUwagi(g) });
+            });
+        });
+        return o;
+    }
+    function lsTekst(plan){
+        var d = new Date(), dd = function (n){ return ('0' + n).slice(-2); };
+        var L = ['LISTA DO PŁATNOŚCI · ' + dd(d.getDate()) + '.' + dd(d.getMonth() + 1) + '.' + d.getFullYear() + ' ' + dd(d.getHours()) + ':' + dd(d.getMinutes())
+                 + ' · ' + (S.kto || zalogowany()) + ' · HUB ' + TIS_VER];
+        plan.koszyki.forEach(function (b){
+            if (!b.lista.length) return;
+            var pl = b.platnik;
+            L.push('', '=== Z rachunku: ' + (pl.spolka || '?') + ' · ' + (pl.bank || '?') + ' · ' + (pl.waluta || '?') + ' · ' + (pl.iban ? ibanFormat(pl.iban) : 'NIEZNANY — ' + pl.blad));
+            b.lista.forEach(function (g, i){
+                var u = lsUwagi(g);
+                L.push((i + 1) + '. ' + g.nazwa,
+                       '   rachunek: ' + (lsRachunekTxt(g) || 'BRAK') + (g.qr ? ' · referencja QR: ' + qrRefFormat(g.qr.ref) : g.qrIban ? ' · referencja QR: WYMAGANA (z faktury)' : ''),
+                       '   kwota: ' + (isFinite(g.gr) ? pbKwPok(g.gr) + ' ' + g.waluta : 'BRAK') + ' · tytuł: ' + (g.numery.join(', ') || '—') + (g.termin ? ' · termin: ' + g.termin : '')
+                       + ' · issue: ' + g.issue.map(function (r){ return r.id; }).join(', '));
+                if (u.length) L.push('   uwagi: ' + u.join(' | '));
+            });
+            L.push('Razem: ' + b.lista.length + ' · ' + Object.keys(b.sumy).map(function (w){ return pbKwPok(b.sumy[w]) + ' ' + w; }).join(' + '));
+        });
+        if (plan.poza.length) L.push('', 'Poza listą: ' + plan.poza.map(function (x){ return x.r.id + ' (' + x.powod + ')'; }).join('; '));
+        return L.join('\n');
+    }
+    function lsLog(plan, jak){
+        var w = lsWiersze(plan);
+        tisLog('start', '📋 Lista do płatności (' + jak + '): ' + w.length + ' przelewów, poza listą ' + plan.poza.length);
+        w.forEach(function (x){
+            tisLog('przelew', (x.platnik.spolka || '?') + ' ' + (x.platnik.bank || '?') + ' ' + (x.platnik.waluta || '') + ' → ' + x.g.nazwa + ' · ' + (x.rach || 'BRAK rachunku')
+                + ' · ' + (x.kwota || 'BRAK kwoty') + ' ' + x.waluta + ' · tytuł ' + (x.tytul || '—') + ' · issue ' + x.g.issue.map(function (r){ return r.id; }).join(',')
+                + (x.uwagi.length ? ' · uwagi: ' + x.uwagi.join(' | ').slice(0, 500) : ''));
+        });
+        tisLog('koniec', '📋 lista ' + jak + ': ' + w.length + ' przelewów');
+    }
+    function lsXlsx(plan){
+        var aoa = [['Z rachunku (spółka)', 'Bank', 'Waluta', 'Rachunek płatnika', 'Odbiorca', 'Rachunek odbiorcy', 'Referencja QR', 'Tytuł (numery FV)', 'Kwota', 'Waluta przelewu', 'Termin', 'Issue', 'Uwagi']];
+        lsWiersze(plan).forEach(function (x){
+            aoa.push([x.platnik.spolka || '', x.platnik.bank || '', x.platnik.waluta || '', x.platnik.iban ? ibanFormat(x.platnik.iban) : x.platnik.blad, x.g.nazwa, x.rach || 'BRAK', x.ref, x.tytul,
+                      isFinite(x.g.gr) ? Math.round(x.g.gr) / 100 : '', x.waluta, x.g.termin || '', x.g.issue.map(function (r){ return r.id; }).join(', '), x.uwagi.join(' | ')]);
+        });
+        var ws = XLSX.utils.aoa_to_sheet(aoa), wb = XLSX.utils.book_new();
+        ws['!cols'] = [28, 12, 7, 30, 30, 34, 34, 30, 12, 7, 14, 22, 80].map(function (w){ return { wch: w }; });
+        XLSX.utils.book_append_sheet(wb, ws, 'Lista do płatności');
+        return new Uint8Array(XLSX.write(wb, { type: 'array', bookType: 'xlsx' }));
+    }
+    function pbHtmlPain(){
         var plan = S.pb.plan = pbPlan(), k = pbKontrole(plan);
         var h = '<div class="tis-ibt" style="border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:8px 0;background:#f8fafc">';
         h += '<div style="font-weight:bold;margin-bottom:6px">🏦 Plik do banku — pain.001.001.09 (HVB)</div>';
@@ -18884,7 +19656,7 @@
               + (r.test ? ' <span class="tis-test" title="Sprawdzone w trybie „🧪 test odczytu”: status zapłaty pominięty — to nie jest zgoda na płatność">🧪 test</span>' : '')
               + (mimoWazne(r) ? ' <span class="tis-spr" title="Wejdzie do pliku do banku z adnotacją o uwagach">➕ w płatności mimo uwag (' + esc(r.mimo.kto || '?') + ', ' + esc(r.mimo.kiedy) + ')</span>' : '');
         if (r.odbite) h += '<div class="tis-mut">' + esc(r.odbite.kiedy + ', ' + r.odbite.kto + ': ' + r.odbite.tekst) + '</div>';
-        var p = (r.powody || []).filter(function (x){ return !r.odbite || r.test || x.w === 'zle'; });
+        var p = (r.powody || []).filter(function (x){ return !r.odbite || r.test || r.reczne || x.w === 'zle'; });
         if (p.length) h += '<ul class="tis-p">' + p.map(function (x){ return '<li class="p-' + x.w + '">' + esc(x.t) + '</li>'; }).join('') + '</ul>';
         return h;
     }
@@ -19184,7 +19956,7 @@
               + ' · <a href="#" data-akcja="ust">' + (S.ustOtw ? 'schowaj ustawienia' : '⚙ Ustawienia') + '</a>'
               + (polaczenie().url ? ' · <a href="#" data-akcja="spolki">↻ odśwież spółki</a>' : '')
               + ' · <a href="#" data-akcja="ibt"><b>' + (S.ibtOtw ? 'schowaj zlecenie przelewu' : '🏦 Zlecenie przelewu wewnętrznego') + '</b></a>'
-              + ' · <a href="#" data-akcja="pb"><b>' + (S.pbOtw ? 'schowaj plik do banku' : '🏦 Plik do banku') + '</b></a></div>';
+              + ' · <a href="#" data-akcja="pb"><b>' + (S.pbOtw ? 'schowaj płatność' : '🏦 Płatność (lista / plik do banku)') + '</b></a></div>';
         if (S.ustOtw) h += htmlUst();
         if (S.ibtOtw) h += htmlIbt();
         if (S.pbOtw) h += pbHtml();
@@ -19192,6 +19964,8 @@
         h += '<div style="margin:6px 0"><button type="button" class="tis-btn" data-akcja="sprawdz"' + (S.praca || !S.lista.length ? ' disabled' : '') + '>🔍 Sprawdź faktury (' + S.lista.length + ')</button>'
            + '<label class="tis-mut" style="margin:0 8px" title="Do testów na zapłaconych issue: pomija PAID, status zamknięty, komentarze o zapłacie i potwierdzenia przelewu, czyta też już odbite. Wynik nie jest zgodą na płatność. Działa przy następnym „Sprawdź faktury”.">'
            + '<input type="checkbox" id="tis-test-odczytu"' + (S.testOdczytu ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 🧪 test odczytu (pomija status zapłaty)</label>'
+           + '<label class="tis-mut" style="margin:0 8px" title="Dla płacących ręcznie (PostFinance, UBS, HSBC…): „please pay from …” to polecenie zapłaty, a nie „już odbite”. Liczy się to, co stoi po ostatnim poleceniu; wynik idzie na „📋 Listę do płatności” w „🏦 Płatność”. Zapamiętane na tym komputerze. Działa przy następnym „Sprawdź faktury”.">'
+           + '<input type="checkbox" id="tis-reczne"' + (S.reczne ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 💳 płatność ręczna (po „please pay from”)</label>'
            + (S.lista.length && !S.praca ? '<button type="button" class="tis-btn tis-btn2" data-akcja="lista-wyczysc" title="Czyści listę issue (nic nie zapisuje w prologistics)">✕ Wyczyść listę</button>' : '')
            + '<label class="tis-mut" style="margin:0 8px" title="Jedna pozycja na przewoźnika: suma faktur i numery issue po przecinku. Rozwinięcie pokazuje pojedyncze faktury z guzikami."><input type="checkbox" id="tis-grupuj"' + (S.grupuj ? ' checked' : '') + '> jedna pozycja per dostawca</label>'
            + (sprawdzone && !S.praca && wsadIssue().length ? '<button type="button" class="tis-btn tis-btn2" data-akcja="wsad" title="Zapisze faktury do Pobranych jednym plikiem ZIP i złoży JEDNO polecenie dla Claude — razem z oceną komentarzy'
@@ -19302,6 +20076,35 @@
             rysuj();
         }
         else if (a === 'pb'){ S.pbOtw = !S.pbOtw; rysuj(); }
+        else if (a === 'pb-widok'){ S.pb.widok = el.getAttribute('data-w') === 'pain' ? 'pain' : 'lista'; rysuj(); }
+        else if (a === 'ls-kop'){
+            var v = el.getAttribute('data-v') || '';
+            try { GM_setClipboard(v); say('Skopiowane: ' + v, 'ok'); } catch (e){ say('Nie udało się skopiować: ' + (e.message || e), 'err'); }
+            rysujStan();
+        }
+        else if (a === 'ls-kopiuj' || a === 'ls-xlsx'){
+            var pl = S.ls.plan || lsPlan();
+            if (!pl.ile){ say('Lista do płatności jest pusta.', 'warn'); rysujStan(); return; }
+            try {
+                if (a === 'ls-kopiuj'){ GM_setClipboard(lsTekst(pl)); say('Lista skopiowana (' + pl.ile + ' przelewów) — wklej ją, gdzie chcesz (mail, Teams, notatnik).', 'ok'); lsLog(pl, 'skopiowana'); }
+                else {
+                    var dls = new Date(), nz = pbDataPL(pbISO(dls)) + ' lista do platnosci ' + ('0' + dls.getHours()).slice(-2) + ('0' + dls.getMinutes()).slice(-2) + '.xlsx';
+                    pbZapisz(lsXlsx(pl), nz, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                    say('Zapisałem „' + nz + '” do Pobranych (' + pl.ile + ' przelewów).', 'ok'); lsLog(pl, 'do Excela');
+                }
+            } catch (e){ say('Nie wyszło: ' + (e.message || e), 'err'); }
+            rysujStan();
+        }
+        else if (a === 'ls-platnik'){
+            var kp = el.getAttribute('data-k'), pp = panel.querySelectorAll('.tis-ls-platnik');
+            for (var ix = 0; ix < pp.length; ix++) if (pp[ix].getAttribute('data-k') === kp){
+                var nb = String(pp[ix].value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+                if (!ibanOk(nb)){ say('To nie jest poprawny numer rachunku: ' + (pp[ix].value || '(puste)'), 'err'); rysuj(); return; }
+                var mp = lsPlatnicyOdczyt(); mp[kp] = nb; lsPlatnicyZapisz(mp);
+                say('Rachunek płatnika „' + kp + '”: ' + ibanFormat(nb) + ' — zapamiętany na tym komputerze.', 'ok'); rysuj(); return;
+            }
+        }
+        else if (a === 'ls-platnik-cofnij'){ var mc = lsPlatnicyOdczyt(); delete mc[el.getAttribute('data-k')]; lsPlatnicyZapisz(mc); say('Rachunek płatnika wraca do arkusza „CH & DE”.', 'info'); rysuj(); }
         else if (a === 'pb-zloz') pbBuduj();
         else if (a === 'pb-kopiuj'){
             try { GM_setClipboard(S.pb.tekst || ''); say('Skopiowane — wklej drugiej osobie.', 'ok'); }
@@ -19399,6 +20202,12 @@
             if (ev.target.value) S.pb.konta[kw] = ev.target.value; else delete S.pb.konta[kw];
             rysuj(); return;
         }
+        if (ev.target && ev.target.classList && ev.target.classList.contains('tis-ls-platnik-sel')){
+            if (!ev.target.value) return;
+            var mpl = lsPlatnicyOdczyt(); mpl[ev.target.getAttribute('data-k')] = ev.target.value; lsPlatnicyZapisz(mpl);
+            say('Rachunek płatnika: ' + ibanFormat(ev.target.value) + ' — zapamiętany na tym komputerze.', 'ok');
+            rysuj(); return;
+        }
         if (ev.target && ev.target.classList && ev.target.classList.contains('tis-ibt-scr-plik')){
             var fw = ev.target.files && ev.target.files[0];
             ev.target.value = '';
@@ -19407,6 +20216,7 @@
         }
         if (id === 'tis-grupuj'){ S.grupuj = !!ev.target.checked; grupujZapisz(S.grupuj); rysuj(); return; }
         if (id === 'tis-test-odczytu'){ S.testOdczytu = !!ev.target.checked; return; }
+        if (id === 'tis-reczne'){ S.reczne = !!ev.target.checked; try { GM_setValue(TIS_RECZNE_KEY, S.reczne ? '1' : '0'); } catch (e){} if (S.reczne && !S.pbOtw) S.pbOtw = true; rysuj(); return; }
         if (!/^tis-ibt-/.test(id)) return;
         if (id === 'tis-ibt-zq' || id === 'tis-ibt-doq') return;
         if (id === 'tis-ibt-z' || id === 'tis-ibt-do' || id === 'tis-ibt-issue'){
@@ -47387,36 +48197,57 @@
         }
         return '';
     }
-    // Nazwy kolumn po niemiecku i po angielsku — raport wychodzi w jezyku konta, a konto
-    // brytyjskie potrafi oddawac plik po niemiecku. Mapujemy PO NAZWIE, nie po numerze:
-    // eBay dokladal juz kolumny w srodku ukladu, a wtedy staly indeks siega nie tam.
+    // Nazwy kolumn po niemiecku, po angielsku i po francusku — raport wychodzi w jezyku
+    // ustawionym na koncie, nie w jezyku kraju: konto brytyjskie potrafi oddawac plik po
+    // niemiecku, a 17.11.2026 beliani_fr (wyplata 7826595042) i beliani_italia (7831172403)
+    // przyszly PO FRANCUSKU („Rapport sur les transactions”, „Montant net”, „Commande”).
+    // Bez francuskich nazw oba pliki konczyly jako „Nie rozpoznałem po zawartości”.
+    // Uklad 38 kolumn jest we wszystkich trzech jezykach ten sam, wiec plik importu
+    // (mkCsvEbay, kolumny po numerze) wychodzi identyczny. Mapujemy PO NAZWIE, nie po
+    // numerze: eBay dokladal juz kolumny w srodku ukladu, a wtedy staly indeks siega nie tam.
     const MK_EBAY_COLS = {
         typ:   ['typ', 'type'],
-        order: ['bestellnummer', 'order number'],
-        net:   ['betrag abzügl. kosten', 'betrag abzugl. kosten', 'net amount'],
-        curNet:['auszahlungswährung', 'auszahlungswahrung', 'payout currency'],
-        pDate: ['auszahlungsdatum', 'payout date'],
-        pNo:   ['auszahlung nr.', 'auszahlung nr', 'payout id', 'payout number'],
-        vat:   ['von ebay eingezogene steuer', 'ebay collected tax'],
-        gross: ['transaktionsbetrag (inkl. kosten)', 'transaction amount (incl. costs)', 'gross transaction amount'],
-        curTx: ['transaktionswährung', 'transaktionswahrung', 'transaction currency'],
+        order: ['bestellnummer', 'order number', 'numéro de commande'],
+        net:   ['betrag abzügl. kosten', 'betrag abzugl. kosten', 'net amount', 'montant net'],
+        curNet:['auszahlungswährung', 'auszahlungswahrung', 'payout currency', 'devise du versement'],
+        pDate: ['auszahlungsdatum', 'payout date', 'date du versement'],
+        pNo:   ['auszahlung nr.', 'auszahlung nr', 'payout id', 'payout number', 'numéro du versement'],
+        vat:   ['von ebay eingezogene steuer', 'ebay collected tax', 'taxe collectée par ebay'],
+        gross: ['transaktionsbetrag (inkl. kosten)', 'transaction amount (incl. costs)', 'gross transaction amount',
+                'montant brut de la transaction'],
+        curTx: ['transaktionswährung', 'transaktionswahrung', 'transaction currency', 'devise de la transaction'],
         // „reference id", „item title", „item id" — nazwy z raportu beliani_uk po angielsku.
-        ref:   ['referenznummer', 'reference number', 'reference id'],
-        title: ['angebotstitel', 'listing title', 'item title'],
-        sku:   ['bestandseinheit', 'custom label'],
-        item:  ['artikelnr.', 'artikelnr', 'item number', 'item id'],
+        ref:   ['referenznummer', 'reference number', 'reference id', 'numéro de référence'],
+        title: ['angebotstitel', 'listing title', 'item title', 'titre de l\'objet'],
+        sku:   ['bestandseinheit', 'custom label', 'libellé personnalisé'],
+        item:  ['artikelnr.', 'artikelnr', 'item number', 'item id', 'numéro de l\'objet'],
         // Kraj wysylki i „Zwischensumme Artikel" sa potrzebne TYLKO do odtworzenia brutto
         // zwrotu, ktoremu eBay nie wypelnil kolumny VAT — patrz ebayBruttoZwrotu. Nie ma ich
         // na liscie kolumn wymaganych (brak), wiec starszy uklad raportu czyta sie jak dotad.
-        land:  ['versandziel - land', 'versandziel land', 'ship to country', 'buyer country'],
-        sub:   ['zwischensumme artikel', 'item subtotal']
+        // „post to country" — tak naprawde brzmi ta kolumna w raportach po angielsku (beliani_uk i beliani-de,
+        // 17.11.2026); dwie wczesniejsze angielskie nazwy byly zgadniete i nie trafialy, wiec (b) w ebayBruttoZwrotu
+        // na angielskim raporcie nie dzialalo wcale.
+        land:  ['versandziel - land', 'versandziel land', 'post to country', 'ship to country', 'buyer country', 'pays de livraison'],
+        sub:   ['zwischensumme artikel', 'item subtotal', 'sous-total de l\'objet'],
+        // Prowizje — potrzebne TYLKO do „lustra prowizji” (ebayLustroProwizji). Tez nie sa wymagane.
+        fFix:  ['fixer anteil der verkaufsprovision', 'final value fee – fixed', 'commission sur le prix final - fixe'],
+        fVar:  ['variabler anteil der verkaufsprovision', 'final value fee – variable', 'commission sur le prix final - variable'],
+        fReg:  ['gebühr für gesetzliche betriebskosten', 'regulatory operating fee', 'frais d\'exploitation réglementaires'],
+        fInad: ['gebühr für sehr hohe quote an „nicht wie beschriebenen artikeln“', 'very high \'item not as described\' fee',
+                'frais pour taux très élevé d\'objets non conformes à la description'],
+        fBsp:  ['gebühr für unterdurchschnittlichen servicestatus', 'below standard performance fee', 'frais pour performance insuffisante'],
+        fInt:  ['internationale gebühr', 'international fee', 'frais de transactions internationales']
     };
+    const MK_EBAY_PROWIZJE = { fFix: 'stała', fVar: 'zmienna', fReg: 'regulacyjna', fInad: 'INAD',
+                               fBsp: 'za słaby serwis', fInt: 'międzynarodowa' };
     // Typy wierszy, ktore cokolwiek znacza. Reszta ("Andere Gebühr", "Versandetikett",
     // "Auszahlung") to prowizje i etykiety zwrotne — sa juz potracone w kolumnie netto,
     // wiec do ksiegowania na zamowieniach NIE ida. Tak samo robi makro dzialu.
-    const MK_EBAY_ORDER  = /^(bestellung|order)$/i;
+    // Po francusku: „Commande”; reszta („Autres frais”, „Bordereau d'affranchissement”) odpada.
+    const MK_EBAY_ORDER  = /^(bestellung|order|commande)$/i;
     // „claim" to angielska nazwa niemieckiego „Fall" — tak stoi w preambule raportu UK.
-    const MK_EBAY_REFUND = /^(rückerstattung|ruckerstattung|refund|fall|case|claim|zahlungsstreitfall|payment dispute)$/i;
+    // Francuskie nazwy z preambuly raportu FR: „remboursement, réclamation, litige relatif au paiement”.
+    const MK_EBAY_REFUND = /^(rückerstattung|ruckerstattung|refund|fall|case|claim|zahlungsstreitfall|payment dispute|remboursement|réclamation|reclamation|litige relatif au paiement)$/i;
 
     function ebayNum(v){
         const s = String(v == null ? '' : v).trim();
@@ -47498,14 +48329,16 @@
     // oba recznie na PELNE brutto (noty 629.99 i 99.99 w ticketach 688495 i 689297), wiec
     // brutto jest tu regula ksiegowa, a nie domyslem.
     //
-    // Brutto odtwarzamy WYLACZNIE z dowodu w tym samym pliku, przy tym samym numerze
-    // zamowienia. Zadnego przeliczania stawka „na slepo":
+    // Brutto odtwarzamy WYLACZNIE z dowodu w tym samym pliku. Zadnego przeliczania
+    // stawka „na slepo":
     //   (a) inny wiersz tego zamowienia, ktory MA kolumne VAT i te sama kwote netto,
     //   (b) „Zwischensumme Artikel" innego wiersza tego zamowienia — na wierszach
     //       „Einbehalten" ta kolumna niesie wartosc auftragu (629.99 = auftrag 15569245,
     //       639.99 = auftrag 15751928), a na „Bestellung" samo netto, wiec bierzemy ja
     //       tylko wtedy, gdy rozni sie od netto o stawke, KTORA TEN PLIK pokazuje dla
-    //       tego kraju wysylki (kraj o dwoch stawkach -> nie zgadujemy).
+    //       tego kraju wysylki (kraj o dwoch stawkach -> nie zgadujemy),
+    //   (c) „lustro prowizji” — prowizje oddane przy zwrocie sa co do grosza prowizjami
+    //       INNEGO zamowienia z tego pliku na te sama kwote netto (ebayLustroProwizji).
     // Brak dowodu -> null: kwota zostaje taka jak dotad, a wiersz idzie na liste bezVat
     // i zlecenie dostaje „wymaga sprawdzenia". Lepiej powiedziec „nie wiem", niz po cichu
     // zaksiegowac netto.
@@ -47514,7 +48347,7 @@
     // co zaplacil klient. Sprawdzone na 14-15162-59228 z tej samej wyplaty — eBay podal
     // 77.02, prologistics wzial te cene za netto i dorobil 19% (auftrag 15731585 ma 91.65),
     // ale wplata 77.02 jest pelna (decyzja uzytkownika 26.10.2026).
-    function ebayBruttoZwrotu(r, c, poZam, stawki){
+    function ebayBruttoZwrotu(r, c, poZam, stawki, wiersze){
         const b = ebayNum(r[c.gross]);
         if (b == null || !b) return null;
         const id = c.order >= 0 ? String(r[c.order] || '').trim() : '';
@@ -47529,6 +48362,10 @@
                          skad: 'wiersz „' + String(q[c.typ] || '').trim() + '” tego samego zamówienia' };
             }
         }
+        return ebayBruttoZSumy(r, c, bracia, stawki, a, zn) || ebayLustroProwizji(r, c, wiersze || [], a, zn);
+    }
+    // (b) z opisu nad ebayBruttoZwrotu — „Zwischensumme Artikel” wiersza tego samego zamowienia.
+    function ebayBruttoZSumy(r, c, bracia, stawki, a, zn){
         if (c.sub < 0 || c.land < 0) return null;
         const kraj = String(r[c.land] || '').trim();
         const kl = (kraj && kraj !== '--' && stawki[kraj]) ? Object.keys(stawki[kraj]) : [];
@@ -47547,6 +48384,54 @@
             }
         }
         return null;
+    }
+    // (c) „Lustro prowizji” — dodane 17.11.2026 na wyplacie 7842807362 (beliani_uk). Wiersz „Claim”
+    // 04-15219-35333 ma −74.99 GBP bez kolumny VAT, a zamowienia nie ma w tej wyplacie, wiec (a) i (b)
+    // nie maja czego chwycic. eBay oddaje jednak przy claimie prowizje: zmienna 10.60, regulacyjna 0.34,
+    // miedzynarodowa 1.17 — a prowizje licza sie od kwoty Z VAT-em (miedzynarodowa to 1,30% kwoty z VAT
+    // na wszystkich zamowieniach UK tego pliku: 1.17 / 1.3% = 90). Dokladnie te trzy prowizje ma w tym
+    // samym pliku inny wiersz „Order” na 74.99 + 15.00 VAT = 89.99. Czyli −74.99 to netto, a brutto
+    // zwrotu 89.99 (decyzja uzytkownika 17.11.2026: dodac te regule).
+    //
+    // Warunki — wszystkie naraz, inaczej null:
+    //   - wiersz zamowienia (MK_EBAY_ORDER) z kolumna VAT i ta sama kwota w „brutto transakcji”,
+    //   - ten sam kraj wysylki, gdy obie strony go podaja,
+    //   - KAZDA prowizja oddana przy zwrocie (niepusta, niezerowa) = ta sama prowizja zamowienia
+    //     z przeciwnym znakiem; takich prowizji co najmniej DWIE — jedna zgodna kwota to za malo,
+    //   - wszystkie pasujace zamowienia maja ten sam VAT — dwa rozne -> nie zgadujemy.
+    // Prowizja, ktorej eBay przy zwrocie NIE oddal (np. stala 0.43 → „--”), nie wchodzi do porownania.
+    function ebayLustroProwizji(r, c, wiersze, a, zn){
+        const oddane = Object.keys(MK_EBAY_PROWIZJE).filter(function (k){
+            if (c[k] == null || c[k] < 0) return false;
+            const v = ebayNum(r[c[k]]);
+            return v != null && v !== 0;
+        });
+        if (oddane.length < 2) return null;
+        const krajZ = c.land >= 0 ? String(r[c.land] || '').trim() : '';
+        const traf = [];
+        for (let i = 0; i < wiersze.length; i++){
+            const q = wiersze[i];
+            if (q === r || !MK_EBAY_ORDER.test(String(q[c.typ] || '').trim())) continue;
+            const gq = ebayNum(q[c.gross]), vq = ebayNum(q[c.vat]);
+            if (gq == null || vq == null || Math.abs(Math.abs(gq) - a) >= 0.005) continue;
+            const krajQ = c.land >= 0 ? String(q[c.land] || '').trim() : '';
+            if (krajZ && krajZ !== '--' && krajQ && krajQ !== '--' && krajQ !== krajZ) continue;
+            const lustro = oddane.every(function (k){
+                const fz = ebayNum(r[c[k]]), fq = ebayNum(q[c[k]]);
+                return fq != null && Math.abs(fq + fz) < 0.005;
+            });
+            if (lustro) traf.push({ q: q, vat: Math.abs(vq) });
+        }
+        if (!traf.length) return null;
+        const vat = traf[0].vat;
+        if (traf.some(function (t){ return Math.abs(t.vat - vat) >= 0.005; })) return null;
+        const zam = c.order >= 0 ? String(traf[0].q[c.order] || '').trim() : '';
+        return { kw: r2(zn * (a + vat)),
+                 skad: 'prowizje oddane przy zwrocie ('
+                     + oddane.map(function (k){ return MK_EBAY_PROWIZJE[k] + ' ' + f2(ebayNum(r[c[k]])); }).join(', ')
+                     + ') = prowizje zamówienia ' + (zam || '—')
+                     + (traf.length > 1 ? (' i ' + (traf.length - 1) + ' innych') : '')
+                     + ' na ' + f2(a) + ' + VAT ' + f2(vat) + ' z tego pliku' };
     }
 
     function mkParseEbay(text){
@@ -47587,8 +48472,8 @@
             const p = ebaySplit(linie[i], sep);
             const k = String(p[0] || '').trim().toLowerCase();
             const v = String(p[1] || '').trim();
-            if (/^(verkäufer|verkaufer|seller)$/.test(k)) seller = v;
-            if (/^(betrag|amount)$/.test(k)){
+            if (/^(verkäufer|verkaufer|seller|vendeur)$/.test(k)) seller = v;
+            if (/^(betrag|amount|montant)$/.test(k)){
                 // Apostrof to szwajcarski separator tysiecy: beliani_fr z wyplata w CHF ma
                 // w naglowku „2'290.54 CHF" (13.10.2026). Bez niego w klasie znakow regula
                 // lapala sama koncowke „290.54" i kontrola sumy odrzucala poprawny raport.
@@ -47657,7 +48542,7 @@
             let kw = r2((b || 0) + (v || 0));
             // Zwrot bez kolumny VAT niesie NETTO — probujemy odtworzyc brutto z tego pliku.
             const bezKolVat = jestZwrot && v == null && b != null && b !== 0;
-            const odtw = bezKolVat ? ebayBruttoZwrotu(r, c, poZam, stawki) : null;
+            const odtw = bezKolVat ? ebayBruttoZwrotu(r, c, poZam, stawki, wiersze) : null;
             if (odtw) kw = odtw.kw;
             const id = String(r[c.order] || '').trim();
             if (!id || id === '--'){ pominiete++; continue; }
@@ -47689,7 +48574,7 @@
                 wRef.push({ r: r, kw: kw });
             }
         }
-        if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung”/„Order” ani „Rückerstattung”/„Refund”' };
+        if (!nPos && !nZwr) return { err: 'raport eBaya nie ma ani jednego wiersza „Bestellung”/„Order”/„Commande” ani „Rückerstattung”/„Refund”/„Remboursement”' };
         return {
             seller: seller, shop: ebayShop(seller),
             payNo: payNo, payDate: payDate,
@@ -71437,6 +72322,8 @@
         const delPrev = (prev.del || []).filter(function (id){ return list.indexOf(id) < 0; });
         if (delPrev.length) all[key].del = delPrev;
         if (prev.net && prev.net.length) all[key].net = prev.net;       // potwierdzenia „znosi się" — patrz rdMarkNet
+        const bzPrev = (prev.bz || []).filter(function (id){ return list.indexOf(id) < 0; });
+        if (bzPrev.length) all[key].bz = bzPrev;                        // zamowienia nieznane prologistics — patrz rdMarkBz
         rdSave(all);
     }
     // Auftrag ze statusem Deleted nigdy sie nie zaksieguje — modul ticketa go pomija
@@ -71456,6 +72343,7 @@
             reczne: !!prev.reczne
         };
         if (prev.net && prev.net.length) all[key].net = prev.net;
+        if (prev.bz && prev.bz.length) all[key].bz = prev.bz;
         rdSave(all);
     }
     // POTWIERDZENIE, ze wplata i zwrot zamowienia sie znosza: wiersz wplaty w paczce importu stoi jako
@@ -71471,6 +72359,21 @@
         ids.forEach(function (id){ if (list.indexOf(id) < 0){ list.push(id); zm = true; } });
         if (!zm) return;
         all[key] = Object.assign({ ids: [] }, prev, { net: list });
+        rdSave(all);
+    }
+    // Zamowienia, ktorych prologistics NIE ZNA: modul ticketa szukal po numerze fulfilmentu (GET, potem formularz) i nie
+    // dostal ani jednego auftragu („Nie znaleziono zamówienia dla tego numeru fulfilment"). Zwrotu nie ma gdzie zaksiegowac,
+    // wiec — jak przy Deleted — pozycja zamyka grupe, ale nie liczy sie do zaksiegowanych, a w arkuszu wiersz idzie na „Tak"
+    // z notatka „brak zamówienia w prologistics" (refDoArkusza). Decyzja uzytkownika 17.11.2026: eBay UK/DE/IT z 04.11 —
+    // 6 numerow bez zamowienia trzymalo trzy wiersze na „Nie" i grupy na „zostało N" mimo ponownych przebiegow.
+    function rdMarkBz(key, ids){
+        if (!key || !ids || !ids.length) return;
+        const all = rdLoad(), prev = all[key] || {};
+        const list = (prev.bz || []).slice();
+        let zm = false;
+        ids.forEach(function (id){ if (list.indexOf(id) < 0){ list.push(id); zm = true; } });
+        if (!zm) return;
+        all[key] = Object.assign({ ids: [], at: new Date().toISOString().slice(0, 16).replace('T', ' ') }, prev, { bz: list });
         rdSave(all);
     }
     // v3.88: cofniecie recznego oznaczenia. Bez tego pomylkowe kliknięcie „oznacz jako
@@ -71541,8 +72444,10 @@
         // „done" zostaje ZALATWIONYMI (na tym opiera sie „zostalo" i wygaszanie grupy),
         // a „zaks" mowi, ile naprawde poszlo — te dwie liczby wolno rozjechac.
         const del = ((d && d.del) || []).filter(function (id){ return ids.indexOf(id) < 0; });
-        if (!ids.length && !del.length) return null;
-        const zalatwione = ids.concat(del);
+        // Zamowienia nieznane prologistics (rdMarkBz) — tak samo: zalatwione, ale nie zaksiegowane.
+        const bz = ((d && d.bz) || []).filter(function (id){ return ids.indexOf(id) < 0 && del.indexOf(id) < 0; });
+        if (!ids.length && !del.length && !bz.length) return null;
+        const zalatwione = ids.concat(del, bz);
         const left = x.rows.filter(function (r){ return zalatwione.indexOf(r.id) < 0; });
         // Z pominietych (Deleted) osobno te, ktore ZNOSZA SIE z wplata: rowna wplata w tym samym rozliczeniu
         // (przy KAZDYM wierszu tego numeru — claim czy Goodwill tego samego zamowienia nie chowa sie pod zielonym)
@@ -71557,7 +72462,7 @@
                  reczne: !!(d && d.reczne),
                  zLogu: zLogu.length,
                  zaks: ids.length, pominiete: del.length - znosi.length, znosi: znosi.length,
-                 delIds: del, znosiIds: znosi,
+                 delIds: del, znosiIds: znosi, bezZam: bz.length, bzIds: bz,
                  done: x.rows.length - left.length, left: left };
     }
     // Zamowienia zlecenia, przy ktorych wplata i zwrot z TEGO SAMEGO rozliczenia znosza sie, a auftrag jest
@@ -72318,6 +73223,10 @@
                 // Przy kilku auftragach modul ticketa pisze „Znaleziono N auftragów, ale nie
                 // znaleziono ticketu w żadnym z nich" — to ten sam brak ticketu.
                 if (/brak\s+ticketu|nie\s+znaleziono\s+ticketu/i.test(t)) { out[r.id] = 'brak ticketu'; return; }
+                // „Nie znaleziono zamówienia dla tego numeru fulfilment" — wyszukiwarka prologistics (GET i formularz) nie oddala
+                // ani jednego auftragu: zamowienia nie ma w prologistics, zwrotu nie ma gdzie zaksiegowac (17.11.2026, eBay 04.11).
+                // Blad sieci albo strona logowania koncza sie w module ticketa innym tekstem („BŁĄD: …"), nie tym.
+                if (/nie\s+znaleziono\s+zam[oó]wienia/i.test(t)) { out[r.id] = 'brak zamówienia'; return; }
                 if (/BŁĄD|blad|błąd/i.test(t)) { out[r.id] = 'błąd'; return; }
             }
         });
@@ -72352,13 +73261,16 @@
     // Wiersz idzie na „Tak", gdy KAZDA jego pozycja jest zalatwiona:
     //   * zaksiegowana — log ticketa albo trwaly zapis modulu ticketa,
     //   * pominieta, bo auftrag jest Deleted — nie ma czego ksiegowac,
-    //   * stoi na braku ticketu — wtedy do Comments idzie notatka z odnosnikiem do auftragu.
+    //   * stoi na braku ticketu — wtedy do Comments idzie notatka z odnosnikiem do auftragu,
+    //   * prologistics nie zna zamowienia („Nie znaleziono zamówienia…" w logu ticketa albo slad „bz"
+    //     grupy, rdMarkBz) — notatka „brak zamówienia w prologistics" bez odnosnika (17.11.2026).
     // Pozycja z innym powodem (czas, blad, log milczy) zostawia wiersz na „Nie": tam
     // naprawde jest jeszcze robota. Dotad po kazdym nieprzerwanym przebiegu cala grupa
     // szla na „Tak", takze z pozycjami, ktore stanely na czasie.
     // Wiersz bez niezerowych pozycji pomijamy — arkusz ma tam „Brak" i niech zostanie.
     function refDoArkusza(x, done, usuniete, powody, zapis, linki){
         const oznacz = [], zostaje = [];
+        const bzSlad = ((rdLoad()[x.key] || {}).bz) || [];
         (x.keys || []).forEach(function (k){
             const poz = (x.rows || []).filter(function (r){ return r.kj === k.kj; });
             if (!poz.length) return;
@@ -72374,6 +73286,10 @@
                              + '(zam. ' + r.id + ', ' + f2(r.amt) + ')',
                         linki: au.map(function (a){ return { fragment: a.num, url: a.url }; })
                     });
+                    return;
+                }
+                if (powody[r.id] === 'brak zamówienia' || bzSlad.indexOf(r.id) >= 0){
+                    notatki.push({ tekst: 'brak zamówienia w prologistics — zwrot bez księgowania (zam. ' + r.id + ', ' + f2(r.amt) + ')', linki: [] });
                     return;
                 }
                 otwarte.push(r.id + (powody[r.id] ? (' (' + powody[r.id] + ')') : ''));
@@ -72534,10 +73450,12 @@
                         // byc widoczne PRZY niej, nie tylko w logu sprzed godziny.
                         + (s.znosi ? (' <span style="font-weight:400">· znoszące się z wpłatą z tego samego rozliczenia: ' + s.znosi + '</span>') : '')
                         + (s.pominiete ? (' <span style="font-weight:400;color:#c47f00">· ' + s.pominiete
-                             + ' pominięte (auftrag Deleted)</span>') : '') + '</span>';
+                             + ' pominięte (auftrag Deleted)</span>') : '')
+                        + (s.bezZam ? (' <span style="font-weight:400;color:#c47f00">· bez zamówienia w prologistics: ' + s.bezZam + '</span>') : '') + '</span>';
                     return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + (s.zaks == null ? s.done : s.zaks) + ' z ' + x.rows.length
                         + (s.znosi ? (' · znoszące się z wpłatą: ' + s.znosi) : '')
                         + (s.pominiete ? (' · ' + s.pominiete + ' pominięte (Deleted)') : '')
+                        + (s.bezZam ? (' · bez zamówienia w prologistics: ' + s.bezZam) : '')
                         + ', zostało ' + s.left.length + '</span>';
                  })()
               // v3.66: stan opisów potrąceń obok stanu księgowania. To jest ta jedna
@@ -72584,9 +73502,15 @@
               // Pozycje, ktorych modul ticketa nie zaksiegowal, bo auftrag jest Deleted — kazda z wyjasnieniem.
               // Rowna wplata w tym samym rozliczeniu = zielono: nic nie weszlo i nic nie mialo wejsc.
               +  (function (){
-                    const s = st[k], delIds = (s && s.delIds) || [];
+                    const s = st[k], delIds = (s && s.delIds) || [], bzIds = (s && s.bzIds) || [];
                     const wpis = rdLoad()[k] || {}, netIds = wpis.net || [], zaksIds = wpis.ids || [];
                     return x.rows.map(function (r){
+                        // Zamowienie nieznane prologistics (rdMarkBz) — nic nie zaksiegowano, w arkuszu „Tak" z notatka.
+                        if (bzIds.indexOf(r.id) >= 0)
+                            return '<div style="font-size:11px;margin-top:3px;color:#c47f00"><b>' + esc(r.id) + '</b> ' + f2(r.amt)
+                                 + (r.rodzaj ? (' (' + esc(r.rodzaj) + ')') : '')
+                                 + ' — prologistics nie zna tego zamówienia (moduł ticketa: „Nie znaleziono zamówienia dla tego numeru fulfilment”):'
+                                 + ' zwrot bez księgowania, w arkuszu Refunded „Tak” z notatką „brak zamówienia w prologistics” w Comments.</div>';
                         const wSlad = delIds.indexOf(r.id) >= 0;
                         // Potwierdzone przy paczce: wplata NOT FOUND, auftrag Deleted, zwrot calej kwoty.
                         const potw = netIds.indexOf(r.id) >= 0 && mkZnosiSie(r);
@@ -74305,17 +75229,25 @@
         const usuniete = (bezTicketa ? [] : ksUsuniete(x)).concat(znP).filter(function (id, n, a){
             return a.indexOf(id) === n && done.indexOf(id) < 0;
         });
+        // Zamowienia, ktorych prologistics nie zna („Nie znaleziono zamówienia…" w logu ticketa) — nic do ksiegowania.
+        // Zamykaja grupe osobnym sladem (rdMarkBz), a wiersz arkusza dostaje „Tak" z notatka (refDoArkusza).
+        const blBz = bezTicketa ? {} : ksBledy(x);
+        const bezZam = x.rows.map(function (rr){ return rr.id; }).filter(function (id, n, a){
+            return a.indexOf(id) === n && blBz[id] === 'brak zamówienia' && done.indexOf(id) < 0 && usuniete.indexOf(id) < 0;
+        });
         const brakP = x.rows.map(function (rr){ return rr.id; })
-                            .filter(function (id){ return done.indexOf(id) < 0 && usuniete.indexOf(id) < 0; });
+                            .filter(function (id){ return done.indexOf(id) < 0 && usuniete.indexOf(id) < 0 && bezZam.indexOf(id) < 0; });
         if (!bezTicketa) mkLog('ticket', 'log ticketa potwierdzil ' + done.length + ' z ' + xs.rows.length + ' wyslanych poz.'
               + ((done.length || !brakP.length) ? '' : ' — reszte, o ktorej log milczy, oznaczam BEZ potwierdzenia'));
         if (done.length)     mkLog('ticket', '    potwierdzone:      ' + done.join(', '));
         if (usuniete.length) mkLog('ticket', '    auftrag Deleted (pominiete, nic nie poszlo): ' + usuniete.join(', '));
+        if (bezZam.length)   mkLog('ticket', '    brak zamowienia w prologistics (nic do ksiegowania, w arkuszu „Tak" z notatka): ' + bezZam.join(', '));
         if (brakP.length)    mkLog('ticket', '    BEZ potwierdzenia: ' + brakP.join(', '));
         const czesc = bezTicketa ? [] : ksCzesciowe(xs);
         if (czesc.length)    mkLog('ticket', '    w tym potwierdzone W CZESCI (jedna pozycja numeru weszla, inna nie — numer zostaje do zrobienia): '
                                    + czesc.join(', '));
         if (usuniete.length) rdMarkDel(x.key, usuniete);
+        if (bezZam.length)   rdMarkBz(x.key, bezZam);
         // Z pominietych: kandydaci do „znosi się" = kazdy wiersz numeru ma rowna wplate w tym samym rozliczeniu.
         // Potwierdza to dopiero paczka importu (wplata NOT FOUND) — czytamy ja teraz, raz na zlecenie.
         const kandZn = usuniete.filter(function (id){
@@ -74392,7 +75324,7 @@
             const nieWeszly = [];
             rdMark(x.key, x.rows.map(function (rr){ return rr.id; })
                                .filter(function (id, n, a){
-                                   if (a.indexOf(id) !== n || usuniete.indexOf(id) >= 0) return false;
+                                   if (a.indexOf(id) !== n || usuniete.indexOf(id) >= 0 || bezZam.indexOf(id) >= 0) return false;
                                    if (!txtL || blK[id] === 'brak ticketu') return true;
                                    const rr = xs.rows.filter(function (y){ return y.id === id; });
                                    if (!rr.some(function (y){ return ksMaLinie(txtL, y); })) return true;
@@ -74458,13 +75390,14 @@
         // szukac nizej w liscie grup.
         // Trzy rozne liczby, ktore dotad zlewaly sie w jedno „Zwroty zaksiegowane":
         // ile poszlo, ile swiadomie pominieto i ile nadal wisi.
-        const nieZal = x.rows.length - done.length - usuniete.length;
-        const czesci = [(nieZal || usuniete.length)
+        const nieZal = x.rows.length - done.length - usuniete.length - bezZam.length;
+        const czesci = [(nieZal || usuniete.length || bezZam.length)
                         ? ('Zwroty: zaksięgowane ' + done.length + ' z ' + x.rows.length
                            + (znosiT.length ? (' · znoszące się z wpłatą z tego samego rozliczenia: ' + znosiT.length
                                                + ' (wpłata nie weszła, auftrag Deleted — nic do księgowania)') : '')
                            + ((usuniete.length - znosiT.length) ? (' · pominięte (auftrag Deleted): ' + (usuniete.length - znosiT.length)
                                 + (znosiNp.length ? (' — przy ' + znosiNp.length + ' jest równa wpłata w tym rozliczeniu; czy się znoszą, pokaże paczka importu') : '')) : '')
+                           + (bezZam.length ? (' · bez zamówienia w prologistics: ' + bezZam.length + ' (nic do księgowania, w arkuszu notatka)') : '')
                            + (nieZal ? (' · zostało ' + nieZal) : ''))
                         : 'Zwroty zaksięgowane'];
         if (kom.msg) czesci.push(kom.msg);
@@ -76270,8 +77203,11 @@
                 const odtw = (p.bruttoZ || []);
                 j.note = 'kwoty zamówień w ' + (p.curTx || '—') + ', wypłata w ' + (p.cur || '—')
                        + ' · prowizje i etykiety zwrotne są już potrącone w wypłacie i nie wchodzą na zamówienia'
+                       // Skad brutto — od 17.11.2026 takze w adnotacji: przy „lustrze prowizji” dowodem jest INNE
+                       // zamowienie, wiec bez tego opisu kwota 89.99 przy zwrocie −74.99 wygladalaby na zgadywanie.
                        + (odtw.length ? (' · zwroty bez kolumny VAT policzone na brutto: '
-                            + odtw.map(function (x){ return x.id + ' ' + f2(x.z) + ' → ' + f2(x.na); }).join(', ')) : '');
+                            + odtw.map(function (x){ return x.id + ' ' + f2(x.z) + ' → ' + f2(x.na)
+                                + (x.skad ? (' (' + x.skad + ')') : ''); }).join(', ')) : '');
                 jobsSave(jobs); render();
                 say((zalozone ? 'Założyłem zlecenie z pliku' : 'Uzupełniłem zlecenie')
                     + ': ' + p.shop + ' · wypłata nr ' + (p.payNo || '—') + ' z ' + (p.payDate || '—')
@@ -118973,7 +119909,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'e5a708c · 17.11.2026 12:32';
+    const HUB_BUDOWA = '0db6763 · 17.11.2026 15:40';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
