@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.16
+// @version      5.63.17
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -14747,6 +14747,7 @@
             fv: poleTxt(it, F.FV), amountTxt: amountTxt, amount: kwota(amountTxt, true),
             approval: poleTxt(it, F.APPROVAL), paid: poleTxt(it, F.PAID), waluta: poleTxt(it, F.CURRENCY),
             uwaga: poleTxt(it, F.COMMENT), resp: it.resp_username || '', solv: it.solving_resp_username || '',
+            bankData: poleTxt(it, TIS_IBT_POLE) || '', ibtTyp: (it.issue_type || []).some(function (t){ return String(t.id) === TIS_IBT_TYP; }),
             wczytane: Date.now(), wynik: null
         };
         // „ship” = pola 555–562 (warunek ten sam, co dotąd w wyszukiwarce: pole FV albo Spółka). Wyszukiwarka i finanse
@@ -15397,7 +15398,7 @@
     }
 
     // ================= ocena issue =================
-    // Wynik: 'ok' ✔, 'zle' ✖, 'spr' ? (sprawdź sam), 'odbite' ↪, 'blad' ? techniczne,
+    // Wynik: 'ok' ✔, 'zle' ✖, 'spr' ? (sprawdź sam), 'zaplacone' ✓ nic do zrobienia (od 18.11.2026 w miejsce 'odbite' ↪), 'blad' ? techniczne,
     // null = niesprawdzone. powody: [{w:'zle'|'spr'|'info', t}]. Jedna funkcja dla odczytu
     // HUB-a, Claude i ręcznego — różnią się tylko źródłem „dokumentów faktury” (r.faktura).
     // B (15.10.2026) „🧪 test odczytu”: powody, które mówią tylko o stanie zapłaty (zamknięte, PAID, „paid”, „In bank file”,
@@ -15411,14 +15412,12 @@
         function stan(w, t){ p.push(powodStatusu(r, w, t)); }
         // Płatność ręczna (17.11.2026): polecenie zapłaty jest warunkiem; komentarze sprzed niego to poprzednie cykle.
         var pol = r.reczne ? r.polecenie : null;
-        if (r.reczne){
-            if (/internal\s+bank\s+transfer/i.test(r.typ || '')) spr('przelew wewnętrzny (Internal Bank Transfer) — zlecasz go przez „🏦 Zlecenie przelewu wewnętrznego”, nie przez listę do płatności');
-            if (!pol) spr('brak polecenia zapłaty w komentarzach („please pay from …”) — finanse jeszcze nie odbiły issue do płatności');
-            else p.push({ w: 'info', t: '💳 polecenie zapłaty: ' + polOpis(pol) + (pol.pozniej ? ' · potem: „' + pol.pozniej.tekst + '” (' + pol.pozniej.kto + ', ' + pol.pozniej.kiedy.slice(0, 16) + ')' : '')
-                + (pol.bankZ ? ' · bank z wcześniejszego polecenia (' + pol.bankZ.slice(0, 10) + ')' : '') });
-        }
+        if (pol) p.push({ w: 'info', t: '💳 polecenie zapłaty: ' + polOpis(pol) + (pol.pozniej ? ' · potem: „' + pol.pozniej.tekst + '” (' + pol.pozniej.kto + ', ' + pol.pozniej.kiedy.slice(0, 16) + ')' : '')
+            + (pol.bankZ ? ' · bank z wcześniejszego polecenia (' + pol.bankZ.slice(0, 10) + ')' : '') });
         var maPola = [r.spolka, r.company, r.fv, r.amountTxt, r.waluta, r.approval].some(function (x){ return x !== null; });
-        if (!maPola && !r.reczne){ spr('inny typ issue (' + (r.typ || 'bez typu') + ') — bez pól faktury; sprawdź ręcznie, jak dziś'); return p; }
+        // 🔁 Nowy cykl: komentarze do ostatniej zapłaty to zapłacone cykle (443659 Primeo: 8 razy „paid” / „Confirmed”).
+        var nowyCykl = r.etap === 'nowyCykl', odKiedy = pol ? pol.kiedy : (nowyCykl && r.cykle && r.cykle.ostatnia ? r.cykle.ostatnia.kiedy : '');
+        if (!maPola && !r.reczne && !nowyCykl){ spr('inny typ issue (' + (r.typ || 'bez typu') + ') — bez pól faktury; sprawdź ręcznie, jak dziś'); return p; }
         if (!maPola) p.push({ w: 'info', t: 'issue bez pól faktury (' + (r.typ || 'bez typu') + ') — kwota i numer z polecenia zapłaty albo z faktury' });
         if (r.zamkniete) stan('spr', 'issue jest zamknięte — do płatności idą tylko otwarte; sprawdź, czy nie anulowane albo już zapłacone');
         if (r.odbite && r.test) stan('info', 'issue już odbite (' + r.odbite.kiedy + ', ' + r.odbite.kto + ') — czytam fakturę mimo to');
@@ -15434,7 +15433,7 @@
         if (r.uwaga && TIS_STOP.test(r.uwaga)) spr('pole Comment: „' + r.uwaga.slice(0, 120) + '”');
         (kom || []).forEach(function (c){
             if (systemowy(c)) return;
-            if (pol && c.kiedy <= pol.kiedy) return;
+            if (odKiedy && c.kiedy <= odKiedy) return;
             var t = c.tekst, gdzie = ' (' + c.kto + ', ' + c.kiedy.slice(0, 10) + ')';
             if (TIS_PPF.test(t) || (r.reczne && TIS_POL_KOM.test(t))) return;
             if (TIS_IN_BANK.test(t)) stan('zle', 'w komentarzu stoi „In bank file”' + gdzie + ' — już w pliku do banku');
@@ -15451,9 +15450,13 @@
         var zleP = zle;
         // Płatność ręczna z poleceniem zapłaty: puste pola Spółka / Company / FV / Amount to norma w issue „Declaration” (MWST:
         // 492843, 529263) — rachunek, kwota i numery idą z polecenia. „?” zamiast „✖”, żeby trafiły na listę z uwagą.
-        if (r.reczne && r.polecenie) zleP = function (t){ p.push({ w: 'spr', t: t + ' — płatność ręczna: według polecenia zapłaty' }); };
+        if (r.reczne && r.polecenie) zleP = function (t){ p.push({ w: 'spr', t: t + ' — jest polecenie zapłaty: płacisz według niego' }); };
         if (!approvalOk(r.approval)) zle('Approval = ' + (r.approval || 'puste') + (r.uklad === 'mkt' ? ' (do przelewu tylko „YES - Transfer Needed”)' : ' (do płatności tylko Yes)'));
-        if (/^yes$/i.test(r.paid || '')) stan('zle', (r.uklad === 'mkt' || r.uklad === 'sea' ? 'Paid (Finance)' : 'PAID - Finance') + ' = Yes — już zapłacone');
+        if (/^yes$/i.test(r.paid || '')){
+            var et = (r.uklad === 'mkt' || r.uklad === 'sea' ? 'Paid (Finance)' : 'PAID - Finance') + ' = Yes';
+            // 🔁 Nowy cykl: „Yes” zostało po poprzedniej zapłacie — o nowej fakturze nic nie mówi.
+            if (r.etap === 'nowyCykl') p.push({ w: 'info', t: et + ' — z poprzedniego cyklu' }); else stan('zle', et + ' — już zapłacone');
+        }
         if (!r.spolka) zleP('puste pole ' + E.sp);
         if (!r.company) zleP('puste pole ' + E.co);
         if (!r.fv || !fvLista(r.fv).length){
@@ -15485,8 +15488,7 @@
     // z kwotą („amount 457.50 chf”, „UBS BI 3157.54 CHF” — decyzja finansów, np. Google po potrąceniu nadpłaty), z plikami
     // („please pay from bs postfinance chf: 6655170851.pdf, 6655185198.pdf”), z datą („Please pay on Friday 23.10.2026”)
     // i z prośbą o osobne przelewy („preferably in separate bank transfers”).
-    var TIS_RECZNE_KEY = 'tis_reczne';
-    var TIS_POL_KOM = /(\bpl(?:ease|s)p?\s+pay\b|prosz[eę]\s+(?:o\s+)?(?:do\s+)?(?:p[łl]atno|zap[łl]at|za[łl]at))/i;
+    var TIS_POL_KOM = /(\bpl(?:ease|s)p?\s+pay\b|prosz[eę]\s+(?:o\s+)?(?:do\s+)?(?:p[łl]atno|zap[łl]at|za[łl]at)|prosz[eę]\s+o\s+(?:przelew|zasileni))/i;
     var TIS_POL_BANKI = [
         // „Postfinace”, „Postfinanse”, „Post Finance” — wszystkie trzy stoją w komentarzach (460511: „Postfinace DKK”).
         ['PostFinance', /post\s*-?\s*fin\w{0,3}[cs]e\b|\bPF\b/i], ['UBS', /\bUBS\b/i], ['HSBC', /\bHSBC\b/i], ['Credit Suisse', /[Cc]redit\s*[Ss]uisse|\bCS\b/],
@@ -15622,6 +15624,215 @@
         var stare = pdf.filter(function (f){ return wybor.indexOf(f) < 0 && f.kiedy <= pol.kiedy && (TIS_POTW.test(f.nazwa) || TIS_WYDRUK_NAZWA.test(f.nazwa)); });
         if (stare.length) wybor.push(stare[stare.length - 1]);
         return wybor;
+    }
+
+    // ================= RODZAJ ISSUE I ETAP PŁATNOŚCI — automatycznie, bez przełącznika (18.11.2026) =================
+    // Prośba: „usuń przełącznik — ma być jak najbardziej intuicyjne, także dla nowych osób”. HUB sam rozpoznaje:
+    //  • rodzaj: 🏦 przelew wewnętrzny (typ „Internal Bank Transfer” / pole 1011 „Bank Data”), 🔁 cykliczne (co najmniej 2 razy
+    //    „polecenie zapłaty → krótkie paid / Confirmed”: SRS 27 cykli, MWST 58, Paytrail 43, SaferPay 13…), 🧾 jednorazowe — reszta;
+    //  • etap: „przed” (brak polecenia — sprawdzanie faktury jak dotąd), „doZaplaty” (polecenie bez zapłaty po nim — lista do płatności),
+    //    „zaplacone” (po poleceniu „paid” / Confirmed / PAID = Yes — nic do zrobienia), „nowyCykl” (cykliczne: po ostatniej zapłacie
+    //    wgrano nową fakturę, polecenia jeszcze nie ma — czytamy TYLKO ją, nie 86 PDF-ów historii).
+    // Zmierzone na 251 issue z trzech list maili (17.11) i 7 przykładach przelewów wewnętrznych (18.11).
+    var TIS_RODZAJ = {
+        jedno: { zn: '🧾', opis: 'jednorazowe — faktura płacona raz' },
+        cykl: { zn: '🔁', opis: 'cykliczne — to samo issue płacone co jakiś czas; liczy się tylko ostatni cykl' },
+        ibt: { zn: '🏦', opis: 'przelew wewnętrzny między naszymi rachunkami' }
+    };
+    var TIS_ZNAK_WYNIKU = { ok: '✔', zle: '✖', spr: '?', blad: '? techniczne', odbite: '↪', zaplacone: '✓' };
+    function jestPotwierdzenie(t){ t = String(t || ''); return TIS_POTWIERDZENIE_KOM.test(t) && !/\?/.test(t) && t.length < 160; }
+    // Pary „polecenie → potwierdzenie” w kolejności czasu. Komentarze przychodzą z komentarze() posortowane rosnąco.
+    function cykleZaplat(kom){
+        var ile = 0, czeka = false, ost = null;
+        (kom || []).forEach(function (c){
+            if (systemowy(c)) return;
+            if (TIS_POL_KOM.test(c.tekst)){ czeka = true; return; }
+            if (jestPotwierdzenie(c.tekst)){ ost = c; if (czeka){ ile++; czeka = false; } }
+        });
+        return { ile: ile, ostatnia: ost };
+    }
+    function rodzajIssue(r, kom){
+        if (r.ibtTyp || /internal\s+bank\s+transfer/i.test(r.typ || '') || r.bankData) return 'ibt';
+        return cykleZaplat(kom).ile >= 2 ? 'cykl' : 'jedno';
+    }
+    function etapPlatnosci(r, kom, pliki){
+        var pol = r.polecenie, c = cykleZaplat(kom);
+        r.cykle = c; r.noweFaktury = [];
+        if (!pol) return 'przed';
+        // 🧪 test odczytu: zapłacone issue czytamy tak, jakby polecenie dopiero czekało na zapłatę (pomiar na zapłaconych).
+        if (r.test) return 'doZaplaty';
+        var zap = (kom || []).filter(function (k){ return !systemowy(k) && k.kiedy > pol.kiedy && jestPotwierdzenie(k.tekst); })[0];
+        r.zaplataPo = zap || null;
+        if (!zap && !/^yes$/i.test(r.paid || '')) return 'doZaplaty';
+        // Zapłacone. Issue cykliczne z fakturą wgraną po ostatniej zapłacie — nowy cykl czeka na polecenie zapłaty.
+        if (r.rodzaj === 'cykl'){
+            var g = (c.ostatnia && c.ostatnia.kiedy) || (zap && zap.kiedy) || pol.kiedy;
+            r.noweFaktury = (pliki || []).filter(function (f){ return /\.pdf$/i.test(f.nazwa) && f.kiedy > g && !TIS_POTW.test(f.nazwa) && !TIS_WYDRUK_NAZWA.test(f.nazwa); });
+            if (r.noweFaktury.length) return 'nowyCykl';
+        }
+        return 'zaplacone';
+    }
+    function etapOpis(r){
+        var p = r.polecenie, d = function (x){ return String(x || '').slice(0, 10).split('-').reverse().join('.'); };
+        if (r.etap === 'doZaplaty') return '💳 do zapłaty — polecenie z ' + d(p && p.kiedy) + (p && p.kto ? ' (' + p.kto + ')' : '');
+        if (r.etap === 'zaplacone') return '✓ zapłacone' + (r.zaplataPo ? ' ' + d(r.zaplataPo.kiedy) + ' (' + (r.zaplataPo.ktoPelny || r.zaplataPo.kto) + ')' : (/^yes$/i.test(r.paid || '') ? ' (PAID = Yes)' : ''));
+        if (r.etap === 'nowyCykl') return '🔁 nowa faktura czeka na polecenie zapłaty';
+        return '';
+    }
+    // Faktury czytamy wszędzie poza przelewem wewnętrznym i issue już zapłaconym (w 🧪 teście odczytu — zawsze).
+    function czytaFaktury(r){ return r.rodzaj !== 'ibt' && (r.etap !== 'zaplacone' || !!r.test); }
+    // Kwoty poprzednich przelewów: z nazw wydruków („21.10.2026REVOLUT LTD- 8 000 chf.pdf”), a gdy ich mało — z wcześniejszych
+    // poleceń z jedną kwotą. Do ostrzeżenia, gdy faktura cykliczna wyraźnie odbiega od zwykłej kwoty.
+    function historiaKwot(r){
+        // Przy „do zapłaty” bieżące polecenie to nie historia; przy nowym cyklu ostatnie polecenie jest już zapłacone — liczy się.
+        var o = [], pol = r.polecenie, biez = r.etap === 'doZaplaty' && pol ? pol.kiedy : '';
+        (r.pliki || []).filter(function (f){ return TIS_WYDRUK_NAZWA.test(f.nazwa) && (!biez || f.kiedy < biez); }).forEach(function (f){
+            var m = /[-–,]\s*(\d[\d' .,]*\d|\d)\s*(chf|eur|usd|gbp|dkk|sek|nok|ron|pln)\b/i.exec(f.nazwa);
+            if (m){ var v = kwota(m[1], true); if (isFinite(v) && v > 0) o.push({ v: v, w: m[2].toUpperCase(), kiedy: f.kiedy }); }
+        });
+        if (o.length < 2) (r.kom || []).forEach(function (c){
+            if (systemowy(c) || !TIS_POL_KOM.test(c.tekst) || (biez && c.kiedy >= biez)) return;
+            var k = polKwoty(c.tekst), w = polWaluty(c.tekst);
+            if (k.length === 1) o.push({ v: k[0], w: w.length === 1 ? w[0] : '', kiedy: c.kiedy });
+        });
+        return o.sort(function (a, b){ return a.kiedy < b.kiedy ? -1 : 1; }).slice(-6);
+    }
+    function mediana(a){ var s = a.slice().sort(function (x, y){ return x - y; }), n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : NaN; }
+    var TIS_CYKL_ODCHYLKA = 0.3;   // ±30% od zwykłej kwoty — próg ostrzeżenia przy fakturach cyklicznych
+    function dataPl(x){ return String(x || '').slice(0, 10).split('-').reverse().join('.'); }
+    // 🔁 Issue cykliczne: co czytamy (tylko bieżący cykl), kiedy ostatnio zapłacone i czy kwota nie odstaje od poprzednich.
+    function cyklPowody(r){
+        var p = [], c = r.cykle || { ile: 0 }, docs = (r.faktura && r.faktura.docs) || [];
+        var nazwy = docs.map(function (d){ return d.plik; }).filter(Boolean);
+        p.push({ w: 'info', t: '🔁 issue cykliczne — zapłacone już ' + c.ile + ' razy' + (c.ostatnia ? ', ostatnio ' + dataPl(c.ostatnia.kiedy) : '')
+            + '. Czytam tylko ' + (r.etap === 'nowyCykl' ? 'fakturę wgraną po ostatniej zapłacie' : 'faktury tej płatności')
+            + (nazwy.length ? ': ' + nazwy.join(', ') : '') + '; starsze to zapłacone cykle.' });
+        if (r.etap === 'nowyCykl') p.push({ w: 'spr', t: 'nowa faktura czeka na polecenie zapłaty („please pay from …”) — sprawdź ją i zleć płatność' });
+        var teraz = r.etap === 'nowyCykl' ? lsSumaFaktur(r) : lsKwota(r), wal = (r.polecenie && r.polecenie.waluta) || r.waluta || r.walutaTemat || '';
+        var h = historiaKwot(r).filter(function (x){ return !x.w || !wal || x.w === wal; });
+        if (isFinite(teraz) && h.length >= 2){
+            var med = mediana(h.map(function (x){ return x.v; }));
+            if (med > 0 && Math.abs(Math.abs(teraz) - med) / med > TIS_CYKL_ODCHYLKA)
+                p.push({ w: 'spr', t: 'kwota ' + kw(Math.abs(teraz)) + (wal ? ' ' + wal : '') + ' wyraźnie inna niż zwykle (poprzednie: '
+                    + h.map(function (x){ return kw(x.v); }).join(', ') + ') — sprawdź, czy to właściwa faktura' });
+        }
+        return p;
+    }
+    // 🏦 Przelew wewnętrzny — powody do wyniku: co odczytane ze zlecenia i czego brakuje.
+    function ibtPowody(r){
+        var p = [];
+        if (r.etap !== 'doZaplaty'){
+            p.push({ w: 'info', t: '🏦 przelew wewnętrzny — ' + (r.polecenie ? etapOpis(r) : 'w komentarzach nie ma zlecenia przelewu') + '. Nic do zrobienia.' });
+            return p;
+        }
+        var b = r.ibt, s = function (k){ return k ? [k.firma, k.bank, k.iban].filter(Boolean).join(' · ') : '—'; };
+        p.push({ w: 'info', t: '🏦 zlecenie: ' + polOpis(r.polecenie) });
+        p.push({ w: 'info', t: '🏦 odczyt: z ' + s(b.z) + ' → na ' + s(b.na) + ' · ' + (isFinite(b.kwota) ? kw(b.kwota) : '?') + ' ' + (b.waluta || '?') + ' · tytuł „' + (b.tytul || '?') + '”' });
+        if (b.braki.length) p.push({ w: 'spr', t: 'ze zlecenia nie odczytałem: ' + b.braki.join(', ') + ' — uzupełnij z treści zlecenia' + (b.kand.length ? ' (rachunki w issue: ' + b.kand.map(function (k){ return [k.firma, k.bank].filter(Boolean).join(' ') + ' ' + k.iban; }).join('; ') + ')' : '') });
+        if (b.z && b.na && b.z.n === b.na.n) p.push({ w: 'zle', t: 'rachunek „skąd” i „dokąd” to ten sam numer — sprawdź zlecenie' });
+        if (b.z && b.waluta && b.z.waluty.length && b.z.waluty.indexOf(b.waluta) < 0) p.push({ w: 'spr', t: 'rachunek „skąd” jest w arkuszu w ' + b.z.waluty.join('/') + ', a zlecenie w ' + b.waluta });
+        if (r.zamkniete) p.push({ w: 'spr', t: 'issue jest zamknięte, a ostatnie zlecenie nie ma potwierdzenia „paid” — sprawdź, czy przelew poszedł' });
+        return p;
+    }
+
+    // ---------- przelew wewnętrzny: z polecenia „skąd → dokąd, kwota, tytuł” ----------
+    // Wzory z issue 18.11.2026: „prosze o przelew z bi UBS chf na kwote 20 000 chf do revolut bi tytułem money transfer”,
+    // „proszę o przelew z UBS konto BI DKK 20 000 DKK na konto BI Revolut tytułem …”, „Proszę o zasilenie Global PF z BI UBS, kwota
+    // 60 000 EUR, tytuł przelewu C11/GeC/2026”, „Proszę o zasilenie Malrany. Kwota: 20 000 CHF Tytuł: rent 11.2026”, „Please pay Loan
+    // 10.2026 from UBS BI CHF to Real Home, amount 8'600 chf”, „🏦 Zlecenie przelewu wewnętrznego”: „Please pay from <rachunek> to
+    // <rachunek>, amount: …, reason of payment: …”. Rachunki: z treści (narzędzie) albo z pola „Bank Data” — para „X to Y” w walucie
+    // polecenia (469012: osobno USD i EUR) albo wybór po banku i spółce z części „skąd” / „dokąd” polecenia i tematu issue.
+    // Polecenie przelewu wewnętrznego: ostatni komentarz-zlecenie (IBT_ZLEC — ten sam wzór, co w narzędziu 🏦; plus „please pay”).
+    function ibtPolecenie(r, kom){
+        var l = (kom || []).filter(function (c){ return !systemowy(c) && (IBT_ZLEC.test(c.tekst) || TIS_POL_KOM.test(c.tekst)); });
+        if (!l.length) return null;
+        var o = polRozbierz(r, l[l.length - 1]);
+        o.granica = '';
+        return o;
+    }
+    // Części „skąd” i „dokąd” zlecenia. Tytuł, kwota i saldo nie należą do żadnej.
+    function ibtCzesci(t){
+        // Fraza kwoty wypada ze środka („z bi UBS chf na kwote 20 000 chf do revolut”), tytuł i saldo — do końca.
+        var s = ' ' + String(t || '').replace(/\s+/g, ' ')
+            .replace(/(?:\bna\s+)?\b(?:kwot[aęey]|amount|betrag)\b\s*(?:of\s*)?:?\s*(?:[A-Za-z]{3}\s*)?\d[\d '’.,]*(?:\s*[A-Za-z]{3}\b)?/gi, ' ')
+            .split(/\b(?:tytu[łl]\w*|reason\s+of|title|account\s+balance)\b/i)[0] + ' ';
+        var z = '', d = '', mz = /\s(?:ze?|from)\s/i.exec(s), md = /\s(?:do|na(?:\s+konto)?|to)\s/i.exec(s);
+        if (mz) z = s.slice(mz.index + mz[0].length, md && md.index > mz.index ? md.index : s.length);
+        else if (md) z = s.slice(0, md.index);   // temat „UBS Storedock to Malrana GmbH 2026” — „skąd” to wszystko przed „to”
+        if (md) d = s.slice(md.index + md[0].length, mz && mz.index > md.index ? mz.index : s.length);
+        // „Proszę o zasilenie Malrany” / „zasilenie Global PF” — odbiorca to słowa po „zasilenie”
+        var mzas = /zasileni[ea]\s+(?:konta\s+)?(.+?)(?=\s(?:ze?|from)\s|[.,]|$)/i.exec(s);
+        if (mzas) d = mzas[1] + ' ' + d;
+        return { z: z, d: d };
+    }
+    // Ile fragment polecenia mówi o rachunku k (z ibtKonto: spółka z arkusza, bank z IBAN-u, waluty).
+    function ibtPunkty(k, frag, wal){
+        if (!frag || !/\S/.test(frag)) return 0;
+        var p = 0, opis = polNorm([k.firma].concat(k.firmyArkusza || []).join(' '));
+        TIS_POL_BANKI.forEach(function (q){ if (q[1].test(frag) && (k.bank === q[0] || q[1].test(k.bank || ''))) p += 2; });
+        var sp = polSpolka(frag, {});
+        if (sp && sp.skad === 'polecenie'){ var kl = polKlucz(sp.nazwa); if (kl.length >= 3 && opis.indexOf(' ' + kl + ' ') >= 0) p += 3; }
+        // Odmiana po polsku („Malrany” → Malrana, „Storedocka”): pierwsze 5 liter słowa w nazwie spółki rachunku.
+        polNorm(frag).split(' ').forEach(function (w){
+            if (w.length >= 5 && !/^(konto|konta|account|money|trans|przel|zasil|beliani|gmbh)/.test(w) && opis.indexOf(' ' + w.slice(0, 5)) >= 0) p += 2;
+        });
+        if (wal && (k.waluty || []).indexOf(wal) >= 0) p += 1;
+        return p;
+    }
+    function ibtZPolecenia(r){
+        var p = r.polecenie, o = { z: null, na: null, kwota: NaN, waluta: '', tytul: '', braki: [], kand: [] };
+        if (!p) return o;
+        // Bez „@Imię(5187)”, bez linii salda i screena (narzędzie 🏦 dopisuje „Account balance: …” — to nie kwota przelewu).
+        var t = String(p.tekst || '').replace(/@[^\s(]+(?:\s[^\s(]+)?\(\d+\)/g, ' ').replace(/\(\d+\)/g, ' ')
+                .replace(/\s*\/?\s*(?:account|available|availaible|current)\s*(?:current\s*)?balance\b[\s\S]*$/i, '');
+        var ma = /(?:amount|kwot[aęe]|betrag)\s*(?:of\s*)?:?\s*(?:([A-Za-z]{3})\s*)?(\d{1,3}(?:[ '’]\d{3})+(?:[.,]\d{1,2})?|\d[\d'’.,]*\d|\d)\s*([A-Za-z]{3})?/i.exec(t);
+        var kw = polKwoty(t);
+        if (ma){ o.kwota = kwota(ma[2], true); o.waluta = [ma[3], ma[1]].map(function (x){ return String(x || '').toUpperCase(); }).filter(function (x){ return WALUTY.indexOf(x) >= 0; })[0] || ''; }
+        else if (kw.length === 1) o.kwota = kw[0];
+        if (!o.waluta){ var wl = polWaluty(t); if (wl.length === 1) o.waluta = wl[0]; }
+        var bd = String(r.bankData || ''), walI = walutyW(r.temat + ' ' + bd);
+        var konto = function (x){ return ibtKonto(x.n, x.przed || '', x.linia || '', x.po || '', walI); };
+        // Narzędzie 🏦 pisze oba rachunki w treści — wtedy nic nie zgadujemy.
+        var wT = ibanyZTekstu(t);
+        if (wT.length >= 2){ o.z = konto(wT[0]); o.na = konto(wT[1]); }
+        else {
+            var kand = ibanyZTekstu(bd);
+            ibanyZTekstu(r.temat).forEach(function (x){ if (!kand.some(function (y){ return y.n === x.n; })) kand.push(x); });
+            var K = kand.map(konto); o.kand = K;
+            // Pole „Bank Data” z parami „X to Y” (469012: „*USD - CH47 … to CH30 … *EUR - CH14 … to CH68 …”) — para w walucie polecenia.
+            var pary = [];
+            bd.split(/\n|\*/).forEach(function (l){ var ib = ibanyZTekstu(l); if (ib.length === 2 && /\bto\b/i.test(l)) pary.push({ z: ib[0].n, na: ib[1].n, wal: walutyW(l) }); });
+            var pw = o.waluta ? pary.filter(function (x){ return x.wal.indexOf(o.waluta) >= 0; }) : [];
+            // Jedyna para w INNEJ walucie niż zlecenie to nie ta para (469012: para USD cała, EUR urwana — zlecenie w EUR).
+            var px = pw.length === 1 ? pw[0] : pary.length === 1 && (!o.waluta || !pary[0].wal.length || pary[0].wal.indexOf(o.waluta) >= 0) ? pary[0] : null;
+            var po = function (n){ return K.filter(function (k){ return k.n === n; })[0] || null; };
+            if (px){ o.z = po(px.z); o.na = po(px.na); }
+            else if (K.length >= 2){
+                var cz = ibtCzesci(t), ct = ibtCzesci(r.temat);
+                var zP = K.map(function (k){ return ibtPunkty(k, cz.z, o.waluta) * 2 + ibtPunkty(k, ct.z, o.waluta); });
+                var dP = K.map(function (k){ return ibtPunkty(k, cz.d, o.waluta) * 2 + ibtPunkty(k, ct.d, o.waluta); });
+                // Najwyższy wynik, jednoznacznie (remis = nie wiem — człowiek wybiera z listy rachunków).
+                var naj = function (a, bez){ var m = 0, i = -1, rem = false; a.forEach(function (v, j){ if (j === bez) return; if (v > m){ m = v; i = j; rem = false; } else if (v === m && v > 0) rem = true; }); return rem ? -1 : i; };
+                var iz = naj(zP, -1), id = naj(dP, iz);
+                if (iz >= 0) o.z = K[iz];
+                if (id >= 0 && id !== iz) o.na = K[id];
+                // Dwa rachunki w „Bank Data” i jeden rozpoznany — drugi to druga strona.
+                if (K.length === 2){
+                    if (o.z && !o.na) o.na = K[K[0] === o.z ? 1 : 0];
+                    else if (o.na && !o.z) o.z = K[K[0] === o.na ? 1 : 0];
+                }
+            }
+        }
+        // „Tytuł: rent 11.2026”, „tytuł przelewu C11/GeC/2026.” (bez dwukropka), „tytułem money transfer”, „reason of payment: …”.
+        var mt = /(?:tytu[łl]em|tytu[łl](?![a-ząćęłńóśźż])(?:\s+przelewu)?\s*:?|reason\s+of\s+payment\s*:?|title(?:\s+of\s+transfer)?\s*:)\s*["„“]?(.+?)["”“]?\s*(?=,?\s*(?:kwota|amount)\b|\.?\s*$)/i.exec(t)
+              || /\bpay\s+(?!from\b|to\b)(.+?)\s+from\b/i.exec(t);
+        o.tytul = mt ? mt[1].replace(/[.,;\s]+$/, '').trim() : '';
+        if (!o.z) o.braki.push('rachunek „skąd”');
+        if (!o.na) o.braki.push('rachunek „dokąd”');
+        if (!isFinite(o.kwota)) o.braki.push(kw.length > 1 ? 'kwota (w poleceniu kilka liczb)' : 'kwota');
+        if (!o.waluta) o.braki.push('waluta');
+        if (!o.tytul) o.braki.push('tytuł');
+        return o;
     }
     // Ocena faktury: r.faktura = { docs:[…], skan, pominiete } albo { brakPdf }.
     function ocenFakture(r){
@@ -15780,7 +15991,8 @@
         if (r.bladDubel) p.unshift({ w: 'spr', t: r.bladDubel });
         if (r.bladTech) p.unshift({ w: 'spr', t: r.bladTech });
         r.powody = p;
-        if (r.odbite && !r.test && !r.reczne) { r.wynik = 'odbite'; return; }
+        // Zapłacone (albo przelew wewnętrzny bez zlecenia do wykonania) — nic do zrobienia, bez względu na uwagi do pól.
+        if (!r.bladTech && !r.test && (r.etap === 'zaplacone' || (r.rodzaj === 'ibt' && r.etap !== 'doZaplaty'))){ r.wynik = 'zaplacone'; return; }
         if (p.some(function (x){ return x.w === 'zle'; })) r.wynik = 'zle';
         else if (r.bladTech || r.bladDubel) r.wynik = 'blad';
         else if (p.some(function (x){ return x.w === 'spr'; })) r.wynik = 'spr';
@@ -16085,8 +16297,7 @@
         ibt: { stan: 'nic', issue: [], osoby: [], blad: '', gen: 0, szcz: {}, uid: {}, wynik: null, historia: [], wysylam: false, mimoO: null, screen: null, scrInfo: '' },
         pbOtw: false, pb: { plan: null, konta: {}, tekst: '', postep: '', pracuje: false },
         wsad: null, grupuj: true, grupaOtw: {}, usuniete: [],
-        // Płatność ręczna (17.11.2026) — zapamiętana na tym komputerze: osoba z payments używa jej zawsze.
-        reczne: (function (){ try { return GM_getValue(TIS_RECZNE_KEY, '0') === '1'; } catch (e){ return false; } })(),
+        // Przełącznik „💳 płatność ręczna” (17.11.2026) usunięty 18.11.2026 — etap płatności każde issue dostaje samo (etapPlatnosci).
         ls: { platnicy: {}, konta: {} }
     };
     function sprawdzJedno(r){
@@ -16108,31 +16319,40 @@
             r.kom = kom;
             var o = ostatnieOdbicie(kom);
             if (o){ r.odbite = { kto: o.kto, kiedy: o.kiedy.slice(0, 10), tekst: o.tekst.replace(/[\s\S]*?please\s+pay\s+from/i, 'please pay from').slice(0, 80) }; }
-            if (!r.reczne){
-                r.powodyPola = ocenPola(r, kom);
-                if (r.odbite && !r.test) return null;
-                return plikiIssue(r.id);
-            }
-            // Płatność ręczna: pliki PRZED oceną pól — polecenie zapłaty wskazuje pliki po nazwie.
+            // Lista plików zawsze PRZED oceną (jedno lekkie zapytanie): rodzaj issue, etap płatności i polecenie zapłaty wskazują
+            // pliki po nazwie i dacie. Bez przełącznika — każde issue dostaje swój etap samo (prośba 18.11.2026).
             return plikiIssue(r.id).then(function (pliki){
                 r.pliki = pliki;
-                r.polecenie = polecenieZaplaty(r, kom);
+                r.rodzaj = rodzajIssue(r, kom);
+                r.polecenie = r.rodzaj === 'ibt' ? ibtPolecenie(r, kom) : polecenieZaplaty(r, kom);
+                r.etap = etapPlatnosci(r, kom, pliki);
+                r.reczne = r.etap === 'doZaplaty' && r.rodzaj !== 'ibt';
+                r.ibt = null;
+                // 🏦 Przelew wewnętrzny: faktur nie ma — czytamy tylko zlecenie (skąd, dokąd, kwota, tytuł).
+                if (r.rodzaj === 'ibt'){
+                    if (r.etap === 'doZaplaty') r.ibt = ibtZPolecenia(r);
+                    r.powodyPola = ibtPowody(r);
+                    return null;
+                }
+                if (r.etap === 'zaplacone'){ r.powodyPola = [{ w: 'info', t: etapOpis(r) }]; return null; }
                 r.powodyPola = ocenPola(r, kom);
                 return pliki;
             });
         }).then(function (pliki){
             if (!pliki) return;
             r.pliki = pliki; r.plikiPrzebieg = S.przebieg;
-            var pol = r.reczne ? r.polecenie : null;
-            // Potwierdzenie / zlecenie przelewu w issue (po nazwie pliku): płatność w toku albo zrobiona. W płatności ręcznej liczy się
-            // tylko wgrane PO poleceniu zapłaty (= już zapłacone); starsze to poprzednie cykle — z nich bierzemy tylko rachunek (niżej).
-            pliki.forEach(function (f){
+            var pol = r.reczne ? r.polecenie : null, nowyCykl = r.etap === 'nowyCykl';
+            // Potwierdzenie / zlecenie przelewu w issue (po nazwie pliku): płatność w toku albo zrobiona. Przy poleceniu zapłaty liczy się
+            // tylko wgrane PO nim (= już zapłacone); starsze to poprzednie cykle — z nich bierzemy tylko rachunek (niżej).
+            // 🔁 Nowy cykl: potwierdzenia są z poprzednich (zapłaconych) cykli — nie mówią nic o nowej fakturze.
+            if (!nowyCykl) pliki.forEach(function (f){
                 if (!TIS_POTW.test(f.nazwa)) return;
                 if (!pol) r.powodyPliki.push(powodStatusu(r, 'spr', 'w issue jest potwierdzenie / zlecenie przelewu („' + f.nazwa + '”) — płatność w toku albo już zrobiona?'));
                 else if (f.kiedy > pol.kiedy) r.powodyPliki.push(powodStatusu(r, 'zle', 'potwierdzenie przelewu „' + f.nazwa + '” wgrane ' + f.kiedy.slice(0, 16) + ', po poleceniu zapłaty — już zapłacone'));
             });
             var pdfy = pol ? plikiReczne(r, pliki).filter(function (f){ return !(TIS_POTW.test(f.nazwa) && f.kiedy > pol.kiedy); })
-                           : pliki.filter(function (f){ return /\.pdf$/i.test(f.nazwa) && !TIS_POTW.test(f.nazwa); });
+                     : nowyCykl ? r.noweFaktury.slice()
+                     : pliki.filter(function (f){ return /\.pdf$/i.test(f.nazwa) && !TIS_POTW.test(f.nazwa); });
             if (!pdfy.length){ r.faktura = { brakPdf: true }; return; }
             var docs = [], skany = [], bledy = [], pominiete = [];
             return pdfy.reduce(function (p, f){
@@ -16190,9 +16410,10 @@
                 if (bledy.length) r.faktura.bledy = bledy;
             });
         }).then(function (){
-            if (!r.odbite || r.test || r.reczne){
+            if (czytaFaktury(r)){
                 r.powodyFaktura = ocenFakture(r);
                 if (r.faktura && r.faktura.bledy) r.powodyFaktura.push({ w: 'spr', t: 'nie przeczytałem: ' + r.faktura.bledy.join('; ') });
+                if (r.rodzaj === 'cykl') r.powodyFaktura = cyklPowody(r).concat(r.powodyFaktura);
                 // Płatność ręczna, issue bez pola kwoty (SRS, MWST, Galaxus, Primeo…): kwotę porównujemy z poleceniem; bez kwoty
                 // w poleceniu zostaje kwota z faktury — do sprawdzenia, bo nie ma jej z czym porównać.
                 if (r.reczne && r.polecenie && !isFinite(r.amount) && !(r.faktura && r.faktura.brakPdf)){
@@ -16262,7 +16483,7 @@
         try { bud = /^__/.test(HUB_BUDOWA) ? '' : String(HUB_BUDOWA); } catch (e){}
         var d0 = new Date(), dd = function (n){ return ('0' + n).slice(-2); };
         var kiedy = d0.getFullYear() + '-' + dd(d0.getMonth() + 1) + '-' + dd(d0.getDate()) + ' ' + dd(d0.getHours()) + ':' + dd(d0.getMinutes());
-        var znak = { ok: '✔', zle: '✖', spr: '?', blad: '? techniczne', odbite: '↪' };
+        var znak = TIS_ZNAK_WYNIKU;
         L.push('HUB ' + TIS_VER + (bud ? ' · zmiana ' + bud : '') + ' · TEST Issue — log odczytu faktur · ' + kiedy + ' · ' + (S.kto || zalogowany()));
         L.push('Zawiera treść faktur (dane kontrahentów) — tylko do analizy odczytu. Nie publikuj, nie wrzucaj do chmury.');
         L.push('Issue w logu: ' + lista.length + ' z ' + S.lista.filter(function (r){ return r.wynik; }).length + ' sprawdzonych — te, w których odczyt faktury nie przeszedł bez uwag'
@@ -16362,7 +16583,7 @@
                 var nb = fvIssue(b).map(fvNorm), pewne = [], mozliwe = [];
                 na.forEach(function (x){ nb.forEach(function (y){ var c = fvPorownaj(x, y); if (c === 'tak') pewne.push(x); else if (c === 'moze') mozliwe.push(x + ' / ' + y); }); });
                 var tenSam = a.companyOpcja && a.companyOpcja === b.companyOpcja, kwotaRowna = isFinite(a.amount) && isFinite(b.amount) && rowne(Math.abs(a.amount), Math.abs(b.amount));
-                if (pewne.length && tenSam) a.powodyDubel.push({ w: 'zle', t: 'dubel: ten sam numer FV ' + pewne.join(', ') + ' w issue ' + b.id + ' (na liście' + (b.odbite ? ', już odbite' : '') + ')' });
+                if (pewne.length && tenSam) a.powodyDubel.push({ w: 'zle', t: 'dubel: ten sam numer FV ' + pewne.join(', ') + ' w issue ' + b.id + ' (na liście' + (b.reczne ? ', już z poleceniem zapłaty' : b.etap === 'zaplacone' ? ', już zapłacone' : '') + ')' });
                 else if (pewne.length && kwotaRowna) a.powodyDubel.push({ w: 'zle', t: 'dubel: ten sam numer FV i kwota w issue ' + b.id + ' (' + (b.company || '?') + ')' });
                 else if (mozliwe.length && (tenSam || kwotaRowna)) a.powodyDubel.push({ w: 'spr', t: 'możliwy dubel: numer ' + mozliwe.join(', ') + ' w issue ' + b.id + ' — sprawdź, czy to ta sama faktura' });
             });
@@ -16413,9 +16634,10 @@
         // dojdzie (przerwanie), zostaje „niesprawdzone”, a nie ze starym ✔.
         // Tryb „🧪 test odczytu” zapamiętany przy issue w chwili sprawdzania — przełącznik ruszony później nie zmienia
         // znaczenia wyników już na ekranie (każdy niesie znaczek „🧪 test”).
-        var test = !!S.testOdczytu, reczne = !!S.reczne;
-        doSpr.forEach(function (r){ r.wynik = null; r.powody = []; r.sprPrzebieg = 0; r.test = test; r.reczne = reczne; });
-        tisLog('start', 'Sprawdź faktury: ' + doSpr.length + ' issue' + (reczne ? ' · 💳 płatność ręczna' : '') + (test ? ' · 🧪 test odczytu' : ''));
+        var test = !!S.testOdczytu;
+        // Etap płatności (r.reczne = „do zapłaty po poleceniu”) ustala sprawdzJedno dla każdego issue osobno.
+        doSpr.forEach(function (r){ r.wynik = null; r.powody = []; r.sprPrzebieg = 0; r.test = test; r.reczne = false; r.etap = ''; });
+        tisLog('start', 'Sprawdź faktury: ' + doSpr.length + ' issue' + (test ? ' · 🧪 test odczytu' : ''));
         S.otwarte = {};
         // Poza stronami React login nie stoi w DOM — bierzemy go ze strony pierwszego issue (odczyt).
         if (S.kto === '?') zapytanie('/react/logs/issue_logs/' + encodeURIComponent(doSpr[0].id), TIS_API_MS)
@@ -16430,32 +16652,32 @@
         }).then(function (){
             if (S.przerwij) return;
             S.postep = 'Szukam dubli (lista + otwarte i zamknięte issue przewoźników)…'; rysujStan();
-            var zrobione = doSpr.filter(function (r){ return r.sprPrzebieg === przebieg && (!r.odbite || r.test || r.reczne) && !r.bladTech; });
+            var zrobione = doSpr.filter(function (r){ return r.sprPrzebieg === przebieg && czytaFaktury(r) && !r.bladTech; });
             return sprawdzDuble(zrobione, doSpr).then(function (){ dubleZrobione = !S.przerwij; });
         }).then(function (){
             doSpr.forEach(function (r){
                 if (r.sprPrzebieg !== przebieg){ r.wynik = null; r.powody = []; return; }
-                if (!dubleZrobione && (!r.odbite || r.test || r.reczne) && !r.bladTech) r.bladDubel = 'dubla nie sprawdziłem — przerwane; kliknij „Sprawdź faktury” jeszcze raz';
+                if (!dubleZrobione && czytaFaktury(r) && !r.bladTech) r.bladDubel = 'dubla nie sprawdziłem — przerwane; kliknij „Sprawdź faktury” jeszcze raz';
                 zlozWynik(r);
             });
             var l = licz();
-            var podsum = (S.przerwij ? 'Przerwane. ' : 'Sprawdzone. ') + '✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ↪ już odbite ' + l.odbite + (l.nie ? ' · niesprawdzone ' + l.nie : '');
-            // Bez trybu płatności ręcznej, a issue mają już polecenie zapłaty (panel 17.11.2026: lista maili „Please answer Issue”
-            // sprawdzona bez „💳” dała „inny typ issue” i „↪ już odbite”) — mówimy wprost, co zaznaczyć.
-            var zPol = reczne ? [] : doSpr.filter(function (r){ return (r.kom || []).some(function (c){ return !systemowy(c) && TIS_POL_KOM.test(c.tekst); }); });
-            say((test ? '🧪 TEST ODCZYTU (status zapłaty pominięty — wyniki nie są zgodą na płatność). ' : '')
-                + (reczne ? '💳 Płatność ręczna — lista w „🏦 Płatność”. ' : '') + podsum
-                + (zPol.length ? ' · ' + zPol.length + ' z ' + doSpr.length + ' issue ma już polecenie zapłaty („please pay …”): jeśli płacisz je Ty, zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz.' : ''),
-                l.zle || l.spr || l.blad || l.nie || zPol.length ? 'warn' : 'ok');
-            doSpr.forEach(function (r){ if (r.wynik) tisLog('issue', r.id + ' ' + ({ ok: '✔', zle: '✖', spr: '?', blad: '? techniczne', odbite: '↪' }[r.wynik] || r.wynik) + ' · ' + (r.company || r.temat || '').slice(0, 50)
-                + ' · ' + (r.amountTxt || '—') + ' ' + (r.waluta || r.walutaTemat || '') + ' · ' + (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 600)); });
+            var podsum = (S.przerwij ? 'Przerwane. ' : 'Sprawdzone. ') + '✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ✓ nic do zrobienia ' + l.zaplacone + (l.nie ? ' · niesprawdzone ' + l.nie : '');
+            // Co dalej — bez przełączników (18.11.2026): ile issue czeka na zapłatę po poleceniu i ile przelewów wewnętrznych.
+            var dz = doSpr.filter(function (r){ return r.wynik && r.reczne; }).length, ib = doSpr.filter(function (r){ return r.wynik && r.ibt; }).length;
+            var dalej = dz || ib ? ' · Do zapłaty: ' + [dz ? '💳 ' + dz + ' po poleceniu zapłaty' : '', ib ? '🏦 ' + ib + ' przelew' + (ib === 1 ? '' : 'y') + ' wewnętrzn' + (ib === 1 ? 'y' : 'e') : ''].filter(Boolean).join(', ') + ' — lista w „🏦 Płatność”.' : '';
+            say((test ? '🧪 TEST ODCZYTU (status zapłaty pominięty — wyniki nie są zgodą na płatność). ' : '') + podsum + dalej,
+                l.zle || l.spr || l.blad || l.nie ? 'warn' : 'ok');
+            if (dz || ib) S.pbOtw = true;
+            doSpr.forEach(function (r){ if (r.wynik) tisLog('issue', r.id + ' ' + (TIS_ZNAK_WYNIKU[r.wynik] || r.wynik) + (r.rodzaj ? ' ' + TIS_RODZAJ[r.rodzaj].zn : '') + (r.etap ? ' [' + r.etap + ']' : '') + ' · ' + (r.company || r.temat || '').slice(0, 50)
+                + ' · ' + (r.amountTxt || '—') + ' ' + (r.waluta || r.walutaTemat || '') + ' · ' + (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }).join(' | ').slice(0, 600)
+                + (r.ibt ? ' · 🏦 ' + (isFinite(r.ibt.kwota) ? kw(r.ibt.kwota) : '?') + ' ' + (r.ibt.waluta || '?') + (r.ibt.braki.length ? ' · brak: ' + r.ibt.braki.join(', ') : '') : '')); });
             tisLog('koniec', podsum);
         }).catch(function (e){ say('Błąd: ' + (e.message || e), 'err'); tisLog('koniec', '✖ wyjątek przy sprawdzaniu: ' + (e.message || e)); })
           .then(function (){ S.praca = false; S.moznaPrzerwac = false; S.postep = ''; rysuj(); });
     }
     function licz(){
-        var l = { ok: 0, zle: 0, spr: 0, blad: 0, odbite: 0, nie: 0 };
-        S.lista.forEach(function (r){ if (!r.wynik) l.nie++; else l[r.wynik]++; });
+        var l = { ok: 0, zle: 0, spr: 0, blad: 0, odbite: 0, zaplacone: 0, nie: 0 };
+        S.lista.forEach(function (r){ if (!r.wynik) l.nie++; else l[r.wynik] = (l[r.wynik] || 0) + 1; });
         return l;
     }
     // Odczyt Claude i ręczny zastępują TYLKO odczyt faktury. Braku PDF, błędu technicznego
@@ -17198,7 +17420,7 @@
             say('Zapisałem „' + nazwa + '” w Pobranych. Teraz kliknij przy issue ' + r.id + ' „② Otwórz w Claude”, tam „Wyślij”, a odpowiedź wklej w pole pod spodem.' + (ust().pobrane.trim() ? '' : ' UWAGA: w „⚙ Ustawienia” nie ma folderu Pobranych — plik dołączysz w aplikacji ręcznie.'), 'ok');
         }).catch(function (e){ say('Nie pobrałem pliku: ' + (e.message || e), 'err'); }).then(rysuj);
     }
-    var OPIS_WYNIKU = { ok: '✔ zgadza się', zle: '✖ nie zgadza się', spr: '? dalej do sprawdzenia', blad: '? techniczne', odbite: '↪ już odbite' };
+    var OPIS_WYNIKU = { ok: '✔ zgadza się', zle: '✖ nie zgadza się', spr: '? dalej do sprawdzenia', blad: '? techniczne', odbite: '↪ już odbite', zaplacone: '✓ nic do zrobienia' };
     function przyjmijClaude(r){
         if (zajety()) return;
         var nie = wpisDozwolony(r);
@@ -17319,6 +17541,8 @@
             var wyb = plikiReczne(r, r.pliki || []).map(function (f){ return f.id; }), pk = r.polecenie.kiedy;
             pdfy = pdfy.filter(function (f){ return wyb.indexOf(f.id) >= 0 && !(f.kiedy > pk) && !TIS_WYDRUK_NAZWA.test(f.nazwa); });
         }
+        // 🔁 Nowy cykl: tylko faktury wgrane po ostatniej zapłacie.
+        else if (r.etap === 'nowyCykl'){ var nf = (r.noweFaktury || []).map(function (f){ return f.id; }); pdfy = pdfy.filter(function (f){ return nf.indexOf(f.id) >= 0; }); }
         var wybrane = ids.length ? pdfy.filter(function (f){ return ids.indexOf(f.id) >= 0; }) : [];
         return wybrane.length ? wybrane : pdfy;
     }
@@ -17338,8 +17562,9 @@
     function wsadDoOdczytu(r){
         // Issue bez pól faktury poza płatnością ręczną: nie ma z czym porównać odczytu, a pliki to cała historia
         // (Paytrail 211586: 76 PDF-ów z trzech lat) — nie idzie do paczki.
-        if (!r.reczne && r.uklad && r.uklad !== 'ship' && r.uklad !== 'mkt' && r.uklad !== 'sea') return false;
-        return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && !wpisDozwolony(r) && wsadPlikiIssue(r).length > 0;
+        if (!r.reczne && r.etap !== 'nowyCykl' && r.uklad && r.uklad !== 'ship' && r.uklad !== 'mkt' && r.uklad !== 'sea') return false;
+        if (!czytaFaktury(r)) return false;   // 🏦 przelew wewnętrzny i ✓ zapłacone — nie ma czego czytać
+        return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && r.wynik !== 'zaplacone' && !wpisDozwolony(r) && wsadPlikiIssue(r).length > 0;
     }
     function wsadKandydat(r){ return wsadDoOdczytu(r) && !wsadOdczytKompletny(r); }
     function wsadIssue(){ return S.lista.filter(wsadKandydat); }
@@ -18564,7 +18789,7 @@
     function mimoUwagi(r){ return (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; }); }
     function mimoKlucz(r){ return naukaHash(r.wynik + '|' + mimoUwagi(r).join('\n')); }
     // Płatność ręczna: issue bez pola kwoty (MWST, SRS…) też da się dodać mimo uwag, gdy kwota jest z polecenia albo z faktury.
-    function mimoMozna(r){ return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && !r.bladTech && !!r.powodyPola && (isFinite(r.amount) || (!!r.reczne && isFinite(lsKwota(r)))); }
+    function mimoMozna(r){ return !!r.wynik && r.wynik !== 'ok' && r.wynik !== 'odbite' && r.wynik !== 'zaplacone' && !r.ibt && !r.bladTech && !!r.powodyPola && (isFinite(r.amount) || (!!r.reczne && isFinite(lsKwota(r)))); }
     function mimoWazne(r){ return !!(r.mimo && mimoMozna(r) && r.mimo.klucz === mimoKlucz(r)); }
     function doPlatnosci(r){ return r.wynik === 'ok' || mimoWazne(r); }
 
@@ -18709,7 +18934,9 @@
     // Jeden odbiorca + kilka issue = jeden przelew, razem z korektami (decyzja 09.10.2026).
     function pbPlan(){
         // Plik do banku płaci kwotę z pola Amount — issue bez niej (płatność ręczna: MWST, SRS…) idą tylko listą do płatności.
-        var ok = S.lista.filter(function (r){ return doPlatnosci(r) && isFinite(r.amount); });
+        // Issue z poleceniem zapłaty („please pay from …”) płaci się z rachunku wskazanego przez finanse — lista, nie plik (18.11.2026);
+        // 🔁 nowa faktura cyklu czeka na polecenie, a pole Amount jest często z pierwszego cyklu.
+        var ok = S.lista.filter(function (r){ return doPlatnosci(r) && isFinite(r.amount) && !r.reczne && !r.ibt && r.etap !== 'nowyCykl'; });
         var plan = { grupy: [], poza: [], odlozone: [], platnik: null, blad: '', data: pbDataWykonania(), waluta: '' };
         if (!ok.length){ plan.blad = 'nie ma issue z ✔ ani dodanych do płatności mimo uwag — najpierw „Sprawdź faktury”'; return plan; }
         // Jeden plik = jeden rachunek płatnika, czyli jedna spółka i jedna waluta.
@@ -19298,7 +19525,8 @@
     // „🏦 Płatność”: dwa wyjścia z tego samego planu przelewów (pytanie użytkownika 17.11.2026: „czy lista do płatności będzie
     // opcją dla pliku do banku?”). Lista — zawsze, dla każdego rachunku płatnika i waluty; plik pain.001 — jak dotąd HVB w EUR.
     function pbHtml(){
-        var w = S.pb.widok || (S.reczne ? 'lista' : 'pain');
+        // Bez przełącznika: lista, gdy są issue z poleceniem zapłaty albo przelewy wewnętrzne; inaczej plik do banku (jak dotąd).
+        var w = S.pb.widok || (S.lista.some(function (r){ return r.wynik && (r.reczne || r.ibt); }) ? 'lista' : 'pain');
         var b = function (k, t){ return '<button type="button" class="tis-btn' + (w === k ? '' : ' tis-btn2') + '" data-akcja="pb-widok" data-w="' + k + '">' + t + '</button>'; };
         return '<div style="margin:8px 0 2px"><b>🏦 Płatność:</b> ' + b('lista', '📋 Lista do płatności (ręcznie w e-bankingu)') + b('pain', '⬇ Plik do banku (pain.001, HVB EUR)') + '</div>'
              + (w === 'lista' ? lsHtml() : pbHtmlPain());
@@ -19342,12 +19570,14 @@
     function lsPowodPoza(r){
         if (!r.wynik) return 'niesprawdzone';
         if (r.bladTech) return 'nie sprawdzone: ' + r.bladTech;
-        if (r.wynik === 'odbite') return 'już odbite do payments — jeśli płacisz je Ty, zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz';
-        if (/internal\s+bank\s+transfer/i.test(r.typ || '')) return 'przelew wewnętrzny — przez „🏦 Zlecenie przelewu wewnętrznego”';
-        if (r.reczne && !r.polecenie) return 'brak polecenia zapłaty („please pay from …”)';
+        if (r.wynik === 'zaplacone') return '✓ ' + (etapOpis(r) || 'nic do zrobienia').replace(/^✓ /, '') + ' — nic do zrobienia';
+        if (r.rodzaj === 'ibt') return r.ibt ? '🏦 przelew wewnętrzny — w sekcji „Przelewy wewnętrzne” niżej' : '🏦 przelew wewnętrzny bez zlecenia';
+        if (r.wynik === 'odbite') return 'już odbite do payments';
+        // 🔁 Nowa faktura issue cyklicznego: rachunek płatnika i kwotę daje dopiero polecenie zapłaty (pole Amount bywa z pierwszego cyklu).
+        if (r.etap === 'nowyCykl') return '🔁 nowa faktura cyklu — czeka na polecenie zapłaty od finansów („please pay from …”)';
         // Issue bez pól faktury (Invoice, Finance-…, Declaration) — kwotę, numery i pliki tej płatności daje tylko polecenie zapłaty.
         if (!r.reczne && r.uklad !== 'ship' && r.uklad !== 'mkt' && r.uklad !== 'sea')
-            return 'issue bez pól faktury — kwotę i faktury tej płatności wskaże dopiero polecenie zapłaty: zaznacz „💳 płatność ręczna” i kliknij „Sprawdź faktury” jeszcze raz';
+            return 'issue bez pól faktury i bez polecenia zapłaty — kwotę i faktury tej płatności wskaże dopiero polecenie od finansów („please pay from …”)';
         if (r.wynik === 'zle' && !mimoWazne(r)) return '✖ ' + (r.powody || []).filter(function (x){ return x.w === 'zle'; }).map(function (x){ return x.t; }).slice(0, 2).join('; ');
         return '';
     }
@@ -19388,10 +19618,12 @@
         return q ? q.qr.nazwa : String(r.temat || '').replace(/\s+/g, ' ').slice(0, 60);
     }
     function lsPlan(){
-        var plan = { koszyki: [], poza: [], ile: 0 };
+        var plan = { koszyki: [], poza: [], ile: 0, ibt: [] };
         var spr = S.lista.filter(function (r){ return r.wynik || r.bladTech; });
         var kosz = {}, kol = [];
         spr.forEach(function (r){
+            // 🏦 Przelew wewnętrzny ze zleceniem do wykonania — osobna sekcja (skąd → dokąd, kwota, tytuł).
+            if (r.ibt && !r.bladTech){ plan.ibt.push(r); return; }
             var pw = lsPowodPoza(r);
             if (pw){ plan.poza.push({ r: r, powod: pw }); return; }
             var pl = lsPlatnik(r), kk = pl.iban || ('?' + pl.klucz);
@@ -19419,7 +19651,35 @@
             plan.ile += b.lista.length;
             plan.koszyki.push(b);
         });
+        plan.ile += plan.ibt.length;
         return plan;
+    }
+    // ---------- 🏦 przelewy wewnętrzne na liście (18.11.2026) ----------
+    function lsIbtStrona(k){ return k ? [k.firma, k.bank, k.iban].filter(Boolean).join(' · ') : ''; }
+    function lsIbtUwagi(r){
+        return (r.powody || []).filter(function (x){ return x.w !== 'info'; }).map(function (x){ return x.t; });
+    }
+    function lsIbtHtml(lista){
+        var h = '<div style="margin-top:10px;border-top:1px solid #cbd5e1;padding-top:6px"><b>🏦 Przelewy wewnętrzne do wykonania (' + lista.length + ')</b>'
+              + ' <span class="tis-mut">— między naszymi rachunkami, według zlecenia w issue (z narzędzia 🏦 albo napisanego ręcznie)</span>';
+        h += '<table class="tis-t" style="margin-top:4px"><thead><tr><th>Z rachunku</th><th>Na rachunek</th><th style="text-align:right">Kwota</th><th>Tytuł</th><th>Zlecił</th><th>Issue</th><th>Uwagi</th></tr></thead><tbody>';
+        lista.forEach(function (r){
+            var b = r.ibt, p = r.polecenie, u = lsIbtUwagi(r);
+            var str = function (k){ return k ? esc(lsIbtStrona(k)) + lsKop(k.n, 'IBAN') : '<span class="tis-zle">nie rozpoznałem — sprawdź w zleceniu</span>'; };
+            h += '<tr><td style="font-size:11px">' + str(b.z) + '</td><td style="font-size:11px">' + str(b.na) + '</td>'
+               + '<td style="text-align:right;white-space:nowrap">' + (isFinite(b.kwota) ? '<b>' + esc(pbKwPok(Math.round(b.kwota * 100))) + '</b> ' + esc(b.waluta || '?') + lsKop(pbKw(Math.round(b.kwota * 100)), 'kwota') : '<span class="tis-zle">brak</span>') + '</td>'
+               + '<td style="font-size:11px">' + (b.tytul ? esc(b.tytul) + lsKop(b.tytul, 'tytuł') : '<span class="tis-spr">brak</span>') + '</td>'
+               + '<td style="font-size:11px">' + esc((p && p.kto) || '?') + ', ' + esc(dataPl(p && p.kiedy)) + '<div class="tis-mut" title="' + esc(p ? p.tekst : '') + '">„' + esc(String(p ? p.tekst : '').replace(/\s+/g, ' ').slice(0, 90)) + '…”</div></td>'
+               + '<td style="font-size:11px"><a href="/react/logs/issue_logs/' + encodeURIComponent(r.id) + '" target="_blank" rel="noopener">' + esc(r.id) + '</a></td>'
+               + '<td style="font-size:11px">' + (u.length ? '<ul style="margin:0;padding-left:14px">' + u.map(function (x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' : '<span class="w-ok">✔</span>') + '</td></tr>';
+        });
+        return h + '</tbody></table></div>';
+    }
+    function lsIbtTekst(r){
+        var b = r.ibt, p = r.polecenie;
+        return ['   z: ' + (lsIbtStrona(b.z) || 'NIE ROZPOZNANY'), '   na: ' + (lsIbtStrona(b.na) || 'NIE ROZPOZNANY'),
+                '   kwota: ' + (isFinite(b.kwota) ? pbKwPok(Math.round(b.kwota * 100)) + ' ' + (b.waluta || '?') : 'BRAK') + ' · tytuł: ' + (b.tytul || '—') + ' · issue: ' + r.id
+                + ' · zlecił: ' + ((p && p.kto) || '?') + ' ' + dataPl(p && p.kiedy)];
     }
     // Uwagi przelewu: wszystko, co człowiek ma zobaczyć, zanim wpisze przelew.
     function lsUwagi(g){
@@ -19497,15 +19757,11 @@
         var h = '<div class="tis-ibt" style="border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:4px 0 8px;background:#f8fafc">';
         h += '<div style="font-weight:bold;margin-bottom:4px">📋 Lista do płatności — do wpisania w e-bankingu</div>';
         h += '<div class="tis-mut">Jeden wiersz = jeden przelew: dostawca + rachunek płatnika, faktury i noty razem (noty na minus). Pola kopiujesz guzikiem 📋. '
-           + (S.reczne ? 'Rachunek płatnika z polecenia zapłaty („please pay from …”) i arkusza „CH & DE”.' : 'Płacisz po „please pay from …”? Włącz „💳 płatność ręczna” i sprawdź jeszcze raz.')
-           + ' Do listy idą ✔ i „?” (z uwagami); ✖ tylko dodane „➕ mimo uwag”. W prologistics nic się nie zapisuje.</div>';
-        if (!plan.koszyki.length && !plan.poza.length) return h + '<div class="tis-mut" style="margin-top:6px">Najpierw „🔍 Sprawdź faktury”.</div></div>';
-        // Lista policzona bez „💳”, a issue mają polecenie zapłaty — ostrzeżenie na górze, zanim ktoś przepisze z niej przelew.
-        var bezTrybu = S.lista.filter(function (r){ return r.wynik && !r.reczne && (r.kom || []).some(function (c){ return !systemowy(c) && TIS_POL_KOM.test(c.tekst); }); });
-        if (bezTrybu.length) h += '<div class="tis-msg warn" style="margin-top:6px">⚠ Lista policzona BEZ trybu „💳 płatność ręczna”, a ' + bezTrybu.length + ' issue ma już polecenie zapłaty („please pay …”: '
-            + bezTrybu.slice(0, 8).map(function (r){ return esc(r.id); }).join(', ') + (bezTrybu.length > 8 ? ', …' : '') + '). Jeśli płacisz je Ty — zaznacz „💳 płatność ręczna” i kliknij „🔍 Sprawdź faktury” jeszcze raz: '
-            + 'dopiero wtedy liczy się polecenie (rachunek płatnika, kwota, pliki tej płatności), a nie cała historia issue.</div>';
+           + 'Rachunek płatnika: z polecenia zapłaty finansów („please pay from …”), a bez polecenia — ze spółki issue; numer z arkusza „CH & DE”. '
+           + 'Do listy idą ✔ i „?” (z uwagami); ✖ tylko dodane „➕ mimo uwag”. Zapłacone issue i nowe faktury cykliczne bez polecenia — poza listą, z powodem. W prologistics nic się nie zapisuje.</div>';
+        if (!plan.koszyki.length && !plan.poza.length && !plan.ibt.length) return h + '<div class="tis-mut" style="margin-top:6px">Najpierw „🔍 Sprawdź faktury”.</div></div>';
         plan.koszyki.forEach(function (b){ h += lsKoszykHtml(b); });
+        if (plan.ibt.length) h += lsIbtHtml(plan.ibt);
         if (plan.poza.length) h += '<div style="margin-top:8px"><b>Poza listą (' + plan.poza.length + '):</b><ul style="margin:4px 0 0 16px;padding:0">'
             + plan.poza.map(function (x){ return '<li>' + esc(x.r.id) + ' ' + esc(String(x.r.company || x.r.temat || '').slice(0, 50)) + ' — ' + esc(x.powod) + '</li>'; }).join('') + '</ul></div>';
         h += '<div style="margin-top:8px"><button type="button" class="tis-btn" data-akcja="ls-kopiuj"' + (plan.ile ? '' : ' disabled') + '>📋 Kopiuj całą listę</button>'
@@ -19541,6 +19797,14 @@
             });
             L.push('Razem: ' + b.lista.length + ' · ' + Object.keys(b.sumy).map(function (w){ return pbKwPok(b.sumy[w]) + ' ' + w; }).join(' + '));
         });
+        if (plan.ibt.length){
+            L.push('', '=== Przelewy wewnętrzne (' + plan.ibt.length + ')');
+            plan.ibt.forEach(function (r, i){
+                L.push((i + 1) + '. ' + String(r.temat || '').replace(/\s+/g, ' ').slice(0, 70));
+                L.push.apply(L, lsIbtTekst(r));
+                var u = lsIbtUwagi(r); if (u.length) L.push('   uwagi: ' + u.join(' | '));
+            });
+        }
         if (plan.poza.length) L.push('', 'Poza listą: ' + plan.poza.map(function (x){ return x.r.id + ' (' + x.powod + ')'; }).join('; '));
         return L.join('\n');
     }
@@ -19552,7 +19816,12 @@
                 + ' · ' + (x.kwota || 'BRAK kwoty') + ' ' + x.waluta + ' · tytuł ' + (x.tytul || '—') + ' · issue ' + x.g.issue.map(function (r){ return r.id; }).join(',')
                 + (x.uwagi.length ? ' · uwagi: ' + x.uwagi.join(' | ').slice(0, 500) : ''));
         });
-        tisLog('koniec', '📋 lista ' + jak + ': ' + w.length + ' przelewów');
+        plan.ibt.forEach(function (r){
+            var b = r.ibt;
+            tisLog('przelew', '🏦 wewnętrzny ' + r.id + ': ' + (lsIbtStrona(b.z) || '?') + ' → ' + (lsIbtStrona(b.na) || '?') + ' · ' + (isFinite(b.kwota) ? kw(b.kwota) : 'BRAK kwoty') + ' ' + (b.waluta || '')
+                + ' · tytuł ' + (b.tytul || '—') + (b.braki.length ? ' · nie odczytane: ' + b.braki.join(', ') : ''));
+        });
+        tisLog('koniec', '📋 lista ' + jak + ': ' + w.length + ' przelewów' + (plan.ibt.length ? ' + ' + plan.ibt.length + ' wewnętrznych' : ''));
     }
     function lsXlsx(plan){
         var aoa = [['Z rachunku (spółka)', 'Bank', 'Waluta', 'Rachunek płatnika', 'Odbiorca', 'Rachunek odbiorcy', 'Referencja QR', 'Tytuł (numery FV)', 'Kwota', 'Waluta przelewu', 'Termin', 'Issue', 'Uwagi']];
@@ -19563,6 +19832,17 @@
         var ws = XLSX.utils.aoa_to_sheet(aoa), wb = XLSX.utils.book_new();
         ws['!cols'] = [28, 12, 7, 30, 30, 34, 34, 30, 12, 7, 14, 22, 80].map(function (w){ return { wch: w }; });
         XLSX.utils.book_append_sheet(wb, ws, 'Lista do płatności');
+        if (plan.ibt.length){
+            var ai = [['Z rachunku', 'Na rachunek', 'Kwota', 'Waluta', 'Tytuł', 'Zlecił', 'Data zlecenia', 'Issue', 'Uwagi']];
+            plan.ibt.forEach(function (r){
+                var b = r.ibt, p = r.polecenie;
+                ai.push([lsIbtStrona(b.z) || 'NIE ROZPOZNANY', lsIbtStrona(b.na) || 'NIE ROZPOZNANY', isFinite(b.kwota) ? b.kwota : '', b.waluta || '', b.tytul || '',
+                         (p && p.kto) || '', dataPl(p && p.kiedy), r.id, lsIbtUwagi(r).join(' | ')]);
+            });
+            var wi = XLSX.utils.aoa_to_sheet(ai);
+            wi['!cols'] = [50, 50, 12, 7, 30, 22, 12, 10, 80].map(function (w){ return { wch: w }; });
+            XLSX.utils.book_append_sheet(wb, wi, 'Przelewy wewnętrzne');
+        }
         return new Uint8Array(XLSX.write(wb, { type: 'array', bookType: 'xlsx' }));
     }
     function pbHtmlPain(){
@@ -19651,12 +19931,16 @@
     }
     function htmlWynik(r){
         if (!r.wynik) return '<span class="tis-mut">' + (r.sprPrzebieg === 0 && S.praca ? '⏳' : '— niesprawdzone') + '</span>';
-        var z = { ok: ['w-ok', '✔ zgadza się'], zle: ['w-zle', '✖ nie zgadza się'], spr: ['w-spr', '? sprawdź sam'], blad: ['w-blad', '? techniczne'], odbite: ['w-odbite', '↪ już odbite'] }[r.wynik];
+        var z = { ok: ['w-ok', '✔ zgadza się'], zle: ['w-zle', '✖ nie zgadza się'], spr: ['w-spr', '? sprawdź sam'], blad: ['w-blad', '? techniczne'], odbite: ['w-odbite', '↪ już odbite'], zaplacone: ['w-odbite', '✓ nic do zrobienia'] }[r.wynik];
+        // Rodzaj issue i etap płatności — rozpoznane samo (18.11.2026), widać od razu, bez rozwijania powodów.
+        var rz = r.rodzaj && TIS_RODZAJ[r.rodzaj], et = r.etap === 'doZaplaty' && r.rodzaj !== 'ibt' ? '💳 do zapłaty' : r.etap === 'doZaplaty' ? '🏦 do wykonania' : r.etap === 'nowyCykl' ? '🆕 nowa faktura' : '';
         var h = '<span class="' + z[0] + '">' + z[1] + '</span>'
+              + (rz ? ' <span class="tis-mut" title="' + esc(rz.opis) + '">' + rz.zn + ' ' + { jedno: 'jednorazowe', cykl: 'cykliczne', ibt: 'przelew wewnętrzny' }[r.rodzaj] + '</span>' : '')
+              + (et ? ' <span class="tis-spr" title="' + esc(etapOpis(r)) + '">' + et + '</span>' : '')
               + (r.test ? ' <span class="tis-test" title="Sprawdzone w trybie „🧪 test odczytu”: status zapłaty pominięty — to nie jest zgoda na płatność">🧪 test</span>' : '')
               + (mimoWazne(r) ? ' <span class="tis-spr" title="Wejdzie do pliku do banku z adnotacją o uwagach">➕ w płatności mimo uwag (' + esc(r.mimo.kto || '?') + ', ' + esc(r.mimo.kiedy) + ')</span>' : '');
-        if (r.odbite) h += '<div class="tis-mut">' + esc(r.odbite.kiedy + ', ' + r.odbite.kto + ': ' + r.odbite.tekst) + '</div>';
-        var p = (r.powody || []).filter(function (x){ return !r.odbite || r.test || r.reczne || x.w === 'zle'; });
+        if (r.odbite && r.wynik === 'odbite') h += '<div class="tis-mut">' + esc(r.odbite.kiedy + ', ' + r.odbite.kto + ': ' + r.odbite.tekst) + '</div>';
+        var p = r.powody || [];
         if (p.length) h += '<ul class="tis-p">' + p.map(function (x){ return '<li class="p-' + x.w + '">' + esc(x.t) + '</li>'; }).join('') + '</ul>';
         return h;
     }
@@ -19855,7 +20139,7 @@
     function grupujOdczyt(){ try { return GM_getValue(TIS_GRUPUJ_KEY, '1') !== '0'; } catch (e){ return true; } }
     function listaWierszHtml(r){
         var akcje = '';
-        if (!S.praca && r.wynik && r.wynik !== 'odbite' && r.wynik !== 'ok' && !wpisDozwolony(r)){
+        if (!S.praca && r.wynik && r.wynik !== 'odbite' && r.wynik !== 'ok' && r.wynik !== 'zaplacone' && r.rodzaj !== 'ibt' && !wpisDozwolony(r)){
             akcje = '<button type="button" class="tis-btn tis-btn2" data-akcja="claude" data-id="' + esc(r.id) + '"' + ((r.pliki || []).some(function (f){ return /\.pdf$/i.test(f.nazwa); }) ? '' : ' disabled') + '>🤖 Claude</button>'
                   + '<button type="button" class="tis-btn tis-btn2" data-akcja="reczny" data-id="' + esc(r.id) + '">✍ Sprawdź sam</button>';
         }
@@ -19896,8 +20180,10 @@
     function listaGrupy(){
         var g = [], wg = {};
         S.lista.forEach(function (r){
-            var k = String(r.companyOpcja || r.company || '—');
-            if (!wg[k]){ wg[k] = { klucz: k, nazwa: r.company || '—', issue: [] }; g.push(wg[k]); }
+            // Issue bez przewoźnika (MWST, SRS, przelewy wewnętrzne…) — każde osobno, z tematem zamiast „—”: inaczej wszystkie
+            // lądowały w jednej grupie „—” z sumą kwot różnych dostawców.
+            var k = r.companyOpcja || r.company ? String(r.companyOpcja || r.company) : '#' + r.id;
+            if (!wg[k]){ wg[k] = { klucz: k, nazwa: r.company || String(r.temat || '').replace(/\s+/g, ' ').slice(0, 50) || '—', issue: [] }; g.push(wg[k]); }
             wg[k].issue.push(r);
         });
         g.forEach(function (x){
@@ -19909,8 +20195,8 @@
             });
             x.waluty = Object.keys(wal); x.spolki = Object.keys(sp); x.gr = gr; x.bezKwoty = bezKwoty;
             x.fv = []; x.issue.forEach(function (r){ fvIssue(r).forEach(function (n){ if (x.fv.indexOf(n) < 0) x.fv.push(n); }); });
-            x.licz = { ok: 0, zle: 0, spr: 0, blad: 0, odbite: 0, nie: 0 };
-            x.issue.forEach(function (r){ if (!r.wynik) x.licz.nie++; else x.licz[r.wynik]++; });
+            x.licz = { ok: 0, zle: 0, spr: 0, blad: 0, odbite: 0, zaplacone: 0, nie: 0 };
+            x.issue.forEach(function (r){ if (!r.wynik) x.licz.nie++; else x.licz[r.wynik] = (x.licz[r.wynik] || 0) + 1; });
         });
         return g;
     }
@@ -19920,6 +20206,7 @@
         if (l.zle) c.push('<span class="tis-zle">✖ ' + l.zle + '</span>');
         if (l.spr + l.blad) c.push('<span class="tis-spr">? ' + (l.spr + l.blad) + '</span>');
         if (l.odbite) c.push('<span class="tis-mut">↪ ' + l.odbite + '</span>');
+        if (l.zaplacone) c.push('<span class="tis-mut">✓ ' + l.zaplacone + '</span>');
         if (l.nie) c.push('<span class="tis-mut">niesprawdzone ' + l.nie + '</span>');
         return c.join(' · ') || '<span class="tis-mut">—</span>';
     }
@@ -19964,13 +20251,11 @@
         h += '<div style="margin:6px 0"><button type="button" class="tis-btn" data-akcja="sprawdz"' + (S.praca || !S.lista.length ? ' disabled' : '') + '>🔍 Sprawdź faktury (' + S.lista.length + ')</button>'
            + '<label class="tis-mut" style="margin:0 8px" title="Do testów na zapłaconych issue: pomija PAID, status zamknięty, komentarze o zapłacie i potwierdzenia przelewu, czyta też już odbite. Wynik nie jest zgodą na płatność. Działa przy następnym „Sprawdź faktury”.">'
            + '<input type="checkbox" id="tis-test-odczytu"' + (S.testOdczytu ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 🧪 test odczytu (pomija status zapłaty)</label>'
-           + '<label class="tis-mut" style="margin:0 8px" title="Dla płacących ręcznie (PostFinance, UBS, HSBC…): „please pay from …” to polecenie zapłaty, a nie „już odbite”. Liczy się to, co stoi po ostatnim poleceniu; wynik idzie na „📋 Listę do płatności” w „🏦 Płatność”. Zapamiętane na tym komputerze. Działa przy następnym „Sprawdź faktury”.">'
-           + '<input type="checkbox" id="tis-reczne"' + (S.reczne ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 💳 płatność ręczna (po „please pay from”)</label>'
            + (S.lista.length && !S.praca ? '<button type="button" class="tis-btn tis-btn2" data-akcja="lista-wyczysc" title="Czyści listę issue (nic nie zapisuje w prologistics)">✕ Wyczyść listę</button>' : '')
            + '<label class="tis-mut" style="margin:0 8px" title="Jedna pozycja na przewoźnika: suma faktur i numery issue po przecinku. Rozwinięcie pokazuje pojedyncze faktury z guzikami."><input type="checkbox" id="tis-grupuj"' + (S.grupuj ? ' checked' : '') + '> jedna pozycja per dostawca</label>'
            + (sprawdzone && !S.praca && wsadIssue().length ? '<button type="button" class="tis-btn tis-btn2" data-akcja="wsad" title="Zapisze faktury do Pobranych jednym plikiem ZIP i złoży JEDNO polecenie dla Claude — razem z oceną komentarzy'
                 + (wsadPominiete().length ? '. Pomija ' + wsadPominiete().length + ' spraw: ' + esc(TIS_WSAD_POMIJAM_OPIS) : '') + '">🤖 Claude: nieprzeczytane (' + wsadIssue().length + ')</button>' : '')
-           + (sprawdzone ? '<span class="tis-mut" style="margin-left:8px">✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ↪ ' + l.odbite + (l.nie ? ' · niesprawdzone ' + l.nie : '') + '</span>' : '')
+           + (sprawdzone ? '<span class="tis-mut" style="margin-left:8px">✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ✓ nic do zrobienia ' + l.zaplacone + (l.odbite ? ' · ↪ ' + l.odbite : '') + (l.nie ? ' · niesprawdzone ' + l.nie : '') + '</span>' : '')
            + (sprawdzone && !S.praca && logOdczytuIssue().length ? ' <button type="button" class="tis-btn tis-btn2" data-akcja="log-odczytu" title="Plik .txt do Pobranych: przy każdym issue, którego faktura nie przeszła bez uwag — pola, powody, kandydaci sumy, wybór, waluty, nabywca i pełny tekst PDF. Zawiera treść faktur.">📄 Log odczytu (' + logOdczytuIssue().length + ')</button>' : '') + '</div>';
         if (S.wsad) h += htmlWsad();
         if (S.lista.length) h += S.grupuj ? htmlListaGrupy() : htmlListaPlaska();
@@ -20216,7 +20501,6 @@
         }
         if (id === 'tis-grupuj'){ S.grupuj = !!ev.target.checked; grupujZapisz(S.grupuj); rysuj(); return; }
         if (id === 'tis-test-odczytu'){ S.testOdczytu = !!ev.target.checked; return; }
-        if (id === 'tis-reczne'){ S.reczne = !!ev.target.checked; try { GM_setValue(TIS_RECZNE_KEY, S.reczne ? '1' : '0'); } catch (e){} if (S.reczne && !S.pbOtw) S.pbOtw = true; rysuj(); return; }
         if (!/^tis-ibt-/.test(id)) return;
         if (id === 'tis-ibt-zq' || id === 'tis-ibt-doq') return;
         if (id === 'tis-ibt-z' || id === 'tis-ibt-do' || id === 'tis-ibt-issue'){
@@ -25046,6 +25330,8 @@
         // _confDocsWsz: to samo dla KAZDEGO zamowienia (depozyt i balance) — czyta je okno
         // „Dane dostawców” (ostatni przelew dostawcy), zeby nie otwierac stron zamowien drugi raz.
         var _confDocs = {}, _poprz = {}, _confDocsWsz = {};
+        // Depozyt: ostatni przelew do dostawcy z INNEGO zamowienia (runPoprzDepo). Klucz: company_id.
+        var _poprzDost = {};
         try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
         try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
         // SWIFT i nazwa banku z pola karty dostawcy (swift_no / beneficiary_bank_name) — klucz:
@@ -25153,6 +25439,9 @@
                 // ulica Top Grace szla do pliku jako „&#34, No.128, Xinyuan Road…".
                 (pola[g] = pola[g] || {})[String(m[3]).toLowerCase()] = pcAdrPole(pcTxt(pcAttrDecode(m[4])));
             }
+            // Blok „beneficiary" z sama strefa (bez miasta) — painAdrWybierz nie bierze wtedy biura „na slepo" (18.11.2026).
+            var benP = pola.beneficiary, benStrefa = (benP && !/[A-Za-z]/.test(String(benP.city || '')) && /[A-Za-z]/.test(String(benP.zone || '')))
+                ? String(benP.zone).replace(/\s+/g, ' ').trim() : '';
             for (var i = 0; i < PC_ADR_GRUPY.length; i++){
                 var p = pola[PC_ADR_GRUPY[i]];
                 // Miasto musi miec litery: „350100" w polu City (Home Broad, blok office) to kod pocztowy.
@@ -25173,7 +25462,7 @@
                 return { grupa: PC_ADR_GRUPY[i], zone: p.zone || '', street: p.street || '',
                          nr: p.house_number || '', zip: p.zip || '', city: mc.city,
                          county: powiat, state: mc.state || '', country: kraj,
-                         linia: linia };
+                         linia: linia, benStrefa: PC_ADR_GRUPY[i] === 'beneficiary' ? '' : benStrefa };
             }
             return null;
         }
@@ -25329,13 +25618,23 @@
             if (pcIsTomato(s)) return true;
             if (!pcConfSubject(s)) return false;
             // prosba albo zaprzeczenie — to NIE jest potwierdzenie
-            if (/\b(?:please|pls|kindly)\s+(?:re-?)?(?:confirm|verify|check)/i.test(s)) return false;
-            if (/\b(?:not|never|un)\s*-?\s*confirm/i.test(s)) return false;
-            if (/\bto\s+be\s+confirmed\b/i.test(s) || /\bneeds?\s+(?:to\s+be\s+)?(?:confirm|verif)/i.test(s)) return false;
+            if (/\b(?:please|pls|kindly)\s+(?:re-?)?(?:confirm|conf\b|verify|check)/i.test(s)) return false;
+            if (/\b(?:not|never|un)\s*-?\s*conf(?:irm|\b)/i.test(s)) return false;
+            if (/\bto\s+be\s+conf(?:irmed\b|\b)/i.test(s) || /\bneeds?\s+(?:to\s+be\s+)?(?:confirm|verif)/i.test(s)) return false;
             if (/\bwait(?:ing)?\s+for\s+(?:the\s+)?confirm/i.test(s)) return false;
             if (/nie\s+(?:jest\s+|zosta[lł][oa]?\s+)?potwierdz/i.test(s) || /do\s+potwierdzenia/i.test(s) || /prosz[eę]\s+o\s+potwierdz/i.test(s)) return false;
+            // WARUNEK, a nie fakt: „ON HOLD TILL BANK ACCOUNT IS VERIFIED" (zam. 22272, 29.10.2026) do 5.63.16 liczylo sie
+            // jak potwierdzenie, bo stoi w nim „verified". Slowo warunku musi stac PRZED slowem o potwierdzeniu —
+            // „confirmed, valid till 2027" dalej potwierdza. „before" i „once" celowo poza lista: „checked before;
+            // confirmed again", „once again confirmed" to potwierdzenia.
+            if (/\b(?:on\s+hold|till|until|unless|as\s+soon\s+as)\b[\s\S]{0,60}?\b(?:confirm|verif|check)/i.test(s)) return false;
+            if (/(?:wstrzyman|wstrzymuj|dop[oó]ki|do\s+czasu|dopiero\s+po)[\s\S]{0,60}?(?:potwierdz|weryfik|sprawdz)/i.test(s)) return false;
             // tylko formy dokonane — samo „confirm" w trybie rozkazujacym nic nie potwierdza
-            return /\bconfirmed\b/i.test(s) || /\bverified\b/i.test(s) || /\b(?:double-?)?checked\b/i.test(s) || /potwierdz(?:one|ono|am|ony|ona|i[lł][ay]?)/i.test(s);
+            if (/\bconfirmed\b/i.test(s) || /\bverified\b/i.test(s) || /\b(?:double-?)?checked\b/i.test(s) || /potwierdz(?:one|ono|am|ony|ona|i[lł][ay]?)/i.test(s)) return true;
+            // Skrot „conf" (karta 3282 Vanguard, 13.11.2026: „bank conf via phone done") — do 5.63.16 niewidoczny, wiec
+            // potwierdzenie telefonem nie istnialo dla HUB-a. Sam skrot to za malo („conf needed"): musi stac przy nim
+            // slad wykonania — done / ok / via / by.
+            return /\bconf\b/i.test(s) && /\b(?:done|ok|via|by)\b/i.test(s);
         }
         // „2023-12-19 08:54:11" i „2023-12-19 08:52" (log konta nie ma sekund) -> ms
         function pcTs(s){
@@ -25344,23 +25643,62 @@
             var t = Date.parse(m[1] + 'T' + (m[2].length === 5 ? m[2] + ':00' : m[2]));
             return isFinite(t) ? t : NaN;
         }
-        // Ostatnia zmiana numeru konta z rozwijanego logu przy polu Bank account number.
-        function pcAccChange(html){
+        // Wszystkie wpisy rozwijanego logu przy polu Bank account number, od najstarszego.
+        function pcAccLogWpisy(html){
             var dm = String(html == null ? '' : html).match(/data-handler-button="bank_account"[^>]*>([\s\S]*?)<\/div>/i);
             if (!dm) return null;
-            var re = /Changed\s+from\s+"([^"]*)"\s+to\s+"([^"]*)"\s+by\s+([^\s<]+)\s+on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)/gi, m, last = null;
+            var re = /Changed\s+from\s+"([^"]*)"\s+to\s+"([^"]*)"\s+by\s+([^\s<]+)\s+on\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)/gi, m, out = [];
             while ((m = re.exec(dm[1])) !== null){
-                var from = String(m[1]).trim(), to = String(m[2]).trim();
+                var ts = pcTs(m[4]);
+                if (!isFinite(ts)) continue;
+                out.push({ ts: ts, from: pcAttrDecode(String(m[1])).trim(), to: pcAttrDecode(String(m[2])).trim(), by: m[3], date: m[4] });
+            }
+            out.sort(function (a, b){ return a.ts - b.ts; });
+            return out;
+        }
+        // Ostatnia zmiana numeru konta z rozwijanego logu przy polu Bank account number.
+        // Do wyniku dochodzi lista WSZYSTKICH zmian (zmiany) — pcConfEval odtwarza z niej, jaki numer stal na karcie
+        // w chwili potwierdzenia (powrot A→B→A nie uniewaznia potwierdzenia A, 18.11.2026).
+        function pcAccChange(html){
+            var W = pcAccLogWpisy(html);
+            if (!W) return null;
+            var last = null, zm = [];
+            W.forEach(function (w){
                 // Liczy sie WYLACZNIE zmiana z jednego konta na inne. Pierwsze wpisanie numeru
                 // (from "") ani wyczyszczenie pola (to "") nie uniewazniaja potwierdzenia —
                 // nie ma tam „starego konta", ktorego potwierdzenie mogloby dotyczyc.
-                if (!from || !to) continue;
-                if (normAcc(from) === normAcc(to)) continue;   // poprawka zapisu, nie zmiana konta
-                var ts = pcTs(m[4]);
-                if (!isFinite(ts)) continue;
-                if (!last || ts > last.ts) last = { ts: ts, from: from, to: to, by: m[3], date: m[4] };
-            }
+                if (!w.from || !w.to) return;
+                if (normAcc(w.from) === normAcc(w.to)) return;   // poprawka zapisu, nie zmiana konta
+                zm.push(w);
+                if (!last || w.ts > last.ts) last = { ts: w.ts, from: w.from, to: w.to, by: w.by, date: w.date };
+            });
+            if (last) last.zmiany = zm;
             return last;
+        }
+        // Ostatni wpis logu z niepustym numerem — takze pierwsze wpisanie (from ""). Gdy numer w polu karty jest INNY,
+        // konto zmieniono poza logiem (Sunwell 2104, 18.11.2026: w polu NRA501511553805, ostatni wpis 2023 na
+        // 44250100012800000391) i data zmiany jest nieznana.
+        function pcAccLogOst(html){
+            var W = pcAccLogWpisy(html), ost = null;
+            (W || []).forEach(function (w){ if (w.to) ost = w; });
+            return ost;
+        }
+        // Numer, ktory stal na karcie w chwili ts — wedlug zmian z logu (pcAccChange().zmiany).
+        // Przed pierwsza zmiana: jej „from"; bez zmian: '' (nie wiadomo).
+        function pcAccNaChwile(zmiany, ts){
+            var Z = zmiany || [], v = '';
+            if (!Z.length || !isFinite(ts)) return '';
+            for (var i = 0; i < Z.length; i++){ if (Z[i].ts <= ts) v = Z[i].to; }
+            return v || Z[0].from;
+        }
+        // Ta sama osoba w logu (login: „ADabkowska", „Kulka", „AlWierzba") i w komentarzu („Aleksandra Dąbkowska",
+        // „Joanna Kulka-Wach", „Alicja Wierzbicka"): pierwsze 5 liter nazwiska (bez ogonkow, przed myslnikiem) w loginie.
+        function pcTaSamaOsoba(login, autor){
+            function bez(x){ return String(x == null ? '' : x).toLowerCase().replace(/ł/g, 'l').normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+            var l = bez(login).replace(/[^a-z]/g, ''), cz = bez(autor).replace(/\(.*?\)/g, ' ').trim().split(/\s+/);
+            if (!l || cz.length < 2) return false;
+            var nz = cz[cz.length - 1].split('-')[0].replace(/[^a-z]/g, '');
+            return nz.length >= 3 && l.indexOf(nz.slice(0, 5)) >= 0;
         }
         // Komentarz o ZMIANIE danych bankowych. Tresci, ktora dopisuje „bi_change", nie widac
         // nigdzie w kodzie strony (leci z js_backend.php), wiec lapiemy typowe warianty.
@@ -25410,10 +25748,26 @@
             for (var i = 0; i < hint.accs.length; i++){ if (normAcc(hint.accs[i]) === a) return true; }
             return false;
         }
+        // ===== Komentarz o KONCIE bez numeru (18.11.2026) =====
+        // „ON HOLD TILL BANK ACCOUNT IS VERIFIED", „Supplier agreed to pay to old bank account" (zam. 22272),
+        // „numer konta się nie zgadza" — ani potwierdzenie, ani zmiana, ani wskazanie numeru, wiec HUB milczal.
+        // Musi byc slowo o koncie (PC_ACC_RE) i slowo o watpliwosci / wstrzymaniu / innym koncie / weryfikacji.
+        // Same „confirmed/verified" tu nie wchodza — to potwierdzenia (pcIsBankConfText), sprawdzane wczesniej.
+        var PC_KONTO_SLAD = /(?:\b(?:on\s+hold|hold|old|previous|former|other|another|different|instead|agreed|wrong|mismatch|confirm|verify|verification|check)\b|not\s+match|doesn'?t\s+match|does\s+not\s+match|pay\s+to|wstrzyma|stare|starego|starym|poprzedni|inne\s+konto|innego\s+konta|innym\s+koncie|zamiast|zgodzi|nie\s+zgadza|b[lł][eę]dn|weryfik|sprawdz|p[lł]a[cć]\s+na)/i;
+        function pcKontoBezNumeru(t){
+            var s = String(t == null ? '' : t);
+            if (!new RegExp(PC_ACC_RE, 'i').test(s)) return false;
+            if (pcAcctFromText(s)) return false;                                   // z numerem — to „hint"
+            if (pcIsBankConfText(s) || pcIsBankConfLista(s) || PC_LISTA_KONTO_NIE.test(s)) return false;
+            if (pcIsBankChgText(s)) return false;                                  // zmiana ma wlasna sciezke
+            return PC_KONTO_SLAD.test(s);
+        }
         // Z listy komentarzy (dostawca albo zamowienie) — najnowsze potwierdzenie i najnowsza
         // wzmianka o zmianie. src trafia do dymka, zeby bylo widac, SKAD to potwierdzenie.
+        // confMocne — najnowsze potwierdzenie, ktore NIE jest lista kontrolna (telefon, TOMATO, inspekcja);
+        // bezNr — najnowszy komentarz o koncie bez numeru (pcKontoBezNumeru).
         function pcScanBankComments(cs, src){
-            var conf = null, chg = null, hint = null;
+            var conf = null, chg = null, hint = null, confMocne = null, bezNr = null;
             function rec(c){ return { ts: pcTs(c.date), date: c.date || '', author: c.author || '', text: c.text || '', src: src || '' }; }
             // Listy z kontem na „NO" — „ok" pozniejsze od ktorejkolwiek z nich jest potwierdzeniem.
             var nie = (cs || []).filter(function(c){ return PC_LISTA_KONTO_NIE.test(String(c.text || '')); }).map(rec);
@@ -25441,16 +25795,21 @@
                         r1.text = (c.text || '') + ' — odpowiedź na listę „BANK ACCOUNT NUMBER: NO" z ' + (nie1.date || '?') + (nie1.author ? ' (' + nie1.author + ')' : '');
                     }
                     if (!conf || pcNewer(r1.ts, conf.ts)) conf = r1;
+                    if (!r1.lista && (!confMocne || pcNewer(r1.ts, confMocne.ts))) confMocne = r1;
                 }
                 else if (pcIsBankChgText(c.text)) { var r2 = rec(c); if (!chg || pcNewer(r2.ts, chg.ts)) chg = r2; }
+                else if (pcKontoBezNumeru(c.text)) { var r3 = rec(c); if (!bezNr || pcNewer(r3.ts, bezNr.ts)) bezNr = r3; }
             });
-            return { conf: conf, chg: chg, hint: hint };
+            return { conf: conf, chg: chg, hint: hint, confMocne: confMocne, bezNr: bezNr };
         }
         // Surowe dane ze strony dostawcy: potwierdzenie, wzmianka o zmianie, log zmiany konta.
         // Ocene (ok/old/none) robi dopiero pcConfEval, bo potrzebuje jeszcze komentarzy zamowien.
+        // logOst — ostatni wpis logu z numerem; numer z pola karty do porownania (zmiana poza logiem).
         function pcBankConf(html){
             var s = pcScanBankComments(pcComments(html), 'strona dostawcy');
-            return { conf: s.conf, chg: s.chg, hint: s.hint, acc: pcAccChange(html) };
+            var mk = String(html == null ? '' : html).match(/name="bank_account_number"[^>]*value="([^"]*)"/);
+            return { conf: s.conf, chg: s.chg, hint: s.hint, confMocne: s.confMocne, bezNr: s.bezNr,
+                     acc: pcAccChange(html), logOst: pcAccLogOst(html), kontoPole: mk ? pcAttrDecode(mk[1]).trim() : '' };
         }
         var PENALTY_DAYS = 7;
         // typy penalty: overpayment / underpayment / penalty / discount / other + / other -
@@ -26978,15 +27337,20 @@
         // nie weszlo, wypadalo (z ostrzezeniem): dzielnica „MONGKOK" (Hongkong TTT), „ANJI COUNTY", „Guangyang
         // district". Skracamy po kolei, kazde slowo w calym napisie, az sie zmiesci — i tylko wtedy; adres
         // krotszy niz 70 znakow idzie tak, jak go wpisano. Wielkosc liter skrotu jak w slowie.
-        var PAIN_SKROC = [['STREET', 'ST'], ['ROAD', 'RD'], ['AVENUE', 'AVE'], ['BUILDING', 'BLDG'], ['FLOOR', 'FL'],
+        // Trzeci element: skrot-akronim, zawsze wersalikami (18.11.2026, Chanwell 22410: „Economic and Technological
+        // Development Zone" — 43 znaki — to w chinskich adresach angielskich zwykle „ETDZ"). Strefy najpierw: jedno
+        // podstawienie oszczedza wiecej niz kilka „Rd"/„St".
+        var PAIN_SKROC = [['ECONOMIC AND TECHNOLOGICAL DEVELOPMENT ZONE', 'ETDZ', 1], ['ECONOMIC & TECHNOLOGICAL DEVELOPMENT ZONE', 'ETDZ', 1],
+                          ['ECONOMIC DEVELOPMENT ZONE', 'EDZ', 1], ['HIGH-TECH INDUSTRIAL DEVELOPMENT ZONE', 'HIDZ', 1],
+                          ['STREET', 'ST'], ['ROAD', 'RD'], ['AVENUE', 'AVE'], ['BUILDING', 'BLDG'], ['FLOOR', 'FL'],
                           ['ROOM', 'RM'], ['DISTRICT', 'DIST'], ['CENTRE', 'CTR'], ['CENTER', 'CTR'], ['COMMERCIAL', 'COMM'],
                           ['HIGHWAY', 'HWY'], ['INDUSTRIAL', 'IND'], ['VILLAGE', 'VLG']];
         function painAdrSkroc(s){
             var t = String(s == null ? '' : s);
             for (var i = 0; i < PAIN_SKROC.length && painChars(t).txt.length > PAIN_STR_MAX; i++){
-                var dl = PAIN_SKROC[i][0], kr = PAIN_SKROC[i][1];
-                t = t.replace(new RegExp('\\b' + dl + '\\b', 'gi'), function (w){
-                    if (w === w.toUpperCase()) return kr;
+                var dl = PAIN_SKROC[i][0], kr = PAIN_SKROC[i][1], akr = !!PAIN_SKROC[i][2];
+                t = t.replace(new RegExp('\\b' + dl.replace(/ /g, '\\s+') + '\\b', 'gi'), function (w){
+                    if (akr || w === w.toUpperCase()) return kr;
                     if (w === w.toLowerCase()) return kr.toLowerCase();
                     return kr.charAt(0) + kr.slice(1).toLowerCase();
                 });
@@ -26996,6 +27360,7 @@
         function painAdrRozwin(s){
             var t = String(s == null ? '' : s);
             PAIN_SKROC.forEach(function (p){
+                if (p[2]){ t = t.replace(new RegExp('\\b' + p[1] + '\\b', 'g'), p[0].charAt(0) + p[0].slice(1).toLowerCase()); return; }
                 t = t.replace(new RegExp('\\b' + p[1] + '\\b', 'g'), p[0])
                      .replace(new RegExp('\\b' + p[1].charAt(0) + p[1].slice(1).toLowerCase() + '\\b', 'g'), p[0].charAt(0) + p[0].slice(1).toLowerCase())
                      .replace(new RegExp('\\b' + p[1].toLowerCase() + '\\b', 'g'), p[0].toLowerCase());
@@ -27006,7 +27371,40 @@
         // „…Aimin Road 159…"), nie wchodzi drugi raz. Gdy kolejny czlon sie nie miesci, najpierw skroty
         // pocztowe (painAdrSkroc); pierwszy czlon dluzszy niz 70 znakow i po skrotach tniemy na granicy
         // slowa; kazdy, ktory sie nie zmiescil, idzie do „ucieto".
+        // Czlon „mikro" — pokoj, lokal, pietro, numer lokalu (3–5 cyfr). Przy przelewie najmniej wazny: liczy sie ulica.
+        var PAIN_ADR_MIKRO = /^(?:room|rm|unit|flat|suite|apt)\b|^no\.?\s*\d{3,5}[a-z]?$|\bfloor\b|^\d+(?:st|nd|rd|th)\s*(?:fl|f)\.?$|^\d+\s*\/\s*f\b|^\d+f$|^f\d+$/i;
+        function painAdrMikro(c){ return PAIN_ADR_MIKRO.test(String(c == null ? '' : c).replace(/\s+/g, ' ').trim()); }
+        // Gdy po skrotach dalej sie nie miesci, wypadaly OSTATNIE czlony — w chinskim adresie (od pokoju do ulicy) to ulica.
+        // LINA 22411 (18.11.2026): „No.1801, 18th Floor, Building 3, Liufang Commercial Plaza, No.11 Zhongxing Avenue.Guzhen
+        // Town" — do pliku szedlby pokoj i pietro, a „Zhongxing Avenue" do ostrzezenia. Teraz najpierw schodza czlony „mikro"
+        // (od pierwszego), dopoki ulica i reszta sie nie zmieszcza; zdjete ida do „ucieto" jak dotad.
+        // „No.146" przed „Gaozhai Road" to numer DOMU, nie lokalu (Art Champ 20818, plik z 18.11.2026 09:49: wypadl numer 146,
+        // a weszlo „LongHua Pharmaceutical"). Numer „No." jest lokalem tylko wtedy, gdy za nim NIE stoi ulica.
+        var PAIN_ADR_ULICA = /\b(?:road|rd|street|st|avenue|ave|lane|ln|lu|jie|dadao|highway|hwy|boulevard|blvd|way)\b\.?$/i;
+        function painAdrMikroW(lista, i){
+            var c = String(lista[i] == null ? '' : lista[i]).replace(/\s+/g, ' ').trim();
+            if (!painAdrMikro(c)) return false;
+            if (/^no\.?\s*\d/i.test(c) && PAIN_ADR_ULICA.test(String(lista[i + 1] == null ? '' : lista[i + 1]).replace(/\s+/g, ' ').trim())) return false;
+            return true;
+        }
         function painAdrSklej(czlony){
+            var a = painAdrSklejRaz(czlony), L = czlony || [];
+            var jestMikro = L.map(function (c, i){ return painAdrMikroW(L, i); });
+            function strata(x){ return x.ucieto.filter(function (c){ var i = L.indexOf(c); return !(i >= 0 ? jestMikro[i] : painAdrMikro(c)); }).length; }
+            if (!strata(a)) return a;
+            var mikro = L.filter(function (c, i){ return jestMikro[i]; });
+            for (var k = 1; k <= mikro.length; k++){
+                var zdjete = mikro.slice(0, k);
+                var b = painAdrSklejRaz((czlony || []).filter(function (c){ return zdjete.indexOf(c) < 0; }));
+                if (strata(b) < strata(a)){
+                    b.ucieto = zdjete.map(function (c){ return String(c).trim(); }).concat(b.ucieto);
+                    if (!strata(b)) return b;
+                    a = b;
+                }
+            }
+            return a;
+        }
+        function painAdrSklejRaz(czlony){
             var razem = '', ucieto = [], lista = [];
             // „No" oddzielone przecinkiem od swojego numeru („11F, Sanshan North Building, No,59, Dong Jie Street" —
             // Fujian You Trust, karta 1251): sklejamy w „No. 59". Do 5.63.13 samo „No" uchodzilo za powtorzenie
@@ -27095,8 +27493,11 @@
             if (pi && painAdrTenSam(k, pi) !== true) pi = '';           // inny adres niz na P/I — P/I niczego tu nie mowi
             var piS = pi ? painAdrTekstZn(pi) : '', poprawki = [];
             function wPI(s){ return painAdrSlowa(s, {}).every(function (w){ return painAdrMaSlowo(piS, w); }); }
+            // Kod z myslnikiem („89970-000", Parpinelli 2545, 18.11.2026) — do 5.63.16 zostawal w StrtNm obok PstCd.
+            var zipD = String(k.zip || '').replace(/\D/g, '');
             var strefa = String(k.zone || '').split(/[,;\n]/).map(function (x){ return painOgonStrefy(x.trim(), k); }).filter(function (x){
                 if (!x || /^\d{4,7}$/.test(x.replace(/\s+/g, ''))) return false;
+                if (zipD.length >= 4 && !/[A-Za-z]/.test(x) && x.replace(/\D/g, '') === zipD) return false;
                 if (!pbStripCtry(x)) return false;                 // sam kraj
                 // „ZHEJIANG PR" — prowincja ucieta przez dlugosc pola strefy na karcie (ANJI XINCHENG, karta 2470).
                 var xn = pbNorm(x);
@@ -27207,19 +27608,29 @@
             var piS = ' ' + pbNorm(piAddr).split(' ').map(function (w){ return PAIN_ADR_SKROTY[w] || w; }).join(' ') + ' ';
             var zwarty = piS.replace(/ /g, '');
             var traf = k.filter(function (w){ return piS.indexOf(' ' + w + ' ') >= 0 || (w.length >= 5 && zwarty.indexOf(w) >= 0); });
-            return traf.length * 2 >= k.length;
+            // Jedno wspolne slowo z dwoch to za malo (18.11.2026): biuro Passion „7/F, D Zone, J Building, No.1, Henglong Road,
+            // Guzhen Town" i beneficjent LINA „No.1801, …, Liufang Commercial Plaza, … Guzhen Town" dzielily tylko GUZHEN (nazwa
+            // miasteczka) — i do pliku szla mieszanka obu adresow. Przy 3 i wiecej slowach warunek bez zmian (polowa, min. 2).
+            return traf.length * 2 >= k.length && (traf.length >= 2 || k.length === 1);
         }
         // -> { kartaA, adrPI, inny }: kartaA — blok karty do pliku (null = adres z tekstu P/I),
         //    inny — blok karty odrzucony, bo to inny adres niz na P/I (do ostrzezenia).
+        // benStrefa (18.11.2026): blok „beneficiary" na karcie wypelniony samym polem Zone/Building, bez miasta (LINA 3301,
+        // Lili 2335, Dowell 3259, Parpinelli 2545). pcSupAdres go pomija, bo bez miasta nie zlozy elementow — ale skoro
+        // ktos wpisal adres beneficjenta, to biuro / magazyn / fabryka wchodza tylko wtedy, gdy to TO SAMO miejsce co ta
+        // strefa (Parpinelli: biuro = beneficjent). Inaczej adres z P/I, a bez adresu w P/I — sama strefa jako tekst.
         function painAdrWybierz(G, b){
-            var ben = null, pierwszy = null;
+            var ben = null, pierwszy = null, benStrefa = '';
             pcKartyGrupy(G).forEach(function (c){
                 var a = pcAdrOf(c);
                 if (!a) return;
                 if (!pierwszy) pierwszy = a;
                 if (!ben && a.grupa === 'beneficiary') ben = a;
+                if (!benStrefa && a.benStrefa) benStrefa = a.benStrefa;
             });
             if (ben) return { kartaA: ben, adrPI: false, inny: null };
+            if (pierwszy && benStrefa && painAdrTenSam(pierwszy, benStrefa) !== true)
+                return { kartaA: null, adrPI: true, inny: null, benStrefa: benStrefa };
             if (pierwszy && painAdrTenSam(pierwszy, b && b.addr) === false) return { kartaA: null, adrPI: true, inny: pierwszy };
             return { kartaA: pierwszy, adrPI: false, inny: null };
         }
@@ -27266,6 +27677,8 @@
         function painAdrCzlonyPI(addr, town, ctry, sub0){
             // „ADD.: 10C, INTERNATIONAL BUILDING…" (Minmetals) — podpis pola przyklejony do wartosci.
             var t = pbStripCtry(pcSzerokie(addr).replace(/\s*\n\s*/g, ', ').replace(/^\s*(?:add|addr|address)\s*[.:]+\s*/i, ''));
+            // Podpis kodu przed liczba („China P.C.: 065700", Vikny 22368, 18.11.2026) — po wycieciu kodu w StrtNm zostawalo „P.C.:".
+            t = t.replace(/(^|[\s,;])(?:p\.?\s?c\.?|post(?:al)?\s*code|zip(?:\s*code)?)\s*[.:#]*\s*(?=\d)/gi, '$1');
             var re = PAIN_PNA_RE[String(ctry || '').toUpperCase()], pst = '', sub = '';
             if (re){
                 var tr = t.match(re) || [];
@@ -27278,6 +27691,7 @@
                 // Myslnik zostajacy po wycietym kodzie („Delhi road Moradabad-244001" -> „Delhi road -").
                 var c = x.replace(/\s+/g, ' ').trim().replace(/(?:\s*[-–—])+$/, '').trim(), n = pbNorm(c).replace(/\s+(?:PROVINCE|SHENG)$/, '');
                 if (!c) return;
+                if (/^(?:p\.?\s?c\.?|post(?:al)?\s*code|zip(?:\s*code)?)\s*[.:#]*$/i.test(c)) return;   // sam podpis kodu
                 if (PB_PROV.test(n)){ if (!sub) sub = c.replace(/\s+(?:province|sheng)\s*$/i, '').trim(); return; }
                 if (sub0 && n === pbNorm(sub0)){ if (!sub) sub = c; return; }
                 czl.push(c);
@@ -27822,6 +28236,12 @@
                 // opisuje to samo miejsce co adres beneficjenta z P/I (painAdrWybierz, 16.11.2026).
                 var adrWyb = painAdrWybierz(G, b);
                 var kartaA = painKartaPrzestaw(adrWyb.kartaA);
+                // P/I bez adresu beneficjenta, a na karcie blok „beneficiary" z sama strefa — strefa jako tekst adresu.
+                // Kopia bloku: b idzie dalej do nazwy, SWIFT-u i banku, tam adres nie ma nic do rzeczy.
+                if (!kartaA && adrWyb.benStrefa && !String(b.addr || '').trim()){
+                    var b2 = {}; for (var kb in b) if (Object.prototype.hasOwnProperty.call(b, kb)) b2[kb] = b[kb];
+                    b2.addr = adrWyb.benStrefa; b = b2;
+                }
                 if (!kartaA) geo = painGeoZPI(b);
                 var karta = kartaA ? {
                     town: kartaA.city,
@@ -27848,6 +28268,14 @@
                 // zmiany starsze od niego (koniec falszywego alarmu ze starego wpisu w logu).
                 var poprzG = (G.bal || []).length ? pcPoprzDlaGrupy(G) : null;
                 var poprzW = poprzG ? pcPoprzWerdykt(poprzG, accV, _cf) : null;
+                // Depozyt bez balansu tego samego zamowienia: kotwica z ostatniego przelewu do dostawcy (18.11.2026).
+                var poprzDG = (!poprzG && (G.dep || []).length) ? pcPoprzDepoDlaGrupy(G) : null;
+                var poprzDW = poprzDG ? pcPoprzDepoWerdykt(poprzDG, accV, _cf) : null;
+                // Kilka nazw beneficjenta — wybor w oknie, domyslnie nazwa ostatniego przelewu na to samo konto (18.11.2026).
+                var poprzN = [poprzG, poprzDG].filter(function (p){ return p && !p.blad && p.nazwa; })[0] || null;
+                var nazwaWar = painNazwyWarianty(G, b.name, nazwaZ, poprzN);
+                var nazwaWyb = painNazwaWybor(G, nazwaWar, poprzN, accV);
+                if (nazwaWyb && nazwaWyb.v.src.indexOf('zapas') < 0) nazwaZ = null;   // uwaga „P/I bez nazwy" mowilaby o innej nazwie
                 // Konto od dostawcy idzie wprost do banku — zmiana numeru na karcie ma byc widoczna
                 // w samym oknie przelewow, nie tylko w naglowku grupy.
                 var kartaZm = [], kontoChg = '';
@@ -27886,7 +28314,9 @@
                     key: G.key, gi: i, sup: G.sup, korzen: G.korzen || G.key,
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
                     title: String(V('title', pcTitleFor(G)) || ''),
-                    name: String(V('name', b.name || (nazwaZ ? nazwaZ.name : ''))),
+                    name: String(V('name', nazwaWyb ? nazwaWyb.v.nazwa : (b.name || (nazwaZ ? nazwaZ.name : '')))),
+                    nazwaWar: nazwaWar, nazwaWyb: nazwaWyb ? nazwaWyb.v.nazwa : '', nazwaWybJak: nazwaWyb ? nazwaWyb.jak : '',
+                    nazwaPoprz: poprzN ? { nazwa: poprzN.nazwa, dzien: poprzN.dzien || '', order: poprzN.order || '', acct: poprzN.acct || '' } : null,
                     nazwaZapas: (ed.name != null && String(ed.name) !== '') ? null : nazwaZ,
                     // Nazwa a karta dostawcy (painNazwaZKarty, 09.11.2026): czy nazwa jest z karty zamiast z P/I,
                     // jaka nazwe mial P/I i jakiego konta dotyczyl, oraz beneficjent karty do porownania.
@@ -27903,6 +28333,9 @@
                     accKarta: kz.karta || '', accBlokInne: blokInne, blokPasuje: !!wb.pasuje,
                     kartaZm: kartaZm, kontoChg: kontoChg,
                     poprz: poprzG, poprzW: poprzW,
+                    // Depozyt: konto wobec ostatniego przelewu do tego dostawcy z INNEGO zamowienia (runPoprzDepo).
+                    poprzD: poprzDG, poprzDW: poprzDW,
+                    kontoBezNr: (_cf && _cf.bezNr) || null, pozaLogiem: (_cf && _cf.pozaLogiem) || null,
                     kilkaNazw: pcKilkaNazw(G, poprzG, String(V('name', b.name || ''))),
                     bic: painNorm(V('bic', b.swift || '')),
                     bicPI: painBicWobecPI(G, V('bic', b.swift || '')),
@@ -28075,6 +28508,9 @@
             // depozyt, niewyjasnione) blokuje zielone. „ok"/„info"/„brak" i „kilka nazw" stoja
             // w plakietce naglowka — zmiana potwierdzona po depozycie nie zdejmuje zielonego.
             if (r.poprzW && r.poprzW.lv === 'warn') warns.push('⚠ ' + r.poprzW.txt + '.');
+            if (r.poprzDW && r.poprzDW.lv === 'warn') warns.push('⚠ ' + r.poprzDW.txt + '.');
+            if (r.kontoBezNr) warns.push('⚠ ' + pcBezNrTxt(r.kontoBezNr) + '.');
+            if (r.pozaLogiem) warns.push('⚠ ' + pcPozaLogiemTxt(r.pozaLogiem) + '.');
             // Od 1.84 nazwa i adres banku beneficjenta NIE ida do pliku, gdy jest BIC
             // (SPS: „When using a BIC, the specification of 'Name'/'Postal Address' is not
             // permitted."). BIC jest bledem blokujacym powyzej, wiec kazdy wiersz w pliku
@@ -29824,6 +30260,30 @@
             var poprz = {};
             try { poprz = await bcPoprzednieKonta(g.prev || {}, Object.keys(potrzebne), dataPl, io || null, say) || {}; }
             catch (e){ poprz = {}; }
+            // Ostatni przelew do DOSTAWCY z innego zamowienia (18.11.2026) — dla zamowien bez wlasnego poprzedniego
+            // przelewu (depozyt, balance bez potwierdzenia depozytu w zamowieniu). Raz na dostawce, tylko potwierdzenia
+            // sprzed dnia tego przelewu, z pominieciem zamowien tego przelewu.
+            var dost = {}, cidyD = [];
+            (g.pdfs || []).forEach(function (q){
+                var wT = bcOrderyZTytulu(q.msg || '');
+                wszystkie.forEach(function (o){
+                    if (!wT[o] || podszywacze.indexOf(o) >= 0) return;
+                    var pp = poprz[o], c = (out.dane[o] || {}).cid;
+                    if (pp && pp.dzien && !pp.blad) return;
+                    if (c && cidyD.indexOf(String(c)) < 0) cidyD.push(String(c));
+                });
+            });
+            if (cidyD.length){
+                var doneD = 0, przedD = bcDzien(dataPl), ioD = io || bcIO();
+                if (say) say('Ostatni przelew do dostawców: 0/' + cidyD.length + '…', '#666');
+                await bcPool(cidyD, 3, async function (c){
+                    try { dost[c] = await pcPoprzDepoJeden(c, wszystkie, ioD, przedD); }
+                    catch (e){ dost[c] = { blad: String((e && e.message) || e) }; }
+                    doneD++;
+                    if (say) say('Ostatni przelew do dostawców: ' + doneD + '/' + cidyD.length + '…', '#666');
+                    return true;
+                });
+            }
 
             (g.pdfs || []).forEach(function (q){
                 // Zamowienia TEGO przelewu bierzemy z jego tytulu — tak dziala tez
@@ -29876,6 +30336,7 @@
                     if (pr != null && pcts.indexOf(pr) < 0) pcts.push(pr);
                 });
                 w.suma = suma; w.pcts = pcts; w.kontrole = [];
+                var dostPokazany = {};      // linia „ostatni przelew do dostawcy" raz na dostawce w tym potwierdzeniu
                 function kon(zam, co, lewo, prawo, wynik){
                     // wynik: 'ok' | 'uwaga' | 'zle'. Zapisujemy KAZDE porownanie razem
                     // z obiema wartosciami — zeby bylo widac nie tylko co nie gra,
@@ -29964,6 +30425,12 @@
                 }
                 moje.forEach(function (o){
                     var d = out.dane[o] || {}, pi = d.pi || {};
+                    // Punkt odniesienia (18.11.2026): OSTATNI przelew — z tego zamowienia, a bez niego do dostawcy z innego
+                    // zamowienia. Od jego dnia liczy sie, ktore slady zmiany konta sa AKTUALNE (bcSladAktualny).
+                    var ppZ = poprz[o], ppD = d.cid ? dost[d.cid] : null;
+                    var kot = (ppZ && ppZ.dzien && !ppZ.blad) ? ppZ : ((ppD && ppD.dzien && !ppD.blad) ? ppD : null);
+                    var kD = kot ? kot.dzien : '';
+                    var wyjZm = bcWyjasnienieZmiany(d.slady, kD, dataPl, q.acct);
                     // Blok NIEPELNY tez jest do czegos: porownujemy pole po polu, a przy
                     // brakujacym mowimy dlaczego go nie ma. Wyrzucanie calosci przez jedno
                     // zle pole kosztowalo porownanie konta i beneficjenta przy P/I, ktore
@@ -30028,16 +30495,6 @@
                     if (!k2.ok) w.bledy.push(o + ': konto z P/I „' + (piAcc || '—') + '” ≠ konto z potwierdzenia „'
                         + (q.acct || '—') + '”' + (k2.msg ? (' — ' + k2.msg) : ''));
                     }
-                    // Na jakie konto poszedl POPRZEDNI przelew tego zamowienia. To jedyne zrodlo,
-                    // ktore mowi o ZAPISIE numeru z praktyki: skoro tamten przelew przeszedl,
-                    // bank przyjal numer w tej postaci. Sprawdzajacy nie musi wiedziec, kto i co
-                    // wybral w Wprowadzaniu — widzi, co bylo poprzednio.
-                    if (potrzebne[o]){
-                        var pw = bcPoprzWynik(poprz[o], q.acct, q.name);
-                        kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, pw.prawo, pw.lv);
-                        if (pw.uwaga) w.uwagi.push(o + ': ' + pw.uwaga);
-                        if (pw.blad) w.bledy.push(o + ': ' + pw.blad);
-                    }
                     // SWIFT o zlym ksztalcie (np. dziesiecioznakowy „BKCHCNBJ72") nie jest
                     // rozjazdem z bankiem, tylko literowka w P/I. Mowimy to wprost i nie
                     // czerwienimy wiersza, o ile poczatek sie zgadza.
@@ -30091,53 +30548,89 @@
                             + '” ≠ konto z potwierdzenia „' + (q.acct || '—') + '”'
                             + (kd.msg ? (' — ' + kd.msg) : ''));
                     }
+                    // OSTATNI PRZELEW (18.11.2026, prosba: „powinien się skupiać na tym, jak ostatnio szło"). Najpierw
+                    // poprzedni przelew TEGO zamowienia; bez niego — ostatni przelew do dostawcy z innego zamowienia
+                    // (pcPoprzDepoJeden, tylko sprzed dnia tego przelewu). Inne konto niz wtedy to blad, chyba ze
+                    // tlumaczy go AKTUALNA zmiana (po tamtym przelewie) — wtedy uwaga. Skad numer: zawsze widac.
+                    if (ppZ && (ppZ.dzien || ppZ.blad) && (potrzebne[o] || ppZ.blad)){
+                        var pw = bcPoprzWynik(ppZ, q.acct, q.name, wyjZm);
+                        kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, pw.prawo, pw.lv);
+                        if (pw.uwaga) w.uwagi.push(o + ': ' + pw.uwaga);
+                        if (pw.blad) w.bledy.push(o + ': ' + pw.blad);
+                    }
+                    if (!(ppZ && ppZ.dzien && !ppZ.blad) && d.cid && !dostPokazany[d.cid]){
+                        dostPokazany[d.cid] = 1;
+                        if (!ppD) kon(o, 'ostatni przelew do dostawcy', '—', 'nie sprawdziłem (brak dostawcy przy zamówieniu)', 'uwaga');
+                        else if (ppD.brak || !ppD.dzien)
+                            kon(o, 'ostatni przelew do dostawcy', '—', ppD.brak ? ('nie znalazłem: ' + (ppD.txt || '') + ' — pierwszy przelew do tego dostawcy?')
+                                                                                : ('nie sprawdziłem: ' + (ppD.blad || '?')), 'uwaga');
+                        else {
+                            var pd = bcPoprzWynik(ppD, q.acct, q.name, wyjZm);
+                            kon(o, 'ostatni przelew do dostawcy (zam. ' + ppD.order + ')', pd.lewo, pd.prawo, pd.lv);
+                            if (pd.uwaga) w.uwagi.push(o + ': ' + pd.uwaga);
+                            if (pd.blad) w.bledy.push(o + ': ' + pd.blad);
+                        }
+                    }
                     // ZMIANA NUMERU KONTA. Przelew na konto, ktore u dostawcy zdazylo sie
                     // zmienic, to jedyny blad z tej listy, ktory kosztuje pieniadze — wiec
                     // patrzymy na to nawet wtedy, gdy wszystkie numery sie zgadzaja.
+                    // Od 18.11.2026 liczy sie tylko to, co AKTUALNE: po ostatnim przelewie (kD), a bez niego z ostatnich
+                    // BC_SWIEZE_DNI dni. Do 5.63.16 szedl ostatni wpis logu i najnowszy komentarz bez wzgledu na wiek —
+                    // zmiana z 2023 (Lejiang) albo komentarz z kontem Nisheel z 2023 (Stallion 18957) dawaly uwage i blad
+                    // przy kazdym przelewie, choc przelewy szly juz od dawna na obecne konto.
                     var sl = d.slady || {};
+                    function akt(x){ return bcSladAktualny(x, kD, dataPl); }
+                    var zmAll = (sl.acc && sl.acc.zmiany && sl.acc.zmiany.length) ? sl.acc.zmiany : (sl.acc ? [sl.acc] : []);
+                    var zmAkt = zmAll.filter(function (z){ return akt(z.date); });
+                    var chgAkt = (sl.chg && akt(sl.chg.date)) ? sl.chg : null;
+                    var hintAkt = (sl.hint && akt(sl.hint.date)) ? sl.hint : null;
+                    var pomin = (zmAll.length - zmAkt.length) + (sl.chg && !chgAkt ? 1 : 0) + (sl.hint && !hintAkt ? 1 : 0);
+                    var okno = kD ? ('po ostatnim przelewie (' + kD + ')') : ('z ostatnich ' + BC_SWIEZE_DNI + ' dni');
                     // Linia jest ZAWSZE, takze gdy nic nie znalazlem. Jej brak dalo sie
                     // czytac dwojako — „nie ma zmiany" albo „kontrola nie dziala" — a to
                     // jest kontrola, ktorej przeoczenie kosztuje pieniadze.
-                    if (!sl.acc && !sl.chg && !sl.hint){
-                        kon(o, 'zmiana numeru konta u dostawcy',
-                            sl.znane ? 'nie znalazłem śladu zmiany' : 'nie sprawdziłem — nie pobrałem strony dostawcy',
-                            sl.znane ? 'sprawdzone: log konta u dostawcy + komentarze (dostawcy i zamówienia)' : '—',
+                    if (!zmAkt.length && !chgAkt && !hintAkt){
+                        kon(o, 'zmiana numeru konta ' + okno,
+                            sl.znane ? 'brak' : 'nie sprawdziłem — nie pobrałem strony dostawcy',
+                            sl.znane ? ('sprawdzone: log konta u dostawcy + komentarze (dostawcy i zamówienia)'
+                                        + (pomin ? ' · starsze ślady pominięte: ' + pomin : '')) : '—',
                             sl.znane ? 'ok' : 'uwaga');
                     }
-                    if (sl.acc){
-                        var doNowego = bcKontoEq(sl.acc.to, q.acct).ok;
-                        var doStarego = bcKontoEq(sl.acc.from, q.acct).ok;
-                        kon(o, 'zmiana konta u dostawcy (log)',
-                            piAccBezUwagi(sl.acc.from) + ' → ' + piAccBezUwagi(sl.acc.to),
-                            sl.acc.date + (sl.acc.by ? (' · ' + sl.acc.by) : '')
+                    if (zmAkt.length){
+                        var za = zmAkt[zmAkt.length - 1];
+                        var doNowego = bcKontoEq(za.to, q.acct).ok;
+                        var doStarego = bcKontoEq(za.from, q.acct).ok;
+                        kon(o, 'zmiana konta u dostawcy ' + okno + ' (log)',
+                            piAccBezUwagi(za.from) + ' → ' + piAccBezUwagi(za.to) + (zmAkt.length > 1 ? ('  (zmian w tym czasie: ' + zmAkt.length + ')') : ''),
+                            za.date + (za.by ? (' · ' + za.by) : '')
                               + (doStarego ? ' — PRZELEW POSZEDŁ NA STARE KONTO' : (doNowego ? ' — przelew na nowe konto' : '')),
                             doStarego ? 'zle' : (doNowego ? 'ok' : 'uwaga'));
-                        if (doStarego) w.bledy.push(o + ': konto zmienione ' + sl.acc.date
-                            + ', a przelew poszedł na STARE (' + piAccBezUwagi(sl.acc.from) + ')');
-                        else if (!doNowego) w.uwagi.push(o + ': konto u dostawcy zmieniono ' + sl.acc.date
+                        if (doStarego) w.bledy.push(o + ': konto zmienione ' + za.date
+                            + ', a przelew poszedł na STARE (' + piAccBezUwagi(za.from) + ')');
+                        else if (!doNowego) w.uwagi.push(o + ': konto u dostawcy zmieniono ' + za.date
                             + ' — przelew nie idzie ani na stare, ani na nowe');
                     }
-                    if (sl.chg){
-                        kon(o, 'komentarz o zmianie danych bankowych',
-                            (sl.chg.date || '—') + (sl.chg.author ? (' · ' + sl.chg.author) : ''),
-                            String(sl.chg.text || '').slice(0, 90) + (sl.chg.src ? (' [' + sl.chg.src + ']') : ''),
+                    if (chgAkt){
+                        kon(o, 'komentarz o zmianie danych bankowych ' + okno,
+                            (chgAkt.date || '—') + (chgAkt.author ? (' · ' + chgAkt.author) : ''),
+                            String(chgAkt.text || '').slice(0, 90) + (chgAkt.src ? (' [' + chgAkt.src + ']') : ''),
                             'uwaga');
                         w.uwagi.push(o + ': jest komentarz o zmianie danych bankowych ('
-                            + (sl.chg.date || 'bez daty') + ') — sprawdź, czy przelew idzie na aktualne konto');
+                            + (chgAkt.date || 'bez daty') + ') — sprawdź, czy przelew idzie na aktualne konto');
                     }
                     // Komentarz wskazujacy KONKRETNY numer do zaplaty. Przy balansie bywa
                     // jedynym sladem, ze pieniadze maja pojsc gdzie indziej niz mowi karta.
-                    if (sl.hint && !pcHintMatches(sl.hint, q.acct)){
-                        kon(o, 'komentarz wskazuje inne konto', (sl.hint.accs || []).join(' / '),
-                            (sl.hint.date || '—') + ' · ' + String(sl.hint.text || '').slice(0, 70), 'zle');
-                        w.bledy.push(o + ': komentarz z ' + (sl.hint.date || 'bez daty') + ' wskazuje konto '
-                            + (sl.hint.accs || []).join(' / ') + ', a przelew poszedł na ' + (q.acct || '—'));
+                    if (hintAkt && !pcHintMatches(hintAkt, q.acct)){
+                        kon(o, 'komentarz wskazuje inne konto', (hintAkt.accs || []).join(' / '),
+                            (hintAkt.date || '—') + ' · ' + String(hintAkt.text || '').slice(0, 70), 'zle');
+                        w.bledy.push(o + ': komentarz z ' + (hintAkt.date || 'bez daty') + ' wskazuje konto '
+                            + (hintAkt.accs || []).join(' / ') + ', a przelew poszedł na ' + (q.acct || '—'));
                     }
                     // Zalacznik z danymi bankowymi — sam w sobie nie jest bledem, ale gdy
                     // konto sie zmienialo, to on jest dowodem. Data wgrania bywa nie do
                     // odczytania i wtedy mowimy to wprost.
                     var dokB = (d.docs || []).filter(function (x){ return pcDocBankowy(x.nazwa); });
-                    if (dokB.length && (sl.acc || sl.chg)){
+                    if (dokB.length && (zmAkt.length || chgAkt)){
                         kon(o, 'załącznik z danymi bankowymi',
                             dokB.map(function (x){ return x.nazwa; }).join(', '),
                             dokB.map(function (x){ return x.data || 'bez daty wgrania'; }).join(', '), 'uwaga');
@@ -30992,8 +31485,34 @@
             var e = bcKontoEq(piAcc, qAcct);
             return !e.ok || !!e.opis;
         }
+        /* ===== Aktualne slady zmiany konta (18.11.2026) =====
+           Prosba: Sprawdzanie „powinno się skupiać na tym, jak ostatnio szło, i czy są aktualne informacje o zmianie
+           konta, a nie stare". Slad (wpis logu konta, komentarz o zmianie, komentarz z numerem) jest AKTUALNY, gdy
+           pochodzi z dnia ostatniego przelewu albo pozniej; bez znanego ostatniego przelewu — z ostatnich BC_SWIEZE_DNI
+           dni przed tym przelewem. Slad bez daty zostaje (nie wiadomo, ze stary).                                      */
+        var BC_SWIEZE_DNI = 90;
+        function bcSladAktualny(data, kotwicaDzien, dataPl){
+            var d = bcDzien(data);
+            if (!d) return true;
+            var k = bcDzien(kotwicaDzien);
+            if (k) return d >= k;
+            var p = bcDzien(dataPl);
+            if (!p) return true;
+            return (Date.parse(p + 'T00:00:00') - Date.parse(d + 'T00:00:00')) <= BC_SWIEZE_DNI * 86400000;
+        }
+        // Czy AKTUALNA zmiana tlumaczy, ze ten przelew idzie na inne konto niz ostatni: wpis logu po ostatnim przelewie
+        // z nowym numerem = kontu tego przelewu, albo komentarz o zmianie danych bankowych po nim. -> opis albo ''.
+        function bcWyjasnienieZmiany(sl, kotwicaDzien, dataPl, qAcct){
+            var s = sl || {}, Z = (s.acc && s.acc.zmiany && s.acc.zmiany.length) ? s.acc.zmiany : (s.acc ? [s.acc] : []);
+            var z = Z.filter(function (x){ return bcSladAktualny(x.date, kotwicaDzien, dataPl) && accTenSam(x.to, qAcct); });
+            if (z.length){ var l = z[z.length - 1]; return 'konto zmienione w logu dostawcy ' + l.date + (l.by ? ' (' + l.by + ')' : '') + ' na ' + l.to; }
+            if (s.chg && bcSladAktualny(s.chg.date, kotwicaDzien, dataPl))
+                return 'po nim jest komentarz o zmianie danych bankowych z ' + (s.chg.date || '?') + (s.chg.author ? ' (' + s.chg.author + ')' : '');
+            return '';
+        }
         // Co wynika z poprzedniego przelewu. -> { lewo, prawo, lv, uwaga, blad }
-        function bcPoprzWynik(pp, qAcct, qName){
+        // wyj — aktualna zmiana konta, ktora tlumaczy inny numer (bcWyjasnienieZmiany): wtedy uwaga zamiast bledu.
+        function bcPoprzWynik(pp, qAcct, qName, wyj){
             if (!pp) return { lewo: '—', lv: 'uwaga',
                 prawo: 'nie ma wcześniejszego potwierdzenia w sekcji „Payment conformation” — to pierwszy przelew do tego zamówienia?',
                 uwaga: '', blad: '' };
@@ -31007,9 +31526,15 @@
             if (e.myslnik)
                 o.uwaga = 'poprzedni przelew (' + op + ') poszedł na ten sam numer zapisany inaczej („'
                         + pp.acct + '”) — sprawdź, w jakiej postaci przyjmuje go bank';
+            else if (!e.ok && !e.brak && wyj){
+                o.lv = 'uwaga';
+                o.prawo = (qAcct || '—') + ' — inne konto, ale ' + wyj;
+                o.uwaga = 'poprzedni przelew (' + op + ') poszedł na „' + pp.acct + '”, ten na „' + (qAcct || '—')
+                        + '” — ' + wyj + '; sprawdź potwierdzenie nowego konta';
+            }
             else if (!e.ok && !e.brak)
                 o.blad = 'poprzedni przelew (' + op + ') poszedł na konto „' + pp.acct
-                       + '”, a ten idzie na „' + (qAcct || '—') + '”';
+                       + '”, a ten idzie na „' + (qAcct || '—') + '”, a po tamtym przelewie nic tej zmiany nie tłumaczy';
             // Nazwa, na ktora poszedl POPRZEDNI przelew, wobec nazwy na tym potwierdzeniu.
             // Porownanie lagodne (krotsza zaczyna dluzsza = ta sama) — nazwy legalnie sie roznia.
             if (pp.nazwa && qName && !pcNazwaTaSama(pp.nazwa, qName)){
@@ -31024,7 +31549,7 @@
         // Opis poprzedniego przelewu do jednej linii raportu.
         function bcPoprzOpis(pp){
             if (!pp) return '';
-            return (pp.rodzaj || 'przelew') + ' z ' + (pp.dzien || '—')
+            return (pp.rodzaj || 'przelew') + ' z ' + (pp.dzien || '—') + (pp.order ? (' · zam. ' + pp.order) : '')
                  + (pp.plik ? ('  ·  ' + String(pp.plik).slice(0, 60)) : '');
         }
         /* ===== Nazwa beneficjenta: kilka nazw dostawcy i nazwa ↔ wlasciciel konta (09.11.2026) =====
@@ -31602,8 +32127,74 @@
         function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
         // Dopisek pod polem nazwy beneficjenta: skad nazwa, gdy nie z P/I, albo jaki beneficjent stoi na karcie,
         // gdy jest inny niz nazwa do pliku (painNazwaZKarty, 09.11.2026).
+        /* ===== Nazwa beneficjenta: kilka nazw do wyboru, domyslnie ta z OSTATNIEGO przelewu (18.11.2026) =====
+           Prosba uzytkownika: „jak jest kilka nazw niech sprawdza na jaką nazwę poszło ostatnio i z automatu tą wybiera,
+           w opcji do wyboru". Warianty: nazwa z potwierdzenia ostatniego przelewu (balance: depozyt tego zamowienia,
+           depozyt: przelew z innego zamowienia dostawcy — runPoprzDepo), P/I, naglowek P/I / karta, „Beneficiary's name"
+           karty i nazwy z pola nazwy firmy. Podobne nazwy (pcNazwaTaSama, jak plakietka „≡ kilka nazw") to jeden wariant,
+           w pisowni z P/I. Domyslnie wariant ostatniego przelewu — TYLKO gdy szedl na to samo konto co ten (Stallion 18957:
+           depozyt na konto Nisheel, balance na nowe konto Stallion — stara nazwa nie moze wejsc sama). Wybor trzyma sie
+           platnosci (state.pcNazwaWyb), schodzi przy „Przetwórz"; nazwa wpisana recznie dalej wygrywa.                      */
+        var PAIN_NAZWA_SRC = { poprz: 'ostatni przelew', pi: 'P/I', zapas: 'nagłówek P/I / karta', karta: 'karta: beneficjent', firma: 'karta: nazwa firmy' };
+        function painNazwyWarianty(G, nazwaPI, nazwaZ, poprz){
+            var zr = [], out = [];
+            if (poprz && poprz.nazwa) zr.push({ n: poprz.nazwa, src: 'poprz' });
+            if (nazwaPI) zr.push({ n: nazwaPI, src: 'pi' });
+            if (nazwaZ && nazwaZ.name) zr.push({ n: nazwaZ.name, src: 'zapas' });
+            var sk = G && G.cid && _sup[G.cid];
+            if (sk && sk.benef) zr.push({ n: sk.benef, src: 'karta' });
+            pcNazwyCzesci((G && G.sup) || '').forEach(function (n){ zr.push({ n: n, src: 'firma' }); });
+            zr.forEach(function (z){
+                var t = String(z.n == null ? '' : z.n).replace(/\s+/g, ' ').trim();
+                if (!pcNazwaNorm(t)) return;
+                var g = out.filter(function (o){ return pcNazwaTaSama(o.nazwa, t); })[0];
+                if (!g){ out.push({ nazwa: t, src: [z.src] }); return; }
+                if (g.src.indexOf(z.src) < 0) g.src.push(z.src);
+                if (z.src === 'pi') g.nazwa = t;   // pisownia z P/I — tak jak dotad szla do pliku
+            });
+            return out.length > 1 ? out : [];
+        }
+        // -> { v: wariant, jak: 'wybor' | 'auto' } albo null (regula jak dotad)
+        function painNazwaWybor(G, war, poprz, accV){
+            if (!war || war.length < 2) return null;
+            var w = state.pcNazwaWyb && G ? state.pcNazwaWyb[G.key] : '';
+            if (w){ var x = war.filter(function (v){ return v.nazwa === w; })[0]; if (x) return { v: x, jak: 'wybor' }; }
+            if (poprz && poprz.nazwa && poprz.acct && normAcc(accV || '') && accTenSam(poprz.acct, accV)){
+                var y = war.filter(function (v){ return v.src.indexOf('poprz') >= 0; })[0];
+                if (y) return { v: y, jak: 'auto' };
+            }
+            return null;
+        }
+        function painNazwaWarHtml(r){
+            var w = (r && r.nazwaWar) || [];
+            if (w.length < 2) return '';
+            var p = r.nazwaPoprz, gdzie = p ? ((p.order ? 'zam. ' + p.order + ', ' : '') + (p.dzien || '?')) : '';
+            var tyt = 'Dostawca ma kilka nazw. Do pliku pain.001 idzie nazwa zaznaczona tutaj.'
+                + (p ? ('\nOstatni przelew (' + gdzie + ') poszedł na nazwę: „' + p.nazwa + '” — konto ' + (p.acct || '—')
+                        + (r.nazwaWybJak === 'auto' ? '\nTa nazwa jest zaznaczona sama, bo przelew szedł na to samo konto.'
+                           : (accTenSam(p.acct || '', r.acc || '') ? '' : '\nTamten przelew szedł na INNE konto — nazwy nie zaznaczam sama.')))
+                     : '\nNie znam nazwy z ostatniego przelewu — zostaje nazwa z P/I (jak dotąd).')
+                + '\nWpisanie nazwy ręcznie w polu wyżej ma pierwszeństwo; kliknięcie wariantu zdejmuje ręczny wpis.';
+            var zazn = r.nameRecznie ? '' : (r.nazwaWyb || '');
+            if (!zazn && !r.nameRecznie) zazn = (w.filter(function (v){ return pbNorm(v.nazwa) === pbNorm(r.name); })[0] || {}).nazwa || '';
+            return '<div class="pain-nazwa-war-box" style="font-size:10px;color:#6a4a9c;margin-top:2px;line-height:1.35" title="' + pcAttr(tyt) + '">≡ nazwa: '
+                + w.map(function (v){
+                    return '<label style="cursor:pointer;display:block;white-space:nowrap">'
+                        + '<input type="radio" class="pain-nazwa-war" name="pain-nw-' + pcAttr(r.key) + '" data-key="' + pcAttr(r.key) + '"'
+                        + ' data-val="' + pcAttr(v.nazwa) + '"' + (v.nazwa === zazn ? ' checked' : '') + '> ' + painEsc(String(v.nazwa).slice(0, 60))
+                        + ' <span style="color:#888">(' + painEsc(v.src.map(function (s){ return PAIN_NAZWA_SRC[s] || s; }).join(', ')) + ')</span>'
+                        + (v.src.indexOf('poprz') >= 0 && r.nazwaWybJak === 'auto' ? ' <span style="color:#0a7a2f;font-weight:700">✓ ostatnio</span>' : '')
+                        + '</label>';
+                  }).join('')
+                + '</div>';
+        }
         function painNazwaNote(r){
-            if (!r || r.nameRecznie) return '';
+            if (!r) return '';
+            var war = painNazwaWarHtml(r);
+            if (r.nameRecznie) return war;
+            return war + painNazwaNoteBez(r);
+        }
+        function painNazwaNoteBez(r){
             if (r.nazwaZKarty)
                 return '<div style="font-size:10px;color:#6a4a9c;line-height:1.3" title="' + pcAttr('Przelew idzie na konto z karty dostawcy, a karta podaje tego beneficjenta.\nP/I: ' + (r.nazwaPI || '—') + (r.nazwaPIacc ? ('\nkonto w P/I: ' + r.nazwaPIacc) : '')) + '">≡ z karty dostawcy' + (r.nazwaPI ? (' · w P/I: „' + esc(String(r.nazwaPI).slice(0, 40)) + '”') : '') + '</div>';
             if (r.kartaBenef && painNorm(r.name) && !bcNazwaPodobna(r.kartaBenef, r.name))
@@ -31821,7 +32412,7 @@
             if (!G) return null;
             var sup = G.cid ? (_conf[G.cid] || null) : null;
             var seen = !!sup, conf = sup ? sup.conf : null, chg = sup ? sup.chg : null, acc = sup ? sup.acc : null;
-            var hint = sup ? sup.hint : null;
+            var hint = sup ? sup.hint : null, confMocne = sup ? (sup.confMocne || null) : null, bezNr = sup ? (sup.bezNr || null) : null;
             // Usuniete wiersze tez: potwierdzenie konta w ich zamowieniu dalej dotyczy tego konta.
             (G.dep || []).concat(G.bal || [], G.usuniete || []).forEach(function(r){
                 var o = _ordConf[String(r && r.order)];
@@ -31830,10 +32421,19 @@
                 if (o.conf && (!conf || pcNewer(o.conf.ts, conf.ts))) conf = o.conf;
                 if (o.chg  && (!chg  || pcNewer(o.chg.ts,  chg.ts)))  chg  = o.chg;
                 if (o.hint && (!hint || pcNewer(o.hint.ts, hint.ts))) hint = o.hint;
+                if (o.confMocne && (!confMocne || pcNewer(o.confMocne.ts, confMocne.ts))) confMocne = o.confMocne;
+                if (o.bezNr && (!bezNr || pcNewer(o.bezNr.ts, bezNr.ts))) bezNr = o.bezNr;
             });
             if (!seen) return null;   // nic jeszcze nie pobrane — plakietka „? konto"
             var chTs = NaN, out = { st: 'none', date: '', author: '', text: '', src: '',
                                     chDate: '', chBy: '', chFrom: '', chTo: '', chSrc: '', chText: '', hint: hint };
+            // Komentarz o koncie bez numeru (18.11.2026) — znika dopiero po POZNIEJSZYM potwierdzeniu telefonem,
+            // TOMATO albo na inspekcji. Sama lista kontrolna go nie gasi: 22272 „Supplier agreed to pay to old bank
+            // account" z 16.11 i lista „BANK ACCOUNT NUMBER: OK" z 18.11 — lista nie mowi, o ktorym koncie mowa.
+            out.bezNr = (bezNr && (!confMocne || pcNewer(bezNr.ts, confMocne.ts))) ? bezNr : null;
+            // Numer w polu karty inny niz ostatni wpis logu — zmiana poza logiem, data nieznana (Sunwell 2104).
+            if (sup && sup.logOst && sup.logOst.to && sup.kontoPole && !accTenSam(sup.logOst.to, sup.kontoPole))
+                out.pozaLogiem = { log: sup.logOst.to, logDate: sup.logOst.date || '', logBy: sup.logOst.by || '', karta: sup.kontoPole };
             if (acc){ chTs = acc.ts; out.chDate = acc.date; out.chBy = acc.by; out.chFrom = acc.from; out.chTo = acc.to; out.chSrc = 'log konta u dostawcy'; }
             if (chg && (!isFinite(chTs) || pcNewer(chg.ts, chTs))){
                 chTs = chg.ts; out.chDate = chg.date; out.chBy = chg.author; out.chFrom = ''; out.chTo = '';
@@ -31886,6 +32486,26 @@
             out.date = conf.date; out.author = conf.author; out.text = conf.text; out.src = conf.src;
             // Brak daty po ktorejkolwiek stronie = nie ma czego porownac; wtedy nie strasz
             var stale = isFinite(chTs) && isFinite(conf.ts) && conf.ts < chTs;
+            // Dwa wyjatki od „potwierdzenie starsze niz zmiana w logu" (18.11.2026). Tylko gdy zmiane wyznacza LOG
+            // (a nie komentarz), log nie ma dziury (pozaLogiem) i po potwierdzeniu nie bylo komentarza o zmianie.
+            if (stale && acc && out.chSrc === 'log konta u dostawcy' && !out.pozaLogiem && !(chg && pcNewer(chg.ts, conf.ts))){
+                var naChwile = pcAccNaChwile(acc.zmiany, conf.ts);
+                // 1. Powrot do potwierdzonego numeru: Vikny 2302 — potwierdzone 28.08.2025 konto 100508118576,
+                //    25.03.2026 zmiana na 63003420902 i po 2 minutach z powrotem. Na karcie stoi to, co potwierdzono.
+                if (naChwile && accTenSam(naChwile, acc.to)){
+                    stale = false;
+                    out.chUwaga = 'w chwili potwierdzenia (' + (conf.date || '?') + ') na karcie stał ten sam numer ' + acc.to
+                        + ' — późniejsze zmiany w logu (ostatnia ' + acc.date + ') wróciły do niego';
+                }
+                // 2. Ta sama osoba potwierdza i zaraz potem wpisuje numer: Lejiang 2093 — „New bank account confirmed"
+                //    09:44:56, wpis w logu 09:57 (ADabkowska). Do 30 minut przed wpisem = potwierdzenie tej zmiany.
+                else if (acc.ts - conf.ts <= 30 * 60000 && pcTaSamaOsoba(acc.by, conf.author)){
+                    stale = false;
+                    out.chUwaga = 'potwierdzenie (' + (conf.date || '?') + ', ' + (conf.author || '?') + ') wpisane '
+                        + Math.max(1, Math.round((acc.ts - conf.ts) / 60000)) + ' min przed zmianą w logu (' + acc.date + ', ' + acc.by
+                        + ') — ta sama osoba, liczę je jako potwierdzenie tej zmiany';
+                }
+            }
             out.st = stale ? (out.needConf ? 'old' : 'chg') : 'ok';
             return out;
         }
@@ -31899,6 +32519,22 @@
                 + (cf.chSrc ? ' (' + cf.chSrc + ')' : '')
                 + ((cf.chFrom && cf.chTo) ? ('\nz konta ' + cf.chFrom + ' na ' + cf.chTo) : (cf.chTo ? ('\nna numer: ' + cf.chTo) : ''))
                 + (cf.chText ? ('\n„' + cf.chText + '"') : '');
+        }
+        // Komentarz o koncie BEZ numeru i numer na karcie spoza logu (18.11.2026) — opisy wspolne dla plakietki
+        // w naglowku grupy i dla uwagi w wierszu okna przelewow.
+        function pcBezNrTxt(b){
+            return 'komentarz o koncie bez numeru z ' + (b.date || '?') + (b.author ? ' (' + b.author + ')' : '') + (b.src ? ' [' + b.src + ']' : '')
+                + ': „' + String(b.text || '').slice(0, 220) + '” — przeczytaj, zanim wyślesz (później nikt nie potwierdził konta telefonem ani TOMATO)';
+        }
+        function pcPozaLogiemTxt(p){
+            return 'na karcie dostawcy stoi konto ' + p.karta + ', a ostatni wpis w logu zmian konta (' + (p.logDate || '?')
+                + (p.logBy ? ', ' + p.logBy : '') + ') to ' + p.log + ' — numer zmieniono poza logiem, data zmiany nieznana; sprawdź, czy potwierdzenie dotyczy obecnego numeru';
+        }
+        function pcBezNrBadge(cf){
+            var o = '';
+            if (cf && cf.bezNr) o += pcConfPill('⚠ komentarz o koncie', '#c47f00', pcBezNrTxt(cf.bezNr));
+            if (cf && cf.pozaLogiem) o += pcConfPill('⚠ konto spoza logu', '#c47f00', pcPozaLogiemTxt(cf.pozaLogiem));
+            return o;
         }
         // Osobna plakietka: komentarz podaje konkretny numer konta. Stoi obok „konto
         // potwierdzone", bo to inna informacja — nie „czy dane sa sprawdzone", tylko
@@ -32070,9 +32706,10 @@
         function pcKilkaNazwBadge(G){
             var piName = '';
             try { piName = ((painBankOfG(G).bank) || {}).name || ''; } catch (e){}
-            var nm = pcKilkaNazw(G, pcPoprzDlaGrupy(G), piName);
+            var pp = pcPoprzDlaGrupy(G) || pcPoprzDepoDlaGrupy(G);
+            var nm = pcKilkaNazw(G, (pp && !pp.blad) ? pp : null, piName);
             if (!nm) return '';
-            return pcConfPill('≡ kilka nazw', '#6a4a9c', nm);
+            return pcConfPill('≡ kilka nazw', '#6a4a9c', nm + '\n\nNazwę do pliku wybierzesz w oknie przelewów („≡ nazwa"); domyślnie ta, na którą poszedł ostatni przelew na to samo konto.');
         }
         // Co stalo w polu konta karty dostawcy obok numeru. Zdjeta waluta — szara informacja;
         // dopisek nieczytelny — propozycja numeru z guzikiem „użyj" (wpisuje ja jak reczna
@@ -32092,7 +32729,8 @@
             var kto = (cf.date || '?') + (cf.author ? ' — ' + cf.author : '') + (cf.src ? ' [' + cf.src + ']' : '');
             var ch = pcConfChgTxt(cf), zm = ch ? ('\n\nOstatnia zmiana danych bankowych: ' + ch) : '';
             if (cf.st === 'ok') return pcConfPill('✓ konto potwierdzone', '#0a7a2f',
-                'Komentarz potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm);
+                'Komentarz potwierdza dane bankowe.\n\n' + kto + '\n„' + (cf.text || '') + '"' + zm
+                + (cf.chUwaga ? ('\n\nPotwierdzenie jest starsze niż ostatni wpis w logu, ale liczę je: ' + cf.chUwaga + '.') : ''));
             // Sam balance: potwierdzenia nie wymagamy (depozyt na to konto juz poszedl),
             // wiec jedyne, co moze tu zapalic lampke, to zmiana numeru konta.
             if (cf.st === 'nochg') return pcConfPill('konto bez zmian', '#777',
@@ -32558,6 +33196,12 @@
                     var ppR = await bcPoprzednieKonta(prevR, ordery, dzisR, bcIO(), null);
                     Object.keys(ppR || {}).forEach(function (o){ _poprz[o] = ppR[o]; });
                 } catch (ePp){ dlog('↻ poprzedni przelew: ' + ((ePp && ePp.message) || ePp)); }
+                // Depozyt: ostatni przelew do dostawcy z innego zamowienia — tylko karty odswiezanych grup z depozytem.
+                try {
+                    var cDep = [];
+                    grupy.forEach(function (G){ if ((G.dep || []).length && G.cid && cDep.indexOf(String(G.cid)) < 0) cDep.push(String(G.cid)); });
+                    if (cDep.length){ mow('↻ Odświeżanie (' + skad + '): poprzedni przelew do dostawcy (DEPO)…'); await runPoprzDepo(null, cDep); }
+                } catch (ePd){ dlog('↻ poprzedni przelew DEPO: ' + ((ePd && ePd.message) || ePd)); }
                 if ((state._gen || 0) !== gen){ mow('„Przetwórz” ruszyło w trakcie odświeżania — wynik odświeżenia odrzucony.', '#c00'); return; }
                 await pcCzekajNaEdycje(mow);
                 var poMapa = pcMapaPlatnosci();
@@ -32698,13 +33342,20 @@
         }
         // ===== Przelewy, przy ktorych bank nie moze przewalutowac USD =====
         // Hongkong, Singapur i Brazylia: przy wprowadzaniu przelewu recznie trzeba dopisac
-        // zastrzezenie, inaczej bank posrednik potrafi przewalutowac kwote. Kraj bierzemy
-        // z bloku bankowego P/I — z adresu, nazwy albo z kodu kraju w BIC-u.
+        // zastrzezenie, inaczej bank posrednik potrafi przewalutowac kwote. Kraj BANKU bierzemy
+        // z kodu kraju w BIC-u; bez poprawnego BIC-u — z bloku bankowego P/I (adres, nazwa).
         var PC_NOFX = { HK: 'Hongkong', SG: 'Singapur', BR: 'Brazylia' };
         var PC_NOFX_TXT = 'DO NOT EXCHANGE OR CONVERT THE USD';
         function pcNoFxCtry(G){
             try {
                 var bk = painBankOfG(G), b = bk && bk.bank;
+                // Kraj BANKU z BIC-u (znaki 5–6), decyzja uzytkownika 18.11.2026. Vanguard 22198: firma w Zhongshan (CN),
+                // konto w DBS Hong Kong (DHBKHKHH) — z adresu beneficjenta wychodzilo CN i dopisku nie bylo. W druga strone
+                // Sunwell 21428: adres w HK, konto NRA w Standard Chartered Shenzhen (SCBLCNSX) — dopisek juz nie wychodzi.
+                // Adres jak dotad (piBankGeo) tylko wtedy, gdy poprawnego BIC-u nie ma. BIC wpisany recznie wygrywa.
+                var ed = (G && state.painEdit && state.painEdit[G.key]) || {};
+                var bic = painNorm((ed.bic != null && String(ed.bic) !== '') ? ed.bic : ((b && b.swift) || ''));
+                if (painBicOk(bic)){ var cb = bic.substr(4, 2); return PC_NOFX[cb] ? cb : ''; }
                 if (!b) return '';
                 var cc = String((piBankGeo(b) || {}).ctry || '').toUpperCase();
                 return PC_NOFX[cc] ? cc : '';
@@ -32811,8 +33462,8 @@
                 + ' <span style="font-weight:400;opacity:.6">(' + (G.dep.length + G.bal.length) + ' poz.)</span>'
                 + '<span style="font-weight:400;margin-left:12px">Konto: <span class="pc-acc" data-key="' + pcAttr(G.key) + '" title="Kliknij, aby edytowac konto" style="cursor:text;font-weight:700;border-bottom:1px dashed #999">' + esc(((state.pcAccEdit && state.pcAccEdit[G.key] != null) ? accShown : painAccPokaz(accShown)) || '—') + '</span></span>'
                 + pcAccDopiskiHtml(G) + pcAccWarHtml(G, hasDep, hasBal)
-                + pcConfBadge(pcConfG(G)) + pcHintBadge(pcConfG(G), accShown)
-                + pcPoprzBadge(G, accShown) + pcKilkaNazwBadge(G)
+                + pcConfBadge(pcConfG(G)) + pcHintBadge(pcConfG(G), accShown) + pcBezNrBadge(pcConfG(G))
+                + pcPoprzBadge(G, accShown) + pcPoprzDepoBadge(G, accShown) + pcKilkaNazwBadge(G)
                 + (hasDep ? '<span style="font-weight:400;margin-left:12px">Suma depo: <b class="pc-sum" data-sup="' + gi + '">' + (depSum != null ? esc(depSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + (hasBal ? '<span style="font-weight:400;margin-left:12px">Suma balance: <b class="pc-balsum" data-sup="' + gi + '">' + (balSum != null ? esc(balSum.toFixed(2)) : '—') + '</b></span>' : '')
                 + ((hasDep && hasBal) ? '<span style="font-weight:400;margin-left:12px">Razem: <b class="pc-sum-total" data-sup="' + gi + '">' + ((depSum || 0) + (balSum || 0)).toFixed(2) + '</b></span>' : '')
@@ -34435,8 +35086,14 @@
             }
             return r.replace(/^[^A-Za-z0-9]+/, '').replace(/[^A-Za-z0-9]+$/, '').replace(/\s+/g, ' ').trim();
         }
+        // „Langfang Economic and Technological Development Zone", „Wuhu High-tech Zone", „Suzhou Industrial Park" —
+        // strefa nazwana od miasta. Miastem jest pierwsze slowo, ale tylko jako OSTATNIA deska: Chanwell 22410
+        // (18.11.2026) nie mial w adresie P/I innego czlonu z miastem, TwnNm wychodzilo puste i trzeba bylo wpisac reczne „TEST".
+        // „Modern Industrial Park", „National High-tech Zone" — pierwsze slowo to przymiotnik, nie miasto.
+        var PB_STREFA_OGOLNE = /^(?:MODERN|NATIONAL|PROVINCIAL|MUNICIPAL|INTERNATIONAL|CENTRAL|NORTH|SOUTH|EAST|WEST|NEW|OLD|GREEN|SCIENCE|TECHNOLOGY|ECONOMIC|COMPREHENSIVE|HIGH|HI|SPECIAL|COUNTY|CITY|TOWN|VILLAGE)$/;
+        var PB_STREFA_MIASTA = /^([A-Za-z][A-Za-z'\-]{2,})\s+(?:economic|economical|hi-?tech|high-?tech|high\s+and\s+new|new\s+(?:and\s+high|district|area)|free\s+trade|bonded|industrial|development|export\s+processing|torch)\b[\s\S]*\b(?:zone|area|park|district)\.?$/i;
         function pbTown(addr){
-            var segs = String(addr == null ? '' : addr).split(/[,;\n、]/), out = '';
+            var segs = String(addr == null ? '' : addr).split(/[,;\n、]/), out = '', zeStrefy = '';
             for (var i = segs.length - 1; i >= 0; i--){
                 var s = pbStripCtry(segs[i]);
                 // kod pocztowy przed/po nazwie miasta: "00-838 Warszawa", "FUZHOU 350003"
@@ -34446,10 +35103,12 @@
                 if (!n) continue;
                 var m = s.match(/^(.+?)\s+CITY$/i);
                 if (m && m[1] && !PB_NOTOWN.test(pbNorm(m[1]))) return m[1].trim();
+                var mz = s.match(PB_STREFA_MIASTA);
+                if (mz && !zeStrefy && !PB_NOTOWN.test(pbNorm(mz[1])) && !PB_PROV.test(pbNorm(mz[1])) && !PB_STREFA_OGOLNE.test(pbNorm(mz[1]))) zeStrefy = mz[1];
                 if (PB_PROV.test(n) || PB_NOTOWN.test(n) || /^[0-9 ]+$/.test(n)) continue;
                 if (!out) out = s;
             }
-            return out;
+            return out || zeStrefy;
         }
         // src: 'addr' = kraj z adresu (pewne), 'name' = z nazwy firmy, 'bic' = z kodu SWIFT (do potwierdzenia)
         function piBankGeo(bank){
@@ -36006,6 +36665,125 @@
         // Poprzedni przelew (depozyt) dla orderow balance — konto i nazwa, na ktore
         // faktycznie poszedl depozyt. Listy potwierdzen (_confDocs) sa juz z pobranych
         // stron zamowien (checkOneBal), wiec dochodzi tylko jedno pobranie PDF-a na grupe.
+        /* ===== Depozyt: konto wobec OSTATNIEGO przelewu do tego dostawcy z innego zamowienia (18.11.2026) =====
+           Prosba uzytkownika: „w przypadku depo znalazło inne zamówienie tego samego dostawcy, jeżeli już szło, żeby
+           sprawdzało numer konta jeszcze z potwierdzenia wcześniejszego z innego zamówienia". Balance ma kotwice
+           w depozycie TEGO SAMEGO zamowienia (runPoprzPrzelew); depozyt jej nie mial wcale.
+           Lista zamowien dostawcy: wyszukiwarka prologistics po firmie (op_search.php, what=company, openclosed pusty =
+           otwarte i zamkniete; zmierzone 18.11.2026: Fondlive 1658 — 20 zamowien, ~2 s). Bierzemy zamowienia SPOZA
+           wklejki od najnowszego numeru i pierwsze z potwierdzeniem w „Payment conformation"; z niego najswiezszy PDF.
+           Strona zamowienia ma ~4 MB (lista wszystkich dostawcow w selekcie), wiec najwyzej PC_POPRZD_MAX stron na
+           dostawce. To swiadek, nie zgoda: wynik nie zmienia oceny potwierdzenia konta (pcConfEval).                  */
+        var PC_POPRZD_MAX = 4;
+        async function pcZamowieniaDostawcy(cid){
+            var h = await fetchT('/op_search.php?what=company&company=' + encodeURIComponent(cid) + '&openclosed=', 60000);
+            if (h == null || /type=["']?password|name=["']?password/i.test(String(h).slice(0, 300000))) return null;
+            var out = [];
+            (String(h).match(/op_order\.php\?id=(\d+)/g) || []).forEach(function (x){
+                var o = x.replace(/\D/g, ''); if (out.indexOf(o) < 0) out.push(o);
+            });
+            return out;
+        }
+        // przed (RRRR-MM-DD, opcjonalnie): tylko potwierdzenia sprzed tego dnia — Sprawdzanie szuka przelewu POPRZEDZAJACEGO
+        // sprawdzany, a nie najnowszego w ogole (18.11.2026).
+        async function pcPoprzDepoJeden(cid, wlasne, IO, przed){
+            var lista = await pcZamowieniaDostawcy(cid);
+            if (lista == null) return { blad: 'nie otworzyłem listy zamówień dostawcy (wyszukiwarka prologistics)' };
+            var inne = lista.filter(function (o){ return wlasne.indexOf(o) < 0; })
+                            .sort(function (a, b){ return Number(b) - Number(a); });
+            if (!inne.length) return { brak: true, sprawdzone: [], txt: 'dostawca nie ma w prologistics innych zamówień niż te z wklejki' };
+            var sprawdzone = [], doc = null, zOrd = '';
+            for (var i = 0; i < inne.length && sprawdzone.length < PC_POPRZD_MAX && !doc; i++){
+                var o = inne[i], docs = _confDocsWsz[o];
+                if (!docs){
+                    var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o), 60000);
+                    if (!pcStronaOrderu(h)){ sprawdzone.push(o + ' (nie otworzyłem)'); continue; }
+                    try { docs = _confDocsWsz[o] = bcDocsIn(bcDocSection(h, BC_DOC_TYPE)); } catch (e){ docs = []; }
+                    h = null;
+                }
+                sprawdzone.push(o);
+                var d0 = (docs || []).filter(function (d){ return d && d.date && (!przed || d.date < przed); }).sort(function (a, b){
+                    var x = a.date + ' ' + (a.time || ''), y = b.date + ' ' + (b.time || '');
+                    return x < y ? 1 : (x > y ? -1 : 0);
+                })[0];
+                if (d0){ doc = d0; zOrd = o; }
+            }
+            if (!doc) return { brak: true, sprawdzone: sprawdzone,
+                txt: 'w ' + sprawdzone.length + ' najnowszych innych zamówieniach (' + sprawdzone.join(', ') + ') nie ma potwierdzenia przelewu' };
+            var w = { order: zOrd, dzien: doc.date || '', plik: doc.name || '', sprawdzone: sprawdzone }, ab = null, q = null;
+            try { ab = await IO.docBin(doc.href); } catch (e){ ab = null; }
+            if (!ab){ w.blad = 'nie udało się pobrać pliku'; return w; }
+            var u8 = (ab.byteLength !== undefined && !(ab instanceof Uint8Array)) ? new Uint8Array(ab) : ab;
+            ab = null;
+            if (!u8 || !u8.length){ w.blad = 'pusty plik'; return w; }
+            if (!bcIsPdf(u8)){ w.blad = 'to nie jest PDF'; return w; }
+            try { q = await IO.parsePdf(u8, doc.name || ('dokument ' + doc.id)); } catch (e){ q = null; }
+            u8 = null;
+            if (!q || q.err){ w.blad = 'nie udało się odczytać treści'; return w; }
+            w.acct = q.acct || ''; w.bic = q.bic || ''; w.nazwa = q.name || ''; w.kwota = q.amt; w.ccy = q.ccy || '';
+            w.tytul = q.msg || ''; w.rodzaj = bcRodzajPrzelewu(q.msg || '');
+            return w;
+        }
+        // tylkoCid: ↻ Odswiez — tylko te karty, bez kasowania wynikow pozostalych dostawcow.
+        async function runPoprzDepo(status, tylkoCid){
+            var wlasne = [], cidy = [];
+            ['dep', 'bal'].forEach(function (s){ state[s].order.forEach(function (sup){ (state[s].groups[sup] || []).forEach(function (r){
+                var o = String((r && r.order) || '').trim(); if (/^\d+$/.test(o) && wlasne.indexOf(o) < 0) wlasne.push(o);
+            }); }); });
+            if (tylkoCid) cidy = tylkoCid.filter(function (c){ return !!c; });
+            else {
+                _poprzDost = {};
+                var MG = pcMergedGroups();
+                MG.combined.concat(MG.depoOnly, MG.balOnly).forEach(function (G){
+                    if ((G.dep || []).length && G.cid && cidy.indexOf(String(G.cid)) < 0) cidy.push(String(G.cid));
+                });
+            }
+            if (!cidy.length) return;
+            var IO = bcIO(), done = 0;
+            await runPool(cidy, async function (c){
+                var w;
+                try { w = await pcPoprzDepoJeden(c, wlasne, IO); } catch (e){ w = { blad: String((e && e.message) || e) }; }
+                _poprzDost[c] = w;
+                done++;
+                if (status) status.textContent = 'Poprzedni przelew do dostawców (DEPO): ' + done + '/' + cidy.length + '…';
+                dlog('Poprzedni przelew DEPO, karta ' + c + ': ' + (w.brak ? ('brak — ' + w.txt) : w.blad && !w.dzien ? ('błąd — ' + w.blad)
+                     : ('zam. ' + w.order + ' (' + w.dzien + ', „' + w.plik + '”)' + (w.blad ? (' — ' + w.blad) : (' konto ' + (w.acct || '—'))))));
+            }, 3);
+        }
+        function pcPoprzDepoDlaGrupy(G){ return (G && G.cid && _poprzDost[String(G.cid)]) || null; }
+        // -> { lv: 'ok'|'info'|'warn'|'brak', txt } — te same poziomy co pcPoprzWerdykt (balance).
+        function pcPoprzDepoWerdykt(p, accPay, cf){
+            if (!p) return null;
+            if (p.brak) return { lv: 'brak', txt: 'nie znalazłem wcześniejszego przelewu do tego dostawcy: ' + (p.txt || '') + ' — może to pierwszy przelew' };
+            if (!p.dzien) return { lv: 'brak', txt: 'poprzedniego przelewu do dostawcy nie sprawdziłem: ' + (p.blad || '?') };
+            var op = 'zam. ' + p.order + ', ' + p.dzien;
+            if (p.blad) return { lv: 'brak', txt: 'potwierdzenie poprzedniego przelewu (' + op + ', „' + p.plik + '”) jest, ale ' + p.blad + ' — konta z niego nie porównałem' };
+            if (!normAcc(p.acct || '')) return { lv: 'brak', txt: 'w potwierdzeniu poprzedniego przelewu (' + op + ') nie znalazłem numeru konta' };
+            if (normAcc(accPay || '') && accTenSam(p.acct, accPay))
+                return { lv: 'ok', txt: 'to samo konto co poprzedni przelew do tego dostawcy (' + op + ')' };
+            // Inne konto. Tlumaczy je tylko zmiana DATOWANA PO tamtym przelewie (log konta albo komentarz o zmianie).
+            var chD = (cf && cf.chDate) || '';
+            var nowsza = chD && bcDzien(chD) && bcDzien(p.dzien) && bcDzien(chD) > bcDzien(p.dzien);
+            if (nowsza) return { lv: 'info', txt: 'konto zmienione po poprzednim przelewie (' + (cf.chSrc || 'zmiana') + ', ' + chD + ') — poprzednio ('
+                + op + ') szło na ' + p.acct + ', ten depozyt idzie na ' + (accPay || '—') };
+            return { lv: 'warn', txt: 'depozyt idzie na inne konto (' + (accPay || '—') + ') niż poprzedni przelew do tego dostawcy ('
+                + op + ': ' + p.acct + '), a po tej dacie nic tego nie tłumaczy — sprawdź' };
+        }
+        function pcPoprzDepoBadge(G, accUsed){
+            if (!G || !(G.dep || []).length || pcPoprzDlaGrupy(G)) return '';
+            var p = pcPoprzDepoDlaGrupy(G);
+            if (!p) return '';
+            var w = pcPoprzDepoWerdykt(p, accUsed, pcConfEval(G));
+            var M = { ok: ['✓ konto = poprzedni przelew', '#0a7a2f'], info: ['konto zmienione po poprzednim przelewie', '#0a58ca'],
+                      warn: ['⚠ inne konto niż poprzedni przelew', '#c47f00'], brak: ['? poprzedni przelew', '#888'] };
+            var m = M[w.lv] || M.brak;
+            var t = 'Ostatni przelew do tego dostawcy z innego zamówienia'
+                + (p.dzien ? (':\nzam. ' + p.order + ', ' + p.dzien + (p.plik ? '\n' + p.plik : '') + '\nkonto: ' + (p.acct || '—') + (p.nazwa ? ('\nnazwa: ' + p.nazwa) : '')) : '')
+                + ((p.sprawdzone && p.sprawdzone.length) ? ('\n\nSprawdzone zamówienia: ' + p.sprawdzone.join(', ')) : '')
+                + '\n\nTen przelew (depozyt) idzie na konto: ' + (accUsed || '—')
+                + '\n\n' + (w.txt || '');
+            return pcConfPill(m[0], m[1], t);
+        }
         async function runPoprzPrzelew(status){
             _poprz = {};
             var ords = [], seen = {};
@@ -36109,7 +36887,7 @@
             state.bal = groupRows(balRows); state.dep = groupRows(dep.rows); state.depoNames = dep.names;
             // painSel i painEdit tez. Bez tego klucz grupy, ktory przezyl nowa wklejke,
             // wracal ZAZNACZONY do pliku pain.001 razem ze stara reczna kwota.
-            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {}; state.pcAccWar = {};
+            state.matched = {}; state.sup2cid = {}; state.resolved = false; state.pcAmt = {}; state.pcAccEdit = {}; state.pcAccWar = {}; state.pcNazwaWyb = {};
             state.painSel = {}; state.painEdit = {};
             state.pcKontoZm = {}; state._odswLog = []; state._painSchowek = []; state._odswKartaBlad = {}; state._penBlad = {};
             // ✂ tez (decyzja uzytkownika 15.10.2026, zgodnie z napisem przy ✂ i z zalozeniem
@@ -36167,6 +36945,9 @@
             dlog('Start: poprzedni przelew (depozyt) dla balance.');
             try { await runPoprzPrzelew(status); dlog('Poprzedni przelew: odczytane ' + Object.keys(_poprz || {}).length + ' zamowien.'); }
             catch (e){ dlog('Poprzedni przelew: ' + ((e && e.message) || e)); }
+            dlog('Start: poprzedni przelew do dostawcy z innego zamówienia (DEPO).');
+            try { await runPoprzDepo(status); dlog('Poprzedni przelew DEPO: sprawdzonych dostawców ' + Object.keys(_poprzDost || {}).length + '.'); }
+            catch (e){ dlog('Poprzedni przelew DEPO: ' + ((e && e.message) || e)); }
             renderTables();
             dlog('Koniec przetwarzania.');
             var c = state.bal.order.filter(function(s){ return !!state.matched[s]; }).length;
@@ -36223,6 +37004,14 @@
                 if (t.classList.contains('pain-acc-war')) {
                     if (!state.pcAccWar) state.pcAccWar = {};
                     state.pcAccWar[t.getAttribute('data-k')] = t.getAttribute('data-val') || '';
+                    renderPain(); return;
+                }
+                // Nazwa beneficjenta z listy wariantow — wybor czlowieka, wiec reczny wpis nazwy schodzi.
+                if (t.classList.contains('pain-nazwa-war')) {
+                    if (!state.pcNazwaWyb) state.pcNazwaWyb = {};
+                    var nk = t.getAttribute('data-key');
+                    state.pcNazwaWyb[nk] = t.getAttribute('data-val') || '';
+                    if (state.painEdit && state.painEdit[nk]) state.painEdit[nk].name = '';
                     renderPain(); return;
                 }
                 if (t.classList.contains('pain-ed')) {
@@ -89451,6 +90240,21 @@
         const m = String(komentarz == null ? '' : komentarz).trim().match(/^([A-Za-z0-9]{20,32})(?![A-Za-z0-9])/);
         return m ? m[1] : '';
     }
+    // Numer ZA slowem „Comment:". Tak wyglada wplata zaksiegowana recznie z numerem
+    // wpisanym w komentarz platnosci, na auftragu BEZ tabelki „Saferpay Payments"
+    // (awaria 01.11.2026 — 89 ksiegowan z 12.11): kolumna pusta, miejsce przed
+    // „Comment:" puste, a numer stoi dalej:
+    //   „Comment: 41W2xKAOU814SAb2880CACEACYxA; Date: 2026-11-12 13:06:07; …"  (16127772)
+    // Czytanie samego poczatku robilo z takiej wplaty „ksiegowanie reczne bez numeru",
+    // a z jej transakcji — „jest w Saferpayu, nie ma na koncie 1022". Za „Comment:"
+    // ludzie pisza tez zwykly tekst, wiec wymagamy ksztaltu numeru Saferpaya: co najmniej
+    // jedna cyfra i jedna mala litera. Dlugie slowo, IBAN ani numer PayPala ich nie maja.
+    function slTxZaKomentarzem(komentarz) {
+        const m = String(komentarz == null ? '' : komentarz).trim()
+            .match(/^Comment:\s*([A-Za-z0-9]{20,32})(?![A-Za-z0-9])/i);
+        if (!m || !/[0-9]/.test(m[1]) || !/[a-z]/.test(m[1])) return '';
+        return m[1];
+    }
     function slCzytajPL(wiersze, konto) {
         const h = (wiersze[0] || []).map(function (x) { return String(x == null ? '' : x).trim(); });
         const K = {};
@@ -89496,6 +90300,13 @@
                           txid: slTxKol(r[K['Transaction ID']], r[K['Comment']]),
                           chwila: slChwila(r[K['Payment Date']]) };
             const wplyw = konto ? (rec.deb === String(konto)) : /^1[23]/.test(rec.deb);
+            // Numer za „Comment:" bierzemy WYLACZNIE dla platnosci. Nota z ticketu z wlasnym
+            // numerem zrobilaby kubelek z sama nota (`suma` = 0, `dolacz` kieruje ja do
+            // `kredyt`) i roznice na pelna kwote — dzis wyjasnia ja sekcja „w tickecie".
+            // Osobne pole, nie `txid`: wykrywanie przeksiegowan miedzy auftragami patrzy
+            // na `txid || id` i ma dzialac tak samo jak przed ta zmiana.
+            rec.txKom = (!rec.txid && wplyw && !/CREDIT/i.test(rec.aufTekst))
+                ? slTxZaKomentarzem(r[K['Comment']]) : '';
             (wplyw ? we : wy).push(rec);
         }
         // Zero wplywow przy niepustym pliku to prawie zawsze zle rozpoznane konto —
@@ -93455,7 +94266,9 @@
             if (x.vatPrzeks || x.przeksAuf) return;
             // Najpierw wlasna kolumna „Transaction ID", potem to, co udalo sie wylowic
             // z komentarza — ta druga droga jest dla zrodel, ktore kolumny nie maja.
-            const klucz = x.txid || x.id;
+            // Trzecia droga — numer za „Comment:" (slTxZaKomentarzem) — stoi PRZED `id`,
+            // bo `id` to wzorzec PayPala i w komentarzu Saferpaya trafia tylko przypadkiem.
+            const klucz = x.txid || x.txKom || x.id;
             if (!klucz){ bezNumeru.push(x); return; }
             if (!L[klucz]) L[klucz] = pustyKub();
             dolacz(L[klucz], x);
@@ -119909,7 +120722,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '0db6763 · 17.11.2026 15:40';
+    const HUB_BUDOWA = 'b085c58 · 18.11.2026 10:03';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
