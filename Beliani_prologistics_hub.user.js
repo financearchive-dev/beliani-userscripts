@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.17
+// @version      5.63.18
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -11559,6 +11559,25 @@
         'ł':'l','Ł':'L','ø':'o','Ø':'O','đ':'d','Đ':'D','ð':'d','Þ':'Th','þ':'th',
         'æ':'ae','Æ':'Ae','œ':'oe','Œ':'Oe','ı':'i','İ':'I'
     };
+    // Przelew krajowy HUF (plik „HU domestic refunds” dla Unicredit HU): węgierskie litery w nazwie i tytule
+    // przechodzą — prologistics tak je wysyła, a bank przyjmuje (decyzja użytkownika 18.11.2026). Dla innych
+    // znaków ostrzeżenie zostaje.
+    const HU_LIT = 'áéíóöőúüűÁÉÍÓÖŐÚÜŰ';
+    const NON_SEPA_HU = /[^A-Za-z0-9\/\-?:().,'+ áéíóöőúüűÁÉÍÓÖŐÚÜŰ]/;
+    // Kody bank CZ — ciselnik CNB „Kody platebniho styku” (kody_bank_CR.csv), stan 18.11.2026, 47 pozycji.
+    // Kod spoza listy to blad: Raiffeisen odrzuci przelew. Gdy CNB doda nowy kod, dopisz go tutaj.
+    const CZ_BANKI = new Set(('0100 0300 0600 0710 0800 2010 2060 2070 2100 2200 2220 2250 2600 2700 3030 3060 3500 4300 5500 5800 '
+        + '6000 6200 6210 6300 6363 6600 6700 6800 7910 7950 7960 7970 7990 8030 8040 8060 8090 8150 8198 8220 8250 8255 8265 8500 '
+        + '8610 8620 8660').split(' '));
+    // Banki trybu „Wprowadzanie” i ich eksport z listy „--” pod tabela Import payments. Numery odczytane 18.11.2026
+    // z /api/filtersOptions/ (bank_settings oraz mapping_setting „refund_payment_export”). dbt = koncowka konta
+    // obciazanego w pliku — po niej tryb „Sprawdzanie” sam rozpoznaje bank (HVB EU: nie widziany w pliku, z konta 34695423).
+    const SP_BANKI = [
+        { id: '132', nm: 'HVB UniCredit', ms: '478', msNm: 'DE Refunds', dbt: /22889389$/ },
+        { id: '201', nm: 'HVB EU', ms: '493', msNm: 'EU refunds', dbt: /34695423$/ },
+        { id: '203', nm: 'Raiffeisenbank CZ Beliani SP GmbH', ms: '500', msNm: 'CZ domestic refunds', dbt: /^(?:0+-)?0*403699004$/ },
+        { id: '24', nm: 'Unicredit HU', ms: '470', msNm: 'HU domestic refunds', dbt: /0610670003$/ }
+    ];
 
     // ---------- Helpery walidacji ----------
     function mod97ok(iban) {
@@ -11589,8 +11608,56 @@
             if (!IBAN_LEN[cc]) errs.push(`nieznany kod kraju ${cc}`);
         }
         if (errs.length === 0 && !mod97ok(cleaned)) errs.push('bledny checksum (mod-97)');
+        // mod-97 sprawdza IBAN jako calosc, ale IBAN policzony z BLEDNEGO numeru krajowego tez go przechodzi.
+        // Numer konta CZ (mod 11) i HU (mod 10) ma wlasna cyfre kontrolna — sprawdzamy ja w srodku IBAN-u.
+        if (errs.length === 0) {
+            const cc = cleaned.slice(0, 2);
+            if (cc === 'CZ') czKontoBledy(cleaned.slice(8, 14), cleaned.slice(14), cleaned.slice(4, 8)).forEach(x => errs.push('konto CZ: ' + x));
+            else if (cc === 'HU') huKontoBledy(cleaned.slice(4)).forEach(x => errs.push('konto HU: ' + x));
+        }
         return errs;
     }
+    // Suma wazona cyfr podzielna przez mod (cyfry dopelnione zerami z lewej do liczby wag).
+    function wazona(cyfry, wagi, mod) {
+        const s = String(cyfry).padStart(wagi.length, '0');
+        if (s.length !== wagi.length || /[^0-9]/.test(s)) return false;
+        let sum = 0;
+        for (let i = 0; i < s.length; i++) sum += (s.charCodeAt(i) - 48) * wagi[i];
+        return sum % mod === 0;
+    }
+    // Numer konta CZ: predcisli (do 6 cyfr) i numer (do 10 cyfr), kazde z wlasna kontrola mod 11 (wyhlaska CNB
+    // 169/2011), numer z co najmniej dwiema cyframi niezerowymi, kod banku z ciselnika CNB. Zwraca liste bledow.
+    // Sprawdzone 18.11.2026 na 7 kontach z pliku „CZ domestic refunds” (wszystkie przechodza).
+    function czKontoBledy(pre, num, bank) {
+        const e = [], p = String(pre || '').replace(/^0+/, ''), n = String(num || '');
+        if (p && !wazona(p, [10, 5, 8, 4, 2, 1], 11)) e.push('zla cyfra kontrolna predcisli ' + p + ' (mod 11)');
+        if (!wazona(n, [6, 3, 7, 9, 10, 5, 8, 4, 2, 1], 11)) e.push('zla cyfra kontrolna numeru ' + n.replace(/^0+(?=[0-9])/, '') + ' (mod 11)');
+        else if (n.replace(/0/g, '').length < 2) e.push('numer ' + n + ' ma mniej niz dwie cyfry rozne od zera');
+        if (!CZ_BANKI.has(String(bank || ''))) e.push('kod banku ' + (bank || '?') + ' nie istnieje w ciselniku CNB (stan 18.11.2026)');
+        return e;
+    }
+    // Numer rachunku HU (24 cyfry w IBAN-ie: bank 3 + oddzial 4 + kontrolna 1, potem 15 + kontrolna 1;
+    // rachunek 16-cyfrowy ma na koncu osiem zer): wagi 9,7,3,1, suma podzielna przez 10 — osobno w obu czlonach.
+    function huKontoBledy(d24) {
+        const w8 = [9, 7, 3, 1, 9, 7, 3, 1], e = [];
+        if (!wazona(d24.slice(0, 8), w8, 10)) e.push('zla cyfra kontrolna banku/oddzialu ' + d24.slice(0, 8) + ' (mod 10)');
+        if (!wazona(d24.slice(8), w8.concat(w8), 10)) e.push('zla cyfra kontrolna numeru rachunku (mod 10)');
+        return e;
+    }
+    // Konto CZ w zapisie krajowym „[predcisli-]numer/kod banku” (spacje bez znaczenia) albo jako IBAN CZ.
+    // Zwraca { pre, num, bank } bez zer wiodacych albo null, gdy to nie jest konto CZ.
+    function czParse(s) {
+        const t = String(s == null ? '' : s).replace(/\s+/g, '');
+        const m = /^(?:([0-9]{1,6})-)?([0-9]{1,10})\/([0-9]{4})$/.exec(t);
+        if (m) return { pre: (m[1] || '').replace(/^0+/, ''), num: m[2].replace(/^0+(?=[0-9])/, ''), bank: m[3] };
+        const ib = cleanupIban(t);
+        if (/^CZ[0-9]{22}$/.test(ib)) return { pre: ib.slice(8, 14).replace(/^0+/, ''), num: ib.slice(14).replace(/^0+(?=[0-9])/, ''), bank: ib.slice(4, 8) };
+        return null;
+    }
+    // Wspolny klucz konta CZ do porownan (plik ABO z requestem, IBAN CZ z zapisem krajowym): „pre-num/bank”.
+    function czKlucz(s) { const k = czParse(s); return k ? (k.pre ? k.pre + '-' : '') + k.num + '/' + k.bank : ''; }
+    // Klucz konta do porownan plik <-> request: konto CZ (dowolny zapis) -> „pre-num/bank”, reszta -> oczyszczony IBAN.
+    function kontoKlucz(s) { return czKlucz(s) || cleanupIban(s); }
 
     // Cyfry kontrolne IBAN dla podanego BBAN i kodu kraju (ISO 13616).
     function ibanCheckDigits(bban, cc) {
@@ -11607,10 +11674,15 @@
     //    tuz po nich nie ma prawa zawiesc. Zmierzone: 20000/20000 przyjetych losowych
     //    ciagow. Jedynym zabezpieczeniem jest tam zgodnosc dlugosci z tablica ISO 13616,
     //    a numer nie zostal z niczym porownany — i uzytkownik musi to wiedziec.
+    //    Wyjatek (18.11.2026): CZ i HU maja krajowa cyfre kontrolna (czKontoBledy/huKontoBledy) — gdy ja przechodza,
+    //    numer JEST sprawdzony; gdy nie, IBAN i tak dostanie blad z validateClean.
     function tryBuildIban(digits, cc) {
         const L = IBAN_LEN[cc]; if (!L) return null;
         if (2 + digits.length === L) { const cand = cc + digits; return mod97ok(cand) ? { v: cand, sprawdzony: true } : null; }
-        if (4 + digits.length === L) { const cand = cc + ibanCheckDigits(digits, cc) + digits; return mod97ok(cand) ? { v: cand, sprawdzony: false } : null; }
+        if (4 + digits.length === L) {
+            const cand = cc + ibanCheckDigits(digits, cc) + digits;
+            return mod97ok(cand) ? { v: cand, sprawdzony: (cc === 'CZ' || cc === 'HU') && validateClean(cand).length === 0 } : null;
+        }
         return null;
     }
     function ccFromName(name) {
@@ -11643,12 +11715,26 @@
         out = out.replace(/\s{2,}/g, ' ').trim();
         return out;
     }
+    // Przelew krajowy HUF na rachunek HU - tu wegierskie litery sa dozwolone (HU_LIT).
+    function huDom(r) { return String(r.ccy || '').toUpperCase() === 'HUF' && /^HU/.test(cleanupIban(r.iban)); }
+    // Znaki niedozwolone w polu wiersza: ABO (.KPC) - wszystko spoza drukowalnego ASCII; HUF krajowy - spoza SEPA
+    // i liter wegierskich; reszta - spoza SEPA.
+    function hasNonSepaR(r, s) {
+        if (r.fmt === 'abo') return /[^ -~]/.test(s || '');
+        return (huDom(r) ? NON_SEPA_HU : NON_SEPA).test(s || '');
+    }
+    function translitR(r, s) {
+        if (!huDom(r)) return translit(s);
+        return String(s || '').split('').map(ch => (ch === ' ' || HU_LIT.indexOf(ch) >= 0) ? ch : (translit(ch) || ' ')).join('').replace(/\s{2,}/g, ' ').trim();
+    }
 
     // ---------- Stan ----------
     let model = [];       // wiersze
     let xmlDoc = null;    // sparsowany dokument (zrodlo prawdy dla struktury)
     let fileName = 'refunds_fixed.xml';
     let fileCc = '';      // kod kraju z nazwy pliku (fallback dla BBAN bez prefiksu)
+    let fmt = 'xml';      // 'xml' (pain.001: DE/EU refunds .xml, HU domestic .HCT) albo 'abo' (CZ domestic .KPC)
+    let abo = null;       // plik ABO: { lines, nl, trail, rows } — zrodlo prawdy dla struktury, jak xmlDoc dla XML
 
     // n bywa nullem, gdy first() nie znalazlo elementu (plik bez GrpHdr). Bez tego
     // guardu txt(first(doc,'GrpHdr'),'CtrlSum') rzucalo TypeError, catch w loadText
@@ -11657,13 +11743,90 @@
     const first = (n, name) => { const l = q(n, name); return l.length ? l[0] : null; };
     const txt = (n, name) => { const e = first(n, name); return e ? (e.textContent || '').trim() : ''; };
 
+    // ---------- ABO (.KPC) — plik „CZ domestic refunds” dla Raiffeisenbank CZ ----------
+    // Czeski format krajowy, nie XML. Uklad z eksportu prologistics (18.11.2026, LF, bez konca linii na koncu):
+    //   UHL1<DDMMRR><nazwa klienta><numer klienta>...          naglowek pliku (zostaje bez zmian)
+    //   1 1501 <DDMMRR> 5500                                    naglowek pliku ksiegowego (1501 = polecenia przelewu)
+    //   2 <konto obciazane> <suma w halerzach> <DDMMRR>        naglowek grupy
+    //   [predcisli-]numer <kwota w halerzach> <VS> <kod banku><KS>[ <SS>][ AV:<wiadomosc>]
+    //   3 +   koniec grupy;   5 +   koniec pliku
+    // Nazwy odbiorcy ABO nie ma. Suma grupy MUSI rownac sie sumie jej pozycji — przeliczamy ja przy zapisie.
+    const ABO_POZ = /^(?:([0-9]{1,6})-)?([0-9]{1,10})\s+([0-9]{1,15})\s+([0-9]{1,10})\s+([0-9]{4})([0-9]{4})(?:\s+([0-9]{1,10}))?(?:\s+AV:(.*))?$/;
+    const ABO_GR = /^2\s+(?:([0-9]{1,6})-)?([0-9]{1,10})\s+([0-9]{1,15})\s+([0-9]{6})$/;
+    function aboParse(text) {
+        const nl = /\r\n/.test(text) ? '\r\n' : '\n';
+        const ls = text.split(/\r?\n/);
+        const trail = ls.length > 1 && ls[ls.length - 1] === '';
+        if (trail) ls.pop();
+        if (!/^UHL1/.test(ls[0] || '')) throw new Error('To nie wyglada na plik ABO (.KPC): pierwszy wiersz nie zaczyna sie od "UHL1".');
+        const lines = [], rows = [];
+        let gr = null;
+        ls.forEach((s, i) => {
+            const t = s.replace(/\s+$/, '');
+            let m;
+            if (i === 0 || /^1\s+[0-9]{4}\s/.test(t) || /^5\s+\+$/.test(t)) { lines.push({ t: 'raw', s: s }); return; }
+            if (/^3\s+\+$/.test(t)) { lines.push({ t: 'raw', s: s, koniecGr: true }); gr = null; return; }
+            if ((m = ABO_GR.exec(t))) { gr = { t: 'g', pre: m[1] || '', num: m[2], sum: m[3], date: m[4] }; lines.push(gr); return; }
+            if (gr && (m = ABO_POZ.exec(t))) {
+                const r = {
+                    fmt: 'abo', e2e: '', nm: '', iban: (m[1] && +m[1] ? String(+m[1]) + '-' : '') + m[2].replace(/^0+(?=[0-9])/, '') + '/' + m[5],
+                    ccy: 'CZK', amt: fmt2(parseInt(m[3], 10)), ustrd: m[8] == null ? '' : m[8],
+                    abo: { vs: m[4], ks: m[6], ss: m[7] || '', gr: gr }, nodes: {}, pmt: null, debtorCc: 'CZ', sel: false, errs: [], warns: [], chk: null
+                };
+                lines.push({ t: 'i', r: r }); rows.push(r); return;
+            }
+            throw new Error('Plik ABO: nie rozumiem wiersza ' + (i + 1) + ': "' + s.slice(0, 70) + '"');
+        });
+        if (!rows.length) throw new Error('Plik ABO bez pozycji przelewow.');
+        return { lines: lines, nl: nl, trail: trail, rows: rows };
+    }
+    // Sklada plik ABO z modelu: pozycje z pol wiersza (konto, kwota, wiadomosc), VS/KS/SS bez zmian, suma grupy
+    // przeliczona. Zwraca { text, zle } — zle = pozycje z kontem albo kwota nie do zapisania (trafiaja doslownie).
+    function aboWrite(tylko) {
+        const jest = l => !tylko || tylko.has(l.r);
+        const sumy = new Map();
+        abo.lines.forEach(l => { if (l.t === 'i' && jest(l)) { const c = centsOf(l.r.amt); sumy.set(l.r.abo.gr, (sumy.get(l.r.abo.gr) || 0) + (isNaN(c) ? 0 : c)); } });
+        // Plik tylko z zaznaczonych (tylko): pozycje spoza zakresu wypadaja, a grupa bez pozycji — razem ze swoim „3 +”.
+        let zle = 0, n = 0, gr = null;
+        const out = abo.lines.map(l => {
+            if (l.t === 'raw') { const bez = l.koniecGr && gr && !sumy.has(gr); if (l.koniecGr) gr = null; return bez ? null : l.s; }
+            if (l.t === 'g') gr = l;
+            if (l.t === 'g' && !sumy.has(l)) return null;
+            if (l.t === 'i' && !jest(l)) return null;
+            if (l.t === 'g') return '2 ' + (l.pre ? l.pre + '-' : '') + l.num + ' ' + (sumy.get(l) || 0) + ' ' + l.date;
+            const r = l.r, k = czParse(r.iban), c = centsOf(r.amt), a = r.abo;
+            n++;
+            if (isNaN(c) || !k) zle++;
+            return (k ? (k.pre ? k.pre + '-' : '') + k.num : String(r.iban || '').trim()) + ' ' + (isNaN(c) ? String(r.amt || '').trim() : String(c))
+                + ' ' + a.vs + ' ' + (k ? k.bank : '0000') + a.ks + (a.ss ? ' ' + a.ss : '') + (r.ustrd ? ' AV:' + r.ustrd : '');
+        }).filter(x => x !== null);
+        return { text: out.join(abo.nl) + (abo.trail ? abo.nl : ''), zle: zle, n: n };
+    }
+    // Suma z naglowkow grup (dla podsumowania, jak CtrlSum w XML).
+    function aboSumaNaglowka() {
+        return abo ? abo.lines.filter(l => l.t === 'g').reduce((s, l) => s + parseInt(l.sum, 10), 0) : 0;
+    }
+
     function parseAndBuild(text) {
+        // ABO (.KPC) rozpoznajemy po tresci, nie po rozszerzeniu — plik wklejony w pole tez ma zadzialac.
+        const bezBom = text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+        if (/^UHL1/.test(bezBom)) {
+            const a = aboParse(bezBom);
+            fmt = 'abo'; abo = a; xmlDoc = null;
+            model = a.rows;
+            chkReset();
+            fileCc = 'CZ';
+            validateAll();
+            return;
+        }
         const doc = new DOMParser().parseFromString(text, 'application/xml');
         if (doc.getElementsByTagName('parsererror').length) {
             throw new Error('Nieprawidlowy XML: ' + doc.getElementsByTagName('parsererror')[0].textContent.replace(/\s+/g, ' ').slice(0, 200));
         }
         if (!first(doc, 'CstmrCdtTrfInitn')) throw new Error('To nie wyglada na pain.001 (brak CstmrCdtTrfInitn).');
         xmlDoc = doc;
+        // Po pliku ABO format MUSI wrocic na XML — inaczej bank rozpoznaje sie ze starego pliku, a pobranie idzie jako ABO.
+        fmt = 'xml'; abo = null;
         model = [];
         chkReset();   // nowy plik = swieze odczyty z prologistics
         fileCc = ccFromName(fileName);
@@ -11699,6 +11862,22 @@
     // Usuwa pozycje: kasuje wezel transakcji (i cale PmtInf, gdy zostaje puste).
     function deleteRow(i) {
         const r = model[i]; if (!r) return;
+        if (r.fmt === 'abo') {
+            // Pozycja znika z pliku; grupa bez pozycji znika razem ze swoim „3 +” (pusta grupa to blad dla banku).
+            abo.lines = abo.lines.filter(l => !(l.t === 'i' && l.r === r));
+            const gr = r.abo.gr;
+            if (!abo.lines.some(l => l.t === 'i' && l.r.abo.gr === gr)) {
+                const gi = abo.lines.indexOf(gr);
+                if (gi >= 0) {
+                    const ki = abo.lines.findIndex((l, j) => j > gi && l.koniecGr);
+                    abo.lines = abo.lines.filter((l, j) => j !== gi && j !== ki);
+                }
+            }
+            model.splice(i, 1);
+            validateAll(); renderTable(); updateSummary();
+            toast('Usunieto pozycje.');
+            return;
+        }
         const tx = r.nodes.tx, pmt = r.pmt;
         if (tx && tx.parentNode) tx.parentNode.removeChild(tx);
         if (pmt && q(pmt, 'CdtTrfTxInf').length === 0 && pmt.parentNode) pmt.parentNode.removeChild(pmt);
@@ -11708,6 +11887,23 @@
     }
     // Dodaje nowa, pusta pozycje (klon szablonu -> trafi do pobranego XML).
     function addRow() {
+        if (fmt === 'abo' && abo) {
+            // Nowa pozycja na koncu ostatniej grupy (przed jej „3 +”), VS i KS zerowe jak w eksporcie prologistics.
+            const grs = abo.lines.filter(l => l.t === 'g');
+            const gr = grs[grs.length - 1];
+            if (!gr) { toast('Brak grupy w pliku ABO.'); return; }
+            const gi = abo.lines.indexOf(gr);
+            let ki = abo.lines.findIndex((l, j) => j > gi && l.koniecGr);
+            if (ki < 0) ki = abo.lines.length;
+            const r = { fmt: 'abo', e2e: '', nm: '', iban: '', ccy: 'CZK', amt: '', ustrd: '', abo: { vs: '0000000000', ks: '0000', ss: '', gr: gr },
+                        nodes: {}, pmt: null, debtorCc: 'CZ', sel: false, errs: [], warns: [], chk: null };
+            abo.lines.splice(ki, 0, { t: 'i', r: r });
+            model.push(r);
+            validateAll(); renderTable(); updateSummary();
+            const box = document.querySelector('#sepa-tbody'); if (box && box.lastElementChild) box.lastElementChild.scrollIntoView({ block: 'nearest' });
+            toast('Dodano pusta pozycje - uzupelnij konto, kwote i wiadomosc (AV).');
+            return;
+        }
         if (!xmlDoc) { toast('Najpierw wczytaj plik.'); return; }
         const pmts = Array.from(q(xmlDoc, 'PmtInf'));
         let tpl = null;
@@ -11735,7 +11931,7 @@
     function markDuplicates() {
         const ibanMap = {}, e2eMap = {};
         model.forEach((r, i) => {
-            const ib = cleanupIban(r.iban);
+            const ib = r.fmt === 'abo' ? (czKlucz(r.iban) || cleanupIban(r.iban)) : cleanupIban(r.iban);
             if (ib) (ibanMap[ib] = ibanMap[ib] || []).push(i);
             if (r.e2e) (e2eMap[r.e2e] = e2eMap[r.e2e] || []).push(i);
         });
@@ -11745,6 +11941,7 @@
 
     function validateRow(r) {
         r.errs = []; r.warns = [];
+        if (r.fmt === 'abo') { validateAboRow(r); return; }
         // IBAN: ok / format do normalizacji / brak prefiksu kraju / realny blad
         const res = resolveIban(r.iban, r.debtorCc);
         if (res.kind === 'format') r.errs.push('IBAN: format do poprawy (spacje/wielkosc liter/prefiks) -> "Popraw zaznaczone"');
@@ -11758,9 +11955,10 @@
         // waluta
         if (!r.ccy) r.errs.push('brak waluty');
         else if (!CCY.has(r.ccy.toUpperCase())) r.warns.push('nietypowa waluta: ' + r.ccy);
-        // nazwa / tytul - znaki spoza SEPA
-        if (hasNonSepa(r.nm)) r.warns.push('nazwa: znaki spoza SEPA (mozna transliterowac)');
-        if (hasNonSepa(r.ustrd)) r.warns.push('tytul: znaki spoza SEPA (mozna transliterowac)');
+        // nazwa / tytul - znaki spoza SEPA (przelew krajowy HUF: wegierskie litery dozwolone)
+        const hu = huDom(r) ? ' i liter wegierskich' : '';
+        if (hasNonSepaR(r, r.nm)) r.warns.push('nazwa: znaki spoza SEPA' + hu + ' (mozna transliterowac)');
+        if (hasNonSepaR(r, r.ustrd)) r.warns.push('tytul: znaki spoza SEPA' + hu + ' (mozna transliterowac)');
         // Dlugosci pol wg pain.001 (ISO 20022). Przekroczenie = bank odrzuca CALY plik,
         // a modul nie sprawdzal tego wcale: nazwa na 80 znakow dostawala zielone "ok".
         // EndToEndId jest polem obowiazkowym, wiec puste tez jest bledem.
@@ -11777,6 +11975,23 @@
         // po kliknieciu "Popraw zaznaczone" wiersz robilby sie zielony i slad by zniknal.
         if (r.zbudowany && cleanupIban(r.iban) === r.zbudowany)
             r.warns.push('IBAN zbudowany z numeru krajowego - cyfry kontrolne policzone, nie sprawdzone; potwierdz numer u odbiorcy');
+    }
+    // Pozycja pliku ABO (.KPC, przelew krajowy CZK): konto w zapisie krajowym z kontrola mod 11 i kodem banku z CNB,
+    // kwota w halerzach (do 15 cyfr), wiadomosc AV do 140 znakow ASCII. Nazwy odbiorcy ABO nie ma — nie wymagamy jej.
+    function validateAboRow(r) {
+        const k = czParse(r.iban);
+        if (!String(r.iban || '').trim()) r.errs.push('brak numeru konta');
+        else if (!k || !/^[0-9 ]*-?[0-9 ]+\/[0-9 ]{4}$/.test(String(r.iban).trim())) r.errs.push('konto: zapis inny niz "[predcisli-]numer/kod banku" (np. 107-2778850267/0100)');
+        else czKontoBledy(k.pre, k.num, k.bank).forEach(e => r.errs.push('konto: ' + e));
+        if (k && czKlucz(r.iban) !== String(r.iban)) r.errs.push('konto: zapis do ujednolicenia (spacje/zera wiodace) -> "Popraw zaznaczone"');
+        const c = centsOf(r.amt);
+        if (isNaN(c)) r.errs.push('kwota: format (' + (r.amt || 'puste') + ')');
+        else if (c <= 0) r.errs.push('kwota: musi byc > 0');
+        else if (String(c).length > 15) r.errs.push('kwota: za duza dla ABO');
+        if (String(r.ccy || '').toUpperCase() !== 'CZK') r.errs.push('ABO to przelew krajowy w CZK - waluta ' + (r.ccy || 'pusta'));
+        const us = String(r.ustrd || '');
+        if (us.length > 140) r.errs.push('wiadomosc (AV) za dluga: ' + us.length + '/140 znakow');
+        if (hasNonSepaR(r, us)) r.warns.push('wiadomosc (AV): znaki spoza ASCII (np. czeskie litery) - bank moze ich nie przyjac (mozna transliterowac)');
     }
     function validateAll() { model.forEach(validateRow); markDuplicates(); chkEval(); }
 
@@ -11907,6 +12122,9 @@
         // (ticket 598127, 16.11.2026). Czytajac sama pierwsza, HUB nie widzial IBAN-u nowego, zatwierdzonego
         // requestu i dopasowywal plik do starego, zdezaktywowanego. Bierzemy numery z KAZDEJ kolumny „iban…".
         const ibCols = h.map((x, i) => (x.indexOf('iban') === 0 ? i : -1)).filter(i => i >= 0);
+        // Request Raiffeisenbank CZ (przelew krajowy CZK) trzyma konto w TRZECH kolumnach: Prefix, Account number,
+        // Bank code — bez IBAN-u (odczyt 18.11.2026, auftrag 16095624). Skladamy z nich „pre-num/bank”.
+        const czP = col('prefix'), czN = col('account number'), czB = col('bank code');
         const out = [];
         rows.slice(hi + 1).forEach(tr => {
             const c = Array.from(tr.children);
@@ -11915,7 +12133,9 @@
             if (!/^\d{5,}$/.test(id)) return;
             const sel = (ci.st >= 0 && c[ci.st]) ? c[ci.st].querySelector('select.state-select option[selected]') : null;
             const ibany = ibCols.map(cell).filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
-            out.push({ id: id, pm: cell(ci.pm), bk: cell(ci.bk), st: sel ? nsp(sel.textContent) : '', iban: ibany[0] || '', ibany: ibany, kwota: numOf(cell(ci.am)), cu: cell(ci.cu), co: cell(ci.co), ms: cell(ci.ms) });
+            const czK = (cell(czN) && cell(czB)) ? czKlucz((cell(czP) ? cell(czP) + '-' : '') + cell(czN) + '/' + cell(czB)) : '';
+            if (czK && ibany.indexOf(czK) < 0) ibany.push(czK);
+            out.push({ id: id, pm: cell(ci.pm), bk: cell(ci.bk), st: sel ? nsp(sel.textContent) : '', iban: ibany[0] || '', ibany: ibany, kwota: numOf(cell(ci.am)), cu: cell(ci.cu), co: cell(ci.co), ms: cell(ci.ms), dt: cell(col('date')).slice(0, 10) });
         });
         return out;
     }
@@ -11985,7 +12205,19 @@
         const ov = om ? numOf(om[1].replace(/['   ]/g, '')) : NaN;
         const inv = chkFaktury(doc), pay = chkPlatnosci(doc), dks = chkDokumenty(doc);
         return { st: 'ok', konta: chkKonta(doc), docs: dks || [], docsBrak: !dks, deleted: dv === '1' || dv === 'true', reqs: chkReqs(doc), eu: chkEupago(doc), tix: tix.slice(0, 6),
-                 inv: inv || [], invBrak: !inv, pay: pay || [], payBrak: !pay, ccy: ccyOf(cm ? cm[1] : ''), open: isFinite(ov) ? ov : null };
+                 inv: inv || [], invBrak: !inv, pay: pay || [], payBrak: !pay, ccy: ccyOf(cm ? cm[1] : ''), open: isFinite(ov) ? ov : null, src: chkZrodlo(doc, html) };
+    }
+    // Zrodlo sprzedazy auftragu (select „Source Seller", option[selected]) i czy to marketplace. Strona auftragu niesie
+    // w danych liste zrodel z grupy „Marketplace" (odczyt 18.11.2026: 115 wpisow, m.in. Amazon NL 443, Bol.com NL 173,
+    // Home24 NL 779; „Beliani Shop NL" 38 i „Beliani Shop DE" 18 na niej nie stoja). null = na stronie nie ma pola.
+    function chkZrodlo(doc, html) {
+        const sel = doc.querySelector('select#source_seller_id') || doc.querySelector('select[name="source_seller_id"]');
+        if (!sel) return null;
+        const o = sel.querySelector('option[selected]');
+        if (!o) return { id: '', nm: '', mp: false, mpNm: '' };
+        const id = String(o.getAttribute('value') || '').trim(), nm = nsp(o.textContent);
+        const m = /^\d+$/.test(id) ? html.match(new RegExp('\\{"id":"' + id + '","shop_id":"[^"]*","name":"((?:[^"\\\\]|\\\\.)*)"[^{}]*?"group":"([^"]*)"')) : null;
+        return { id: id, nm: nm, mp: !!m && m[2] === 'Marketplace', mpNm: m ? m[1] : '' };
     }
     function chkParseTicket(html) {
         if (html.length < 3000 || /type=["']password["']/i.test(html)) throw new Error('to nie jest strona ticketu (sesja wygasla? zaloguj sie w prologistics)');
@@ -12065,8 +12297,21 @@
     }
     // Dokument korekty dolaczony do auftragu przez dzial finansow („Korekta_11180207-1.pdf",
     // Attached documents, 15208528). Zwraca pierwszy pasujacy plik albo null.
-    function chkKorektaDok(A) {
-        return (A.docs || []).filter(d => CHK_KOREKTA_DOK.test(d.name))[0] || null;
+    // Od 19.11.2026 (decyzja uzytkownika; 14484967 i 15896224, Wlochy B2B): korekta sa tez dolaczone przez finanse PDF-y
+    // storna i nowej faktury („Invoice 10447993-2.pdf” + „Invoice 10447993-3.pdf”) — OBA, z numerami storna i nowej
+    // faktury z systemu (k). Sam „VIES_VAT_validation.pdf” korekta nie jest (16002521).
+    function chkKorektaDok(A, k) {
+        const d = (A.docs || []).filter(x => CHK_KOREKTA_DOK.test(x.name))[0];
+        if (d) return d;
+        if (!k || k.poz !== 'faktury') return null;
+        const pdf = id => {
+            const p = String(id).split('/');
+            if (p.length !== 2 || !/^[0-9]+$/.test(p[0] + p[1])) return null;
+            const re = new RegExp('(^|[^0-9])' + p[0] + '[-_ ]' + p[1] + '([^0-9]|$)');
+            return (A.docs || []).filter(x => re.test(x.name))[0] || null;
+        };
+        const a = pdf(k.n.id), b = pdf(k.p.id);
+        return a && b ? { name: a.name + '" + "' + b.name, date: b.date > a.date ? b.date : a.date, who: a.who || b.who } : null;
     }
     function chkFakturyOpis(inv) {
         return inv.slice(0, 5).map(x => x.id + ' ' + x.amt.toFixed(2) + (x.rate == null ? '' : ' (' + x.rate + '%)')).join(', ') || 'brak faktur';
@@ -12109,9 +12354,10 @@
         // Numer auftragu w komunikatach i w kluczu dopuszczenia ma byc tym, z ktorego naprawde pochodza dane (A),
         // a nie pierwszym numerem z pola, ktorego odczyt mogl sie nie udac.
         if (aufA) aufNr = aufA;
-        const nr = cleanupIban(r.iban), kw = centsOf(r.amt);
+        const nr = kontoKlucz(r.iban), kw = centsOf(r.amt);
         // Request niesie numery ze wszystkich kolumn „IBAN/Account number" (ibany); zgodny = ktorykolwiek z nich.
-        const maIban = x => !!nr && (x.ibany && x.ibany.length ? x.ibany : [x.iban]).some(v => cleanupIban(v) === nr);
+        // Konto CZ porownujemy po kluczu „pre-num/bank” — IBAN CZ i zapis krajowy (plik ABO, request CZ) to wtedy to samo.
+        const maIban = x => !!nr && (x.ibany && x.ibany.length ? x.ibany : [x.iban]).some(v => kontoKlucz(v) === nr);
         const exact = () => reqs.filter(x => maIban(x) && !isNaN(kw) && Math.round(x.kwota * 100) === kw);
         // Request z ticketu auftrag nie pokazuje: bez pasujacego na auftragu czytamy jego tickety.
         if (A && !exact().length) A.tix.forEach(t => { const e = get('T:' + t); if (e) add(e, 'ticket ' + t); });
@@ -12128,8 +12374,8 @@
             const zIban = reqs.filter(maIban), zKw = reqs.filter(x => Math.round(x.kwota * 100) === kw);
             const opis = x => 'request ' + x.id + ' (' + x.z + ')';
             if (zIban.length) c.notes.push(['e', 'IBAN pasuje do ' + opis(zIban[0]) + ', ale kwota w pliku ' + fmt2(kw) + ' rozni sie od kwoty w requescie ' + (isNaN(zIban[0].kwota) ? '?' : zIban[0].kwota.toFixed(2))]);
-            else if (zKw.length) c.notes.push(['e', 'kwota pasuje do ' + opis(zKw[0]) + ', ale IBAN w pliku ...' + nr.slice(-6) + ' rozni sie od IBAN-u w requescie ...' + cleanupIban(zKw[0].iban).slice(-6)]);
-            else c.notes.push(['e', 'zaden request nie pasuje do IBAN-u ani kwoty z pliku (requesty: ' + reqs.slice(0, 3).map(x => x.id + ' ' + (isNaN(x.kwota) ? '?' : x.kwota.toFixed(2)) + ' ...' + cleanupIban(x.iban).slice(-4)).join('; ') + ')']);
+            else if (zKw.length) c.notes.push(['e', 'kwota pasuje do ' + opis(zKw[0]) + ', ale IBAN w pliku ...' + nr.slice(-6) + ' rozni sie od IBAN-u w requescie ...' + kontoKlucz(zKw[0].iban).slice(-6)]);
+            else c.notes.push(['e', 'zaden request nie pasuje do IBAN-u ani kwoty z pliku (requesty: ' + reqs.slice(0, 3).map(x => x.id + ' ' + (isNaN(x.kwota) ? '?' : x.kwota.toFixed(2)) + ' ...' + kontoKlucz(x.iban).slice(-4)).join('; ') + ')']);
         } else {
             ex.sort((a, b) => (zatw(b) ? 1 : 0) - (zatw(a) ? 1 : 0));
             rq = ex[0];
@@ -12144,9 +12390,10 @@
                 const zgodna = x => x.length > 0 && (a === x || (x.length >= 8 && a.length >= 8 && (a.indexOf(x) === 0 || x.indexOf(a) === 0)));
                 if (!zgodna(nnorm(rq.co)) && !zgodna(nnorm(rq.cu))) c.notes.push(['w', 'nazwa odbiorcy w pliku "' + r.nm + '" rozni sie od nazwy w requescie "' + nmReq + '"']);
             }
-            if (validateClean(nr).length) c.notes.push(['w', 'ten sam IBAN stoi w requescie - popraw go w prologistics (zrodlo bledu) i wygeneruj plik od nowa']);
+            if (r.fmt === 'abo' ? !!r.errs.some(e => /^konto/.test(e)) : validateClean(nr).length) c.notes.push(['w', 'ten sam ' + (r.fmt === 'abo' ? 'numer konta' : 'IBAN') + ' stoi w requescie - popraw go w prologistics (zrodlo bledu) i wygeneruj plik od nowa']);
         }
         c.reqMsg = rq ? rq.ms : '';
+        c.rqId = rq ? rq.id : '';   // Import ID requestu = file_id wiersza listy Import payments (Book Refunds/Orders)
         // Link ↗ ma prowadzic tam, gdzie JEST request (ticket), a nie do auftragu z E2E (ticket 700151, 21.10.2026).
         const mtk = rq ? /^ticket (\d+)$/.exec(rq.z) : null;
         c.rqTicket = mtk ? { id: mtk[1], auf: aufNr } : null;
@@ -12196,6 +12443,75 @@
                 else c.notes.push(['w', opisM + ' (wplata mniejsza niz zwrot) - sprawdz, czy czesc zwrotu nie powinna isc pierwotna forma platnosci']);
             }
         }
+        // Zwrot VAT: slowo „VAT" w E2E, tytule albo requescie. Rozpoznajemy go PRZED marketplace i open amount
+        // (19.11.2026): rozpoznanie ze struktury faktur stalo wczesniej za nimi, wiec obie kontrole nie wiedzialy,
+        // ze to zwrot VAT (14484967: pytanie o marketplace i open amount przy zwrocie VAT firmie z Wloch).
+        if (!c.vatNeed && CHK_VAT.test(String(c.reqMsg || ''))) c.vatNeed = true;
+        // „VAT" widziane raz w requescie tego wiersza zostaje, dopoki E2E i tytul sie nie zmienia: edycja kwoty/IBAN-u
+        // albo chwilowy blad odczytu odbierały requestowi trafienie, a wiersz — blokadę i pytanie.
+        const vatTekst = String(r.e2e || '') + '|' + String(r.ustrd || '');
+        if (c.vatNeed) r.vatHint = vatTekst;
+        else if (r.vatHint === vatTekst) c.vatNeed = true;
+        // Zwrot VAT rozpoznany z SAMEJ struktury auftragu, bez slowa „VAT" w tytule (15797102, 27.10.2026):
+        // storno faktury i nowa faktura na NIZSZEJ stawce (chkVatKorekta poz. 'faktury') to ta sama zmiana
+        // stawki, ktora wymaga korekty od finansow co zwrot z „VAT" w tytule. Waskie, zeby zwykly zwrot za
+        // towar na auftragu z historyczna faktura 0% nie blokowal przelewu:
+        //  - stawka musi isc w DOL (p.rate < n.rate) — to zwrot NADPLACONEGO VAT-u, nie korekta w gore;
+        //  - kwota przelewu nie przekracza spadku wartosci faktury z tej zmiany (|storno| - nowa faktura) —
+        //    zwykly zwrot za towar jest wiekszy niz sama roznica stawki, wiec w to okno nie wpada.
+        // vatHint tu NIE ustawiamy — strukture czytamy na nowo za kazdym razem (bez lepkosci po edycji).
+        if (!c.vatNeed && A && A.inv.length && okCcy && !isNaN(kw)) {
+            const ks = chkVatKorekta(A);
+            if (ks && ks.poz === 'faktury' && ks.p.rate != null && ks.n.rate != null && ks.p.rate < ks.n.rate) {
+                const spadek = Math.round((Math.abs(ks.n.amt) - ks.p.amt) * 100) / 100;
+                if (spadek > 0.005 && kw / 100 <= spadek + 0.011) { c.vatNeed = true; c.vatStruct = true; }
+            }
+        }
+        // Zwrot juz wykonany (14484967, 19.11.2026): na auftragu/tickecie jest request „Refund Done” na te sama kwote
+        // (±0,05), a open amount nie pokazuje nadplaty na drugi zwrot — ten przelew najpewniej juz poszedl (tam: Refund
+        // Done 2322658 na 30.47, platnosc -30.47 z 16.11 i 0.01 na 8100; w pliku jeszcze dwa requesty po 30.48).
+        // Decyzja uzytkownika: jasny komunikat i blokada, ale do swiadomego dopuszczenia (jak open amount). Przy
+        // requescie z ticketu open amount nie mowi nic (claim, rekompensata) — wystarczy wykonany request tej kwoty.
+        if (rq && !isNaN(kw)) {
+            const nadpl = (A && A.open != null) ? Math.round(-A.open * 100) : null;
+            const zrob = reqs.filter(x => x !== rq && /^refund done$/i.test(x.st) && !isNaN(x.kwota) && Math.abs(Math.round(x.kwota * 100) - kw) <= 5);
+            if (zrob.length && (c.rqTicket || nadpl == null || nadpl < kw - 5)) {
+                const z = zrob[0];
+                c.juzBaza = 'ZWROT JUZ WYKONANY? request ' + z.id + ' (' + z.z + (z.dt ? ', ' + z.dt : '') + ') ma stan "Refund Done" na ' + z.kwota.toFixed(2)
+                    + (nadpl != null && !c.rqTicket ? ', a open amount auftragu ' + A.open.toFixed(2) + ' nie pokazuje nadplaty na drugi zwrot' : '')
+                    + ' - ten przelew najpewniej juz poszedl';
+                c.juzKlucz = (aufNr || '') + '|' + kw + '|' + nr + '|juz|' + z.id;
+                if (r.juzDop && r.juzDop.klucz === c.juzKlucz) {
+                    c.juzDop = r.juzDop;
+                    c.notes.push(['w', 'DOPUSZCZONE MIMO WYKONANEGO ZWROTU (decyzja uzytkownika, ' + r.juzDop.kiedy + '). ' + c.juzBaza]);
+                } else {
+                    if (r.juzDop) r.juzDop = null;
+                    c.juzNeed = true;
+                    c.notes.push(['e', c.juzBaza + ' - usun pozycje z listy (albo dopusc ja swiadomie przyciskiem obok)']);
+                }
+            }
+        }
+        // Zamowienie z marketplace'u (zrodlo sprzedazy auftragu z grupy „Marketplace", np. Amazon NL — ticket 713669,
+        // auftrag 15792723, 18.11.2026): zwroty takich zamowien robi zwykle marketplace (Customer Service), a nie przelew
+        // z banku. Przelew bywa uzasadniony (koszt odeslania, zwrot, ktorego marketplace nie zrobi), wiec decyduje
+        // czlowiek: „Przelew ma isc" przy pozycji albo ✕. Bez decyzji pozycja blokuje pobranie; decyzja dotyczy tego
+        // auftragu, kwoty i IBAN-u (klucz) — zmiana ktoregos ja uniewaznia, powrot do starej wartosci jej nie wskrzesza.
+        // Zwrot VAT (19.11.2026, decyzja uzytkownika): marketplace go nie zrobi — bez pytania, tylko informacja.
+        if (A && A.src && A.src.mp && c.vatNeed) {
+            c.notes.push(['i', 'zamowienie z marketplace ' + (A.src.nm || A.src.mpNm || '?') + ' - to zwrot VAT, ktorego marketplace nie zrobi, wiec przelew bez decyzji']);
+        } else if (A && A.src && A.src.mp) {
+            c.mpNm = A.src.nm || A.src.mpNm || '?';
+            c.mpBaza = 'ZAMOWIENIE Z MARKETPLACE ' + c.mpNm + ' (zrodlo sprzedazy auftragu ' + aufNr + ') - zwroty zamowien z marketplace ida zwykle przez marketplace (Customer Service), a ten zwrot zlecono przelewem z banku';
+            c.mpKlucz = aufNr + '|' + kw + '|' + nr + '|mp';
+            if (r.mpDop && r.mpDop.klucz === c.mpKlucz) {
+                c.mpDop = r.mpDop;
+                c.notes.push(['w', 'PRZELEW MIMO MARKETPLACE (decyzja uzytkownika, ' + r.mpDop.kiedy + '). ' + c.mpBaza]);
+            } else {
+                if (r.mpDop) r.mpDop = null;
+                c.mpNeed = true;
+                c.notes.push(['e', c.mpBaza + ' - zdecyduj: przelew ma isc (przycisk obok) albo usun pozycje z listy (✕)']);
+            }
+        } else if (A && !A.src) c.notes.push(['i', 'nie odczytalem zrodla sprzedazy auftragu ' + aufNr + ' - nie wiem, czy to zamowienie z marketplace']);
 
         // Open amount auftragu a kwota zwrotu (decyzja uzytkownika 30.10.2026, 15569828: open -200.39, zwrot 199.00).
         // Nadplate („Auftrag value - Total of Payments" ujemny) oddajemy przelewem — ma rownac sie zwrotowi.
@@ -12203,7 +12519,8 @@
         // nie calego salda auftragu (c.rqTicket -> pomijamy). Zwrot VAT ma wlasna kontrole, wiec go tu pomijamy.
         if (A && A.open != null) {
             c.openVal = A.open;
-            if (rq && !c.rqTicket && !c.vatNeed && okCcy && !isNaN(kw)) {
+            // Wykonany zwrot tej kwoty (c.juzBaza) sam tlumaczy roznice open amount — drugiej blokady nie stawiamy.
+            if (rq && !c.rqTicket && !c.vatNeed && !c.juzBaza && okCcy && !isNaN(kw)) {
                 const nad = Math.round(-A.open * 100) / 100;            // dodatnia = auftrag nadplacony o tyle
                 const rozn = Math.round((nad - kw / 100) * 100) / 100;
                 if (Math.abs(rozn) > 0.011) {
@@ -12227,38 +12544,17 @@
             }
         }
 
-        // Zwrot VAT: slowo „VAT" w E2E, tytule albo requescie.
-        if (!c.vatNeed && CHK_VAT.test(String(c.reqMsg || ''))) c.vatNeed = true;
-        // „VAT" widziane raz w requescie tego wiersza zostaje, dopoki E2E i tytul sie nie zmienia: edycja kwoty/IBAN-u
-        // albo chwilowy blad odczytu odbierały requestowi trafienie, a wiersz — blokadę i pytanie.
-        const vatTekst = String(r.e2e || '') + '|' + String(r.ustrd || '');
-        if (c.vatNeed) r.vatHint = vatTekst;
-        else if (r.vatHint === vatTekst) c.vatNeed = true;
-        // Zwrot VAT rozpoznany z SAMEJ struktury auftragu, bez slowa „VAT" w tytule (15797102, 27.10.2026):
-        // storno faktury i nowa faktura na NIZSZEJ stawce (chkVatKorekta poz. 'faktury') to ta sama zmiana
-        // stawki, ktora wymaga korekty od finansow co zwrot z „VAT" w tytule. Waskie, zeby zwykly zwrot za
-        // towar na auftragu z historyczna faktura 0% nie blokowal przelewu:
-        //  - stawka musi isc w DOL (p.rate < n.rate) — to zwrot NADPLACONEGO VAT-u, nie korekta w gore;
-        //  - kwota przelewu nie przekracza spadku wartosci faktury z tej zmiany (|storno| - nowa faktura) —
-        //    zwykly zwrot za towar jest wiekszy niz sama roznica stawki, wiec w to okno nie wpada.
-        // vatHint tu NIE ustawiamy — strukture czytamy na nowo za kazdym razem (bez lepkosci po edycji).
-        if (!c.vatNeed && A && A.inv.length && okCcy && !isNaN(kw)) {
-            const ks = chkVatKorekta(A);
-            if (ks && ks.poz === 'faktury' && ks.p.rate != null && ks.n.rate != null && ks.p.rate < ks.n.rate) {
-                const spadek = Math.round((Math.abs(ks.n.amt) - ks.p.amt) * 100) / 100;
-                if (spadek > 0.005 && kw / 100 <= spadek + 0.011) { c.vatNeed = true; c.vatStruct = true; }
-            }
-        }
+        // Korekta VAT (rozpoznanie zwrotu VAT stoi wyzej, przed marketplace i open amount).
         if (c.vatNeed) {
             if (!A) { c.fail = true; c.notes.push(['w', 'zwrot VAT: nie mam auftragu, wiec nie sprawdzilem korekty (storno + zmiana stawki)']); }
             else {
                 const k = (A.inv.length || A.pay.length) ? chkVatKorekta(A) : null;
                 // Korekta = dokument od finansow w Attached documents ORAZ storno i zmiana stawki w systemie
                 // (15208528). Sama zmiana stawki z systemu nie wystarcza (15848550).
-                const kor = chkKorektaDok(A);
+                const kor = chkKorektaDok(A, k);
                 if (k && k.poz === 'faktury' && !kor && !A.docsBrak) {
                     c.vatOk = false; c.vatKod = 'dok';
-                    c.vatBaza = 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty wystawionej recznie przez dzial finansow (np. "Korekta_<numer faktury>.pdf"). '
+                    c.vatBaza = 'ZWROT VAT BEZ KOREKTY na auftragu ' + aufNr + ': w systemie jest storno ' + k.n.id + ' i faktura ' + k.p.id + ' na zmienionej stawce, ale w Attached documents nie ma korekty od dzialu finansow (np. "Korekta_<numer faktury>.pdf" albo PDF-ow storna i nowej faktury "Invoice ' + k.n.id.replace('/', '-') + '.pdf" i "Invoice ' + k.p.id.replace('/', '-') + '.pdf"). '
                         + 'Sama zmiana stawki z systemu ("Make 0% VAT Invoice") nie jest korekta - klient dostaje wtedy ten sam numer faktury na dwoch stawkach.'
                         + (c.vatStruct ? ' (rozpoznane po storno i fakturze na nizszej stawce - w tytule przelewu nie ma "VAT")' : '');
                     c.vatRada = ' Zaczekaj na korekte i usun pozycje z listy (albo dopusc ja swiadomie przyciskiem obok)';
@@ -12298,7 +12594,7 @@
         } else if (A && A.inv.length && A.pay.length && okCcy && !isNaN(kw)) {
             // Zwrot VAT bez slowa „VAT": podpowiedz, gdy korekta jest, a roznica wplat i faktur = kwota zwrotu.
             const k = chkVatKorekta(A);
-            if (k && k.poz === 'faktury' && chkKorektaDok(A) && Math.abs(Math.round((sumC(A.pay) - sumC(A.inv)) * 100) / 100 - kw / 100) <= 0.011)
+            if (k && k.poz === 'faktury' && chkKorektaDok(A, k) && Math.abs(Math.round((sumC(A.pay) - sumC(A.inv)) * 100) / 100 - kw / 100) <= 0.011)
                 c.notes.push(['i', 'wyglada na zwrot VAT (dokument korekty, storno i faktura na zmienionej stawce, roznica wplat i faktur = kwota zwrotu), a w tytule nie ma "VAT"']);
         }
         const rk = { e: 0, w: 1, ok: 2, i: 3 };
@@ -12313,13 +12609,19 @@
             try { r.chk = chkRow(r, needs); }
             catch (e) { r.chk = { notes: [['w', 'blad sprawdzania: ' + ((e && e.message) || e)]], pend: false, checked: true, vatNeed: CHK_VAT.test(String(r.e2e || '') + ' ' + String(r.ustrd || '')) || r.vatHint === String(r.e2e || '') + '|' + String(r.ustrd || ''), vatOk: null, fail: true }; }
         });
+        try { spDopasuj(); } catch (e) {}
         needs.forEach(chkEnqueue);
         if (chkQueue.length && !chkTimer) chkTimer = setTimeout(() => { chkTimer = null; chkPump(); }, 400);
     }
+    // Zakres pliku, blokad i Book (19.11.2026, zgloszenie uzytkownika): ZAZNACZONE pozycje, a bez zaznaczenia — wszystkie.
+    // Wczesniej zaznaczenie sluzylo tylko do „Popraw”/„Transliteruj”: blokady liczyly sie z calego pliku, a plik wychodzil
+    // z wszystkimi pozycjami, choc zaznaczone byly dwie.
+    function wZak(r) { return !!r.sel || !model.some(x => x.sel); }
+    function zakres() { return model.filter(wZak); }
     // Brak korekty VAT, ktory dalej blokuje pobranie (dopuszczone swiadoma decyzja — c.vatDop — juz nie).
     function vatBrakIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.vatNeed && r.chk.vatOk === false && !r.chk.vatDop) out.push(i); });
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.vatNeed && r.chk.vatOk === false && !r.chk.vatDop) out.push(i); });
         return out;
     }
     // Zdejmuje blokade „zwrot VAT bez korekty" z wybranych pozycji — po jednym potwierdzeniu, ktore
@@ -12333,7 +12635,7 @@
         const opis = lista.map(i => {
             const m = model[i], c = m.chk;
             return 'poz. ' + (i + 1) + ' (' + (m.e2e || '?') + ', ' + m.amt + ' ' + (m.ccy || '') + '):\n   ' + c.vatBaza
-                + ((c.euBlok || c.stanBlok) ? '\n   UWAGA: ta pozycja ma tez INNA blokade (wplata eupago albo request nieaktywny/wykonany) - dopuszczenie VAT jej nie zdejmuje, plik nie wyjdzie, dopoki jej nie usuniesz.' : '');
+                + ((c.euBlok || c.stanBlok || (c.mpNeed && !c.mpDop) || c.juzNeed) ? '\n   UWAGA: ta pozycja ma tez INNA blokade (wplata eupago, request nieaktywny/wykonany, zwrot juz wykonany albo zamowienie z marketplace bez decyzji) - dopuszczenie VAT jej nie zdejmuje, plik nie wyjdzie, dopoki jej nie usuniesz albo nie rozstrzygniesz.' : '');
         }).join('\n\n');
         if (!confirm('Dopuscic zwrot VAT MIMO BRAKU KOREKTY (' + lista.length + ' poz.)?\n\n' + opis + '\n\n'
             + 'Bez korekty klient dostaje ten sam numer faktury na dwoch stawkach, a zwrot idzie do banku bez dokumentu od finansow. '
@@ -12351,7 +12653,7 @@
     // Roznica open amount (request na auftragu), ktora dalej blokuje pobranie (dopuszczone — c.openDop — juz nie).
     function openBrakIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.openOk === false && !r.chk.openDop) out.push(i); });
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.openOk === false && !r.chk.openDop) out.push(i); });
         return out;
     }
     function openDopusc(idx) {
@@ -12360,7 +12662,7 @@
         const opis = lista.map(i => {
             const m = model[i], c = m.chk;
             return 'poz. ' + (i + 1) + ' (' + (m.e2e || '?') + ', ' + m.amt + ' ' + (m.ccy || '') + '):\n   ' + c.openBaza
-                + ((c.euBlok || c.stanBlok || (c.vatNeed && c.vatOk === false && !c.vatDop)) ? '\n   UWAGA: ta pozycja ma tez INNA blokade - dopuszczenie open amount jej nie zdejmuje.' : '');
+                + ((c.euBlok || c.stanBlok || (c.vatNeed && c.vatOk === false && !c.vatDop) || (c.mpNeed && !c.mpDop) || c.juzNeed) ? '\n   UWAGA: ta pozycja ma tez INNA blokade - dopuszczenie open amount jej nie zdejmuje.' : '');
         }).join('\n\n');
         if (!confirm('Dopuscic zwrot MIMO ROZNICY OPEN AMOUNT (' + lista.length + ' poz.)?\n\n' + opis + '\n\n'
             + 'Kwota zwrotu nie rowna sie nadplacie na auftragu. Dopuszczasz to na wlasna odpowiedzialnosc - '
@@ -12375,50 +12677,109 @@
         delete model[i].openDop;
         chkEval(); refreshRows();
     }
+    // Zwrot przelewem przy zamowieniu z marketplace, bez decyzji czlowieka (z decyzja — c.mpDop — juz nie blokuje).
+    function mpBrakIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.mpNeed && !r.chk.mpDop) out.push(i); });
+        return out;
+    }
+    function mpDopusc(idx) {
+        const lista = idx.filter(i => model[i] && model[i].chk && model[i].chk.mpNeed && !model[i].chk.mpDop);
+        if (!lista.length) return;
+        const opis = lista.map(i => {
+            const m = model[i], c = m.chk;
+            return 'poz. ' + (i + 1) + ' (' + (m.e2e || '?') + ', ' + m.amt + ' ' + (m.ccy || '') + ', ' + (m.nm || '?') + '):\n   ' + c.mpBaza
+                + ((c.euBlok || c.stanBlok || (c.vatNeed && c.vatOk === false && !c.vatDop) || (c.openOk === false && !c.openDop) || c.juzNeed) ? '\n   UWAGA: ta pozycja ma tez INNA blokade - ta decyzja jej nie zdejmuje.' : '');
+        }).join('\n\n');
+        if (!confirm('Przelew MIMO ZAMOWIENIA Z MARKETPLACE (' + lista.length + ' poz.)?\n\n' + opis + '\n\n'
+            + 'Zwroty zamowien z marketplace robi zwykle marketplace (Customer Service). Przelew z banku bywa uzasadniony, np. koszt odeslania '
+            + 'albo zwrot, ktorego marketplace nie zrobi. Jesli marketplace odda klientowi te sama kwote, klient dostanie ja dwa razy.\n\n'
+            + 'Przelew ma isc?')) return;
+        const d = new Date(), kiedy = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        lista.forEach(i => { model[i].mpDop = { klucz: model[i].chk.mpKlucz, kiedy: kiedy }; });
+        chkEval(); refreshRows();
+        toast('Przelew mimo marketplace: ' + lista.length + ' poz.');
+    }
+    function mpCofnijDop(i) {
+        if (!model[i] || !model[i].mpDop) return;
+        delete model[i].mpDop;
+        chkEval(); refreshRows();
+    }
+    // Zwrot juz wykonany (request „Refund Done” tej kwoty, c.juzNeed) bez swiadomego dopuszczenia — blokuje pobranie i Book.
+    function juzBrakIdx() {
+        const out = [];
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.juzNeed && !r.chk.juzDop) out.push(i); });
+        return out;
+    }
+    function juzDopusc(idx) {
+        const lista = idx.filter(i => model[i] && model[i].chk && model[i].chk.juzNeed && !model[i].chk.juzDop);
+        if (!lista.length) return;
+        const opis = lista.map(i => {
+            const m = model[i], c = m.chk;
+            return 'poz. ' + (i + 1) + ' (' + (m.e2e || m.ustrd || '?') + ', ' + m.amt + ' ' + (m.ccy || '') + '):\n   ' + c.juzBaza
+                + ((c.euBlok || c.stanBlok || (c.vatNeed && c.vatOk === false && !c.vatDop) || (c.openOk === false && !c.openDop) || (c.mpNeed && !c.mpDop)) ? '\n   UWAGA: ta pozycja ma tez INNA blokade - ta decyzja jej nie zdejmuje.' : '');
+        }).join('\n\n');
+        if (!confirm('Dopuscic zwrot MIMO WYKONANEGO JUZ ZWROTU tej kwoty (' + lista.length + ' poz.)?\n\n' + opis + '\n\n'
+            + 'Jesli to ten sam zwrot, klient dostanie pieniadze drugi raz. Dopuszczasz to na wlasna odpowiedzialnosc - '
+            + 'wykonany zwrot przestaje blokowac pobranie (inne blokady zostaja).\n\nDopuscic?')) return;
+        const d = new Date(), kiedy = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        lista.forEach(i => { model[i].juzDop = { klucz: model[i].chk.juzKlucz, kiedy: kiedy }; });
+        chkEval(); refreshRows();
+        toast('Dopuszczono mimo wykonanego zwrotu: ' + lista.length + ' poz.');
+    }
+    function juzCofnijDop(i) {
+        if (!model[i] || !model[i].juzDop) return;
+        delete model[i].juzDop;
+        chkEval(); refreshRows();
+    }
     // Zwrot przelewem przy wplacie przez eupago mlodszej niz 3 miesiace (c.euBlok).
     function euBrakIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.euBlok) out.push(i); });
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.euBlok) out.push(i); });
         return out;
     }
     // Request nieaktywny („Refund Deactivated") albo juz wykonany (stan inny niz „Refund approved").
     function stanBrakIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.stanBlok) out.push(i); });
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.stanBlok) out.push(i); });
         return out;
     }
     // Zwrot przelewem mimo wplaty karta/portfelem — nie blokuje na stale, pyta (wyjatek: karta wygasla).
     function metSoftIdx() {
         const out = [];
-        model.forEach((r, i) => { if (r.chk && r.chk.metSoft) out.push(i); });
+        model.forEach((r, i) => { if (wZak(r) && r.chk && r.chk.metSoft) out.push(i); });
         return out;
     }
     function blokIdx() {
-        const a = vatBrakIdx().concat(euBrakIdx(), stanBrakIdx(), openBrakIdx());
+        const a = vatBrakIdx().concat(euBrakIdx(), stanBrakIdx(), openBrakIdx(), mpBrakIdx(), juzBrakIdx());
         return a.filter((v, i) => a.indexOf(v) === i).sort((x, y) => x - y);
     }
     // Brak korekty VAT i zwrot przelewem przy mlodej wplacie eupago blokuja pobranie (decyzje
     // uzytkownika 21.10.2026); sprawdzenia, ktorego nie dalo sie zrobic, nie blokuje na stale — pyta.
     function vatGate() {
-        const brak = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), op = openBrakIdx(), trwa = [], nieczyt = [];
+        const brak = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), op = openBrakIdx(), mp = mpBrakIdx(), juz = juzBrakIdx(), trwa = [], nieczyt = [];
         model.forEach((r, i) => {
             const c = r.chk;
-            if (!c) return;
+            if (!c || !wZak(r)) return;
             if (c.pend) { trwa.push(i); return; }
             if (!c.vatNeed || c.vatOk === false) return;
             if (c.vatOk == null) nieczyt.push(i);
         });
         const lista = idx => idx.map(i => 'poz. ' + (i + 1) + ' (' + (model[i].e2e || '?') + ')').join(', ');
-        if (brak.length || eu.length || stn.length || op.length) {
+        if (brak.length || eu.length || stn.length || op.length || mp.length || juz.length) {
             alert('POBRANIE ZABLOKOWANE.\n\n'
+                + (juz.length ? 'Zwrot tej kwoty juz wykonany (request "Refund Done") - drugi przelew to podwojny zwrot: ' + lista(juz) + '\n\n' : '')
                 + (brak.length ? 'Zwrot VAT bez korekty (potrzebny dokument korekty od finansow oraz storno i zmiana stawki w systemie): ' + lista(brak) + '\n\n' : '')
                 + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lista(stn) + '\n\n' : '')
                 + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago (modul Zwroty), a nie przelewem z banku: ' + lista(eu) + '\n\n' : '')
                 + (op.length ? 'Open amount auftragu rozni sie od kwoty zwrotu (request na auftragu): ' + lista(op) + '\n\n' : '')
+                + (mp.length ? 'Zamowienie z marketplace - zdecyduj, czy przelew ma isc: ' + lista(mp) + '\n\n' : '')
                 + 'Usun te pozycje z listy (przycisk ✕ w ostatniej kolumnie albo przycisk w czerwonym pasku nad tabela) '
                 + 'i pobierz plik ponownie.'
                 + (brak.length ? '\n\nZwrot VAT bez korekty mozna tez dopuscic swiadomie: przycisk "Dopusc mimo braku korekty" przy pozycji albo w czerwonym pasku.' : '')
-                + (op.length ? '\n\nRoznice open amount mozna tez dopuscic swiadomie: przycisk "Dopusc mimo roznicy open amount" przy pozycji albo w czerwonym pasku.' : ''));
+                + (op.length ? '\n\nRoznice open amount mozna tez dopuscic swiadomie: przycisk "Dopusc mimo roznicy open amount" przy pozycji albo w czerwonym pasku.' : '')
+                + (mp.length ? '\n\nZamowienie z marketplace: gdy przelew ma isc - przycisk "Przelew ma isc (marketplace)" przy pozycji albo w czerwonym pasku; gdy nie - usun pozycje.' : '')
+                + (juz.length ? '\n\nWykonany juz zwrot mozna tez dopuscic swiadomie: przycisk "Dopusc: zwrot juz wykonany" przy pozycji albo w czerwonym pasku.' : ''));
             return false;
         }
         if (trwa.length) { alert('Trwa sprawdzanie w prologistics: ' + lista(trwa) + '.\n\nPoczekaj chwile i pobierz plik ponownie.'); return false; }
@@ -12431,27 +12792,365 @@
     function updateVatBan() {
         const el = document.getElementById('sepa-vatban');
         if (!el) return;
-        const vat = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), op = openBrakIdx(), idx = blokIdx();
+        const vat = vatBrakIdx(), eu = euBrakIdx(), stn = stanBrakIdx(), op = openBrakIdx(), mp = mpBrakIdx(), juz = juzBrakIdx(), idx = blokIdx();
         if (!idx.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
         const lst = a => a.map(i => 'poz. ' + (i + 1) + ' (' + esc(model[i].e2e || '?') + ')').join(', ');
         el.style.display = 'block';
         el.innerHTML = '<b>Pobranie pliku zablokowane.</b> '
+            + (juz.length ? 'Zwrot tej kwoty juz wykonany (request "Refund Done"): ' + lst(juz) + '. ' : '')
             + (vat.length ? 'Zwrot VAT bez korekty (potrzebny dokument korekty od finansow oraz storno i zmiana stawki w systemie): ' + lst(vat) + '. ' : '')
             + (stn.length ? 'Request nieaktywny albo juz wykonany (stan inny niz "Refund approved"): ' + lst(stn) + '. ' : '')
             + (eu.length ? 'Wplata przez eupago mlodsza niz ' + CHK_EU_MIES + ' miesiace - zwrot ma isc przez eupago, nie przelewem: ' + lst(eu) + '. ' : '')
             + (op.length ? 'Open amount auftragu rozni sie od kwoty zwrotu (request na auftragu): ' + lst(op) + '. ' : '')
+            + (mp.length ? 'Zamowienie z marketplace - zdecyduj, czy przelew ma isc: ' + lst(mp) + '. ' : '')
             + 'Usun te pozycje z listy (✕) i pobierz plik ponownie. '
             + '<button id="sepa-vatdel" style="margin-left:6px;padding:3px 9px;border:1px solid #b91c1c;background:#b91c1c;color:#fff;border-radius:5px;cursor:pointer;font:600 12px system-ui">Usun te pozycje (' + idx.length + ')</button>'
             + (vat.length ? ' <button id="sepa-vatdop" title="Zwrot VAT bez dokumentu korekty od finansow — swiadoma decyzja; jedno okno wymienia kazda pozycje i to, czego brakuje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Dopusc zwroty VAT mimo braku korekty (' + vat.length + ')</button>' : '')
-            + (op.length ? ' <button id="sepa-opendop" title="Open amount auftragu rozni sie od kwoty zwrotu — swiadoma decyzja; jedno okno wymienia kazda pozycje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Dopusc mimo roznicy open amount (' + op.length + ')</button>' : '');
+            + (op.length ? ' <button id="sepa-opendop" title="Open amount auftragu rozni sie od kwoty zwrotu — swiadoma decyzja; jedno okno wymienia kazda pozycje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Dopusc mimo roznicy open amount (' + op.length + ')</button>' : '')
+            + (mp.length ? ' <button id="sepa-mpdop" title="Zamowienie z marketplace, zwrot przelewem — swiadoma decyzja; jedno okno wymienia kazda pozycje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Przelew ma isc (marketplace) (' + mp.length + ')</button>' : '')
+            + (juz.length ? ' <button id="sepa-juzdop" title="Request tej kwoty ma juz stan Refund Done — swiadoma decyzja; jedno okno wymienia kazda pozycje" style="margin-left:6px;padding:3px 9px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 12px system-ui">Dopusc: zwrot juz wykonany (' + juz.length + ')</button>' : '');
         el.querySelector('#sepa-vatdel').onclick = () => {
-            if (!confirm('Usunac z listy ' + idx.length + ' poz. (zwrot VAT bez korekty, wplata przez eupago albo roznica open amount)?')) return;
+            if (!confirm('Usunac z listy ' + idx.length + ' poz. zablokowanych (wymienione w czerwonym pasku)?')) return;
             idx.slice().reverse().forEach(i => deleteRow(i));
         };
         const bd = el.querySelector('#sepa-vatdop');
         if (bd) bd.onclick = () => vatDopusc(vat.slice());
         const bo = el.querySelector('#sepa-opendop');
         if (bo) bo.onclick = () => openDopusc(op.slice());
+        const bm = el.querySelector('#sepa-mpdop');
+        if (bm) bm.onclick = () => mpDopusc(mp.slice());
+        const bj = el.querySelector('#sepa-juzdop');
+        if (bj) bj.onclick = () => juzDopusc(juz.slice());
+    }
+
+    // ---------- Tryby: Wprowadzanie (lista + eksport z prologistics) i Sprawdzanie (plik + Book) ----------
+    // Proces zespolu (18.11.2026): osoba 1 na stronie Import payments filtruje Type=Refund, Booking status=Refund
+    // approved i bank, zaznacza wiersze, wybiera z listy „--” eksport banku (DE Refunds, EU refunds, CZ domestic
+    // refunds, HU domestic refunds) i klika Export — wychodzi plik dla banku. Osoba 2 sprawdza i klika
+    // „Book Refunds/Orders”, co ksieguje zwrot w tickecie albo auftragu (tam, gdzie jest request).
+    //  - lista:   GET /api/importPayments/?...&type=Refund&booking_status=Refund%20approved&bank_name=<id>
+    //             (zaobserwowane 18.11.2026, 200; wiersz: file_id = Import ID requestu, filename = ["auftrag","3"(,ticket)],
+    //             requested_refund_amount z waluta, auftrag_open_amount; per_page 500);
+    //  - eksport: GET /api/mappingSettings/procedure/export?id=<ustawienie>&type_setting=refund_payment_export
+    //             &import_payments_ids[]=..&mode=file (zaobserwowane 18.11.2026 kliknieciem Export, 200, plik w
+    //             Content-Disposition; NIC nie zmienia na liscie — te same wiersze i czasy po eksporcie);
+    //  - Book:    POST /api/importPayments/bookRecords/ z import_payments_ids i booking_date (pola z kodu strony).
+    let tryb = 'wpr';          // 'wpr' | 'spr'
+    try { if (localStorage.getItem('sepa_tryb') === 'spr') tryb = 'spr'; } catch (e) {}
+    let spBank = null;         // element SP_BANKI
+    let spLst = null;          // { bank, st: 'load'|'ok'|'err', rows, n, wiecej, czas, err, brakWPliku }
+    let spGen = 0;             // numer pobrania listy: odpowiedz starszego jest porzucana
+    let spStatus = '';         // postep trybu Wprowadzanie (pobieram liste / eksport)
+    let spBook = null;         // { kiedy, ids, data, st: 'wysylam'|'ok'|'err', wynik, zostalo } — Book wyslany dla TEGO pliku
+    let spData = '';           // data ksiegowania Book (RRRR-MM-DD), domyslnie dzis
+    let spHtmlOst = '';        // ostatnio narysowany panel listy (bez zmian = bez przerysowania, nie zamyka kalendarza)
+
+    function spDzis() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+    function spGodz() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+    // Waluta kwoty z listy Import payments: „662.39 Kč”, „42,834.00 Ft”, „119.00 €”.
+    function spCcy(s) {
+        const t = String(s == null ? '' : s);
+        if (/Kč/.test(t)) return 'CZK';
+        if (/Ft\s*$/.test(t)) return 'HUF';
+        if (/zł/.test(t)) return 'PLN';
+        return ccyOf(t);
+    }
+    async function spPobierzListe(bank) {
+        const txt = await chkFetch('/api/importPayments/?booking_method=manual&date_type=import_date&inactive=0&page=1&type=Refund&booking_status=Refund%20approved&bank_name=' + encodeURIComponent(bank.id));
+        let j = null;
+        try { j = JSON.parse(txt); } catch (e) { throw new Error('lista Import payments nie przyszla jako JSON (sesja wygasla? zaloguj sie w prologistics)'); }
+        if (!j || !Array.isArray(j.parsing_list)) throw new Error('w odpowiedzi listy Import payments nie ma "parsing_list"');
+        const pg = j.log_pagination || {};
+        const rows = j.parsing_list.filter(x => String(x.bank_id) === String(bank.id) && /^refund$/i.test(String(x.type || ''))).map(x => {
+            let f = [];
+            try { f = JSON.parse(x.filename || '[]'); } catch (e) { f = []; }
+            if (!Array.isArray(f)) f = [];
+            return { fid: String(x.file_id), auf: f[0] != null ? String(f[0]) : '', tix: f[2] != null ? String(f[2]) : '', kw: numOf(x.requested_refund_amount),
+                     ccy: spCcy(x.requested_refund_amount), open: numOf(x.auftrag_open_amount), kto: x.user || '', kiedy: x.import_datetime_from || '' };
+        });
+        const n = +pg.total_count || rows.length;
+        return { rows: rows, n: n, wiecej: !!j.limitExceeded || (+pg.total_pages || 1) > 1 || n > j.parsing_list.length };
+    }
+    async function spEksport(bank, ids) {
+        // Kolejnosc rosnaca — tak wysyla strona (zaznaczenia trzyma w obiekcie kluczowanym numerem).
+        const q = 'id=' + encodeURIComponent(bank.ms) + '&type_setting=refund_payment_export'
+            + ids.slice().sort((a, b) => +a - +b).map(x => '&import_payments_ids%5B%5D=' + encodeURIComponent(x)).join('') + '&mode=file';
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), CHK_TIMEOUT);
+        try {
+            const res = await fetch('/api/mappingSettings/procedure/export?' + q, { credentials: 'same-origin', cache: 'no-store', signal: ctl.signal });
+            const text = await res.text();
+            if (!res.ok) throw new Error('HTTP ' + res.status + (text ? ': ' + nsp(text).slice(0, 160) : ''));
+            const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(res.headers.get('content-disposition') || '');
+            // Bez pliku w odpowiedzi to zwykle JSON z bledem albo strona logowania.
+            if (!m) throw new Error('eksport nie oddal pliku' + (text ? ': ' + nsp(text).slice(0, 160) : ' (pusta odpowiedz)'));
+            let nm = m[1].trim();
+            try { nm = decodeURIComponent(nm); } catch (e) {}
+            return { name: nm, text: text };
+        } catch (e) {
+            throw new Error(e && e.name === 'AbortError' ? 'brak odpowiedzi eksportu w ' + (CHK_TIMEOUT / 1000) + ' s' : ((e && e.message) || String(e)));
+        } finally { clearTimeout(to); }
+    }
+    function spWyczyscPlik() {
+        model = []; xmlDoc = null; abo = null; fmt = 'xml'; spBook = null;
+        chkReset();
+        const c = document.getElementById('sepa-content');
+        if (c) c.innerHTML = '';
+        tbody = null; summaryEl = null;
+    }
+    // Wprowadzanie: bank -> lista „Refund approved” -> eksport wszystkich jej pozycji -> sprawdzenie pliku.
+    async function spWprowadz(bank) {
+        const gen = ++spGen;
+        spBank = bank;
+        spWyczyscPlik();
+        spLst = { bank: bank, st: 'load', rows: [] };
+        spStatus = 'Pobieram liste "Refund approved" dla ' + bank.nm + '...';
+        spRysujListe();
+        try {
+            const L = await spPobierzListe(bank);
+            if (gen !== spGen) return;
+            spLst = Object.assign({ bank: bank, st: 'ok', czas: spGodz() }, L);
+            if (!L.rows.length) { spStatus = 'Brak zwrotow "Refund approved" dla ' + bank.nm + ' - nie ma czego eksportowac.'; spRysujListe(); return; }
+            spStatus = 'Eksport "' + bank.msNm + '" (' + L.rows.length + ' poz.)...';
+            spRysujListe();
+            const f = await spEksport(bank, L.rows.map(x => x.fid));
+            if (gen !== spGen) return;
+            fileName = f.name;   // plik dla banku pod nazwa z prologistics (np. DomesticRefundsCzech_2026-11-18.KPC)
+            spStatus = '';
+            loadText(f.text);
+            spRysujListe();
+        } catch (e) {
+            if (gen !== spGen) return;
+            spStatus = '';
+            spLst = { bank: bank, st: 'err', rows: [], err: (e && e.message) || String(e) };
+            spRysujListe();
+        }
+    }
+    // Sprawdzanie: bank rozpoznany z konta obciazanego w pliku (koncowka, SP_BANKI.dbt); da sie zmienic recznie.
+    function spWykryjBank() {
+        let dbt = '';
+        if (fmt === 'abo' && abo) { const g = abo.lines.filter(l => l.t === 'g')[0]; if (g) dbt = (g.pre ? g.pre + '-' : '') + g.num; }
+        else if (xmlDoc) { const a = first(xmlDoc, 'DbtrAcct'); dbt = cleanupIban(a ? txt(a, 'IBAN') : ''); }
+        return SP_BANKI.filter(b => dbt && b.dbt.test(dbt))[0] || null;
+    }
+    async function spOdswiezListe() {
+        if (!spBank) { spLst = null; spRysujListe(); return; }
+        const gen = ++spGen, bank = spBank;
+        spLst = { bank: bank, st: 'load', rows: [] };
+        spRysujListe();
+        try {
+            const L = await spPobierzListe(bank);
+            if (gen !== spGen) return;
+            spLst = Object.assign({ bank: bank, st: 'ok', czas: spGodz() }, L);
+        } catch (e) {
+            if (gen !== spGen) return;
+            spLst = { bank: bank, st: 'err', rows: [], err: (e && e.message) || String(e) };
+        }
+        chkEval(); refreshRows();
+        spRysujListe();
+    }
+    function spPoWczytaniu() {
+        spBook = null;
+        if (tryb !== 'spr') return;
+        spBank = spWykryjBank();
+        spOdswiezListe();
+    }
+    // Pozycja pliku <-> wiersz listy „Refund approved”: najpierw po Import ID requestu, ktory znalazlo sprawdzenie
+    // (c.rqId), potem po numerze auftragu/ticketu z E2E i tytulu ORAZ kwocie. Kazdy wiersz listy najwyzej raz.
+    function spDopasuj() {
+        model.forEach(r => { if (r.chk) r.chk.lst = null; });
+        if (!spLst || spLst.st !== 'ok') return;
+        const zaj = new Set();
+        model.forEach(r => {
+            const c = r.chk; if (!c || !c.rqId) return;
+            const x = spLst.rows.find(w => w.fid === String(c.rqId) && !zaj.has(w));
+            if (x) { c.lst = x; zaj.add(x); }
+        });
+        model.forEach(r => {
+            const c = r.chk; if (!c || c.lst || c.pend) return;
+            const kw = centsOf(r.amt), refs = refsOf(r.e2e, r.ustrd).map(f => f.n);
+            if (isNaN(kw)) return;
+            const x = spLst.rows.find(w => !zaj.has(w) && (refs.indexOf(w.auf) >= 0 || (w.tix && refs.indexOf(w.tix) >= 0)) && Math.round(w.kw * 100) === kw);
+            if (x) { c.lst = x; zaj.add(x); }
+        });
+        spLst.brakWPliku = spLst.rows.filter(w => !zaj.has(w));
+        const bn = spLst.bank.nm;
+        model.forEach(r => {
+            const c = r.chk; if (!c || c.pend) return;
+            if (c.lst) c.notes.push(['i', 'na liscie "Refund approved" banku ' + bn + ' (Import ID ' + c.lst.fid + ')']);
+            else c.notes.push(['w', 'pozycji NIE MA na liscie "Refund approved" banku ' + bn + ' w Import payments - Book jej nie zaksieguje (request juz zaksiegowany, zmieniony albo z innego banku?)']);
+            const rk = { e: 0, w: 1, ok: 2, i: 3 };
+            c.notes.sort((a, b) => rk[a[0]] - rk[b[0]]);
+        });
+    }
+    // Czy Book wolno wyslac: lista wczytana, sprawdzenie skonczone, zadnej blokady ani bledu; zwraca ids i powody.
+    function spBookStan() {
+        const pow = [], miekkie = [];
+        if (!model.length) pow.push('brak pliku');
+        if (!spLst || spLst.st !== 'ok') pow.push('lista "Refund approved" nie jest wczytana');
+        const pend = model.filter(r => wZak(r) && r.chk && r.chk.pend).length;
+        if (pend) pow.push('trwa sprawdzanie w prologistics (' + pend + ' poz.)');
+        const bl = blokIdx();
+        if (bl.length) pow.push('pozycje zablokowane (czerwony pasek): ' + bl.map(i => i + 1).join(', '));
+        const zle = [];
+        model.forEach((r, i) => {
+            if (!wZak(r)) return;
+            const c = r.chk;
+            let e = (c ? c.notes.filter(n => n[0] === 'e') : []).length;
+            if (c && c.metSoft) { e--; miekkie.push(i + 1); }
+            if (r.errs.length || e > 0) zle.push(i + 1);
+        });
+        if (zle.length) pow.push('pozycje z bledem (✗): ' + zle.join(', ') + ' - popraw albo usun je z pliku');
+        const ids = model.filter(r => wZak(r) && r.chk && r.chk.lst).map(r => r.chk.lst.fid);
+        if (!ids.length && model.length && spLst && spLst.st === 'ok') pow.push('zadna pozycja pliku nie stoi na liscie "Refund approved"');
+        if (spBook) pow.push('Book wyslany o ' + spBook.kiedy + ' - nie ponawiam w tym przebiegu (wczytaj plik od nowa)');
+        const zak = zakres();
+        return { ids: ids, pow: pow, miekkie: miekkie, poza: zak.filter(r => !(r.chk && r.chk.lst)).length, czesc: zak.length < model.length ? zak.length : 0 };
+    }
+    // Ksztalt Book z kodu strony (bookRecords({ import_payments_ids, booking_date })); cialo jak w pozostalych
+    // zapisach /api/importPayments/ w HUB-ie (formularz, tablica jako name[]).
+    async function spBookWyslij(ids, data) {
+        const body = ids.map(x => 'import_payments_ids%5B%5D=' + encodeURIComponent(x)).join('&') + '&booking_date=' + encodeURIComponent(data);
+        const res = await fetch('/api/importPayments/bookRecords/', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': '*/*' },
+            body: body });
+        const text = await res.text();
+        if (!res.ok) throw new Error('HTTP ' + res.status + (text ? ': ' + nsp(text).slice(0, 200) : ''));
+        return text;
+    }
+    async function spBookKlik() {
+        const S = spBookStan();
+        if (S.pow.length) { alert('Book Refunds/Orders - nie teraz:\n\n- ' + S.pow.join('\n- ')); return; }
+        const data = spData || spDzis();
+        if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(data)) { alert('Podaj date ksiegowania (RRRR-MM-DD).'); return; }
+        // Lista jest z chwili wczytania pliku — przed zapisem czytamy ja na swiezo. Pozycja, ktorej juz nie ma
+        // (ktos zaksiegowal albo zmienil request), zatrzymuje Book: drugi Book tego samego zwrotu to dubel.
+        let L0;
+        try { L0 = await spPobierzListe(spLst.bank); }
+        catch (e) { alert('Nie odczytalem listy "Refund approved" przed Book: ' + ((e && e.message) || e) + '\n\nNic nie wyslalem.'); return; }
+        const swieze = new Set(L0.rows.map(x => x.fid));
+        const znikly = S.ids.filter(x => !swieze.has(x));
+        if (znikly.length) {
+            spLst = Object.assign({ bank: spLst.bank, st: 'ok', czas: spGodz() }, L0);
+            chkEval(); refreshRows(); spRysujListe();
+            alert('Od wczytania pliku z listy "Refund approved" zniknely: Import ID ' + znikly.join(', ') + ' - ktos je juz zaksiegowal albo zmienil request.\n\n'
+                + 'Nic nie wyslalem. Sprawdz te pozycje w Import payments (lista jest juz odswiezona) i wczytaj plik od nowa.');
+            return;
+        }
+        const wiersze = model.filter(r => wZak(r) && r.chk && r.chk.lst);
+        const sumy = {};
+        wiersze.forEach(r => { const k = r.ccy || '?'; sumy[k] = (sumy[k] || 0) + (centsOf(r.amt) || 0); });
+        if (!confirm('BOOK REFUNDS/ORDERS - ' + spLst.bank.nm + '\n\n'
+            + 'Zaksiegowac ' + S.ids.length + ' zwrot(ow) z data ' + data + ' (suma ' + Object.keys(sumy).map(k => fmt2(sumy[k]) + ' ' + k).join(', ') + ')?\n'
+            + 'Prologistics zaksieguje kazdy w tickecie albo auftragu, na ktorym jest request - jak przycisk "Book Refunds/Orders" w Import payments.\n\n'
+            + (S.czesc ? 'Tylko ZAZNACZONE pozycje pliku: ' + S.czesc + ' z ' + model.length + '.\n' : '')
+            + (S.poza ? 'Pozycji pliku spoza listy "Refund approved" (' + S.poza + ') NIE ksieguje.\n' : '')
+            + (S.miekkie.length ? 'UWAGA: poz. ' + S.miekkie.join(', ') + ' - wplata pierwotna karta/portfelem, a zwrot przelewem.\n' : '')
+            + (data !== spDzis() ? 'UWAGA: data inna niz dzisiejsza - strona Import payments pilnuje zakresu dozwolonych dat, HUB go nie zna.\n' : '')
+            + '\nTo ZAPIS w prologistics. Ksiegowac?')) return;
+        spBook = { kiedy: spGodz(), ids: S.ids.slice(), data: data, st: 'wysylam' };
+        spRysujListe();
+        try {
+            const odp = await spBookWyslij(S.ids, data);
+            spBook.st = 'ok';
+            spBook.wynik = nsp(odp).slice(0, 300);
+        } catch (e) {
+            spBook.st = 'err';
+            spBook.wynik = (e && e.message) || String(e);
+        }
+        // Wynik czytamy z listy na swiezo (policz przed i po), a nie z odpowiedzi: zaksiegowany zwrot znika z „Refund approved”.
+        // Pozycji, ktore zostaly, NIE ponawiamy w tym przebiegu (zapis bez widocznego wyniku -> ryzyko dubla).
+        try {
+            const L = await spPobierzListe(spLst.bank);
+            const zost = new Set(L.rows.map(x => x.fid));
+            spBook.zostalo = spBook.ids.filter(x => zost.has(x));
+            spLst = Object.assign({ bank: spLst.bank, st: 'ok', czas: spGodz() }, L);
+        } catch (e) { spBook.zostalo = null; spBook.listaErr = (e && e.message) || String(e); }
+        spRysujListe();
+    }
+    // Panel nad tabela: bank, lista „Refund approved”, czego brakuje w pliku i (Sprawdzanie) Book.
+    function spRysujListe() {
+        const el = document.getElementById('sepa-lista');
+        if (!el) return;
+        const wpr = tryb === 'wpr';
+        const p = [];
+        const L = spLst;
+        if (!wpr) {
+            p.push('<div><b>Bank name:</b> <select id="sepa-bank"><option value="">— wybierz —</option>'
+                + SP_BANKI.map(b => '<option value="' + b.id + '"' + (spBank && spBank.id === b.id ? ' selected' : '') + '>' + esc(b.nm) + '</option>').join('')
+                + '</select>' + (model.length ? (spBank && spBank === spWykryjBank() ? ' <span style="color:#64748b">(rozpoznany po koncie obciazanym w pliku)</span>'
+                : (spBank ? '' : ' <span style="color:#b45309">nie rozpoznalem banku po koncie obciazanym - wybierz go</span>')) : '') + '</div>');
+        }
+        if (spStatus) p.push('<div style="color:#334155">⏳ ' + esc(spStatus) + '</div>');
+        if (L && L.st === 'load' && !spStatus) p.push('<div style="color:#334155">⏳ Pobieram liste "Refund approved" dla ' + esc(L.bank.nm) + '...</div>');
+        if (L && L.st === 'err') p.push('<div style="color:#b91c1c">✗ ' + esc(L.bank.nm) + ': ' + esc(L.err) + ' <button type="button" id="sepa-lst-re">↻ sprobuj ponownie</button></div>');
+        if (L && L.st === 'ok') {
+            const sumy = {};
+            L.rows.forEach(w => { sumy[w.ccy || '?'] = (sumy[w.ccy || '?'] || 0) + Math.round((isNaN(w.kw) ? 0 : w.kw) * 100); });
+            p.push('<div>Lista <b>"Refund approved"</b> w Import payments - <b>' + esc(L.bank.nm) + '</b>: <b>' + L.rows.length + '</b> poz.'
+                + (L.rows.length ? ', suma ' + Object.keys(sumy).map(k => fmt2(sumy[k]) + ' ' + esc(k)).join(', ') : '')
+                + ' <span style="color:#64748b">(pobrana ' + esc(L.czas || '') + (wpr ? ', eksport "' + esc(L.bank.msNm) + '"' : '') + ')</span>'
+                + ' <a href="/react/settings_page/import_payments/?booking_method=manual&date_type=import_date&inactive=0&page=1&type=Refund&booking_status=Refund%20approved&bank_name=' + esc(L.bank.id) + '" target="_blank" rel="noopener">↗ Import payments</a>'
+                + ' <button type="button" id="sepa-lst-re">↻ odswiez liste</button></div>');
+            if (L.wiecej) p.push('<div style="color:#b91c1c">✗ Lista ma wiecej pozycji (' + L.n + ') niz jedna strona (500) - HUB widzi tylko pierwsza strone.</div>');
+            const brak = model.length ? (L.brakWPliku || []) : [];
+            if (brak.length) p.push('<div style="color:#b45309">▲ Na liscie, a NIE MA ich w pliku (' + brak.length + '): '
+                + brak.map(w => 'Import ID ' + esc(w.fid) + ' (' + (w.auf ? '<a href="/auction.php?number=' + esc(w.auf) + '&txnid=3" target="_blank" rel="noopener">' + esc(w.auf) + '</a>' : '?')
+                    + (w.tix ? ', ticket <a href="/rma.php?rma_id=' + esc(w.tix) + '" target="_blank" rel="noopener">' + esc(w.tix) + '</a>' : '') + ', '
+                    + (isNaN(w.kw) ? '?' : w.kw.toFixed(2)) + ' ' + esc(w.ccy) + ')').join('; ')
+                + (wpr ? ' - eksport ich nie objal' : ' - zostaja na liscie, Book ich nie ruszy') + '</div>');
+        }
+        if (!wpr && model.length) {
+            const S = spBookStan();
+            if (!spBook) {
+                p.push('<div style="margin-top:6px;padding-top:6px;border-top:1px solid #e2e8f0"><b>Book Refunds/Orders</b> - data ksiegowania '
+                    + '<input type="date" id="sepa-bkdata" value="' + esc(spData || spDzis()) + '" style="font:12px system-ui;padding:1px 4px"> '
+                    + '<button type="button" id="sepa-book"' + (S.pow.length ? ' disabled' : '') + ' style="padding:4px 10px;border:1px solid #15803d;background:' + (S.pow.length ? '#e5e7eb;color:#64748b' : '#15803d;color:#fff') + ';border-radius:6px;font:600 12px system-ui;cursor:' + (S.pow.length ? 'not-allowed' : 'pointer') + '">📗 Book Refunds/Orders (' + S.ids.length + ' poz.)</button>'
+                    + (S.pow.length ? '<div style="color:#64748b;margin-top:3px">Jeszcze nie: ' + S.pow.map(esc).join('; ') + '</div>' : '') + '</div>');
+            } else {
+                const B = spBook;
+                p.push('<div style="margin-top:6px;padding-top:6px;border-top:1px solid #e2e8f0"><b>Book Refunds/Orders</b> wyslany o ' + esc(B.kiedy) + ' (' + B.ids.length + ' poz., data ' + esc(B.data) + '): '
+                    + (B.st === 'wysylam' ? '⏳ czekam na odpowiedz...'
+                        : (B.st === 'err' ? '<span style="color:#b91c1c">✗ ' + esc(B.wynik) + '</span>' : '<span style="color:#334155">odpowiedz: ' + esc(B.wynik || '(pusta)') + '</span>'))
+                    + (B.zostalo ? (B.zostalo.length
+                        ? '<div style="color:#b91c1c">✗ Nadal na liscie "Refund approved" (' + B.zostalo.length + '): Import ID ' + B.zostalo.map(esc).join(', ') + ' - sprawdz w Import payments; HUB NIE ponawia.</div>'
+                        : '<div style="color:#15803d">✓ Wszystkie ' + B.ids.length + ' zniknely z listy "Refund approved" - zaksiegowane.</div>') : '')
+                    + (B.listaErr ? '<div style="color:#b45309">▲ Nie odczytalem listy po Book: ' + esc(B.listaErr) + ' - sprawdz w Import payments.</div>' : '')
+                    + '</div>');
+            }
+        }
+        const html = p.join('');
+        el.style.display = html ? 'block' : 'none';
+        if (html === spHtmlOst) return;
+        spHtmlOst = html;
+        el.innerHTML = html;
+        const sel = el.querySelector('#sepa-bank');
+        if (sel) sel.onchange = () => { spBank = SP_BANKI.filter(b => b.id === sel.value)[0] || null; spBook = null; spOdswiezListe(); };
+        const re = el.querySelector('#sepa-lst-re');
+        if (re) re.onclick = () => { if (wpr && spBank) spWprowadz(spBank); else spOdswiezListe(); };
+        const bd = el.querySelector('#sepa-bkdata');
+        if (bd) bd.onchange = () => { spData = bd.value; spRysujListe(); };
+        const bk = el.querySelector('#sepa-book');
+        if (bk) bk.onclick = spBookKlik;
+    }
+    function spUstawTryb(t) {
+        if (t === tryb) return;
+        if (model.length && !confirm('Przelaczyc na "' + (t === 'wpr' ? 'Wprowadzanie' : 'Sprawdzanie') + '"? Wczytany plik i zmiany w nim znikna z ekranu.')) return;
+        tryb = t;
+        try { localStorage.setItem('sepa_tryb', t); } catch (e) {}
+        spGen++; spBank = null; spLst = null; spStatus = ''; spBook = null;
+        spWyczyscPlik();
+        spPokazTryb();
+        spRysujListe();
+    }
+    function spPokazTryb() {
+        if (!panel) return;
+        panel.querySelectorAll('.sepa-tab').forEach(b => b.classList.toggle('on', b.getAttribute('data-t') === tryb));
+        const w = panel.querySelector('#sepa-wpr'), d = panel.querySelector('#sepa-drop');
+        if (w) w.style.display = tryb === 'wpr' ? 'block' : 'none';
+        if (d) d.style.display = tryb === 'spr' ? 'block' : 'none';
+        panel.querySelectorAll('.sepa-bk').forEach(b => b.classList.toggle('on', !!spBank && b.getAttribute('data-b') === spBank.id));
     }
 
     // ---------- Zapis do XML + pobranie ----------
@@ -12475,10 +13174,11 @@
     // sa), CtrlSum juz nie (bo nie ma czego dodac) — plik wychodzi wewnetrznie sprzeczny
     // i bank go odrzuca. Sama funkcja tego nie naprawi; ma o tym POWIEDZIEC, zanim plik
     // pojdzie dalej. Patrz download().
-    function recomputeSums() {
+    function recomputeSums(dok) {
+        dok = dok || xmlDoc;
         // per PmtInf
         let grpCents = 0, grpN = 0, zle = 0;
-        Array.from(q(xmlDoc, 'PmtInf')).forEach(pmt => {
+        Array.from(q(dok, 'PmtInf')).forEach(pmt => {
             let cents = 0, n = 0;
             Array.from(q(pmt, 'CdtTrfTxInf')).forEach(tx => {
                 const a = first(tx, 'InstdAmt');
@@ -12490,7 +13190,7 @@
             const nb = first(pmt, 'NbOfTxs'); if (nb) nb.textContent = String(n);
             grpCents += cents; grpN += n;
         });
-        const gh = first(xmlDoc, 'GrpHdr');
+        const gh = first(dok, 'GrpHdr');
         if (gh) {
             const cs = first(gh, 'CtrlSum'); if (cs) cs.textContent = fmt2(grpCents);
             const nb = first(gh, 'NbOfTxs'); if (nb) nb.textContent = String(grpN);
@@ -12500,9 +13200,37 @@
     function download() {
         if (!vatGate()) return;   // zwrot VAT bez korekty (storno + zmiana stawki) nie wychodzi do banku
         // Dopuszczone swiadomie pozycje nie blokuja, ale plik ma o nich przypominac (decyzja zyje tylko na ekranie).
-        const nDop = model.filter(r => r.chk && r.chk.vatDop).length;
+        const nDop = model.filter(r => wZak(r) && r.chk && r.chk.vatDop).length;
         if (nDop) toast('Plik zawiera ' + nDop + ' poz. dopuszczonych mimo braku korekty VAT');
-        const st = writeModelToDoc() || { zle: 0 };
+        const nMp = model.filter(r => wZak(r) && r.chk && r.chk.mpDop).length;
+        if (nMp) toast('Plik zawiera ' + nMp + ' poz. z zamowien z marketplace (przelew z Twojej decyzji)');
+        const zak = zakres(), czesc = zak.length < model.length;
+        if (!zak.length) { alert('Brak pozycji do pliku.'); return; }
+        if (czesc) {
+            const sz = {};
+            zak.forEach(r => { const k = String(r.ccy || '?').toUpperCase(); sz[k] = (sz[k] || 0) + (centsOf(r.amt) || 0); });
+            if (!confirm('Plik TYLKO z zaznaczonych pozycji: ' + zak.length + ' z ' + model.length + ' (suma ' + Object.keys(sz).map(k => fmt2(sz[k]) + ' ' + k).join(', ') + ').\n\n'
+                + 'Pozostale ' + (model.length - zak.length) + ' poz. NIE trafia do pliku. Pobrac?')) return;
+        }
+        if (fmt === 'abo') {
+            // ABO: suma grupy przeliczona z pozycji; konto albo kwota nie do odczytania trafia doslownie i bank odrzuci plik.
+            const w = aboWrite(czesc ? new Set(zak) : null);
+            if (w.zle && !confirm('Uwaga: ' + w.zle + ' poz. ma konto albo kwote, ktorych nie da sie zapisac w ABO.\n\n'
+                + 'Trafia do pliku doslownie, a suma grupy ich nie obejmuje - bank odrzuci plik.\n\nPobrac mimo to?')) return;
+            zapiszPlik(w.text, 'text/plain');
+            return;
+        }
+        let st = writeModelToDoc() || { zle: 0 }, dok = xmlDoc;
+        if (czesc) {
+            // Kopia dokumentu bez niezaznaczonych transakcji (puste PmtInf wypadaja), sumy przeliczone na kopii —
+            // wczytany plik na ekranie zostaje caly. Transakcje kopii i oryginalu ida w tej samej kolejnosci.
+            const wsz = Array.from(q(xmlDoc, 'CdtTrfTxInf'));
+            const zostaw = new Set(zak.map(r => wsz.indexOf(r.nodes.tx)));
+            dok = xmlDoc.cloneNode(true);
+            Array.from(q(dok, 'CdtTrfTxInf')).forEach((tx, j) => { if (!zostaw.has(j) && tx.parentNode) tx.parentNode.removeChild(tx); });
+            Array.from(q(dok, 'PmtInf')).forEach(p => { if (!q(p, 'CdtTrfTxInf').length && p.parentNode) p.parentNode.removeChild(p); });
+            st = recomputeSums(dok);
+        }
         // Kwota nie do odczytania trafia do pliku doslownie, a do CtrlSum juz nie —
         // NbOfTxs liczy taka transakcje, suma jej nie obejmuje. Taki plik bank odrzuci.
         // Nie blokujemy pobrania (modul nigdzie nie blokuje), ale nie wypuszczamy go
@@ -12510,8 +13238,10 @@
         if (st.zle && !confirm('Uwaga: ' + st.zle + ' poz. ma kwote, ktorej nie da sie odczytac.\n\n'
             + 'Trafia do pliku bez zmian, ale NIE wchodza do CtrlSum, a NbOfTxs je liczy — '
             + 'plik bedzie wewnetrznie sprzeczny i bank go odrzuci.\n\nPobrac mimo to?')) return;
-        const xml = new XMLSerializer().serializeToString(xmlDoc);
-        const blob = new Blob([xml], { type: 'application/xml' });
+        zapiszPlik(new XMLSerializer().serializeToString(dok), 'application/xml');
+    }
+    function zapiszPlik(tresc, typ) {
+        const blob = new Blob([tresc], { type: typ });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = fileName;
@@ -12523,7 +13253,15 @@
     function applyFixSelected() {
         let fixed = 0, left = 0, zbud = 0;
         model.forEach(r => {
-            if (!r.sel) return;
+            if (!wZak(r)) return;
+            if (r.fmt === 'abo') {
+                // ABO: ujednolicenie zapisu krajowego (spacje, zera wiodace, IBAN CZ -> „pre-num/bank”); bledu mod 11 nie naprawi nic.
+                const k = czKlucz(r.iban);
+                if (k && k !== r.iban) { r.iban = k; fixed++; }
+                const p = k ? czParse(k) : null;
+                if (!p || czKontoBledy(p.pre, p.num, p.bank).length) left++;
+                return;
+            }
             const res = resolveIban(r.iban, r.debtorCc);
             if ((res.kind === 'format' || res.kind === 'prefix') && res.value && r.iban !== res.value) {
                 r.iban = res.value; fixed++;
@@ -12540,16 +13278,16 @@
     function applyTranslit() {
         let n = 0;
         model.forEach(r => {
-            if (r.sel) {
-                if (hasNonSepa(r.nm)) { r.nm = translit(r.nm); n++; }
-                if (hasNonSepa(r.ustrd)) { r.ustrd = translit(r.ustrd); n++; }
+            if (wZak(r)) {
+                if (hasNonSepaR(r, r.nm)) { r.nm = translitR(r, r.nm); n++; }
+                if (hasNonSepaR(r, r.ustrd)) { r.ustrd = translitR(r, r.ustrd); n++; }
             }
         });
         validateAll(); renderTable(); updateSummary();
         toast(`Transliterowano pol: ${n}.`);
     }
-    function selectErrors() { model.forEach(r => r.sel = r.errs.length > 0); renderTable(); }
-    function selectNone() { model.forEach(r => r.sel = false); renderTable(); }
+    function selectErrors() { model.forEach(r => r.sel = r.errs.length > 0); renderTable(); updateSummary(); }
+    function selectNone() { model.forEach(r => r.sel = false); renderTable(); updateSummary(); }
 
     // ---------- UI ----------
     let panel, tbody, summaryEl, toastEl;
@@ -12587,7 +13325,19 @@
         td.st .i{color:#64748b}
         td.st button.sepa-dop{margin:3px 0 1px;padding:2px 8px;border:1px solid #b45309;background:#fff;color:#92400e;border-radius:5px;cursor:pointer;font:600 11px system-ui}
         td.st button.sepa-dop.cof{border-color:#94a3b8;color:#475569}
+        td.st .sk span{display:inline}
+        td.st .sd{margin-top:3px;padding-top:3px;border-top:1px dashed #e2e8f0}
+        td.st a.sepa-roz{cursor:pointer;color:#0a58ca;font-size:11px;white-space:nowrap;text-decoration:none}
         #sepa-vatban{display:none;margin:8px 0;padding:8px 10px;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:6px;font-size:12px;line-height:1.5}
+        .sepa-tabs{display:flex;gap:6px;margin-bottom:10px}
+        .sepa-tab{padding:7px 14px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;font:600 13px system-ui;color:#334155}
+        .sepa-tab.on{background:#1e293b;color:#fff;border-color:#1e293b}
+        #sepa-wpr{border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;background:#f8fafc}
+        .sepa-bk{padding:7px 12px;margin:4px 6px 0 0;border:1px solid #0f766e;background:#fff;color:#0f766e;border-radius:6px;cursor:pointer;font:600 12px system-ui}
+        .sepa-bk.on{background:#0f766e;color:#fff}
+        .sepa-bk small{display:block;font-weight:400;opacity:.8}
+        #sepa-lista{display:none;margin:8px 0;padding:8px 10px;border:1px solid #cbd5e1;background:#f8fafc;border-radius:6px;font-size:12px;line-height:1.6}
+        #sepa-lista button{padding:2px 8px;border:1px solid #94a3b8;background:#fff;border-radius:5px;cursor:pointer;font:600 11px system-ui}
         .sepa-num{width:150px}
         #sepa-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:8px;z-index:2147483041;font:13px system-ui;display:none}
         `;
@@ -12605,19 +13355,28 @@
         ov.innerHTML = `
           <div id="sepa-panel">
             <div class="sepa-head">
-              <h2>€ Walidator SEPA (pain.001)</h2>
+              <h2>€ Walidator SEPA (pain.001 / ABO)</h2>
               <span style="font-size:11px;color:#64748b">HUB v${(typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?'}</span>
               <button class="sepa-x" title="Zamknij">×</button>
             </div>
             <div class="sepa-body">
+              <div class="sepa-tabs">
+                <button type="button" class="sepa-tab" data-t="wpr" title="Pobiera z Import payments zwroty Refund approved wybranego banku, robi eksport i sprawdza plik dla banku">📤 Wprowadzanie</button>
+                <button type="button" class="sepa-tab" data-t="spr" title="Sprawdza wgrany plik (XML, .HCT, .KPC) z lista Refund approved banku; potem Book Refunds/Orders">🔎 Sprawdzanie</button>
+              </div>
+              <div id="sepa-wpr">
+                <div><b>Bank name</b> — HUB pobierze z Import payments zwroty „Refund approved” tego banku, zrobi eksport w formacie banku i sprawdzi każdą pozycję:</div>
+                <div>${SP_BANKI.map(b => '<button type="button" class="sepa-bk" data-b="' + b.id + '">' + esc(b.nm) + '<small>' + esc(b.msNm) + '</small></button>').join('')}</div>
+              </div>
               <div class="sepa-drop" id="sepa-drop">
-                <div style="margin-bottom:8px"><b>Wgraj plik</b> — przeciagnij tutaj albo
+                <div style="margin-bottom:8px"><b>Wgraj plik</b> (XML, .HCT, .KPC) — przeciagnij tutaj albo
                 <button id="sepa-pick" style="padding:6px 14px;border:1px solid #0f766e;background:#FF2F00;color:#fff;border-radius:6px;cursor:pointer;font-weight:600">📂 Wybierz plik</button></div>
                 <input type="file" id="sepa-file" accept=".xml,.hct,.kpc,text/xml,application/xml" style="display:none">
                 <div style="border-top:1px solid #e2e8f0;margin-top:6px;padding-top:8px"><b>...albo wklej XML</b>
                 <textarea id="sepa-paste" placeholder="wklej tresc XML tutaj" style="width:100%;height:60px;font:12px ui-monospace,monospace;margin-top:4px"></textarea>
                 <button id="sepa-load" style="margin-top:6px;padding:6px 12px;border:1px solid #64748b;background:#fff;color:#334155;border-radius:6px;cursor:pointer">Wczytaj z pola</button></div>
               </div>
+              <div id="sepa-lista"></div>
               <div id="sepa-content"></div>
             </div>
           </div>`;
@@ -12639,15 +13398,28 @@
         ov.querySelector('#sepa-load').onclick = () => {
             const t = ov.querySelector('#sepa-paste').value.trim();
             if (!t) return;
-            fileName = 'refunds_fixed.xml';
+            fileName = /^UHL1/.test(t) ? 'refunds_fixed.KPC' : 'refunds_fixed.xml';
             loadText(t);
         };
+        ov.querySelectorAll('.sepa-tab').forEach(b => { b.onclick = () => spUstawTryb(b.getAttribute('data-t')); });
+        ov.querySelectorAll('.sepa-bk').forEach(b => {
+            b.onclick = () => {
+                const bank = SP_BANKI.filter(x => x.id === b.getAttribute('data-b'))[0];
+                if (!bank) return;
+                if (model.length && !confirm('Pobrac od nowa liste i eksport dla ' + bank.nm + '? Obecny plik i zmiany w nim znikna z ekranu.')) return;
+                spWprowadz(bank);
+                spPokazTryb();
+            };
+        });
+        spPokazTryb();
 
         const te = document.createElement('div'); te.id = 'sepa-toast'; document.body.appendChild(te); toastEl = te;
     }
 
     function readFile(f) {
-        fileName = f.name.replace(/\.xml$/i, '') + '_fixed.xml';
+        // Rozszerzenie zostaje (.xml, .HCT, .KPC) — bank przyjmuje plik po swoim formacie; wczesniej .HCT wychodzil jako „.HCT_fixed.xml”.
+        const mN = /^(.*?)(\.[A-Za-z0-9]{2,4})?$/.exec(f.name);
+        fileName = mN[1] + '_fixed' + (mN[2] || '.xml');
         const r = new FileReader();
         r.onload = () => loadText(r.result);
         r.readAsText(f, 'UTF-8');
@@ -12656,8 +13428,8 @@
         try {
             parseAndBuild(text);
             renderContent();
-            selectErrors();
             updateSummary();
+            spPoWczytaniu();
         } catch (e) {
             document.getElementById('sepa-content').innerHTML = `<div style="color:#b91c1c;padding:10px;border:1px solid #fecaca;background:#fef2f2;border-radius:6px">${esc(e.message)}</div>`;
         }
@@ -12672,9 +13444,10 @@
             <button id="sepa-selerr">Zaznacz bledne</button>
             <button id="sepa-selnone">Odznacz wszystko</button>
             <button id="sepa-add" style="background:#047857;color:#fff;border-color:#047857">➕ Dodaj pozycje</button>
-            <button id="sepa-loadfile">📂 Wczytaj plik</button>
+            ${tryb === 'spr' ? '<button id="sepa-loadfile">📂 Wczytaj plik</button>' : ''}
             <button id="sepa-rechk" title="Sprawdzenie w prologistics idzie samo po wczytaniu pliku; ten przycisk czyta wszystko od nowa (np. po poprawce requestu)">↻ Sprawdz ponownie w prologistics</button>
-            <button id="sepa-dl" style="background:#1d4ed8;color:#fff;border-color:#1d4ed8">⬇ Pobierz poprawiony XML</button>
+            <button id="sepa-rozall" title="Pelne uwagi przy wszystkich pozycjach (przy jednej: „szczegoly” w kolumnie Status)">${rozwWsz ? '▾ Zwin uwagi' : '▸ Rozwin uwagi'}</button>
+            <button id="sepa-dl" style="background:#1d4ed8;color:#fff;border-color:#1d4ed8" title="${esc(fileName)}">⬇ ${tryb === 'wpr' ? 'Pobierz plik do banku' : 'Pobierz poprawiony plik'} (${fmt === 'abo' ? 'ABO .KPC' : 'XML'})</button>
             <div class="sepa-sum" id="sepa-summary"></div>
           </div>
           <div id="sepa-vatban"></div>
@@ -12683,9 +13456,9 @@
               <thead><tr>
                 <th style="width:28px"><input type="checkbox" id="sepa-all"></th>
                 <th style="width:34px">#</th>
-                <th style="width:132px">E2E / ref</th>
-                <th>Odbiorca</th>
-                <th style="width:290px">IBAN</th>
+                <th style="width:132px">${fmt === 'abo' ? 'Wiadomosc (AV) / ref' : 'E2E / ref'}</th>
+                <th>${fmt === 'abo' ? 'Odbiorca <span style="font-weight:400;color:#64748b">(brak w ABO)</span>' : 'Odbiorca'}</th>
+                <th style="width:290px">${fmt === 'abo' ? 'Konto CZ (predcisli-numer/kod banku)' : 'IBAN'}</th>
                 <th style="width:90px">Kwota</th>
                 <th style="width:60px">Ccy</th>
                 <th style="width:92px" title="Saldo auftragu „Auftrag value - Total of Payments". Ujemne = nadplata. Sprawdzane tylko gdy request jest na auftragu (nie z ticketu).">Open amount</th>
@@ -12697,12 +13470,20 @@
           </div>`;
         tbody = c.querySelector('#sepa-tbody');
         tbody.addEventListener('click', e => {
+            const roz = e.target && e.target.closest ? e.target.closest('a.sepa-roz') : null;
+            if (roz) {
+                const trR = roz.closest('tr'), iR = trR ? Array.prototype.indexOf.call(tbody.children, trR) : -1;
+                if (iR >= 0 && model[iR]) { model[iR].rozw = !(model[iR].rozw != null ? model[iR].rozw : rozwWsz); refreshRows(); }
+                return;
+            }
             const b = e.target && e.target.closest ? e.target.closest('button.sepa-dop') : null;
             if (!b) return;
             const tr = b.closest('tr'), i = tr ? Array.prototype.indexOf.call(tbody.children, tr) : -1;
             if (i < 0 || !model[i]) return;
             const cof = b.getAttribute('data-a') === 'cof';
             if (b.getAttribute('data-k') === 'open') { if (cof) openCofnijDop(i); else openDopusc([i]); }
+            else if (b.getAttribute('data-k') === 'mp') { if (cof) mpCofnijDop(i); else mpDopusc([i]); }
+            else if (b.getAttribute('data-k') === 'juz') { if (cof) juzCofnijDop(i); else juzDopusc([i]); }
             else { if (cof) vatCofnijDop(i); else vatDopusc([i]); }
         });
         summaryEl = c.querySelector('#sepa-summary');
@@ -12711,10 +13492,17 @@
         c.querySelector('#sepa-selerr').onclick = selectErrors;
         c.querySelector('#sepa-selnone').onclick = selectNone;
         c.querySelector('#sepa-add').onclick = addRow;
-        c.querySelector('#sepa-loadfile').onclick = () => panel.querySelector('#sepa-file').click();
+        const lf = c.querySelector('#sepa-loadfile');
+        if (lf) lf.onclick = () => panel.querySelector('#sepa-file').click();
         c.querySelector('#sepa-dl').onclick = download;
-        c.querySelector('#sepa-rechk').onclick = () => { chkReset(); chkEval(); refreshRows(); };
-        c.querySelector('#sepa-all').onchange = e => { model.forEach(r => r.sel = e.target.checked); renderTable(); };
+        c.querySelector('#sepa-rechk').onclick = () => { chkReset(); chkEval(); refreshRows(); if (spBank) spOdswiezListe(); };
+        c.querySelector('#sepa-rozall').onclick = e => {
+            rozwWsz = !rozwWsz;
+            model.forEach(r => { delete r.rozw; });
+            e.currentTarget.textContent = rozwWsz ? '▾ Zwin uwagi' : '▸ Rozwin uwagi';
+            refreshRows();
+        };
+        c.querySelector('#sepa-all').onchange = e => { model.forEach(r => r.sel = e.target.checked); renderTable(); updateSummary(); };
         renderTable();
     }
 
@@ -12729,11 +13517,10 @@
         else if (c.openOk === false) { col = c.openDop ? '#b45309' : '#b91c1c'; fw = ';font-weight:600'; }
         return '<span style="color:' + col + fw + '">' + v + '</span>';
     }
-    // Uwagi ze sprawdzenia w prologistics (r.chk.notes) — tekst pochodzi z requestow, wiec ucieczka HTML.
+    // Przyciski decyzji przy pozycji (dopuszczenia, marketplace) — uwagi rysuje statusHtml.
     function chkHtml(r) {
         const c = r.chk;
-        if (!c || (!c.notes.length && c.openOk !== false)) return '';
-        const ik = { e: '✗', w: '▲', ok: '✓', i: 'ℹ' };
+        if (!c) return '';
         // Przyciski w komorce Status nie maja wlasnych uchwytow (komorka jest przepisywana innerHTML) —
         // klik lapie jeden nasluch na tbody (renderContent), pozycje wskazuje wiersz tabeli (data-k: vat/open).
         const vatPrzyc = c.vatNeed && c.vatOk === false
@@ -12746,13 +13533,73 @@
                 ? '<button type="button" class="sepa-dop cof" data-k="open" data-a="cof" title="Przywroc blokade pobrania dla tej pozycji">↶ cofnij dopuszczenie (open amount)</button>'
                 : '<button type="button" class="sepa-dop" data-k="open" data-a="dop" title="Zdejmuje blokade pobrania dla tej pozycji — po potwierdzeniu">✓ Dopusc mimo roznicy open amount</button>')
             : '';
-        return c.notes.map(n => `<span class="${n[0]}">${ik[n[0]]} ${esc(n[1])}</span>`).join('') + vatPrzyc + openPrzyc;
+        const mpPrzyc = c.mpBaza
+            ? (c.mpDop
+                ? '<button type="button" class="sepa-dop cof" data-k="mp" data-a="cof" title="Cofa decyzje — pozycja znow blokuje pobranie">↶ cofnij decyzje (marketplace)</button>'
+                : '<button type="button" class="sepa-dop" data-k="mp" data-a="dop" title="Przelew dla zamowienia z marketplace ma isc — po potwierdzeniu; gdy nie ma isc, usun pozycje (✕)">✓ Przelew ma isc (marketplace)</button>')
+            : '';
+        const juzPrzyc = c.juzBaza
+            ? (c.juzDop
+                ? '<button type="button" class="sepa-dop cof" data-k="juz" data-a="cof" title="Przywroc blokade pobrania dla tej pozycji">↶ cofnij dopuszczenie (zwrot wykonany)</button>'
+                : '<button type="button" class="sepa-dop" data-k="juz" data-a="dop" title="Request tej kwoty ma juz stan Refund Done — zdejmuje blokade po potwierdzeniu">✓ Dopusc: zwrot juz wykonany</button>')
+            : '';
+        return vatPrzyc + openPrzyc + mpPrzyc + juzPrzyc;
     }
+    // Krotkie etykiety uwag do podsumowania w kolumnie Status (null = tylko w szczegolach). Kolejnosc ma znaczenie.
+    const KROTKO = [
+        [/^ZWROT JUZ WYKONANY/, 'zwrot juz wykonany?'], [/^DOPUSZCZONE MIMO WYKONANEGO/, 'zwrot wykonany (dopuszczony)'],
+        [/^ZAMOWIENIE Z MARKETPLACE/, 'marketplace - decyzja'], [/^PRZELEW MIMO MARKETPLACE/, 'marketplace (przelew z decyzji)'],
+        [/^zamowienie z marketplace .*zwrot VAT/, 'marketplace (zwrot VAT)'],
+        [/^OPEN AMOUNT/, 'open amount ≠ zwrot'], [/^DOPUSZCZONE MIMO ROZNICY OPEN/, 'open amount (dopuszczony)'],
+        [/^ZWROT VAT BEZ KOREKTY/, 'VAT bez korekty'], [/^DOPUSZCZONE MIMO BRAKU KOREKTY/, 'VAT bez korekty (dopuszczony)'],
+        [/^korekta VAT jest .*rozni sie/, 'korekta VAT, kwota ≠ roznica'], [/^korekta VAT jest/, 'korekta VAT ok'],
+        [/^zwrot VAT: nie/, 'korekta VAT nieczytelna'], [/^wyglada na zwrot VAT/, 'chyba zwrot VAT'],
+        [/kilka zatwierdzonych requestow/, 'kilka requestow - dubel?'],
+        [/NIEAKTYWNY/, 'request nieaktywny'], [/a nie "Refund approved"/, 'request nie approved'],
+        [/^request \d+ .*zgodne z plikiem/, 'request ok'], [/nie odczytalem jego stanu/, 'stan requestu?'],
+        [/^IBAN pasuje do/, 'kwota ≠ request'], [/^kwota pasuje do/, 'IBAN ≠ request'], [/^zaden request nie pasuje/, 'brak pasujacego requestu'],
+        [/^brak requestu/, 'brak requestu'], [/^jest nowy request/, 'jest nowy request'],
+        [/^open amount auftragu .* = kwota zwrotu/, 'open ok'],
+        [/^wplata przez eupago .*usun pozycje/, 'eupago < 3 mies.'], [/^wplata przez eupago .*ponad/, null], [/^wplata przez eupago/, 'eupago - czesc?'],
+        [/^wplata pierwotna .*wygaslej karcie/, 'karta wygasla'], [/^wplata pierwotna/, 'karta/portfel'],
+        [/jest skasowany/, 'auftrag skasowany'],
+        [/NIE MA na liscie/, 'spoza listy Refund approved'], [/^na liscie "Refund approved"/, null],
+        [/^nie odczytalem zrodla/, null], [/^nie odczytalem/, 'blad odczytu'],
+        [/rozni sie od nazwy w requescie/, 'nazwa ≠ request'], [/^waluta auftragu/, 'waluta ≠ plik'], [/przewyzsza wplaty/, 'zwrot > wplaty'],
+        [/ stoi w requescie - popraw/, 'blad u zrodla (request)'],
+        [/^brak numeru auftragu/, 'bez numeru - nie sprawdzam'], [/^IBAN albo kwota puste/, 'puste pola'],
+        [/^zdublowany IBAN/, 'dubel IBAN'], [/^zdublowany EndToEndId/, 'dubel E2E'],
+        [/^nazwa: znaki/, 'znaki w nazwie'], [/^tytul: znaki/, 'znaki w tytule'], [/^wiadomosc \(AV\): znaki/, 'znaki w AV'],
+        [/^IBAN: format do poprawy/, 'IBAN do poprawy'], [/^IBAN: brak prefiksu/, 'IBAN bez kraju'], [/^IBAN zbudowany/, 'IBAN zbudowany'],
+        [/^konto: zapis do ujednolicenia/, 'konto do ujednolicenia'], [/^konto: /, 'zle konto CZ'], [/^IBAN: /, 'zly IBAN']
+    ];
+    function krotko(t) {
+        for (let i = 0; i < KROTKO.length; i++) if (KROTKO[i][0].test(t)) return KROTKO[i][1];
+        return t.length > 42 ? t.slice(0, 40) + '…' : t;
+    }
+    let rozwWsz = false;   // „Rozwin uwagi” dla wszystkich; r.rozw (klik przy pozycji) ma pierwszenstwo
+    // Kolumna Status (19.11.2026, prosba uzytkownika — za duzo tekstu): na wierzchu krotkie etykiety (bledy, ostrzezenia,
+    // potem to, co zgodne), pelne uwagi dopiero po „▸ szczegoly”. Bez <details>: komorka jest przepisywana innerHTML przy
+    // kazdym odczycie, a odtworzone <details open> samo odpala toggle (PULAPKI). Klik lapie jeden nasluch na tbody.
+    // errs/warns niosa surowe pola z pliku, uwagi — tekst z requestow: ucieczka HTML wszedzie.
     function statusHtml(r) {
         const c = r.chk;
-        if (r.errs.length === 0 && r.warns.length === 0) return '<span class="ok">✓ ' + (c && c.checked ? 'format ok' : 'ok') + '</span>' + chkHtml(r);
-        // errs/warns niosa surowe pola z pliku (kwota, waluta) — ucieczka HTML, jak przy uwagach z prologistics
-        return r.errs.map(e => `<span class="e">✗ ${esc(e)}</span>`).join('') + r.warns.map(w => `<span class="w">▲ ${esc(w)}</span>`).join('') + chkHtml(r);
+        const ik = { e: '✗', w: '▲', ok: '✓', i: 'ℹ' }, rk = { e: 0, w: 1, ok: 2, i: 3 };
+        const wsz = r.errs.map(e => ['e', e]).concat(r.warns.map(w => ['w', w]));
+        if (!r.errs.length && !r.warns.length) wsz.push(['ok', 'format ok']);
+        if (c) c.notes.forEach(n => wsz.push(n));
+        const byly = {}, skrot = [];
+        wsz.slice().sort((a, b) => rk[a[0]] - rk[b[0]]).forEach(n => {
+            const k = krotko(n[1]);
+            if (!k || byly[n[0] + k]) return;
+            byly[n[0] + k] = 1;
+            skrot.push('<span class="' + n[0] + '">' + ik[n[0]] + ' ' + esc(k) + '</span>');
+        });
+        const rozw = r.rozw != null ? r.rozw : rozwWsz;
+        return '<div class="sk">' + skrot.join(' · ')
+            + ' <a class="sepa-roz" title="Pelne uwagi tej pozycji">' + (rozw ? '▾ zwin' : '▸ szczegoly (' + wsz.length + ')') + '</a></div>'
+            + (rozw ? '<div class="sd">' + wsz.map(n => '<span class="' + n[0] + '">' + ik[n[0]] + ' ' + esc(n[1]) + '</span>').join('') + '</div>' : '')
+            + chkHtml(r);
     }
     function rowCls(r) {
         const c = r.chk, has = n => !!c && c.notes.some(x => x[0] === n);
@@ -12781,13 +13628,19 @@
             tr.className = rowCls(r);
             const cbTd = document.createElement('td');
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = r.sel;
-            cb.onchange = () => { r.sel = cb.checked; };
+            cb.onchange = () => { r.sel = cb.checked; updateSummary(); };
             cbTd.appendChild(cb); tr.appendChild(cbTd);
 
             const idTd = document.createElement('td'); idTd.textContent = i + 1; tr.appendChild(idTd);
 
-            tr.appendChild(inputCell(r, 'e2e', ''));
-            tr.appendChild(inputCell(r, 'nm', ''));
+            if (r.fmt === 'abo') {
+                // ABO nie ma E2E ani nazwy odbiorcy: numer auftragu/ticketu niesie wiadomosc AV.
+                tr.appendChild(inputCell(r, 'ustrd', ''));
+                const nmTd = document.createElement('td'); nmTd.style.color = '#94a3b8'; nmTd.textContent = '—'; tr.appendChild(nmTd);
+            } else {
+                tr.appendChild(inputCell(r, 'e2e', ''));
+                tr.appendChild(inputCell(r, 'nm', ''));
+            }
             tr.appendChild(inputCell(r, 'iban', ''));
             tr.appendChild(inputCell(r, 'amt', 'sepa-num'));
             tr.appendChild(inputCell(r, 'ccy', ''));
@@ -12847,7 +13700,7 @@
         // E2E/ref niesie numer auftraga (np. „Refund_ 14548371"). Pole zostaje edytowalne —
         // obok dochodzi tylko ikonka otwierajaca auftrag w nowej karcie, zeby nie trzeba
         // bylo przepisywac numeru recznie. Ikonka znika, gdy w polu nie ma numeru.
-        if (key === 'e2e') {
+        if (key === 'e2e' || (key === 'ustrd' && r.fmt === 'abo')) {
             const a = document.createElement('a');
             a.target = '_blank'; a.rel = 'noopener'; a.textContent = '↗';
             a.style.cssText = 'margin-left:4px;text-decoration:none;font-weight:bold;color:#0a58ca';
@@ -12885,8 +13738,8 @@
             if (r.errs.length) { bad++; errs += r.errs.length; }
             if (r.warns.length) warns += r.warns.length;
         });
-        const hdr = xmlDoc ? txt(first(xmlDoc, 'GrpHdr'), 'CtrlSum') : '';
-        const sumOk = hdr && fmt2(cents) === hdr;
+        const hdr = fmt === 'abo' ? (abo ? fmt2(aboSumaNaglowka()) : '') : (xmlDoc ? txt(first(xmlDoc, 'GrpHdr'), 'CtrlSum') : '');
+        const sumOk = hdr && fmt2(cents) === (/\./.test(hdr) ? hdr : hdr + '.00');
         let cp = 0, ce = 0, cw = 0, cok = 0;
         model.forEach(r => {
             const k = r.chk; if (!k || !k.checked) return;
@@ -12897,7 +13750,14 @@
             `Przelewy: <b>${model.length}</b> &nbsp; Suma: <b>${fmt2(cents)}</b> ` +
             (hdr ? `(naglowek: ${hdr}${sumOk ? ' ✓' : ' — zostanie przeliczony przy pobraniu'}) ` : '') +
             `<br>Pozycje z bledem: <b style="color:${bad ? '#b91c1c' : '#15803d'}">${bad}</b> &nbsp; bledy: ${errs} &nbsp; ostrzezenia: ${warns}` + chkLine;
+        // Zakres widac na przycisku pobrania i w podsumowaniu — plik z czesci pozycji nie moze wyjsc „po cichu”.
+        const nZaz = model.filter(x => x.sel).length;
+        if (nZaz) summaryEl.innerHTML += '<br><b style="color:#1d4ed8">Zaznaczone: ' + nZaz + ' z ' + model.length + '</b> - plik, blokady i Book tylko z nich (bez zaznaczenia: wszystkie)';
+        const dl = document.getElementById('sepa-dl');
+        if (dl) dl.textContent = '⬇ ' + (tryb === 'wpr' ? 'Pobierz plik do banku' : 'Pobierz poprawiony plik') + ' (' + (fmt === 'abo' ? 'ABO .KPC' : 'XML')
+            + (nZaz ? ', zaznaczone ' + nZaz + ' z ' + model.length : '') + ')';
         updateVatBan();
+        spRysujListe();
     }
 
     addRow._n = 0;
@@ -14758,6 +15618,13 @@
             var U = (pole(it, F_MKT.PAYER) || pole(it, F_MKT.ISSUER)) ? F_MKT : (pole(it, F_SEA.PAYER) || pole(it, F_SEA.ISSUER)) ? F_SEA : null;
             if (U){
                 var iss = poleTxt(it, U.ISSUER), walIss = '', mi = iss ? /^\s*([A-Za-z]{3})\s*-\s*(\S.*)$/.exec(iss) : null;
+                // Kilka wpisów w jednym polu („EUR - HPL; USD - HECNY”, 547660 — zapłacone 73 425 USD do HECNY): wpis w walucie
+                // z tematu („… HECNY; USD …”), inaczej ten, którego nazwę ma temat; dopiero potem pierwszy.
+                var wpisy = U === F_SEA && iss ? String(iss).split(/\s*[;\n]\s*/).map(function (x){ return /^\s*([A-Za-z]{3})\s*-\s*(\S.*)$/.exec(x); }).filter(function (x){ return x && walutaZTekstu(x[1]); }) : [];
+                if (wpisy.length > 1){
+                    var wt = walutaZTekstu(String(it.issue || '')), tn = String(it.issue || '').toLowerCase();
+                    mi = wpisy.filter(function (x){ return wt && x[1].toUpperCase() === wt; })[0] || wpisy.filter(function (x){ return tn.indexOf(x[2].trim().toLowerCase()) >= 0; })[0] || wpisy[0];
+                }
                 if (U === F_SEA && mi && walutaZTekstu(mi[1])){ walIss = mi[1].toUpperCase(); iss = mi[2].trim(); }
                 var op = function (v){ return v ? U.uklad + ':' + v : v; };
                 r.uklad = U.uklad;
@@ -15450,7 +16317,10 @@
         var zleP = zle;
         // Płatność ręczna z poleceniem zapłaty: puste pola Spółka / Company / FV / Amount to norma w issue „Declaration” (MWST:
         // 492843, 529263) — rachunek, kwota i numery idą z polecenia. „?” zamiast „✖”, żeby trafiły na listę z uwagą.
-        if (r.reczne && r.polecenie) zleP = function (t){ p.push({ w: 'spr', t: t + ' — jest polecenie zapłaty: płacisz według niego' }); };
+        // 18.11.2026: jedna linia informacji zamiast „?” przy każdym polu („puste pole Spółka / Company / Invoices no. — jest polecenie
+        // zapłaty: płacisz według niego” trzy razy przy mandacie 562378) — przy poleceniu finansów puste pola nie zmieniają przelewu.
+        var puste = [];
+        if (r.reczne && r.polecenie) zleP = function (t){ puste.push(String(t).replace(/^puste pole /, '')); };
         if (!approvalOk(r.approval)) zle('Approval = ' + (r.approval || 'puste') + (r.uklad === 'mkt' ? ' (do przelewu tylko „YES - Transfer Needed”)' : ' (do płatności tylko Yes)'));
         if (/^yes$/i.test(r.paid || '')){
             var et = (r.uklad === 'mkt' || r.uklad === 'sea' ? 'Paid (Finance)' : 'PAID - Finance') + ' = Yes';
@@ -15469,6 +16339,7 @@
         if (!r.amountTxt) zleP('puste pole ' + E.am); else if (!isFinite(r.amount)) zle('kwota w polu ' + E.am + ' nieczytelna: „' + r.amountTxt + '”');
         if (!r.waluta) zleP(r.uklad === 'mkt' || r.uklad === 'sea' ? 'waluty nie widać (' + E.wal + ' ani temat issue)' : 'puste pole Currency');
         else if (/\+/.test(r.waluta)) zle('Currency = ' + r.waluta + ' — dwie waluty w jednym issue; płatność ręczna');
+        if (puste.length) p.push({ w: 'info', t: 'w issue puste: ' + puste.join(', ') + ' — płacisz według polecenia zapłaty' });
     }
     function ostatnieOdbicie(kom){
         var o = null;
@@ -15488,7 +16359,9 @@
     // z kwotą („amount 457.50 chf”, „UBS BI 3157.54 CHF” — decyzja finansów, np. Google po potrąceniu nadpłaty), z plikami
     // („please pay from bs postfinance chf: 6655170851.pdf, 6655185198.pdf”), z datą („Please pay on Friday 23.10.2026”)
     // i z prośbą o osobne przelewy („preferably in separate bank transfers”).
-    var TIS_POL_KOM = /(\bpl(?:ease|s)p?\s+pay\b|prosz[eę]\s+(?:o\s+)?(?:do\s+)?(?:p[łl]atno|zap[łl]at|za[łl]at)|prosz[eę]\s+o\s+(?:przelew|zasileni))/i;
+    // 18.11.2026: „Ula proszę o zapłacenie i podpięcie potwierdzenia” (440675 HMRC, co miesiąc) i „Poroszę o płatność z CS Global.”
+    // (286196) — dotąd nie były poleceniem, więc HUB brał polecenie sprzed pół roku.
+    var TIS_POL_KOM = /(\bpl(?:ease|s)p?\s+pay\b|\bpo?ro[sś]z[eę]\s+(?:o\s+)?(?:do\s+)?(?:p[łl]atno|zap[łl]a[tc]|za[łl]at)|\bpo?ro[sś]z[eę]\s+o\s+(?:przelew|zasileni))/i;
     var TIS_POL_BANKI = [
         // „Postfinace”, „Postfinanse”, „Post Finance” — wszystkie trzy stoją w komentarzach (460511: „Postfinace DKK”).
         ['PostFinance', /post\s*-?\s*fin\w{0,3}[cs]e\b|\bPF\b/i], ['UBS', /\bUBS\b/i], ['HSBC', /\bHSBC\b/i], ['Credit Suisse', /[Cc]redit\s*[Ss]uisse|\bCS\b/],
@@ -15529,6 +16402,10 @@
         var lista = (S.spolki.lista || []).map(function (sp){ return { sp: sp, k: polKlucz(sp.nazwa) }; })
             .filter(function (x){ return x.k.length >= 5; }).sort(function (a, b){ return b.k.length - a.k.length; });
         for (var i = 0; i < lista.length; i++) if (n.indexOf(' ' + lista[i].k + ' ') >= 0) return { nazwa: lista[i].sp.nazwa.split('\n')[0].trim(), sp: lista[i].sp, skad: 'polecenie' };
+        // „Please pay from Michael's private account UBS in CHF” (505865, 18.11.2026) — rachunki właścicieli są w TIS_IBT_WLASNE,
+        // nie w arkuszu (skrypt spółek pomija wiersze prywatne).
+        var wl = /\bmichael'?s?\b/i.test(fr) ? 'Michael Widmer' : /\bstephan'?s?\b/i.test(fr) ? 'Stephan Widmer' : '';
+        if (wl){ var ww = TIS_IBT_WLASNE.filter(function (x){ return x.nazwa === wl; })[0]; if (ww) return { nazwa: wl, sp: { nazwa: wl, konta: ww.konta }, skad: 'polecenie' }; }
         for (var j = 0; j < TIS_POL_ALIASY.length; j++) if (TIS_POL_ALIASY[j][0].test(fr)){
             var nz = TIS_POL_ALIASY[j][1], kz = nazwaNorm(nz);
             var sp = (S.spolki.lista || []).filter(function (x){ return x.nazwa.split('\n')[0].trim().toLowerCase() === nz.toLowerCase(); })[0]
@@ -15584,6 +16461,10 @@
         var ost = lista[lista.length - 1], o = null;
         for (var i = lista.length - 1; i >= 0 && !o; i--){ var p = polRozbierz(r, lista[i]); if (p.tresc) o = p; }
         if (!o) o = polRozbierz(r, ost);
+        // Polecenie bez treści PO zapłacie poprzedniego („Ula proszę o zapłacenie i podpięcie potwierdzenia”, 440675 HMRC co miesiąc)
+        // to nowy cykl, nie przypomnienie: liczy się ono, a bank / spółkę / walutę dziedziczy niżej z wcześniejszego polecenia.
+        // Kwot, numerów i plików z poprzedniego cyklu NIE bierzemy.
+        if (ost !== o.c && (kom || []).some(function (c){ return !systemowy(c) && c.kiedy > o.kiedy && c.kiedy < ost.kiedy && jestPotwierdzenie(c.tekst); })) o = polRozbierz(r, ost);
         if (ost !== o.c){
             o.pozniej = { kiedy: ost.kiedy, kto: ost.kto, tekst: ost.tekst.slice(0, 160) };
             if (!o.termin && /\b(tomorrow|jutro)\b/i.test(ost.tekst)) o.termin = 'następny dzień (polecenie z ' + ost.kiedy.slice(0, 10) + ')';
@@ -15659,8 +16540,8 @@
         var pol = r.polecenie, c = cykleZaplat(kom);
         r.cykle = c; r.noweFaktury = [];
         if (!pol) return 'przed';
-        // 🧪 test odczytu: zapłacone issue czytamy tak, jakby polecenie dopiero czekało na zapłatę (pomiar na zapłaconych).
-        if (r.test) return 'doZaplaty';
+        // 🧪 test odczytu NIE zmienia etapu (18.11.2026: zapłacone issue w teście wyglądały jak „do zapłaty” i trafiały na listę
+        // do płatności). Faktury tej płatności test czyta osobno — r.reczne w sprawdzJedno.
         var zap = (kom || []).filter(function (k){ return !systemowy(k) && k.kiedy > pol.kiedy && jestPotwierdzenie(k.tekst); })[0];
         r.zaplataPo = zap || null;
         if (!zap && !/^yes$/i.test(r.paid || '')) return 'doZaplaty';
@@ -15992,7 +16873,7 @@
         if (r.bladTech) p.unshift({ w: 'spr', t: r.bladTech });
         r.powody = p;
         // Zapłacone (albo przelew wewnętrzny bez zlecenia do wykonania) — nic do zrobienia, bez względu na uwagi do pól.
-        if (!r.bladTech && !r.test && (r.etap === 'zaplacone' || (r.rodzaj === 'ibt' && r.etap !== 'doZaplaty'))){ r.wynik = 'zaplacone'; return; }
+        if (!r.bladTech && ((r.etap === 'zaplacone' && !r.test) || (r.rodzaj === 'ibt' && r.etap !== 'doZaplaty'))){ r.wynik = 'zaplacone'; return; }
         if (p.some(function (x){ return x.w === 'zle'; })) r.wynik = 'zle';
         else if (r.bladTech || r.bladDubel) r.wynik = 'blad';
         else if (p.some(function (x){ return x.w === 'spr'; })) r.wynik = 'spr';
@@ -16065,7 +16946,10 @@
     // (przegląd 14.10.2026; wszystkie 20 wydruków z korpusu i próbki dalej rozpoznane). Dokument z sumą do zapłaty
     // uznajemy za wydruk dopiero przy dwóch mocnych.
     // HSBC UK „Make a bill payment | Step 4 of 4” (wydruki Beliani UK, 17.11.2026) — dotąd niewidoczny jako wydruk przelewu.
-    var PRZELEW_MOCNE = /(Direct\s+print-?out\s+from\s+e-?finance|Credit\s+Transfer\s+Details|Batch[_\s-]?Details|Status:?\s*(?:Entered|To\s+be\s+approved|Not\/partially\s+approved|Confirmed\s+by\s+bank)|UBS\s+e-banking|Payment\s+ingested\s+or\s+registered|SpectraNet\s+Plusz|Spectra\s+unique\s+ID|Make\s+a\s+bill\s+payment)/gi;
+    // Credit Suisse e-banking (przelewy do 2025, 18.11.2026: 286196 DFDS — „International Payment with IBAN”, „Approval still
+    // required”, „Account to be Debited”): jeden przelew za kilka faktur, ten sam plik w każdym issue tej płatności. Nierozpoznany
+    // szedł jako faktura na 8 744,30 EUR — „✖ dubel: ten sam plik faktury” we wszystkich issue i „✖ kwota” tam, gdzie nie było faktury.
+    var PRZELEW_MOCNE = /(Direct\s+print-?out\s+from\s+e-?finance|Credit\s+Transfer\s+Details|Batch[_\s-]?Details|Status:?\s*(?:Entered|To\s+be\s+approved|Not\/partially\s+approved|Confirmed\s+by\s+bank)|UBS\s+e-banking|Payment\s+ingested\s+or\s+registered|SpectraNet\s+Plusz|Spectra\s+unique\s+ID|Make\s+a\s+bill\s+payment|(?:International|Domestic)\s+Payment\s+with(?:out)?\s+IBAN|Approval\s+still\s+required|Account\s+to\s+be\s+Debited)/gi;
     var PRZELEW_SLABE = /(Debit\s+account|From\s+account|Remitter|Beneficiary|Recipient'?s\s+account|Message\s+to\s+beneficiary|Payment\s+details|Remittance\s+information|(?:Requested\s+)?execution\s+date|Transfer\s+amount|requires\s+authori[sz]ation|Authori[sz]ed\s+by)/gi;
     // Bank spoza listy (drugi przegląd 14.10.2026): fraza zlecenia razem ze stroną obciążenia („Remitter”, „Debit account”)
     // liczy się jak jeden mocny znacznik — faktura z blokiem płatności strony obciążenia nie ma.
@@ -16132,12 +17016,37 @@
     function ukZIban(n){ n = String(n || ''); return /^GB\d{2}[A-Z]{4}\d{14}$/.test(n) ? { sort: n.slice(8, 10) + '-' + n.slice(10, 12) + '-' + n.slice(12, 14), konto: n.slice(14) } : null; }
     // Rachunek bez IBAN („Account Number: 6289193, SWIFT / BIC: SURBSPAXXX” — freelancer z Surinamu; na fakturze była literówka
     // w BIC, w banku poszło SURBSRPAXXX). Takiego numeru nie da się sprawdzić sumą kontrolną — zawsze do przepisania ręcznie.
+    // „A/c No : 914030041616638 | Swift Code : AXISINBB063” (CLEARSHIP, Axis Bank India — 18.11.2026: wydruki 12.10 i 02.11 poszły
+    // dokładnie na ten numer, a HUB pisał „brak rachunku na fakturze”). Routing (USA, 9 cyfr) dokładamy, gdy stoi obok.
     function kontoBezIban(t){
-        var s = String(t || ''), m = /(?:Account\s*(?:Number|No\.?|nr)|Kontonummer|Konto-?Nr\.?)\s*:?\s*(\d[\d\-. ]{3,24}\d)/i.exec(s);
+        var s = String(t || ''), m = /(?:Account\s*(?:Number|No\.?|nr)|A\/c\.?\s*No\.?|Kontonummer|Konto-?Nr\.?)\s*:?\s*(\d[\d\-. ]{3,24}\d)/i.exec(s);
         if (!m) return null;
         // 8–11 znaków: na fakturze freelancera stał 10-znakowy „SURBSPAXXX” (literówka) — pokazujemy go, żeby człowiek go poprawił.
-        var b = /\b(?:SWIFT|BIC)(?:\s*\/\s*(?:BIC|SWIFT))?(?:\s*code)?\s*:?\s*([A-Z]{6}[A-Z0-9]{2,5})\b/.exec(s);
-        return { konto: m[1].replace(/\s+/g, ' ').trim(), bic: b ? b[1] : '' };
+        var b = /\b(?:SWIFT|Swift|swift|BIC|Bic)(?:\s*\/\s*(?:BIC|SWIFT|Swift))?(?:\s*[Cc]ode)?\s*:?\s*([A-Z]{6}[A-Z0-9]{2,5})\b/.exec(s);
+        var ro = /Routing\s*(?:Number|No\.?)\s*:?\s*(\d{9})\b/i.exec(s);
+        return { konto: m[1].replace(/\s+/g, ' ').trim(), bic: b ? b[1] : '', routing: ro ? ro[1] : '' };
+    }
+    // Rachunek wskazany dla waluty płatności (18.11.2026, wydruki Global eCommerce): FLEXPORT „If paying with EUR: … IBAN DE36…”,
+    // „If paying with USD: Routing Number 021000021, Account Number 515928072, BIC CHASUS33” — EUR poszło na DE36, USD na 515928072;
+    // HOPPE „For payments in USD please use: … IBAN DE28…” — USD poszło na DE28. Bez tego HUB pisał „wskaż rachunek — 4 różne”.
+    // Okno: do 9 linii za nagłówkiem, do następnego nagłówka waluty. Najpierw IBAN, potem numer bez IBAN.
+    var TIS_SEKCJA_WALUTY = /(?:if\s+paying\s+(?:with|in)|for\s+payments?\s+in|payments?\s+in|pay(?:ing)?\s+in)\s+(EUR|USD|GBP|CHF|DKK|SEK|NOK|PLN|CZK|HUF|RON)\b/i;
+    function kontaWalut(linie){
+        var t = (linie || []).map(function (l){ return l.t; }), o = {}, nasze = ibtArkusz();
+        t.forEach(function (l, i){
+            var m = TIS_SEKCJA_WALUTY.exec(l); if (!m) return;
+            var wal = m[1].toUpperCase(); if (o[wal]) return;
+            var okno = [l.slice(m.index + m[0].length)];
+            for (var j = i + 1; j < Math.min(t.length, i + 10); j++){
+                var n = TIS_SEKCJA_WALUTY.exec(t[j]);
+                if (n){ okno.push(t[j].slice(0, n.index)); break; }
+                okno.push(t[j]);
+            }
+            var tx = okno.join('\n'), ib = ibanyZTekstu(tx).filter(function (x){ return !nasze[x.n]; });
+            if (ib.length) o[wal] = { n: ib[0].n };
+            else { var k = kontoBezIban(tx); if (k) o[wal] = { inne: k }; }
+        });
+        return Object.keys(o).length ? o : null;
     }
     // Rachunek odbiorcy z wydruku przelewu (PostFinance „Direct print-out from e-finance”, UBS e-banking, HSBC „Make a bill payment”).
     function kontoZWydruku(linie){
@@ -16257,7 +17166,8 @@
             odliczenia: kosztyFinansowania(linie, tekst),
             polecenie: TIS_POLECENIE.test(tekst),
             // Rachunek odbiorcy poza zwykłym IBAN-em (17.11.2026): część płatnicza QR, UK, numer bez IBAN.
-            qr: qrCzesc(linie), uk: kontoUK(tekst), kontoInne: kontoBezIban(tekst), qrKotwica: QR_KONTO_ET.test(tekst)
+            qr: qrCzesc(linie), uk: kontoUK(tekst), kontoInne: kontoBezIban(tekst), qrKotwica: QR_KONTO_ET.test(tekst),
+            kontaWalut: kontaWalut(linie)
         };
     }
     // Dokument z odczytu Claude albo ręcznego → ta sama postać.
@@ -16298,7 +17208,10 @@
         pbOtw: false, pb: { plan: null, konta: {}, tekst: '', postep: '', pracuje: false },
         wsad: null, grupuj: true, grupaOtw: {}, usuniete: [],
         // Przełącznik „💳 płatność ręczna” (17.11.2026) usunięty 18.11.2026 — etap płatności każde issue dostaje samo (etapPlatnosci).
-        ls: { platnicy: {}, konta: {} }
+        ls: { platnicy: {}, konta: {} },
+        // Issue sprawdzone w „🧪 teście odczytu” nie idą na listę ani do pliku do banku. true TYLKO na stanowisku testowym
+        // (pomiar listy i pliku na zapłaconych issue) — w panelu nic tego nie włącza.
+        testDoPlatnosci: false
     };
     function sprawdzJedno(r){
         r.bladTech = ''; r.bladDubel = ''; r.odbite = null; r.powodyPola = null; r.powodyPliki = []; r.powodyFaktura = []; r.powodyDubel = [];
@@ -16323,10 +17236,12 @@
             // pliki po nazwie i dacie. Bez przełącznika — każde issue dostaje swój etap samo (prośba 18.11.2026).
             return plikiIssue(r.id).then(function (pliki){
                 r.pliki = pliki;
+                r.kontoZKom = kontoZKomentarzy(kom);
                 r.rodzaj = rodzajIssue(r, kom);
                 r.polecenie = r.rodzaj === 'ibt' ? ibtPolecenie(r, kom) : polecenieZaplaty(r, kom);
                 r.etap = etapPlatnosci(r, kom, pliki);
-                r.reczne = r.etap === 'doZaplaty' && r.rodzaj !== 'ibt';
+                // 🧪 test odczytu: zapłacone issue z poleceniem czytamy jak w dniu zapłaty (pliki tej płatności), etap zostaje prawdziwy.
+                r.reczne = r.rodzaj !== 'ibt' && (r.etap === 'doZaplaty' || (!!r.test && !!r.polecenie && r.etap !== 'nowyCykl'));
                 r.ibt = null;
                 // 🏦 Przelew wewnętrzny: faktur nie ma — czytamy tylko zlecenie (skąd, dokąd, kwota, tytuł).
                 if (r.rodzaj === 'ibt'){
@@ -16334,7 +17249,7 @@
                     r.powodyPola = ibtPowody(r);
                     return null;
                 }
-                if (r.etap === 'zaplacone'){ r.powodyPola = [{ w: 'info', t: etapOpis(r) }]; return null; }
+                if (r.etap === 'zaplacone' && !r.test){ r.powodyPola = [{ w: 'info', t: etapOpis(r) }]; return null; }
                 r.powodyPola = ocenPola(r, kom);
                 return pliki;
             });
@@ -16663,7 +17578,8 @@
             var l = licz();
             var podsum = (S.przerwij ? 'Przerwane. ' : 'Sprawdzone. ') + '✔ ' + l.ok + ' · ✖ ' + l.zle + ' · ? ' + (l.spr + l.blad) + ' · ✓ nic do zrobienia ' + l.zaplacone + (l.nie ? ' · niesprawdzone ' + l.nie : '');
             // Co dalej — bez przełączników (18.11.2026): ile issue czeka na zapłatę po poleceniu i ile przelewów wewnętrznych.
-            var dz = doSpr.filter(function (r){ return r.wynik && r.reczne; }).length, ib = doSpr.filter(function (r){ return r.wynik && r.ibt; }).length;
+            // 🧪 test odczytu nigdy nie mówi „Do zapłaty” — to pomiar odczytu, nie zgoda na płatność.
+            var dz = test ? 0 : doSpr.filter(function (r){ return r.wynik && r.etap === 'doZaplaty' && r.reczne; }).length, ib = test ? 0 : doSpr.filter(function (r){ return r.wynik && r.ibt; }).length;
             var dalej = dz || ib ? ' · Do zapłaty: ' + [dz ? '💳 ' + dz + ' po poleceniu zapłaty' : '', ib ? '🏦 ' + ib + ' przelew' + (ib === 1 ? '' : 'y') + ' wewnętrzn' + (ib === 1 ? 'y' : 'e') : ''].filter(Boolean).join(', ') + ' — lista w „🏦 Płatność”.' : '';
             say((test ? '🧪 TEST ODCZYTU (status zapłaty pominięty — wyniki nie są zgodą na płatność). ' : '') + podsum + dalej,
                 l.zle || l.spr || l.blad || l.nie ? 'warn' : 'ok');
@@ -17421,6 +18337,19 @@
         }).catch(function (e){ say('Nie pobrałem pliku: ' + (e.message || e), 'err'); }).then(rysuj);
     }
     var OPIS_WYNIKU = { ok: '✔ zgadza się', zle: '✖ nie zgadza się', spr: '? dalej do sprawdzenia', blad: '? techniczne', odbite: '↪ już odbite', zaplacone: '✓ nic do zrobienia' };
+    // Blok „INNY” od Claude, który jest potwierdzeniem / zleceniem przelewu (18.11.2026, 286196: Credit Suisse „International Payment
+    // with IBAN” — jeden przelew 8 744,30 EUR za 5 faktur DFDS). Dotąd tylko „pominąłem 1 blok(i) niebędące fakturą”, a to najważniejsza
+    // wiadomość: płatność w toku albo już zrobiona. Nazwa pliku wraca z paczki („HUB-<issue>-<plik>-…”) do nazwy z issue.
+    var TIS_INNY_PRZELEW = /(potwierdzeni\w*\s+(?:zlecenia\s+)?(?:przelewu|płatności|platnosci|zapłaty|zaplaty)|zleceni\w*\s+przelewu|payment\s+(?:confirmation|order)|już\s+zapłac|podwójn\w*\s+płatno)/i;
+    function claudeInnePrzelewy(r, bloki){
+        return (bloki || []).filter(function (b){ return /^INNY$/i.test(String(b.DOKUMENT || '').trim()) && TIS_INNY_PRZELEW.test(String(b.WATPLIWOSCI || '')); }).map(function (b){
+            var m = /^HUB-\d+-(\d+)-/i.exec(String(b.PLIK || '')), f = m ? (r.pliki || []).filter(function (x){ return x.id === m[1]; })[0] : null;
+            var kw = String(b.SUMA_DO_ZAPLATY || ''), wal = String(b.WALUTA || '');
+            return { w: 'spr', t: 'Claude: „' + (f ? f.nazwa : (b.PLIK || 'plik')) + '” to potwierdzenie / zlecenie przelewu, nie faktura'
+                + (kw && !/^BRAK$/i.test(kw) ? ' (' + kw + (wal && !/^BRAK$/i.test(wal) ? ' ' + wal : '') + ')' : '')
+                + ' — płatność w toku albo już zrobiona? Jeden przelew bywa za kilka faktur.' };
+        });
+    }
     function przyjmijClaude(r){
         if (zajety()) return;
         var nie = wpisDozwolony(r);
@@ -17430,10 +18359,18 @@
         if (!p.bloki.length){ say('W wklejonym tekście nie ma bloku „HUB-ODCZYT v1 … KONIEC”.', 'err'); rysuj(); return; }
         // Tylko faktura i korekta. „INNY” i „PRZYPOMNIENIE” to nie dokument do zapłaty.
         var docs = p.bloki.filter(function (b){ return /^(FAKTURA|KOREKTA)$/i.test(String(b.DOKUMENT || '').trim()); });
+        var inne = claudeInnePrzelewy(r, p.bloki);
+        if (!docs.length && inne.length){
+            // Sam wydruk przelewu, bez faktury — przyjmujemy jako uwagę do issue (odczyt HUB-a zostaje).
+            r.powodyPliki = (r.powodyPliki || []).filter(function (x){ return inne.every(function (y){ return y.t !== x.t; }); }).concat(inne); zlozWynik(r); delete S.otwarte[r.id];
+            tisLog('start', '🤖 Odpowiedź Claude: issue ' + r.id + ' · ' + inne.map(function (x){ return x.t; }).join(' | '));
+            say('Issue ' + r.id + ': Claude rozpoznał potwierdzenie przelewu, nie fakturę — sprawdź, czy już nie zapłacone.', 'warn'); rysuj(); return;
+        }
         if (!docs.length){ say('Issue ' + r.id + ': w odczycie Claude nie ma dokumentu FAKTURA ani KOREKTA (są: ' + p.bloki.map(function (b){ return b.DOKUMENT || '?'; }).join(', ') + ').', 'err'); rysuj(); return; }
         ocenZWpisu(r, docs, 'claude', {});
         var reszta = p.bloki.length - docs.length;
         if (reszta) r.powodyFaktura.push({ w: 'info', t: 'pominąłem ' + reszta + ' blok(i) niebędące fakturą' });
+        inne.forEach(function (x){ r.powodyFaktura.push(x); });
         if (p.odrzucone.length) r.powodyFaktura.push({ w: 'info', t: 'pominąłem linie spoza formatu: ' + p.odrzucone.slice(0, 3).join(' | ').slice(0, 160) });
         zlozWynik(r);
         var nauka = naukaZapisz(r, docs, 'claude');
@@ -17753,10 +18690,15 @@
             var nie = wpisDozwolony(r);
             if (nie){ pominiete.push(id + ': ' + nie); return; }
             var docs = wg[id].filter(function (b){ return /^(FAKTURA|KOREKTA)$/i.test(String(b.DOKUMENT || '').trim()); });
-            if (!docs.length){ pominiete.push(id + ': w odczycie nie ma dokumentu FAKTURA ani KOREKTA'); return; }
+            var inne = claudeInnePrzelewy(r, wg[id]);
+            if (!docs.length){
+                if (inne.length){ r.powodyPliki = (r.powodyPliki || []).filter(function (x){ return inne.every(function (y){ return y.t !== x.t; }); }).concat(inne); zrobione++; return; }
+                pominiete.push(id + ': w odczycie nie ma dokumentu FAKTURA ani KOREKTA'); return;
+            }
             ocenZWpisu(r, docs, 'claude', {});
             var reszta = wg[id].length - docs.length;
             if (reszta) r.powodyFaktura.push({ w: 'info', t: 'pominąłem ' + reszta + ' blok(i) niebędące fakturą' });
+            inne.forEach(function (x){ r.powodyFaktura.push(x); });
             doNauki.push({ r: r, docs: docs });
             zrobione++;
         });
@@ -17916,6 +18858,18 @@
             CHF: 'CH1609000000853712378\nCH9500700345232330452',
             EUR: 'DE84240603002463143400\nPL35175000120000000036270101' } }
     ];
+    // Rachunki spółek, których NIE MA w arkuszu „CH & DE” (kopia 09.10.2026), a polecenia zapłaty je wskazują (18.11.2026):
+    // „Please pay from Global PostFinance EUR / USD” — 33 z 37 issue Global eCommerce; 36 wydruków przelewów (28.10–18.11.2026)
+    // obciążało dokładnie te dwa numery, a 469012 (Bank Data, zasilenia z BI UBS) potwierdza EUR. Arkusz ma pierwszeństwo:
+    // gdy kiedyś dopisze PostFinance, ten wpis tylko się powtórzy.
+    var TIS_KONTA_SPOLEK_DOP = [
+        { nazwa: 'Global eCommerce GmbH', konta: { EUR: 'PostFinance CH6809000000167814548', USD: 'PostFinance CH3009000000167814553' } }
+    ];
+    function kontaSpolkiDop(nazwa){
+        var n = String(nazwa || '').split('\n')[0].trim().toLowerCase();
+        var w = TIS_KONTA_SPOLEK_DOP.concat(TIS_IBT_WLASNE).filter(function (x){ return x.nazwa.toLowerCase() === n; })[0];
+        return w ? w.konta : {};
+    }
     var ibtArkCache = { kiedy: null, mapa: {} };
     function ibtArkusz(){
         if (ibtArkCache.kiedy === S.spolki.kiedy) return ibtArkCache.mapa;
@@ -17930,8 +18884,8 @@
             });
         }
         (S.spolki.lista || []).forEach(function (sp){ dodaj(sp.nazwa, sp.konta); });
-        // Rachunki właścicieli — zawsze, także gdy arkusz się nie wczytał.
-        TIS_IBT_WLASNE.forEach(function (sp){ dodaj(sp.nazwa, sp.konta); });
+        // Rachunki właścicieli i spółek spoza arkusza — zawsze, także gdy arkusz się nie wczytał.
+        TIS_IBT_WLASNE.concat(TIS_KONTA_SPOLEK_DOP).forEach(function (sp){ dodaj(sp.nazwa, sp.konta); });
         ibtArkCache = { kiedy: S.spolki.kiedy, mapa: mapa };
         return mapa;
     }
@@ -18730,16 +19684,39 @@
         { kto: /noerpel/i, iban: 'DE16630400530924424500', wlasciciel: 'Noerpel SE', bank: 'Commerzbank Ulm',
           skad: 'wskazany przez użytkownika 02.11.2026 z faktury 5151050525; faktura podaje trzy rachunki Noerpel SE, ten jest pierwszy w stopce' },
         { kto: /hellmann/i, iban: 'DE83265501051551731753', wlasciciel: 'Hellmann Worldwide Logistics Germany GmbH & Co. KG', bank: 'Sparkasse Osnabrück',
-          skad: 'wskazany przez użytkownika 02.11.2026; cała strona faktury jest obrazem, więc numeru nie ma w tekście — ten sam rachunek dostał przelew w przebiegu ręcznym z 30.10.2026' }
+          skad: 'wskazany przez użytkownika 02.11.2026; cała strona faktury jest obrazem, więc numeru nie ma w tekście — ten sam rachunek dostał przelew w przebiegu ręcznym z 30.10.2026' },
+        // HECNY w USD: rachunek bez IBAN w Hongkongu. Na fakturach z Chin („BANK ACCOUNT#” bez numeru — obrazek) go nie ma, a faktury
+        // hamburskie podają Commerzbank DE67… (HECNY Hamburg, EUR) — stąd pierwszeństwo przed IBAN-em z faktury, tylko w USD.
+        // 004-181-427568-001 to rachunek tego samego klienta w HKD (użytkownik 18.11.2026) — NIE do USD.
+        { kto: /hecny/i, waluta: 'USD', konto: '004-181-427568-274', bic: 'HSBCHKHHXXX', wlasciciel: 'HECNY Transportation S.A.', bank: 'HSBC Hong Kong',
+          pierwszenstwo: true,
+          skad: 'potwierdzony przez użytkownika 18.11.2026; cztery wydruki przelewów USD z PostFinance Global (28.10, 04.11, 16.11, 18.11.2026) poszły na ten numer' }
     ];
-    function pbRachunekZTabeli(r){
+    // Wpis może mieć walutę (tylko dla niej), rachunek bez IBAN (konto + BIC) i „pierwszenstwo” — wtedy wygrywa z IBAN-em
+    // z faktury, bo ten należy do innego oddziału albo innej waluty (18.11.2026: HECNY — faktury hamburskie podają DE67…, a przelewy
+    // USD szły na HSBC Hong Kong, którego numeru nie ma w tekście żadnej faktury).
+    function pbRachunekZTabeli(r, waluta, tylkoPierwszenstwo){
         var kto = String((r && r.company) || '');
         if (!kto) return null;
         for (var i = 0; i < TIS_RACHUNKI.length; i++){
             var t = TIS_RACHUNKI[i];
-            if (t.kto.test(kto) && ibanOk(t.iban)) return t;
+            if (!t.kto.test(kto) || (t.waluta && t.waluta !== waluta) || (tylkoPierwszenstwo && !t.pierwszenstwo)) continue;
+            if (t.iban ? ibanOk(t.iban) : !!t.konto) return t;
         }
         return null;
+    }
+    // Rachunek z komentarza (18.11.2026, 539730 Freight28: faktury podają DE39… i DE45…, a komentarz „Agent confirmed that all USD
+    // invoices should be paid to account DE45 … Please pay all of them to this IBAN …” — zapłacono wszystkie na DE45). Ostatni
+    // komentarz z jednym obcym IBAN-em i słowem o płatności; samo „IBAN: DE45…” (pytanie) nie wystarcza.
+    var TIS_KOM_KONTO = /\b(pa(?:y|id)|transfer|account|konto|rachunek|zapła|przelew)/i;
+    function kontoZKomentarzy(kom){
+        var nasze = ibtArkusz(), o = null;
+        (kom || []).forEach(function (c){
+            if (systemowy(c) || !TIS_KOM_KONTO.test(c.tekst)) return;
+            var ib = []; ibanyZTekstu(c.tekst).forEach(function (x){ if (!nasze[x.n] && ib.indexOf(x.n) < 0) ib.push(x.n); });
+            if (ib.length === 1) o = { n: ib[0], kto: c.ktoPelny || c.kto, kiedy: c.kiedy, tekst: String(c.tekst).replace(/\s+/g, ' ').slice(0, 140) };
+        });
+        return o;
     }
     // Rachunki z KAŻDEGO dokumentu osobno (uwaga z testu 04.11.2026, pkt 3: każda faktura i korekta jednej firmy ma
     // mieć ten sam rachunek). Dokument z linią tekstu (odczyt HUB-a) czytamy na bieżąco. Gdy fakturę przyjęto odczytem
@@ -18748,7 +19725,7 @@
     // Rachunki własnych spółek i właścicieli odpadają.
     function pbKontaZDocs(docs){
         return (docs || []).filter(function (d){ return d.linieT; }).map(function (d){
-            return { plik: d.plik, plikId: d.plikId || '', zrodlo: 'hub', korekta: !!d.korekta, qr: d.qr || null, uk: d.uk || null, inne: d.kontoInne || null,
+            return { plik: d.plik, plikId: d.plikId || '', zrodlo: 'hub', korekta: !!d.korekta, qr: d.qr || null, uk: d.uk || null, inne: d.kontoInne || null, kw: d.kontaWalut || null,
                      ibany: ibanyZTekstu(d.linieT.join('\n')).map(function (x){ return { n: x.n, przed: x.przed, linia: x.linia }; }) };
         });
     }
@@ -18756,7 +19733,7 @@
         var nasze = ibtArkusz(), docs = (r.faktura && r.faktura.docs) || [], out = [];
         var zLinii = docs.filter(function (d){ return d.linieT; });
         (zLinii.length ? pbKontaZDocs(zLinii) : (r.kontaHub || [])).forEach(function (x){
-            out.push({ plik: x.plik, plikId: x.plikId, zrodlo: x.zrodlo, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, ibany: x.ibany.slice() });
+            out.push({ plik: x.plik, plikId: x.plikId, zrodlo: x.zrodlo, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, kw: x.kw || null, ibany: x.ibany.slice() });
         });
         docs.forEach(function (d){
             if (!d.linieT && (d.ibany || []).length)
@@ -18843,7 +19820,7 @@
             pbKontaDok(r).forEach(function (x){
                 // Do zgodności rachunków liczą się dokumenty TEGO issue (z jego numerem FV); RIB i inne załączniki dają tylko kandydatów.
                 if (x.zrodlo === 'claude' || !fakt.length || fakt.indexOf(x.plikId) >= 0)
-                    g.dok.push({ issue: r.id, plik: x.plik, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, ibany: x.ibany.map(function (q){ return q.n; }) });
+                    g.dok.push({ issue: r.id, plik: x.plik, korekta: !!x.korekta, qr: x.qr || null, uk: x.uk || null, inne: x.inne || null, kw: x.kw || null, ibany: x.ibany.map(function (q){ return q.n; }) });
                 x.ibany.forEach(function (q){ if (!g.konta.some(function (y){ return y.n === q.n; })) g.konta.push({ n: q.n, przed: q.przed, linia: q.linia, plik: x.plik }); });
             });
         });
@@ -18881,9 +19858,20 @@
         g.dok.forEach(function (d){ if (!d.korekta && d.qr && d.qr.konto && qrs.indexOf(d.qr.konto) < 0) qrs.push(d.qr.konto); });
         var wyb = S.pb.konta[g.klucz];
         g.wybrany = !!wyb; g.zWaluty = false; g.zQr = false; g.rozneQr = null; g.zTabeli = null; g.zPoprzedniego = null; g.innyNizPoprzednio = null; g.kontoInne = null;
+        g.zSekcji = false; g.zKomentarza = null;
+        // Rachunek z sekcji „If paying with <waluta>” / „For payments in <waluta>” — jeden dla wszystkich dokumentów grupy.
+        var sek = [], sekK = [];
+        g.dok.forEach(function (d){ var k = !d.korekta && d.kw && d.kw[waluta]; if (!k) return; var kl = k.n || ('#' + k.inne.konto); if (sekK.indexOf(kl) < 0){ sekK.push(kl); sek.push(k); } });
+        // Rachunek z komentarza — gdy wszystkie issue grupy, które go mają, mówią to samo.
+        var kz = []; g.issue.forEach(function (r){ if (r.kontoZKom && !kz.some(function (x){ return x.n === r.kontoZKom.n; })) kz.push(r.kontoZKom); });
+        var zTab = function (zt){ if (zt.iban) g.iban = zt.iban; else { g.iban = ''; g.kontoInne = { konto: zt.konto, bic: zt.bic || '' }; } g.zTabeli = zt; };
+        var ztP = pbRachunekZTabeli(g.issue[0], waluta, true);
         if (wyb) g.iban = wyb;
+        else if (kz.length === 1){ g.iban = kz[0].n; g.zKomentarza = kz[0]; }
         else if (qrs.length === 1){ g.iban = qrs[0]; g.zQr = true; }
         else if (qrs.length > 1){ g.iban = ''; g.rozneQr = qrs; }
+        else if (ztP) zTab(ztP);
+        else if (sek.length === 1){ if (sek[0].n) g.iban = sek[0].n; else { g.iban = ''; g.kontoInne = sek[0].inne; } g.zSekcji = true; }
         else if (g.rozne) g.iban = '';
         else if (wspolne.length === 1) g.iban = wspolne[0];
         else if (g.konta.length === 1) g.iban = g.konta[0].n;
@@ -18901,12 +19889,12 @@
         }
         // Żadnego numeru z dokumentów — sięgamy po rachunek wpisany na stałe (TIS_RACHUNKI).
         // Wskazanie człowieka i numer z faktury mają pierwszeństwo, bo stoją wyżej.
-        if (!g.iban && !g.konta.length){
-            var zt = pbRachunekZTabeli(g.issue[0]);
-            if (zt){ g.iban = zt.iban; g.zTabeli = zt; }
+        if (!g.iban && !g.kontoInne && !g.konta.length){
+            var zt = pbRachunekZTabeli(g.issue[0], waluta);
+            if (zt) zTab(zt);
         }
         // Rachunek bez IBAN z faktury (konto + SWIFT) i UK (sort code + konto).
-        if (!g.iban && !g.konta.length) g.dok.forEach(function (d){ if (!g.kontoInne && !d.korekta && d.inne) g.kontoInne = d.inne; });
+        if (!g.iban && !g.kontoInne && !g.konta.length) g.dok.forEach(function (d){ if (!g.kontoInne && !d.korekta && d.inne) g.kontoInne = d.inne; });
         g.uk = null;
         if (waluta === 'GBP'){
             g.uk = ukZIban(g.iban);
@@ -18928,7 +19916,7 @@
             if (zRef.length) g.qr = { ref: zRef[0].qr.ref, plik: zRef[0].plik, ile: zRef.length };
         }
         g.qrIban = !!g.iban && /^(CH|LI)\d{2}3[01]\d{3}/.test(g.iban);
-        g.reczny = !!g.iban && !g.zTabeli && !g.zPoprzedniego && !g.konta.some(function (x){ return x.n === g.iban; }) && qrs.indexOf(g.iban) < 0;
+        g.reczny = !!g.iban && !g.zTabeli && !g.zPoprzedniego && !g.zKomentarza && !g.konta.some(function (x){ return x.n === g.iban; }) && qrs.indexOf(g.iban) < 0;
         g.brakNaDok = g.iban ? zIban.filter(function (d){ return d.ibany.indexOf(g.iban) < 0; }) : [];
     }
     // Jeden odbiorca + kilka issue = jeden przelew, razem z korektami (decyzja 09.10.2026).
@@ -18936,9 +19924,14 @@
         // Plik do banku płaci kwotę z pola Amount — issue bez niej (płatność ręczna: MWST, SRS…) idą tylko listą do płatności.
         // Issue z poleceniem zapłaty („please pay from …”) płaci się z rachunku wskazanego przez finanse — lista, nie plik (18.11.2026);
         // 🔁 nowa faktura cyklu czeka na polecenie, a pole Amount jest często z pierwszego cyklu.
-        var ok = S.lista.filter(function (r){ return doPlatnosci(r) && isFinite(r.amount) && !r.reczne && !r.ibt && r.etap !== 'nowyCykl'; });
+        var ok = S.lista.filter(function (r){ return doPlatnosci(r) && isFinite(r.amount) && !r.reczne && !r.ibt && r.etap !== 'nowyCykl' && (!r.test || S.testDoPlatnosci); });
         var plan = { grupy: [], poza: [], odlozone: [], platnik: null, blad: '', data: pbDataWykonania(), waluta: '' };
-        if (!ok.length){ plan.blad = 'nie ma issue z ✔ ani dodanych do płatności mimo uwag — najpierw „Sprawdź faktury”'; return plan; }
+        if (!ok.length){
+            plan.blad = S.lista.some(function (r){ return r.wynik && r.test; }) && !S.testDoPlatnosci
+                ? '🧪 issue sprawdzone w teście odczytu nie idą do pliku do banku — wyłącz 🧪 i kliknij „🔍 Sprawdź faktury” jeszcze raz'
+                : 'nie ma issue z ✔ ani dodanych do płatności mimo uwag — najpierw „Sprawdź faktury”';
+            return plan;
+        }
         // Jeden plik = jeden rachunek płatnika, czyli jedna spółka i jedna waluta.
         var pary = {};
         ok.forEach(function (r){ pary[(r.spolkaOpcja || r.spolka || '—') + '|' + (r.waluta || '—')] = (r.spolka || '—') + ' ' + (r.waluta || '—'); });
@@ -19526,10 +20519,11 @@
     // opcją dla pliku do banku?”). Lista — zawsze, dla każdego rachunku płatnika i waluty; plik pain.001 — jak dotąd HVB w EUR.
     function pbHtml(){
         // Bez przełącznika: lista, gdy są issue z poleceniem zapłaty albo przelewy wewnętrzne; inaczej plik do banku (jak dotąd).
-        var w = S.pb.widok || (S.lista.some(function (r){ return r.wynik && (r.reczne || r.ibt); }) ? 'lista' : 'pain');
+        var w = S.pb.widok || (S.lista.some(function (r){ return r.wynik && !r.test && (r.etap === 'doZaplaty' || r.ibt); }) ? 'lista' : 'pain');
         var b = function (k, t){ return '<button type="button" class="tis-btn' + (w === k ? '' : ' tis-btn2') + '" data-akcja="pb-widok" data-w="' + k + '">' + t + '</button>'; };
-        return '<div style="margin:8px 0 2px"><b>🏦 Płatność:</b> ' + b('lista', '📋 Lista do płatności (ręcznie w e-bankingu)') + b('pain', '⬇ Plik do banku (pain.001, HVB EUR)') + '</div>'
-             + (w === 'lista' ? lsHtml() : pbHtmlPain());
+        return '<div style="margin:8px 0 2px"><b>🏦 Płatność:</b> ' + b('lista', '📋 Lista do płatności (ręcznie w e-bankingu)') + b('pain', '⬇ Plik do banku (pain.001, HVB EUR)')
+             + b('pf', '⬇ Pliki PostFinance Global (EUR / USD)') + '</div>'
+             + (w === 'lista' ? lsHtml() : w === 'pf' ? pfHtml() : pbHtmlPain());
     }
 
     // ================= LISTA DO PŁATNOŚCI (17.11.2026) =================
@@ -19570,6 +20564,7 @@
     function lsPowodPoza(r){
         if (!r.wynik) return 'niesprawdzone';
         if (r.bladTech) return 'nie sprawdzone: ' + r.bladTech;
+        if (r.test && !S.testDoPlatnosci) return '🧪 sprawdzone w teście odczytu — nie do płatności';
         if (r.wynik === 'zaplacone') return '✓ ' + (etapOpis(r) || 'nic do zrobienia').replace(/^✓ /, '') + ' — nic do zrobienia';
         if (r.rodzaj === 'ibt') return r.ibt ? '🏦 przelew wewnętrzny — w sekcji „Przelewy wewnętrzne” niżej' : '🏦 przelew wewnętrzny bez zlecenia';
         if (r.wynik === 'odbite') return 'już odbite do payments';
@@ -19600,7 +20595,8 @@
         if (wpis && ibanOk(wpis)){ o.iban = wpis; o.reczny = true; return o; }
         if (!sp || !sp.sp){ o.blad = 'spółki płacącej nie znam (' + (o.spolka || 'brak w poleceniu i w issue') + ') — wpisz rachunek'; return o; }
         if (!wal){ o.blad = 'waluty płatności nie znam — wpisz rachunek'; return o; }
-        var pole = (sp.sp.konta || {})[wal];
+        // Arkusz + rachunki spoza arkusza (Global PostFinance, właściciele) — TIS_KONTA_SPOLEK_DOP / TIS_IBT_WLASNE.
+        var pole = [(sp.sp.konta || {})[wal], kontaSpolkiDop(o.spolka)[wal]].filter(Boolean).join('\n');
         if (!pole){ o.blad = 'w arkuszu „CH & DE” spółka ' + o.spolka + ' nie ma rachunku w ' + wal + ' — wpisz rachunek'; return o; }
         var nasze = ibanyZTekstu(pole).filter(function (x){ return !/salar/i.test(x.linia); });
         var kand = bank ? nasze.filter(function (x){ return lsBankPasuje(x, bank); }) : nasze;
@@ -19623,7 +20619,7 @@
         var kosz = {}, kol = [];
         spr.forEach(function (r){
             // 🏦 Przelew wewnętrzny ze zleceniem do wykonania — osobna sekcja (skąd → dokąd, kwota, tytuł).
-            if (r.ibt && !r.bladTech){ plan.ibt.push(r); return; }
+            if (r.ibt && !r.bladTech && (!r.test || S.testDoPlatnosci)){ plan.ibt.push(r); return; }
             var pw = lsPowodPoza(r);
             if (pw){ plan.poza.push({ r: r, powod: pw }); return; }
             var pl = lsPlatnik(r), kk = pl.iban || ('?' + pl.klucz);
@@ -19692,7 +20688,11 @@
         if (g.qr && g.qr.ile > 1) u.push('kilka QR-faktur w jednym przelewie: referencja pierwszej (' + g.qr.plik + '), numery wszystkich w wiadomości');
         if (g.zPoprzedniego) u.push('rachunek z poprzedniego przelewu (' + String(g.zPoprzedniego.kiedy).slice(0, 10) + ', ' + g.zPoprzedniego.plik + '), nie z faktury');
         if (g.innyNizPoprzednio) u.push('poprzedni przelew poszedł na ' + ibanFormat(g.innyNizPoprzednio.n) + ' (' + String(g.innyNizPoprzednio.kiedy).slice(0, 10) + ') — sprawdź zmianę rachunku');
-        if (g.zTabeli) u.push('rachunek z tabeli HUB-a, nie z faktury');
+        if (g.zTabeli) u.push('rachunek z tabeli HUB-a, nie z faktury (' + [g.zTabeli.bank, g.zTabeli.wlasciciel].filter(Boolean).join(', ') + ')'
+            + (g.konta.length ? ' — na fakturach inny: ' + g.konta.map(function (x){ return ibanFormat(x.n); }).join(', ') : ''));
+        if (g.zKomentarza) u.push('rachunek z komentarza (' + g.zKomentarza.kto + ', ' + String(g.zKomentarza.kiedy).slice(0, 10) + '): „' + g.zKomentarza.tekst + '”'
+            + (g.konta.some(function (x){ return x.n !== g.zKomentarza.n; }) ? ' — na fakturach też: ' + g.konta.filter(function (x){ return x.n !== g.zKomentarza.n; }).map(function (x){ return ibanFormat(x.n); }).join(', ') : ''));
+        if (g.zSekcji) u.push('rachunek z sekcji faktury „płatność w ' + g.waluta + '” (' + (g.iban ? ibanFormat(g.iban) : g.kontoInne ? g.kontoInne.konto : '') + ')');
         if (g.zKraju) u.push('na fakturze kilka rachunków — wybrany ten z kraju waluty ' + g.waluta + '; sprawdź');
         if (g.zWaluty) u.push('na fakturze kilka rachunków — wybrany ten opisany walutą ' + g.waluta);
         if (g.issue.some(function (r){ return r.reczne && r.polecenie && r.polecenie.osobno; })) u.push('polecenie prosi o osobne przelewy (każda faktura osobno)');
@@ -19710,10 +20710,28 @@
         if ((g.odlozoneKor || []).length) u.push('noty odłożone (większe niż faktury): ' + g.odlozoneKor.map(function (r){ return r.id; }).join(', '));
         return u;
     }
+    // Jedna linia „co zrobić” przy przelewie (prośba 18.11.2026: „jest tyle informacji, że ciężko się połapać”). Kolejność: to, co
+    // blokuje przelew, potem to, co trzeba sprawdzić, na końcu „gotowe”. Pełne uwagi zostają pod „szczegóły”.
+    function lsCoZrobic(g){
+        var zle = [], spr = [], skr = function (t){ t = String(t || ''); return t.length > 150 ? t.slice(0, 147) + '…' : t; };
+        g.issue.forEach(function (r){ (r.powody || []).forEach(function (x){ (x.w === 'zle' ? zle : x.w === 'spr' ? spr : []).push(x.t); }); });
+        if (g.powod && !(g.gr <= 0)) return { k: 'zle', t: '⛔ ' + g.powod };
+        if (!lsRachunekTxt(g)) return { k: 'zle', t: '⚠ wpisz rachunek odbiorcy — nie ma go na fakturze' };
+        if (g.kontoInne && !g.iban) return { k: 'zle', t: '⚠ rachunek bez IBAN — przepisz konto i BIC' + (g.kontoInne.routing ? ' (i routing)' : '') + (g.zTabeli ? ' (z tabeli HUB-a, potwierdzony wydrukami)' : g.zSekcji ? ' (z sekcji ' + g.waluta + ' na fakturze)' : ' z faktury') };
+        if (g.qrIban && !g.qr) return { k: 'zle', t: '⚠ przepisz referencję QR z części płatniczej faktury' };
+        if (!isFinite(g.gr)) return { k: 'zle', t: '⚠ wpisz kwotę z faktury' };
+        if (zle.length) return { k: 'zle', t: '➕ dodane mimo uwag: ' + skr(zle[0]) };
+        if (g.zKomentarza) return { k: 'spr', t: '? rachunek z komentarza (' + g.zKomentarza.kto + '), nie z faktury — sprawdź' };
+        if (g.innyNizPoprzednio) return { k: 'spr', t: '? poprzedni przelew poszedł na inny rachunek — sprawdź zmianę rachunku' };
+        if (g.zPoprzedniego) return { k: 'spr', t: '? rachunek z poprzedniego przelewu, nie z faktury — sprawdź' };
+        if (spr.length) return { k: 'spr', t: '? sprawdź: ' + skr(spr[0]) + (spr.length > 1 ? ' (i ' + (spr.length - 1) + ' inne)' : '') };
+        if (g.zKraju || (g.brakNaDok || []).length) return { k: 'spr', t: '? na fakturach kilka rachunków — sprawdź wybrany' };
+        return { k: 'ok', t: '✔ gotowe — przepisz do e-bankingu' };
+    }
     function lsRachunekTxt(g){
         if (g.uk && g.waluta === 'GBP') return 'sort code ' + g.uk.sort + ' · konto ' + g.uk.konto + (g.iban ? ' (IBAN ' + ibanFormat(g.iban) + ')' : '');
         if (g.iban) return ibanFormat(g.iban) + (g.qrIban ? ' (QR-IBAN)' : '');
-        if (g.kontoInne) return 'konto ' + g.kontoInne.konto + (g.kontoInne.bic ? ' · BIC ' + g.kontoInne.bic : '');
+        if (g.kontoInne) return 'konto ' + g.kontoInne.konto + (g.kontoInne.bic ? ' · BIC ' + g.kontoInne.bic : '') + (g.kontoInne.routing ? ' · routing ' + g.kontoInne.routing : '');
         return '';
     }
     function lsKop(v, tytul){ return v ? ' <button type="button" class="tis-btn tis-btn2" style="padding:0 4px;margin:0 2px" data-akcja="ls-kop" data-v="' + esc(v) + '" title="Kopiuj: ' + esc(tytul || v) + '">📋</button>' : ''; }
@@ -19732,9 +20750,9 @@
         }
         if (b.lista.length){
             h += '<table class="tis-t" style="margin-top:4px"><thead><tr><th>Odbiorca</th><th>Rachunek odbiorcy</th><th>Referencja QR</th><th>Tytuł (numery FV)</th>'
-               + '<th style="text-align:right">Kwota</th><th>Termin</th><th>Issue</th><th>Uwagi</th></tr></thead><tbody>';
+               + '<th style="text-align:right">Kwota</th><th>Termin</th><th>Issue</th><th>Co zrobić</th></tr></thead><tbody>';
             b.lista.forEach(function (g){
-                var rach = lsRachunekTxt(g), u = lsUwagi(g), tyt = g.numery.join(', ');
+                var rach = lsRachunekTxt(g), u = lsUwagi(g), tyt = g.numery.join(', '), cz = lsCoZrobic(g);
                 var kopRach = g.uk && g.waluta === 'GBP' ? lsKop(g.uk.sort, 'sort code') + lsKop(g.uk.konto, 'numer konta') : g.iban ? lsKop(g.iban, 'IBAN odbiorcy') : g.kontoInne ? lsKop(g.kontoInne.konto, 'numer konta') + lsKop(g.kontoInne.bic, 'BIC') : '';
                 h += '<tr><td>' + esc(g.nazwa) + lsKop(g.nazwa, 'odbiorca') + '</td>'
                    + '<td style="font-family:ui-monospace,monospace;font-size:11px">' + (rach ? esc(rach) + kopRach : '<span class="tis-zle">brak rachunku</span>') + pbKontoForm(g, !rach) + '</td>'
@@ -19743,7 +20761,8 @@
                    + '<td style="text-align:right;white-space:nowrap">' + (isFinite(g.gr) ? '<b>' + esc(pbKwPok(g.gr)) + '</b> ' + esc(g.waluta) + lsKop(pbKw(g.gr), 'kwota') : '<span class="tis-zle">brak</span>') + '</td>'
                    + '<td style="font-size:11px">' + esc(g.termin || '—') + '</td>'
                    + '<td style="font-size:11px">' + g.issue.map(function (r){ return '<a href="/react/logs/issue_logs/' + encodeURIComponent(r.id) + '" target="_blank" rel="noopener">' + esc(r.id) + '</a>' + (r.wynik === 'ok' ? '' : ' <span class="tis-spr">' + (r.wynik === 'zle' ? '✖' : '?') + '</span>'); }).join(', ') + '</td>'
-                   + '<td style="font-size:11px">' + (u.length ? '<ul style="margin:0;padding-left:14px">' + u.map(function (x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' : '<span class="w-ok">✔</span>') + '</td></tr>';
+                   + '<td style="font-size:11px;min-width:220px"><div class="' + (cz.k === 'ok' ? 'w-ok' : cz.k === 'zle' ? 'tis-zle' : 'tis-spr') + '">' + esc(cz.t) + '</div>'
+                   + (u.length ? '<details><summary class="tis-mut">szczegóły (' + u.length + ')</summary><ul style="margin:0;padding-left:14px">' + u.map(function (x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></details>' : '') + '</td></tr>';
             });
             var sumy = Object.keys(b.sumy).map(function (w){ return pbKwPok(b.sumy[w]) + ' ' + w; }).join(' + ');
             h += '<tr style="font-weight:bold;border-top:2px solid #94a3b8"><td colspan="4">RAZEM: ' + b.lista.length + (b.lista.length === 1 ? ' przelew' : ' przelewów') + '</td><td style="text-align:right;white-space:nowrap">' + esc(sumy || '—') + '</td><td colspan="3"></td></tr>';
@@ -19760,10 +20779,15 @@
            + 'Rachunek płatnika: z polecenia zapłaty finansów („please pay from …”), a bez polecenia — ze spółki issue; numer z arkusza „CH & DE”. '
            + 'Do listy idą ✔ i „?” (z uwagami); ✖ tylko dodane „➕ mimo uwag”. Zapłacone issue i nowe faktury cykliczne bez polecenia — poza listą, z powodem. W prologistics nic się nie zapisuje.</div>';
         if (!plan.koszyki.length && !plan.poza.length && !plan.ibt.length) return h + '<div class="tis-mut" style="margin-top:6px">Najpierw „🔍 Sprawdź faktury”.</div></div>';
+        var wTescie = S.testDoPlatnosci ? 0 : plan.poza.filter(function (x){ return x.r.test; }).length;
+        if (wTescie) h += '<div class="tis-msg warn" style="margin-top:6px">🧪 ' + wTescie + ' issue sprawdzono w teście odczytu — lista ich nie obejmuje. '
+            + 'Żeby płacić: <a href="#" data-akcja="test-wylacz">wyłącz 🧪</a> i kliknij „🔍 Sprawdź faktury” jeszcze raz.</div>';
         plan.koszyki.forEach(function (b){ h += lsKoszykHtml(b); });
         if (plan.ibt.length) h += lsIbtHtml(plan.ibt);
-        if (plan.poza.length) h += '<div style="margin-top:8px"><b>Poza listą (' + plan.poza.length + '):</b><ul style="margin:4px 0 0 16px;padding:0">'
-            + plan.poza.map(function (x){ return '<li>' + esc(x.r.id) + ' ' + esc(String(x.r.company || x.r.temat || '').slice(0, 50)) + ' — ' + esc(x.powod) + '</li>'; }).join('') + '</ul></div>';
+        // Poza listą — zwinięte (to, czego NIE płacisz, jest drugorzędne); 🧪 mówi o sobie raz, w ostrzeżeniu wyżej.
+        var poza = plan.poza.filter(function (x){ return !(x.r.test && !S.testDoPlatnosci); });
+        if (poza.length) h += '<details style="margin-top:8px"><summary><b>Poza listą (' + poza.length + ')</b> <span class="tis-mut">— zapłacone, bez polecenia albo z błędem; rozwiń, żeby zobaczyć powód</span></summary><ul style="margin:4px 0 0 16px;padding:0">'
+            + poza.map(function (x){ return '<li>' + esc(x.r.id) + ' ' + esc(String(x.r.company || x.r.temat || '').slice(0, 50)) + ' — ' + esc(x.powod) + '</li>'; }).join('') + '</ul></details>';
         h += '<div style="margin-top:8px"><button type="button" class="tis-btn" data-akcja="ls-kopiuj"' + (plan.ile ? '' : ' disabled') + '>📋 Kopiuj całą listę</button>'
            + '<button type="button" class="tis-btn tis-btn2" data-akcja="ls-xlsx"' + (plan.ile ? '' : ' disabled') + '>⬇ Lista do Excela</button>'
            + ' <span class="tis-mut">Kopia i plik zostawiają wpis w „HUB Log” (rachunki maskowane).</span></div>';
@@ -19793,7 +20817,8 @@
                        '   rachunek: ' + (lsRachunekTxt(g) || 'BRAK') + (g.qr ? ' · referencja QR: ' + qrRefFormat(g.qr.ref) : g.qrIban ? ' · referencja QR: WYMAGANA (z faktury)' : ''),
                        '   kwota: ' + (isFinite(g.gr) ? pbKwPok(g.gr) + ' ' + g.waluta : 'BRAK') + ' · tytuł: ' + (g.numery.join(', ') || '—') + (g.termin ? ' · termin: ' + g.termin : '')
                        + ' · issue: ' + g.issue.map(function (r){ return r.id; }).join(', '));
-                if (u.length) L.push('   uwagi: ' + u.join(' | '));
+                L.push('   co zrobić: ' + lsCoZrobic(g).t);
+                if (u.length) L.push('   szczegóły: ' + u.join(' | '));
             });
             L.push('Razem: ' + b.lista.length + ' · ' + Object.keys(b.sumy).map(function (w){ return pbKwPok(b.sumy[w]) + ' ' + w; }).join(' + '));
         });
@@ -19824,13 +20849,13 @@
         tisLog('koniec', '📋 lista ' + jak + ': ' + w.length + ' przelewów' + (plan.ibt.length ? ' + ' + plan.ibt.length + ' wewnętrznych' : ''));
     }
     function lsXlsx(plan){
-        var aoa = [['Z rachunku (spółka)', 'Bank', 'Waluta', 'Rachunek płatnika', 'Odbiorca', 'Rachunek odbiorcy', 'Referencja QR', 'Tytuł (numery FV)', 'Kwota', 'Waluta przelewu', 'Termin', 'Issue', 'Uwagi']];
+        var aoa = [['Z rachunku (spółka)', 'Bank', 'Waluta', 'Rachunek płatnika', 'Odbiorca', 'Rachunek odbiorcy', 'Referencja QR', 'Tytuł (numery FV)', 'Kwota', 'Waluta przelewu', 'Termin', 'Issue', 'Co zrobić', 'Szczegóły']];
         lsWiersze(plan).forEach(function (x){
             aoa.push([x.platnik.spolka || '', x.platnik.bank || '', x.platnik.waluta || '', x.platnik.iban ? ibanFormat(x.platnik.iban) : x.platnik.blad, x.g.nazwa, x.rach || 'BRAK', x.ref, x.tytul,
-                      isFinite(x.g.gr) ? Math.round(x.g.gr) / 100 : '', x.waluta, x.g.termin || '', x.g.issue.map(function (r){ return r.id; }).join(', '), x.uwagi.join(' | ')]);
+                      isFinite(x.g.gr) ? Math.round(x.g.gr) / 100 : '', x.waluta, x.g.termin || '', x.g.issue.map(function (r){ return r.id; }).join(', '), lsCoZrobic(x.g).t, x.uwagi.join(' | ')]);
         });
         var ws = XLSX.utils.aoa_to_sheet(aoa), wb = XLSX.utils.book_new();
-        ws['!cols'] = [28, 12, 7, 30, 30, 34, 34, 30, 12, 7, 14, 22, 80].map(function (w){ return { wch: w }; });
+        ws['!cols'] = [28, 12, 7, 30, 30, 34, 34, 30, 12, 7, 14, 22, 50, 80].map(function (w){ return { wch: w }; });
         XLSX.utils.book_append_sheet(wb, ws, 'Lista do płatności');
         if (plan.ibt.length){
             var ai = [['Z rachunku', 'Na rachunek', 'Kwota', 'Waluta', 'Tytuł', 'Zlecił', 'Data zlecenia', 'Issue', 'Uwagi']];
@@ -19844,6 +20869,307 @@
             XLSX.utils.book_append_sheet(wb, wi, 'Przelewy wewnętrzne');
         }
         return new Uint8Array(XLSX.write(wb, { type: 'array', bookType: 'xlsx' }));
+    }
+    // ================= PLIKI POSTFINANCE — GLOBAL eCOMMERCE (18.11.2026) =================
+    // Prośba: „czy można generować plik pain w przypadku płatności Globala, USD, EUR, płacone z PostFinance — to są nasze konta;
+    // niech potrafi zrobić dwa niezależne pliki, jak mają iść w innych walutach”. Decyzje użytkownika 18.11.2026: tylko Global
+    // eCommerce; koszty USD = SHAR; adresy odbiorców z wydruków PostFinance + pamięć na komputerze.
+    // Format: pain.001.001.09 wg Swiss Payment Standards 2025 (SIX IG v2.2, ważne od 22.11.2025):
+    //  • EUR na IBAN w SEPA → typ „S”: SvcLvl SEPA, ChrgBr SLEV, CdtrAgt niepotrzebny (z IBAN-u);
+    //  • USD → typ „X”: bez SvcLvl, ChrgBr SHAR, CdtrAgt/BICFI, rachunek IBAN albo Othr/Id, adres odbiorcy strukturalny
+    //    (TwnNm + Ctry obowiązkowe; numer domu wolno trzymać w StrtNm — „until further notice”);
+    //  • każda waluta = osobny blok płatności, tu: osobny PLIK (prośba użytkownika);
+    //  • DbtrAgt = BIC PostFinance POFICHBEXXX (w .09 element obowiązkowy).
+    // Do pliku idą tylko ✔ i „➕ mimo uwag” — jak do pliku HVB; „?” zostaje na liście do płatności.
+    var PF_GLOBAL = { EUR: 'CH6809000000167814548', USD: 'CH3009000000167814553' };
+    var PF_BIC = 'POFICHBEXXX';
+    // Adres płatnika z Company Overview (zakładka „CH & DE”, wiersz Global eCommerce GmbH, 18.11.2026) — skrypt spółek go nie oddaje.
+    var PF_DLUZNIK = { nazwa: 'Global eCommerce GmbH', ulica: 'Sonnenhof 13', kod: '8808', miasto: 'Pfaeffikon', kraj: 'CH' };
+    // Kraje SEPA (kody IBAN) — EUR na rachunek spoza tej listy to nie SEPA.
+    var PF_SEPA = ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GI', 'GR', 'HU', 'IS', 'IE', 'IT', 'LV', 'LI', 'LT', 'LU', 'MT',
+                   'MC', 'NL', 'NO', 'PL', 'PT', 'RO', 'SM', 'SK', 'SI', 'ES', 'SE', 'CH', 'GB', 'VA', 'AD'];
+    // Odbiorcy Global z wydruków PostFinance (28.10–18.11.2026, 36 przelewów): rachunek → BIC, nazwa i adres tak, jak zapisał je bank.
+    // Klucz = numer rachunku (IBAN albo konto bez IBAN). Nowego odbiorcę człowiek wpisuje raz w podglądzie (pamięć: GM tis_pf_odbiorcy).
+    var TIS_ODBIORCY = [
+        { konto: 'DE45292500001090003757', bic: 'BRLADE21BRS', nazwa: 'Freight28 GmbH', ulica: 'Schellackstr. 1', kod: '28217', miasto: 'Bremen', kraj: 'DE' },
+        { konto: '004-181-427568-274', bic: 'HSBCHKHHXXX', nazwa: 'HECNY TRANSPORTATION S.A.', ulica: '', kod: '', miasto: 'Hong Kong', kraj: 'HK' },
+        { konto: '914030041616638', bic: 'AXISINBB063', nazwa: 'Clearship Forwarders Pvt. Ltd.', ulica: '', kod: '122001', miasto: 'Haryana', kraj: 'IN' },
+        { konto: '515928072', bic: 'CHASUS33', nazwa: 'FLEXPORT, INC. US Collections', ulica: '', kod: '94111', miasto: 'San Francisco', kraj: 'US' },
+        { konto: 'DE36501108006161619538', bic: 'CHASDEFXXXX', nazwa: 'Flexport Inc - Collections (Ger)', ulica: '', kod: '94111', miasto: 'San Francisco', kraj: 'US' },
+        { konto: 'PL32160014621087666580000001', bic: 'PPABPLPKXXX', nazwa: 'New Wave International Cargo', ulica: 'Aleja Niepodleglosci 18', kod: '02-653', miasto: 'Warszawa', kraj: 'PL' },
+        { konto: 'PL21175000120000000023715546', bic: 'PPABPLPKXXX', nazwa: 'New Wave International Cargo Sp. z o.o. Sp. K', ulica: 'Aleja Niepodleglosci 18', kod: '02-653', miasto: 'Warszawa', kraj: 'PL' },
+        { konto: 'DE28290700500031653900', bic: 'DEUTDEHBXXX', nazwa: 'Heinrich Hoppe GmbH', ulica: '', kod: '28876', miasto: 'Oyten', kraj: 'DE' },
+        { konto: 'DE67200400000171448400', bic: 'COBADEFFXXX', nazwa: 'HECNY FREIGHT SERVICES GMBH', ulica: '', kod: '21077', miasto: 'Hamburg', kraj: 'DE' },
+        { konto: 'PL82236000050000004550295244', bic: 'DABAPLPWXXX', nazwa: 'JAS WORLDWIDE POLAND SP. Z O.O.', ulica: '', kod: '02-001', miasto: 'Warsaw', kraj: 'PL' },
+        { konto: 'PL38236000050000004550295260', bic: 'DABAPLPWXXX', nazwa: 'JAS WORLDWIDE POLAND SP. Z O.O.', ulica: '', kod: '02-001', miasto: 'Warsaw', kraj: 'PL' },
+        { konto: 'DE29290700500205118303', bic: 'DEUTDEHBXXX', nazwa: 'CMA CGM & ANL SECURITIES BV', ulica: '', kod: '13235', miasto: 'Marseille', kraj: 'FR' },
+        { konto: 'PL69109016650000000149258401', bic: 'WBKPPLPPXXX', nazwa: 'Forto Poland Sp. z o.o', ulica: 'Al. Ujazdowskie 41', kod: '00-540', miasto: 'Warszawa', kraj: 'PL' },
+        { konto: 'DK6881491010164035', bic: 'FTSBDKKKXXX', nazwa: 'DFDS A/S', ulica: '', kod: '2100', miasto: 'Kobenhavn', kraj: 'DK' },
+        { konto: 'DE70200400000138583000', bic: 'COBADEFFXXX', nazwa: 'Transworld Shipping Gmbh', ulica: 'Burchardstrasse 24', kod: '20095', miasto: 'Hamburg', kraj: 'DE' },
+        { konto: 'CH8300231231408328313', bic: 'UBSWCHZH50A', nazwa: 'GEODIS FREIGHT FORWARDING SWITZERLAND LTD.', ulica: '', kod: '4053', miasto: 'Basel', kraj: 'CH' },
+        { konto: 'CH4400231231408274792', bic: 'UBSWCHZH50A', nazwa: 'GEODIS FREIGHT FORWARDING SWITZERLAND LTD.', ulica: '', kod: '4053', miasto: 'Basel', kraj: 'CH' },
+        { konto: 'PL58102010260000170205990264', bic: 'BPKOPLPWXXX', nazwa: 'GT Air&Ocean Sp. z o.o.', ulica: '', kod: '97-300', miasto: 'Piotrkow Trybunalski', kraj: 'PL' },
+        { konto: 'PL88102010260000120206086484', bic: 'BPKOPLPWXXX', nazwa: 'GT Air&Ocean Sp. z o.o', ulica: '', kod: '97-300', miasto: 'Piotrkow Trybunalski', kraj: 'PL' },
+        { konto: 'PL07103015080000000804894012', bic: 'CITIPLPXXXX', nazwa: 'FedEx Logistics Poland sp. z o.o.', ulica: '', kod: '81-300', miasto: 'Gdynia', kraj: 'PL' },
+        { konto: 'PL54103015080000000804894039', bic: 'CITIPLPXXXX', nazwa: 'FedEx Logistics Poland sp. z o.o.', ulica: '', kod: '81-300', miasto: 'Gdynia', kraj: 'PL' }
+    ];
+    var TIS_PF_ODB_KEY = 'tis_pf_odbiorcy';
+    function pfOdbPamiec(){ try { var o = JSON.parse(GM_getValue(TIS_PF_ODB_KEY, '{}') || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e){ return {}; } }
+    function pfOdbZapisz(o){ try { GM_setValue(TIS_PF_ODB_KEY, JSON.stringify(o || {})); } catch (e){} }
+    function pfNumer(s){ return String(s || '').replace(/\s+/g, '').toUpperCase(); }
+    function pfKlucz(g){ return g.iban ? pfNumer(g.iban) : g.kontoInne ? pfNumer(g.kontoInne.konto) : ''; }
+    // Odbiorca: pamięć (wpis człowieka) → wydruki PostFinance (tabela). Brak = null.
+    function pfOdbiorca(g){
+        var k = pfKlucz(g); if (!k) return null;
+        var p = pfOdbPamiec()[k]; if (p) return Object.assign({ konto: k, skad: 'wpisany na tym komputerze' }, p);
+        var t = TIS_ODBIORCY.filter(function (x){ return pfNumer(x.konto) === k; })[0];
+        return t ? Object.assign({ skad: 'z wydruku PostFinance' }, t) : null;
+    }
+    function pfAdresOk(o){ return !!(o && String(o.miasto || '').trim() && /^[A-Z]{2}$/.test(String(o.kraj || '').trim())); }
+    // Tytuł PostFinance: limit 140 znaków (SPS: RmtInf/Ustrd). Numery ze wspólnym początkiem skracamy tak jak payments na wydrukach
+    // („NGBIT260900033,34,TSNIT260900044,49,52,139,144,147,FOCIT…” — HECNY USD 28.10.2026): pierwszy numer serii w całości, kolejne
+    // tylko końcówką od miejsca, w którym różnią się od pierwszego (co najmniej 2 znaki, najwyżej 4). Do 18.11 HUB mieścił 9 numerów
+    // HECNY i „+54”. Czego się nie da zmieścić, HUB nie gubi po cichu — „+N” jak w pliku HVB.
+    function pfTytul(numery){
+        // Mieszczą się pełne numery — zostają pełne (Freight28 „6101 6100 6099…”, nie „6101,00,99”). Skracamy tylko długie (≥ 8 znaków).
+        var pelne = pbTytul(numery);
+        if (!pelne.poza) return pelne;
+        var l = numery.map(pbEpc).filter(Boolean), cz = [], baza = '';
+        l.forEach(function (n){
+            var k = 0;
+            if (baza && baza.length === n.length){ while (k < n.length && baza[k] === n[k]) k++; }
+            var ogon = n.length - k;
+            if (baza && baza.length === n.length && n.length >= 8 && ogon <= 4 && /^\d+$/.test(n.slice(-Math.max(ogon, 2))) && k >= 2) cz.push(n.slice(-Math.max(ogon, 2)));
+            else { cz.push(n); baza = n; }
+        });
+        var t = '', poza = 0;
+        for (var i = 0; i < cz.length; i++){
+            var kand = t ? t + ',' + cz[i] : cz[i], zapas = i < cz.length - 1 ? (' +' + (cz.length - i - 1)).length : 0;
+            if (kand.length + zapas > PB_TYT_MAX){ poza = cz.length - i; break; }
+            t = kand;
+        }
+        // Tniemy od końca, więc tytuł zawsze zaczyna się pełnym numerem; „+N” liczy także końcówki, które nie weszły.
+        if (poza) t = (t + ' +' + poza).slice(0, PB_TYT_MAX);
+        return { tytul: t, poza: poza };
+    }
+    function pfPlan(){
+        var ls = lsPlan(), out = [];
+        ['EUR', 'USD'].forEach(function (wal){
+            var plan = { waluta: wal, typ: wal === 'EUR' ? 'S' : 'X', platnik: { iban: PF_GLOBAL[wal], nazwa: PF_DLUZNIK.nazwa }, data: pbDataWykonania(),
+                         grupy: [], poza: [], gr: 0, issue: 0 };
+            var b = ls.koszyki.filter(function (x){ return x.platnik.iban === PF_GLOBAL[wal]; })[0];
+            if (b){
+                b.poza.forEach(function (g){ plan.poza.push({ g: g, powod: g.powod || (g.gr === 0 ? 'faktury i noty znoszą się do zera' : 'noty większe niż faktury') }); });
+                var uzyte = {};
+                b.lista.forEach(function (g){
+                    var nie = g.issue.filter(function (r){ return !doPlatnosci(r); }), pw = '';
+                    var odb = pfOdbiorca(g);
+                    g.pf = { odb: odb, bic: (odb && odb.bic) || (g.kontoInne && g.kontoInne.bic) || '' };
+                    if (nie.length) pw = (nie.some(function (r){ return r.wynik === 'zle'; }) ? '✖' : '?') + ' w issue ' + nie.map(function (r){ return r.id; }).join(', ')
+                        + ' — sprawdź albo „➕ Do płatności mimo uwag” (do pliku idą tylko ✔)';
+                    else if (g.waluta !== wal) pw = 'przelew w ' + (g.waluta || '?') + ', a rachunek płatnika w ' + wal;
+                    else if (!(g.gr > 0)) pw = 'brak kwoty';
+                    else if (!g.iban && !(g.kontoInne && g.kontoInne.konto)) pw = 'brak rachunku odbiorcy — wpisz go na liście do płatności';
+                    else if (wal === 'EUR' && !g.iban) pw = 'EUR na rachunek bez IBAN — to nie SEPA; zapłać ręcznie';
+                    else if (wal === 'EUR' && PF_SEPA.indexOf(g.iban.slice(0, 2)) < 0) pw = 'EUR na rachunek spoza SEPA (' + g.iban.slice(0, 2) + ') — zapłać ręcznie';
+                    else if (g.qrIban) pw = 'QR-IBAN (referencja QR) — zapłać ręcznie';
+                    if (pw){ plan.poza.push({ g: g, powod: pw }); return; }
+                    var t = pfTytul(g.numery);
+                    g.pf.tytul = t.tytul || pbEpc(g.nazwa).slice(0, 35); g.pf.pozaTyt = t.poza;
+                    g.pf.e2e = pbE2e(g.numery.length ? g.numery.slice(0, 4) : [g.nazwa], uzyte);
+                    g.pf.nazwa = pbEpc((odb && odb.nazwa) || g.nazwa).slice(0, PB_NAZWA_MAX);
+                    plan.grupy.push(g);
+                });
+            }
+            plan.gr = plan.grupy.reduce(function (s, g){ return s + g.gr; }, 0);
+            plan.issue = plan.grupy.reduce(function (s, g){ return s + g.issue.length; }, 0);
+            out.push(plan);
+        });
+        return out;
+    }
+    function pfKontrole(plan){
+        var b = [], o = [];
+        if (!plan.grupy.length) b.push('żadne issue nie weszło do pliku ' + plan.waluta);
+        plan.grupy.forEach(function (g){
+            var odb = g.pf.odb, n = g.pf.nazwa || g.klucz;
+            if (!g.pf.nazwa) b.push(g.klucz + ': pusta nazwa odbiorcy');
+            if (g.iban && !ibanOk(g.iban)) b.push(n + ': rachunek ' + ibanFormat(g.iban) + ' nie przechodzi sumy kontrolnej');
+            if (plan.typ === 'X' && !pfAdresOk(odb)) b.push(n + ': brak adresu odbiorcy (miasto i kraj) — wpisz go niżej, przy przelewie');
+            if (plan.typ === 'X' && !/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(g.pf.bic)) b.push(n + ': brak BIC banku odbiorcy — wpisz go niżej, przy przelewie');
+            if (plan.typ === 'S' && !pfAdresOk(odb)) o.push(n + ': bez adresu odbiorcy (SEPA go nie wymaga; bank może dopytać)');
+            if (g.pf.pozaTyt) o.push(n + ': w tytule nie mieści się ' + g.pf.pozaTyt + ' numerów — stoi „+' + g.pf.pozaTyt + '”');
+            if (g.zKomentarza) o.push(n + ': rachunek z komentarza (' + g.zKomentarza.kto + '), nie z faktury');
+            if (g.zTabeli) o.push(n + ': rachunek z tabeli HUB-a, nie z faktury (' + [g.zTabeli.bank, g.zTabeli.wlasciciel].filter(Boolean).join(', ') + ')');
+            if (g.reczny) o.push(n + ': rachunek wpisany ręcznie');
+            if (g.innyNizPoprzednio) o.push(n + ': poprzedni przelew poszedł na ' + ibanFormat(g.innyNizPoprzednio.n) + ' — sprawdź zmianę rachunku');
+            if (odb && odb.skad && odb.konto && g.iban && pfNumer(odb.konto) !== pfNumer(g.iban)) b.push(n + ': adres z innego rachunku');
+            (g.issue || []).filter(mimoWazne).forEach(function (r){ o.push(n + ': issue ' + r.id + ' dodane do płatności MIMO UWAG (' + (r.mimo.kto || '?') + ')'); });
+        });
+        if (plan.data.przesuniete) o.push('dziś przelewu nie wykonasz (weekend) — data wykonania ' + plan.data.data + ' (' + plan.data.dzien + ')');
+        return { blokady: b, uwagi: o };
+    }
+    function pfAdresXml(o, wciecie){
+        if (!pfAdresOk(o)) return '';
+        var e = function (t){ return pbX(pbEpc(t)); }, x = [wciecie + '<PstlAdr>'];
+        if (String(o.ulica || '').trim()) x.push(wciecie + ' <StrtNm>' + e(o.ulica).slice(0, 70) + '</StrtNm>');
+        if (String(o.kod || '').trim()) x.push(wciecie + ' <PstCd>' + e(o.kod).slice(0, 16) + '</PstCd>');
+        x.push(wciecie + ' <TwnNm>' + e(o.miasto).slice(0, 35) + '</TwnNm>');
+        x.push(wciecie + ' <Ctry>' + String(o.kraj).trim().toUpperCase() + '</Ctry>');
+        x.push(wciecie + '</PstlAdr>');
+        return x.join('\n');
+    }
+    function pfXml(plan){
+        var d = new Date();
+        var stempel = pbISO(d).replace(/-/g, '') + ('0' + d.getHours()).slice(-2) + ('0' + d.getMinutes()).slice(-2) + ('0' + d.getSeconds()).slice(-2);
+        var msgId = 'HUBPF' + plan.waluta + stempel, x = [];   // nie „BEL…” — ten przedrostek rozpoznaje moduł Depozyty
+        x.push('<?xml version="1.0" encoding="UTF-8"?>');
+        x.push('<Document xmlns="' + PB_NS + '" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">');
+        x.push(' <CstmrCdtTrfInitn>');
+        x.push('  <GrpHdr>');
+        x.push('   <MsgId>' + msgId + '</MsgId>');
+        x.push('   <CreDtTm>' + pbISO(d) + 'T' + d.toTimeString().slice(0, 8) + '</CreDtTm>');
+        x.push('   <NbOfTxs>' + plan.grupy.length + '</NbOfTxs>');
+        x.push('   <CtrlSum>' + pbKw(plan.gr) + '</CtrlSum>');
+        x.push('   <InitgPty><Nm>' + pbX(pbEpc(PF_DLUZNIK.nazwa)) + '</Nm></InitgPty>');
+        x.push('  </GrpHdr>');
+        x.push('  <PmtInf>');
+        x.push('   <PmtInfId>' + msgId + '-01</PmtInfId>');
+        x.push('   <PmtMtd>TRF</PmtMtd>');
+        x.push('   <BtchBookg>false</BtchBookg>');
+        x.push('   <NbOfTxs>' + plan.grupy.length + '</NbOfTxs>');
+        x.push('   <CtrlSum>' + pbKw(plan.gr) + '</CtrlSum>');
+        if (plan.typ === 'S') x.push('   <PmtTpInf><SvcLvl><Cd>SEPA</Cd></SvcLvl></PmtTpInf>');
+        x.push('   <ReqdExctnDt><Dt>' + plan.data.data + '</Dt></ReqdExctnDt>');
+        x.push('   <Dbtr>');
+        x.push('    <Nm>' + pbX(pbEpc(PF_DLUZNIK.nazwa)) + '</Nm>');
+        x.push(pfAdresXml(PF_DLUZNIK, '    '));
+        x.push('   </Dbtr>');
+        x.push('   <DbtrAcct><Id><IBAN>' + plan.platnik.iban + '</IBAN></Id></DbtrAcct>');
+        x.push('   <DbtrAgt><FinInstnId><BICFI>' + PF_BIC + '</BICFI></FinInstnId></DbtrAgt>');
+        x.push('   <ChrgBr>' + (plan.typ === 'S' ? 'SLEV' : 'SHAR') + '</ChrgBr>');
+        plan.grupy.forEach(function (g){
+            var odb = g.pf.odb;
+            x.push('   <CdtTrfTxInf>');
+            x.push('    <PmtId><EndToEndId>' + pbX(g.pf.e2e) + '</EndToEndId></PmtId>');
+            x.push('    <Amt><InstdAmt Ccy="' + plan.waluta + '">' + pbKw(g.gr) + '</InstdAmt></Amt>');
+            if (plan.typ === 'X' || g.pf.bic) x.push('    <CdtrAgt><FinInstnId><BICFI>' + g.pf.bic + '</BICFI></FinInstnId></CdtrAgt>');
+            x.push('    <Cdtr>');
+            x.push('     <Nm>' + pbX(g.pf.nazwa) + '</Nm>');
+            var a = pfAdresXml(odb, '     '); if (a) x.push(a);
+            x.push('    </Cdtr>');
+            x.push(g.iban ? '    <CdtrAcct><Id><IBAN>' + pfNumer(g.iban) + '</IBAN></Id></CdtrAcct>'
+                          : '    <CdtrAcct><Id><Othr><Id>' + pbX(String(g.kontoInne.konto).replace(/\s+/g, '')) + '</Id></Othr></Id></CdtrAcct>');
+            x.push('    <RmtInf><Ustrd>' + pbX(g.pf.tytul) + '</Ustrd></RmtInf>');
+            x.push('   </CdtTrfTxInf>');
+        });
+        x.push('  </PmtInf>');
+        x.push(' </CstmrCdtTrfInitn>');
+        x.push('</Document>');
+        return x.filter(function (l){ return l !== ''; }).join('\n') + '\n';
+    }
+    // Gotowy plik czytamy od nowa i porównujemy z podglądem (jak przy HVB).
+    function pfSprawdzXml(xml, plan){
+        var dok = new DOMParser().parseFromString(xml, 'text/xml');
+        if (dok.getElementsByTagName('parsererror').length) return 'gotowy plik nie daje się przeczytać jako XML';
+        var q = function (el, n){ return el.getElementsByTagNameNS(PB_NS, n); };
+        var tx = q(dok, 'CdtTrfTxInf');
+        if (tx.length !== plan.grupy.length) return 'w gotowym pliku jest ' + tx.length + ' przelewów, a w podglądzie ' + plan.grupy.length;
+        var suma = 0, e2e = {};
+        for (var i = 0; i < tx.length; i++){
+            var kw = q(tx[i], 'InstdAmt')[0], id = (q(tx[i], 'EndToEndId')[0] || {}).textContent;
+            if (!kw || kw.getAttribute('Ccy') !== plan.waluta) return 'przelew ' + (i + 1) + ': waluta inna niż ' + plan.waluta;
+            if (!/^\d+\.\d{2}$/.test(kw.textContent)) return 'kwota „' + kw.textContent + '” nie jest zapisana jako grosze';
+            if (e2e[id]) return 'EndToEndId „' + id + '” występuje dwa razy';
+            e2e[id] = 1;
+            var ib = q(tx[i], 'IBAN')[0];
+            if (ib && !ibanOk(ib.textContent)) return 'rachunek ' + ib.textContent + ' nie przechodzi sumy kontrolnej';
+            if (!ib && !q(tx[i], 'Othr').length) return 'przelew ' + (i + 1) + ' bez rachunku odbiorcy';
+            if (plan.typ === 'X'){
+                if (!q(tx[i], 'BICFI').length) return 'przelew ' + (i + 1) + ' (USD) bez BIC banku odbiorcy';
+                var cd = q(tx[i], 'Cdtr')[0];
+                if (!cd || !q(cd, 'TwnNm').length || !q(cd, 'Ctry').length) return 'przelew ' + (i + 1) + ' (USD) bez miasta i kraju odbiorcy';
+            }
+            suma += pbGr(kw.textContent);
+        }
+        if (suma !== plan.gr) return 'suma przelewów w pliku to ' + pbKw(suma) + ', a w podglądzie ' + pbKw(plan.gr);
+        var ctrl = q(dok, 'CtrlSum');
+        for (var j = 0; j < ctrl.length; j++) if (pbGr(ctrl[j].textContent) !== plan.gr) return 'CtrlSum nie zgadza się z sumą przelewów';
+        var ustrd = q(dok, 'Ustrd');
+        for (var u = 0; u < ustrd.length; u++) if (ustrd[u].textContent.length > PB_TYT_MAX) return 'tytuł przelewu ' + (u + 1) + ' ma ' + ustrd[u].textContent.length + ' znaków (PostFinance: najwyżej ' + PB_TYT_MAX + ')';
+        var dbtr = q(dok, 'DbtrAcct')[0];
+        if (!dbtr || q(dbtr, 'IBAN')[0].textContent !== PF_GLOBAL[plan.waluta]) return 'rachunek płatnika w pliku to nie Global PostFinance ' + plan.waluta;
+        var svc = q(dok, 'SvcLvl').length, chrg = (q(dok, 'ChrgBr')[0] || {}).textContent;
+        if (plan.typ === 'S' && (!svc || chrg !== 'SLEV')) return 'plik EUR musi mieć SEPA i SLEV';
+        if (plan.typ === 'X' && (svc || chrg !== 'SHAR')) return 'plik USD nie może mieć SEPA i musi mieć SHAR';
+        return '';
+    }
+    function pfBuduj(wal){
+        if (S.praca || S.pb.pracuje) return;
+        var plan = (S.pf || []).filter(function (p){ return p.waluta === wal; })[0];
+        if (!plan){ say('Najpierw otwórz podgląd plików PostFinance.', 'warn'); rysuj(); return; }
+        var k = pfKontrole(plan);
+        if (k.blokady.length){ say('Pliku ' + wal + ' nie składam: ' + k.blokady.join(' · '), 'err'); rysuj(); return; }
+        if (!confirm('Złożyć plik PostFinance ' + wal + '?\n\n' + plan.grupy.length + ' przelewów, suma ' + pbKwPok(plan.gr) + ' ' + wal
+            + '\nz rachunku ' + ibanFormat(plan.platnik.iban) + ' (Global eCommerce GmbH, PostFinance)'
+            + '\n' + (plan.typ === 'S' ? 'SEPA, koszty SLEV' : 'przelew zagraniczny, koszty dzielone (SHAR)')
+            + '\ndata wykonania: ' + plan.data.data
+            + (k.uwagi.length ? '\n\nUwagi:\n- ' + k.uwagi.join('\n- ') : '')
+            + '\n\nPlik wgrywasz w e-finance PostFinance. W prologistics nic się nie zapisuje.')) return;
+        var xml = pfXml(plan), zle = pfSprawdzXml(xml, plan);
+        if (zle){ say('Pliku ' + wal + ' nie składam — kontrola gotowego XML-a: ' + zle, 'err'); rysuj(); return; }
+        var nazwa = pbDataPL(plan.data.data) + ' Global PostFinance ' + wal + ' pain001.xml';
+        pbZapisz(pbUtf8(xml), nazwa, 'application/xml');
+        tisLog('start', '⬇ Plik PostFinance ' + wal + ': ' + plan.grupy.length + ' przelewów, ' + pbKwPok(plan.gr) + ' ' + wal + ' z ' + ibanFormat(plan.platnik.iban));
+        plan.grupy.forEach(function (g){
+            tisLog('przelew', g.pf.nazwa + ' · ' + (g.iban ? ibanFormat(g.iban) : g.kontoInne.konto) + ' · ' + pbKwPok(g.gr) + ' ' + wal + ' · tytuł ' + g.pf.tytul + ' · issue ' + g.issue.map(function (r){ return r.id; }).join(','));
+        });
+        tisLog('koniec', '⬇ ' + nazwa);
+        say('Złożone: ' + nazwa + ' (' + plan.grupy.length + ' przelewów, ' + pbKwPok(plan.gr) + ' ' + wal + '). Wgraj go w e-finance PostFinance.' + (k.uwagi.length ? ' Uwagi: ' + k.uwagi.join(' · ') : ''), k.uwagi.length ? 'warn' : 'ok');
+        rysuj();
+    }
+    function pfAdresForm(g){
+        var k = esc(pfKlucz(g)), o = g.pf.odb || {}, pole = function (n, ph, w, v){ return '<input class="tis-pf-adr" data-k="' + k + '" data-p="' + n + '" placeholder="' + ph + '" value="' + esc(v || '') + '" style="width:' + w + 'px"> '; };
+        return '<details' + (pfAdresOk(o) && /^[A-Z]{6}/.test(g.pf.bic) ? '' : ' open') + ' style="margin-top:2px"><summary class="tis-mut" style="cursor:pointer">✎ adres / BIC</summary>'
+            + pole('nazwa', 'nazwa odbiorcy', 200, o.nazwa || g.nazwa) + pole('ulica', 'ulica i nr', 140, o.ulica) + pole('kod', 'kod', 60, o.kod)
+            + pole('miasto', 'miasto *', 110, o.miasto) + pole('kraj', 'kraj (2 litery) *', 50, o.kraj) + pole('bic', 'BIC banku', 100, o.bic || g.pf.bic)
+            + '<button type="button" class="tis-btn tis-btn2" data-akcja="pf-adres" data-k="' + k + '">Zapisz</button>'
+            + ' <span class="tis-mut">pamiętam na tym komputerze dla rachunku ' + esc(pfKlucz(g)) + '</span></details>';
+    }
+    function pfHtml(){
+        var plany = S.pf = pfPlan();
+        var h = '<div class="tis-ibt" style="border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:4px 0 8px;background:#f8fafc">';
+        h += '<div style="font-weight:bold;margin-bottom:4px">⬇ Pliki PostFinance — Global eCommerce GmbH</div>';
+        h += '<div class="tis-mut">Osobny plik na każdą walutę: EUR (SEPA) z ' + esc(ibanFormat(PF_GLOBAL.EUR)) + ', USD (zagraniczny, koszty dzielone) z ' + esc(ibanFormat(PF_GLOBAL.USD))
+           + '. Wchodzą issue z poleceniem „please pay from Global PostFinance …” i wynikiem ✔ albo „➕ mimo uwag”. Adres i BIC odbiorcy z wydruków PostFinance; nowego odbiorcę wpisujesz raz. W prologistics nic się nie zapisuje.</div>';
+        if (S.lista.some(function (r){ return r.wynik && r.test; }) && !S.testDoPlatnosci)
+            h += '<div class="tis-msg warn" style="margin-top:6px">🧪 Issue sprawdzone w teście odczytu nie idą do plików — <a href="#" data-akcja="test-wylacz">wyłącz 🧪</a> i sprawdź jeszcze raz.</div>';
+        plany.forEach(function (plan){
+            var k = pfKontrole(plan);
+            h += '<div style="margin-top:10px;border-top:1px solid #cbd5e1;padding-top:6px"><b>Plik ' + plan.waluta + '</b> · z ' + esc(ibanFormat(plan.platnik.iban))
+               + ' · ' + (plan.typ === 'S' ? 'SEPA, SLEV' : 'zagraniczny, SHAR') + ' · data wykonania ' + esc(plan.data.data);
+            if (!plan.grupy.length && !plan.poza.length){ h += ' <span class="tis-mut">— brak issue z poleceniem z tego rachunku</span></div>'; return; }
+            if (plan.grupy.length){
+                h += '<table class="tis-t" style="margin-top:4px"><thead><tr><th>Odbiorca</th><th>Rachunek</th><th>BIC</th><th>Adres</th><th style="text-align:right">Kwota</th><th>Tytuł</th><th>Issue</th></tr></thead><tbody>';
+                plan.grupy.forEach(function (g){
+                    var o = g.pf.odb;
+                    h += '<tr><td>' + esc(g.pf.nazwa) + '</td><td style="font-family:ui-monospace,monospace;font-size:11px">' + esc(g.iban ? ibanFormat(g.iban) : g.kontoInne.konto) + '</td>'
+                       + '<td style="font-size:11px">' + (g.pf.bic ? esc(g.pf.bic) : '<span class="' + (plan.typ === 'X' ? 'tis-zle' : 'tis-mut') + '">' + (plan.typ === 'X' ? 'brak' : '—') + '</span>') + '</td>'
+                       + '<td style="font-size:11px">' + (pfAdresOk(o) ? esc([o.ulica, [o.kod, o.miasto].filter(Boolean).join(' '), o.kraj].filter(Boolean).join(', ')) + '<div class="tis-mut">' + esc(o.skad || '') + '</div>'
+                           : '<span class="' + (plan.typ === 'X' ? 'tis-zle' : 'tis-mut') + '">' + (plan.typ === 'X' ? 'brak — wpisz' : 'bez adresu') + '</span>') + pfAdresForm(g) + '</td>'
+                       + '<td style="text-align:right;white-space:nowrap"><b>' + esc(pbKwPok(g.gr)) + '</b> ' + plan.waluta + '</td>'
+                       + '<td style="font-size:11px">' + esc(g.pf.tytul) + '</td>'
+                       + '<td style="font-size:11px">' + g.issue.map(function (r){ return esc(r.id) + (mimoWazne(r) ? ' ➕' : ''); }).join(', ') + '</td></tr>';
+                });
+                h += '<tr style="font-weight:bold;border-top:2px solid #94a3b8"><td colspan="4">RAZEM: ' + plan.grupy.length + ' przelewów</td><td style="text-align:right">' + esc(pbKwPok(plan.gr)) + ' ' + plan.waluta + '</td><td colspan="2"></td></tr></tbody></table>';
+            }
+            if (plan.poza.length) h += '<details style="margin-top:4px"' + (plan.grupy.length ? '' : ' open') + '><summary><b>Poza plikiem (' + plan.poza.length + ')</b></summary><ul style="margin:4px 0 0 16px;padding:0">'
+                + plan.poza.map(function (x){ return '<li>' + esc(x.g.nazwa || '?') + ' (' + x.g.issue.map(function (r){ return esc(r.id); }).join(', ') + ') — ' + esc(x.powod) + '</li>'; }).join('') + '</ul></details>';
+            if (k.uwagi.length && plan.grupy.length) h += '<div class="tis-spr" style="margin-top:4px">⚠ ' + k.uwagi.map(esc).join('<br>⚠ ') + '</div>';
+            if (k.blokady.length && plan.grupy.length) h += '<div class="tis-zle" style="margin-top:4px">⛔ ' + k.blokady.map(esc).join('<br>⛔ ') + '</div>';
+            h += '<div style="margin-top:6px"><button type="button" class="tis-btn" data-akcja="pf-zloz" data-w="' + plan.waluta + '"' + (k.blokady.length || !plan.grupy.length ? ' disabled' : '') + '>⬇ Złóż plik ' + plan.waluta
+               + (plan.grupy.length ? ' (' + plan.grupy.length + ', ' + esc(pbKwPok(plan.gr)) + ' ' + plan.waluta + ')' : '') + '</button></div></div>';
+        });
+        return h + '</div>';
     }
     function pbHtmlPain(){
         var plan = S.pb.plan = pbPlan(), k = pbKontrole(plan);
@@ -19859,6 +21185,7 @@
                 h += '<tr><td>' + esc(g.nazwa) + '</td><td style="font-family:ui-monospace,monospace;font-size:11px">' + esc(ibanFormat(g.iban))
                    + (g.konta.length > 1 ? ' <span class="tis-spr">(' + g.konta.length + ' na fakturach)</span>' : '')
                    + (g.zTabeli ? ' <span class="tis-spr">(z tabeli HUB-a, nie z faktury)</span>' : '')
+                   + (g.zKomentarza ? ' <span class="tis-spr">(z komentarza ' + esc(g.zKomentarza.kto) + ', ' + esc(String(g.zKomentarza.kiedy).slice(0, 10)) + ' — nie z faktury)</span>' : '')
                    + (g.reczny ? ' <span class="tis-spr">(wpisany ręcznie)</span>' : '')
                    + (g.zWaluty ? ' <span class="tis-spr">(rachunek ' + esc(plan.waluta) + ' z kilku na fakturze)</span>' : '')
                    + ((g.brakNaDok || []).length ? ' <span class="tis-zle">(nie ma go na ' + g.brakNaDok.length + ' dok.)</span>' : '')
@@ -19926,6 +21253,9 @@
           + '<button type="button" class="tis-btn" data-akcja="ust-zapisz">Zapisz</button>'
           + '<button type="button" class="tis-btn tis-btn2" data-akcja="ust-ping"' + (pol.url ? '' : ' disabled') + '>Sprawdź skrypt</button>'
           + (pol.zly ? '<div class="tis-msg err">Zapisany adres nie wygląda na adres wdrożenia Apps Scriptu — używam wbudowanego.</div>' : '')
+          // 🧪 przeniesiony tu 18.11.2026: zaznaczony przypadkiem (panel 18.11) dawał „do zapłaty” przy zapłaconych issue.
+          + '<div style="margin-top:6px"><label title="Do testów na zapłaconych issue: pomija PAID, status zamknięty, komentarze o zapłacie i potwierdzenia przelewu, czyta też zapłacone. Wynik nie jest zgodą na płatność — lista do płatności i plik do banku pomijają tak sprawdzone issue. Działa przy następnym „Sprawdź faktury”.">'
+          + '<input type="checkbox" id="tis-test-odczytu"' + (S.testOdczytu ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 🧪 test odczytu faktur (dla testów, nie do płacenia)</label></div>'
           + htmlNaukaStan()
           + '</div>';
     }
@@ -20238,6 +21568,7 @@
     function rysuj(){
         var zach = {}, akt = document.activeElement && document.activeElement.id;
         tresc.querySelectorAll('input[id],textarea[id],select[id]').forEach(function (e){ zach[e.id] = e.type === 'checkbox' ? e.checked : e.value; });
+        delete zach['tis-test-odczytu'];   // stan 🧪 trzyma S — „wyłącz” z ostrzeżenia nie może wrócić ze starego pola
         var l = licz(), sprawdzone = S.lista.some(function (r){ return r.wynik; });
         var h = '<div class="tis-mut" style="margin:4px 0">' + htmlSpolki()
               + ' · <a href="#" data-akcja="ust">' + (S.ustOtw ? 'schowaj ustawienia' : '⚙ Ustawienia') + '</a>'
@@ -20249,8 +21580,8 @@
         if (S.pbOtw) h += pbHtml();
         h += '<div id="tis-stan">' + htmlStan() + '</div>';
         h += '<div style="margin:6px 0"><button type="button" class="tis-btn" data-akcja="sprawdz"' + (S.praca || !S.lista.length ? ' disabled' : '') + '>🔍 Sprawdź faktury (' + S.lista.length + ')</button>'
-           + '<label class="tis-mut" style="margin:0 8px" title="Do testów na zapłaconych issue: pomija PAID, status zamknięty, komentarze o zapłacie i potwierdzenia przelewu, czyta też już odbite. Wynik nie jest zgodą na płatność. Działa przy następnym „Sprawdź faktury”.">'
-           + '<input type="checkbox" id="tis-test-odczytu"' + (S.testOdczytu ? ' checked' : '') + (S.praca ? ' disabled' : '') + '> 🧪 test odczytu (pomija status zapłaty)</label>'
+           // 🧪 siedzi w „⚙ Ustawienia”; włączony widać tutaj, z odnośnikiem do wyłączenia.
+           + (S.testOdczytu ? ' <span class="tis-test" style="margin:0 8px">🧪 test odczytu włączony — nie do płacenia · <a href="#" data-akcja="test-wylacz">wyłącz</a></span>' : '')
            + (S.lista.length && !S.praca ? '<button type="button" class="tis-btn tis-btn2" data-akcja="lista-wyczysc" title="Czyści listę issue (nic nie zapisuje w prologistics)">✕ Wyczyść listę</button>' : '')
            + '<label class="tis-mut" style="margin:0 8px" title="Jedna pozycja na przewoźnika: suma faktur i numery issue po przecinku. Rozwinięcie pokazuje pojedyncze faktury z guzikami."><input type="checkbox" id="tis-grupuj"' + (S.grupuj ? ' checked' : '') + '> jedna pozycja per dostawca</label>'
            + (sprawdzone && !S.praca && wsadIssue().length ? '<button type="button" class="tis-btn tis-btn2" data-akcja="wsad" title="Zapisze faktury do Pobranych jednym plikiem ZIP i złoży JEDNO polecenie dla Claude — razem z oceną komentarzy'
@@ -20290,6 +21621,7 @@
         }
         else if (a === 'przerwij'){ if (S.moznaPrzerwac){ S.przerwij = true; przerwijZapytania(); S.postep = 'Przerywam…'; rysujStan(); } }
         else if (a === 'ust'){ S.ustOtw = !S.ustOtw; rysuj(); }
+        else if (a === 'test-wylacz'){ S.testOdczytu = false; say('🧪 test odczytu wyłączony — kliknij „🔍 Sprawdź faktury”, żeby wyniki i lista do płatności były prawdziwe.', 'info'); rysuj(); }
         else if (a === 'spolki') pobierzSpolki();
         else if (a === 'ust-zapisz'){
             var u = ust();
@@ -20361,7 +21693,19 @@
             rysuj();
         }
         else if (a === 'pb'){ S.pbOtw = !S.pbOtw; rysuj(); }
-        else if (a === 'pb-widok'){ S.pb.widok = el.getAttribute('data-w') === 'pain' ? 'pain' : 'lista'; rysuj(); }
+        else if (a === 'pb-widok'){ var pw = el.getAttribute('data-w'); S.pb.widok = pw === 'pain' || pw === 'pf' ? pw : 'lista'; rysuj(); }
+        else if (a === 'pf-zloz') pfBuduj(el.getAttribute('data-w'));
+        else if (a === 'pf-adres'){
+            // Adres i BIC odbiorcy — pamięć na tym komputerze, klucz = numer rachunku (GM tis_pf_odbiorcy).
+            var pk = el.getAttribute('data-k'), wpis = {};
+            [].slice.call(tresc.querySelectorAll('.tis-pf-adr')).filter(function (x){ return x.getAttribute('data-k') === pk; })
+                .forEach(function (x){ wpis[x.getAttribute('data-p')] = String(x.value || '').trim(); });
+            wpis.kraj = String(wpis.kraj || '').toUpperCase(); wpis.bic = String(wpis.bic || '').toUpperCase().replace(/\s+/g, '');
+            if (!wpis.miasto || !/^[A-Z]{2}$/.test(wpis.kraj)){ say('Adres odbiorcy: wpisz miasto i kraj (2 litery, np. HK, US, DE).', 'err'); rysuj(); return; }
+            if (wpis.bic && !/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(wpis.bic)){ say('BIC „' + wpis.bic + '” ma zły format (8 albo 11 znaków).', 'err'); rysuj(); return; }
+            var pam = pfOdbPamiec(); pam[pk] = wpis; pfOdbZapisz(pam);
+            say('Zapamiętane dla rachunku ' + pk + ': ' + [wpis.nazwa, wpis.miasto, wpis.kraj, wpis.bic].filter(Boolean).join(', ') + '.', 'ok'); rysuj();
+        }
         else if (a === 'ls-kop'){
             var v = el.getAttribute('data-v') || '';
             try { GM_setClipboard(v); say('Skopiowane: ' + v, 'ok'); } catch (e){ say('Nie udało się skopiować: ' + (e.message || e), 'err'); }
@@ -20500,7 +21844,7 @@
             return;
         }
         if (id === 'tis-grupuj'){ S.grupuj = !!ev.target.checked; grupujZapisz(S.grupuj); rysuj(); return; }
-        if (id === 'tis-test-odczytu'){ S.testOdczytu = !!ev.target.checked; return; }
+        if (id === 'tis-test-odczytu'){ S.testOdczytu = !!ev.target.checked; rysuj(); return; }
         if (!/^tis-ibt-/.test(id)) return;
         if (id === 'tis-ibt-zq' || id === 'tis-ibt-doq') return;
         if (id === 'tis-ibt-z' || id === 'tis-ibt-do' || id === 'tis-ibt-issue'){
@@ -30336,7 +31680,8 @@
                     if (pr != null && pcts.indexOf(pr) < 0) pcts.push(pr);
                 });
                 w.suma = suma; w.pcts = pcts; w.kontrole = [];
-                var dostPokazany = {};      // linia „ostatni przelew do dostawcy" raz na dostawce w tym potwierdzeniu
+                var dostPokazany = {};      // uwagi z „ostatniego przelewu do dostawcy" raz na dostawce w tym potwierdzeniu
+                var ostN = [];              // nazwy ostatnich przelewow (bcPoprzNazwa) — dla bloku „Kilka nazw"
                 function kon(zam, co, lewo, prawo, wynik){
                     // wynik: 'ok' | 'uwaga' | 'zle'. Zapisujemy KAZDE porownanie razem
                     // z obiema wartosciami — zeby bylo widac nie tylko co nie gra,
@@ -30552,13 +31897,24 @@
                     // poprzedni przelew TEGO zamowienia; bez niego — ostatni przelew do dostawcy z innego zamowienia
                     // (pcPoprzDepoJeden, tylko sprzed dnia tego przelewu). Inne konto niz wtedy to blad, chyba ze
                     // tlumaczy go AKTUALNA zmiana (po tamtym przelewie) — wtedy uwaga. Skad numer: zawsze widac.
+                    // Wiersz stoi przy KAZDYM zamowieniu (18.11.2026, „czemu we wszystkich nie ma rubryki, gdzie szedł
+                    // ostatni przelew"): do 5.63.17 ostatni przelew do dostawcy szedl raz na dostawce w potwierdzeniu,
+                    // wiec drugie i dalsze zamowienie przelewu laczonego (22421, 22405, 22403…) mialo o kontrole mniej.
+                    // Uwagi i bledy z niego — dalej raz na dostawce, zeby lista uwag nie powtarzala tego samego.
+                    // Pod kontem — wiersz nazwy (bcPoprzNazwa); jego wynik zbiera ostN dla bloku „Kilka nazw".
                     if (ppZ && (ppZ.dzien || ppZ.blad) && (potrzebne[o] || ppZ.blad)){
                         var pw = bcPoprzWynik(ppZ, q.acct, q.name, wyjZm);
                         kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, pw.prawo, pw.lv);
                         if (pw.uwaga) w.uwagi.push(o + ': ' + pw.uwaga);
                         if (pw.blad) w.bledy.push(o + ': ' + pw.blad);
+                        if (pw.nazwa){
+                            kon(o, 'nazwa na poprzednim przelewie ↔ nazwa na tym przelewie', pw.nazwa.lewo, pw.nazwa.prawo, pw.nazwa.lv);
+                            ostN.push({ nazwa: ppZ.nazwa || '', rozna: pw.nazwa.rozna, konto: bcKontoEq(ppZ.acct, q.acct).ok,
+                                        op: 'poprzedni przelew ' + o + ' z ' + ppZ.dzien });
+                        }
                     }
-                    if (!(ppZ && ppZ.dzien && !ppZ.blad) && d.cid && !dostPokazany[d.cid]){
+                    if (!(ppZ && ppZ.dzien && !ppZ.blad) && d.cid){
+                        var pierwszyD = !dostPokazany[d.cid];
                         dostPokazany[d.cid] = 1;
                         if (!ppD) kon(o, 'ostatni przelew do dostawcy', '—', 'nie sprawdziłem (brak dostawcy przy zamówieniu)', 'uwaga');
                         else if (ppD.brak || !ppD.dzien)
@@ -30567,8 +31923,14 @@
                         else {
                             var pd = bcPoprzWynik(ppD, q.acct, q.name, wyjZm);
                             kon(o, 'ostatni przelew do dostawcy (zam. ' + ppD.order + ')', pd.lewo, pd.prawo, pd.lv);
-                            if (pd.uwaga) w.uwagi.push(o + ': ' + pd.uwaga);
-                            if (pd.blad) w.bledy.push(o + ': ' + pd.blad);
+                            if (pierwszyD && pd.uwaga) w.uwagi.push(o + ': ' + pd.uwaga);
+                            if (pierwszyD && pd.blad) w.bledy.push(o + ': ' + pd.blad);
+                            if (pd.nazwa){
+                                kon(o, 'nazwa na ostatnim przelewie (zam. ' + ppD.order + ') ↔ nazwa na tym przelewie', pd.nazwa.lewo, pd.nazwa.prawo, pd.nazwa.lv);
+                                if (pierwszyD) ostN.push({ nazwa: ppD.nazwa || '', rozna: pd.nazwa.rozna, konto: bcKontoEq(ppD.acct, q.acct).ok,
+                                                           op: 'ostatni przelew do dostawcy, zam. ' + ppD.order + ' z ' + ppD.dzien,
+                                                           dost: ppD, cid: d.cid });
+                            }
                         }
                     }
                     // ZMIANA NUMERU KONTA. Przelew na konto, ktore u dostawcy zdazylo sie
@@ -30677,7 +32039,20 @@
                     if (pp0 && pp0.nazwa) zrN.push({ n: pp0.nazwa, rodzaj: 'poprz', o: o, acc: pp0.acct || '', et: 'poprzedni przelew',
                         dop: (pp0.dzien ? (' z ' + pp0.dzien) : '') + (pp0.acct ? (' (konto ' + pp0.acct + ')') : '') });
                 });
+                // Ostatni przelew do dostawcy z INNEGO zamowienia (depozyt) — tez zrodlo nazwy (18.11.2026).
+                ostN.forEach(function (x){
+                    var p = x.dost;
+                    if (!p || !p.nazwa) return;
+                    zrN.push({ n: p.nazwa, rodzaj: 'poprz', acc: p.acct || '', et: 'ostatni przelew do dostawcy (zam. ' + p.order + ')',
+                        dop: (p.dzien ? (' z ' + p.dzien) : '') + (p.acct ? (' (konto ' + p.acct + ')') : '') });
+                });
                 var NZ = bcNazwyOcena(zrN, q.name || '', q.acct || '');
+                // Kilka nazw, ale przelew poszedl na te sama nazwe I to samo konto co ostatni przelew (kazdy znany) —
+                // informacja, nie uwaga (18.11.2026: „jak jest kilka nazw a poszło na to co wcześniej, to niech nie
+                // wskazuje błędu"). Nazwa niepasujaca do wlasciciela konta na karcie (NZ.zle) zostaje bledem.
+                var ostZn = ostN.filter(function (x){ return x.nazwa; });
+                if (NZ.kilka && !NZ.zle && ostZn.length && ostZn.every(function (x){ return !x.rozna && x.konto; }))
+                    NZ.jakOstatnio = ostZn.map(function (x){ return x.op; }).join('; ');
                 w.nazwy = NZ;
                 NZ.porown.forEach(function (p){
                     kon('', 'nazwa na przelewie ↔ beneficjent konta na karcie ' + p.cid, q.name || '—',
@@ -30686,11 +32061,12 @@
                 if (zrN.length){
                     kon('', 'nazwy dostawcy (karta, P/I, poprzedni przelew, ten przelew)',
                         NZ.grupy.length === 1 ? 'jedna nazwa' : (NZ.grupy.length + ' różne nazwy'),
-                        NZ.grupy.map(function (g){ return '„' + g.n + '”' + (g.ten ? ' ← ten przelew' : ''); }).join(' · '),
-                        NZ.kilka ? 'uwaga' : 'ok');
+                        NZ.grupy.map(function (g){ return '„' + g.n + '”' + (g.ten ? ' ← ten przelew' : ''); }).join(' · ')
+                          + (NZ.jakOstatnio ? (' — ta sama nazwa i konto co ostatnio (' + NZ.jakOstatnio + ')') : ''),
+                        (NZ.kilka && !NZ.jakOstatnio) ? 'uwaga' : 'ok');
                 }
                 if (NZ.blad) w.bledy.push(NZ.blad);
-                if (NZ.uwaga) w.uwagi.push(NZ.uwaga);
+                if (NZ.uwaga && !NZ.jakOstatnio) w.uwagi.push(NZ.uwaga);
                 var tt = bcTytulOk(q.msg, moje, pcts);
                 kon('', 'tytuł ↔ numery zamówień', (moje || []).join(', ') || '—',
                     tt.brak.length ? ('brakuje: ' + tt.brak.join(', ')) : 'wszystkie są',
@@ -31535,16 +32911,23 @@
             else if (!e.ok && !e.brak)
                 o.blad = 'poprzedni przelew (' + op + ') poszedł na konto „' + pp.acct
                        + '”, a ten idzie na „' + (qAcct || '—') + '”, a po tamtym przelewie nic tej zmiany nie tłumaczy';
-            // Nazwa, na ktora poszedl POPRZEDNI przelew, wobec nazwy na tym potwierdzeniu.
-            // Porownanie lagodne (krotsza zaczyna dluzsza = ta sama) — nazwy legalnie sie roznia.
-            if (pp.nazwa && qName && !pcNazwaTaSama(pp.nazwa, qName)){
-                var nmsg = 'poprzedni przelew był na nazwę „' + pp.nazwa + '”, a ten na „' + qName
-                         + '” — sprawdź, czy to ten sam beneficjent (kilka nazw dostawcy?)';
-                o.uwaga = o.uwaga ? (o.uwaga + '; ' + nmsg) : nmsg;
-                if (o.lv === 'ok') o.lv = 'uwaga';
-                o.prawo = o.prawo + ' · nazwa „' + qName + '” (poprzednio „' + pp.nazwa + '”)';
-            }
+            // Nazwa, na ktora poszedl POPRZEDNI przelew, wobec nazwy na tym potwierdzeniu — osobny wiersz, ZAWSZE
+            // (18.11.2026, prosba: „niech porównuje też nazwę z tym na ostatnim przelewie"). Do tego dnia nazwa
+            // dopisywala sie do wiersza konta tylko przy roznicy, wiec zgodnosci nie bylo widac wcale.
+            o.nazwa = bcPoprzNazwa(pp, qName);
             return o;
+        }
+        // Nazwa z ostatniego przelewu ↔ nazwa na tym potwierdzeniu. -> { lewo, prawo, lv, rozna }
+        // Lagodnie (pcNazwaTaSama albo bcNazwaPodobna): bank ucina nazwe, IMP/EXP, slowa w innej kolejnosci,
+        // „DINGSHENG"/„DING SHENG". Inna nazwa to UWAGA, nie blad — nazwy dostawcy legalnie sie roznia; do uwag
+        // przelewu trafia przez blok „Kilka nazw" (bcNazwyOcena dostaje nazwe ostatniego przelewu jako zrodlo).
+        function bcPoprzNazwa(pp, qName){
+            var pn = String((pp && pp.nazwa) || '').trim(), qn = String(qName || '').trim();
+            if (!pn) return { lewo: '—', prawo: (qn || '—') + ' — nazwy z potwierdzenia ostatniego przelewu nie odczytałem', lv: 'uwaga', rozna: false };
+            if (!qn) return { lewo: pn, prawo: '— — nazwy z tego potwierdzenia nie odczytałem', lv: 'uwaga', rozna: false };
+            if (pcNazwaTaSama(pn, qn) || bcNazwaPodobna(pn, qn))
+                return { lewo: pn, prawo: qn + (bcNazwaKlucz(pn) === bcNazwaKlucz(qn) ? ' — ta sama nazwa' : ' — ta sama nazwa (inaczej zapisana albo ucięta)'), lv: 'ok', rozna: false };
+            return { lewo: pn, prawo: qn + ' — INNA nazwa niż na ostatnim przelewie: sprawdź, na jaką nazwę ma iść przelew', lv: 'uwaga', rozna: true };
         }
         // Opis poprzedniego przelewu do jednej linii raportu.
         function bcPoprzOpis(pp){
@@ -31581,6 +32964,8 @@
             var x = bcNazwaKlucz(a), y = bcNazwaKlucz(b);
             if (!x || !y) return false;
             if (x === y) return true;
+            // Roznia sie tylko spacje: „QUANZHOU DINGSHENG GIFT" / „QUANZHOU DING SHENG GIFT" (karta 1634, 18.11.2026).
+            if (x.replace(/ /g, '') === y.replace(/ /g, '')) return true;
             var kr = x.length <= y.length ? x : y, dl = (kr === x) ? y : x;
             if (kr.indexOf(' ') > 0 && kr.length >= 12 && dl.indexOf(kr) === 0) return true;
             return x.split(' ').sort().join(' ') === y.split(' ').sort().join(' ');
@@ -31652,11 +33037,14 @@
         // wierszu staly juz czerwone bledy konta P/I, ktore wszyscy znali, i nazwa przeszla niezauwazona).
         function bcNazwyHtml(nz){
             if (!nz || !(nz.kilka || nz.zle)) return '';
-            var kol = nz.zle ? '#c00' : '#6a4a9c', tlo = nz.zle ? '#fdecea' : '#f4effa';
+            // Przelew na te sama nazwe i konto co ostatnio (nz.jakOstatnio) — szara informacja, bez wezwania do sprawdzania.
+            var spok = !!(nz.jakOstatnio && !nz.zle);
+            var kol = nz.zle ? '#c00' : (spok ? '#5f6b5f' : '#6a4a9c'), tlo = nz.zle ? '#fdecea' : (spok ? '#f5f7f5' : '#f4effa');
             var h = '<div class="bc-nazwy" style="margin-top:5px;padding:5px 8px;border-radius:6px;background:' + tlo
-                  + ';border:1px solid ' + kol + ';font-size:11px;line-height:1.5">'
+                  + ';border:1px solid ' + (spok ? '#cfd8cf' : kol) + ';font-size:11px;line-height:1.5">'
                   + '<b style="color:' + kol + '">' + (nz.zle ? '✗ Nazwa nie pasuje do konta' : '≡ Kilka nazw dostawcy')
-                  + ' — upewnij się, na jaką nazwę ma iść przelew</b>';
+                  + (spok ? (' — ten przelew na tę samą nazwę i konto co ostatnio (' + esc(nz.jakOstatnio) + ')</b>')
+                          : ' — upewnij się, na jaką nazwę ma iść przelew</b>');
             if (nz.zle)
                 h += '<div style="color:#c00;margin-top:2px">Ten przelew poszedł na konto <span style="font-family:monospace">'
                    + esc(nz.zle.acc) + '</span>, którego beneficjentem na karcie dostawcy ' + esc(nz.zle.cid) + ' jest <b>„'
@@ -37387,7 +38775,8 @@
                             + 'albo ich tam nie ma, albo mają inną datę niż wpisana obok.', '#c00');
                     } else {
                         // Przelewy z kilkoma nazwami dostawcy (bcNazwyOcena) — osobno, zeby nie zginely w „z zastrzeżeniami".
-                        var nNaz = (r.wiersze || []).filter(function (w){ return w.nazwy && (w.nazwy.kilka || w.nazwy.zle); }).length;
+                        // Bez tych, ktore poszly na te sama nazwe i konto co ostatnio (nazwy.jakOstatnio) — to nie uwaga.
+                        var nNaz = (r.wiersze || []).filter(function (w){ return w.nazwy && ((w.nazwy.kilka && !w.nazwy.jakOstatnio) || w.nazwy.zle); }).length;
                         var nNazZle = (r.wiersze || []).filter(function (w){ return w.nazwy && w.nazwy.zle; }).length;
                         mow('Gotowe: ' + (r.wiersze || []).length + ' potwierdzeń, '
                             + (zle ? (zle + ' z zastrzeżeniami') : 'bez zastrzeżeń')
@@ -59970,7 +61359,8 @@
     }
     // Plik do importu. Uklad taki, jaki wgrywano dotad recznie: srednik, przecinek
     // dziesietny, data DD/MM/RRRR i kolumna brutto zaraz za data.
-    function mkCsvWayf(p){
+    // `pomin` (j.data.wfPomin): zamowienia, ktorych faktura idzie do ticketu na minus, bo auftrag jest juz oplacony — do pliku nie wchodza.
+    function mkCsvWayf(p, pomin){
         const c = p.c;
         const q = function (v){
             const s = (v == null) ? '' : String(v);
@@ -59996,6 +61386,7 @@
         const out = [], at = {};
         let merged = 0;
         p.dat.forEach(function (d){
+            if (pomin && pomin[d.id]) return;
             const r = d.r.slice();
             if (ins) r.splice(c.prod, 0, '');
             r[gi] = (d.g == null) ? '' : wayfMoney(d.g);
@@ -60482,6 +61873,8 @@
                    net: p.net, netOk: eq(p.net, j.amount), ord: p.ord, ref: p.ref,
                    refNote: p.refNote, credits: p.credits, unknown: {}, skipped: {},
                    full: true, both: both,
+                   // Faktura i potracenie tego samego zamowienia w tym rozliczeniu: auftrag do sprawdzenia przed importem (wfSprawdz).
+                   wfKand: wfKandydaci(p), wfAuf: {}, wfPomin: {},
                    pays: 1, split: false, rows: p.nPos, total: p.nPos, pages: 1, how: how };
         const bad = [];
         if (!eq(p.net, j.amount)) bad.push('suma z rozliczenia ' + f2(p.net) + ' ≠ ' + f2(j.amount) + ' z wyciągu');
@@ -60516,6 +61909,165 @@
                + (p.credits.length ? (' · oddane potrącenia ' + p.credits.length + ' na ' + f2(p.creditSum)
                                       + ' — to nie zwrot; księguje się je osobno, w sekcji „Oddane potrącenia"') : '');
         return bad;
+    }
+
+    // ---------- faktura na auftrag, ktory jest juz oplacony: do ticketu na minus ----------
+    // 18.11.2026, UK685388321 (auftrag 15946898, ticket 725602): Wayfair oddal potracenie (+145,13 w rozliczeniu z 10.11), zanim
+    // je pobral — pobral je dopiero 16.11, w tym samym rozliczeniu co fakture UK685388321_1. Oddanie zaplacilo auftrag, wiec faktura
+    // z importu zrobila na nim nadplate −145,13, a potracenie poszlo do ticketu. Decyzja uzytkownika 18.11.2026: gdy auftrag nie ma
+    // juz open amount, wplata idzie do ticketu NA MINUS; bez ticketu — na auftrag, jak dotad.
+    // Sprawdzamy TYLKO zamowienia, ktore w tym rozliczeniu maja i fakture, i potracenie (dowolny znak) — tak umowione 18.11.2026;
+    // faktura bez potracenia idzie do importu bez czytania auftragu. Faktura do ticketu wypada z pliku importu (mkCsvWayf + wfPomin)
+    // i z j.data.ord, a na liste „Zwroty" wchodzi z rodzajem „Invoice" i ujemna kwota (wfDoTicketuPozycje): modul ticketa ksieguje
+    // ja jedna nota na pierwszej pozycji, osobno od potracenia tego zamowienia. Wynik odczytu zyje w j.data.wfAuf; dopoki ktoregos
+    // zamowienia nie udalo sie odczytac, import czeka (wfImportBlokada).
+    const MK_WF_FAKT_RODZAJ = 'Invoice';
+    function wfKandydaci(p){
+        if (!p || !p.ord) return [];
+        const zPotr = {};
+        (p.ded || []).forEach(function (d){ if (d && d.id) zPotr[d.id] = 1; });
+        return Object.keys(p.ord).filter(function (id){ return !!zPotr[id]; }).sort();
+    }
+    function wfFaktury(p, id){
+        const c = (p && p.c) || {};
+        return ((p && p.dat) || []).filter(function (d){ return d && d.id === id; })
+            .map(function (d){ const v = (d.r || [])[c.inv]; return String(v == null ? '' : v).trim() || id; });
+    }
+    // Same odczyty: search.php po numerze PO, potem auction.php. Wynik per numer:
+    //   { stan: 'ok', num, open, tickety } — jeden zywy auftrag, open amount odczytany
+    //   { stan: 'nie', opis }              — nie ma czego przenosic (brak auftragu, kilka, skasowany): faktura do importu jak dotad
+    //   { stan: 'blad', opis }             — nie odczytalem (siec, sesja, open amount): import czeka na ponowienie
+    async function wfSprawdz(lista){
+        const out = {};
+        for (let i = 0; i < (lista || []).length; i++){
+            const id = lista[i];
+            try {
+                const f = await crFind(id);
+                const sk = f.skreslone || {};
+                const zywe = (f.nums || []).filter(function (n){ return !sk[n]; });
+                if (!zywe.length){
+                    out[id] = f.pusto ? { stan: 'nie', opis: 'nie ma auftragu' }
+                            : ((f.nums || []).length ? { stan: 'nie', opis: 'auftrag skreślony w wyszukiwarce' }
+                                                     : { stan: 'blad', opis: f.err || 'wyszukiwarka nic nie oddała' });
+                    continue;
+                }
+                if (zywe.length > 1){ out[id] = { stan: 'nie', opis: 'kilka auftragów (' + zywe.join(', ') + ')' }; continue; }
+                const r = await crRead(zywe[0]);
+                if (r.deleted){ out[id] = { stan: 'nie', opis: 'auftrag ' + zywe[0] + ' skasowany' }; continue; }
+                if (!r.ok){ out[id] = { stan: 'blad', opis: r.err || ('nie odczytałem auftragu ' + zywe[0]), num: zywe[0] }; continue; }
+                if (r.open == null){ out[id] = { stan: 'blad', opis: 'nie odczytałem open amount z auftragu ' + zywe[0], num: zywe[0] }; continue; }
+                out[id] = { stan: 'ok', num: zywe[0], open: r.open, tickety: r.tickety || [] };
+            } catch (e){ out[id] = { stan: 'blad', opis: (e && e.message) || String(e) }; }
+        }
+        return out;
+    }
+    // Wynik odczytu do zlecenia — synchronicznie, na obiekcie, ktory zaraz idzie do zapisu. wfPomin i j.data.ord liczymy OD NOWA
+    // z danych parsera (j.data.wayf.ord): ponowne sprawdzenie moze decyzje odwrocic (np. ktos w miedzyczasie zdjal platnosc).
+    function wfZastosuj(j, wyniki){
+        if (!j || !j.data || !j.data.wayf) return [];
+        const p = j.data.wayf;
+        const kiedy = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        const auf = Object.assign({}, j.data.wfAuf || {});
+        Object.keys(wyniki || {}).forEach(function (id){ auf[id] = Object.assign({ kiedy: kiedy }, wyniki[id]); });
+        const pomin = {}, ord = Object.assign({}, p.ord || {});
+        Object.keys(auf).forEach(function (id){
+            const w = auf[id];
+            if (!w || w.stan !== 'ok' || !crBezOpen(w.open) || !(w.tickety || []).length || (p.ord || {})[id] == null) return;
+            const kw = r2(Math.abs(Number(p.ord[id])));
+            const fakt = wfFaktury(p, id);
+            pomin[id] = { amt: kw, num: w.num, rma: w.tickety.join('/'), fakt: fakt,
+                          note: 'Wayfair invoice ' + fakt.join(', ') + ' ' + f2(kw) + (j.remit ? (' (remittance ' + j.remit + ')') : '')
+                              + ' — auftrag ' + w.num + ' was already paid (open amount 0.00), so the payment is booked in this ticket as minus' };
+            delete ord[id];
+        });
+        j.data.wfAuf = auf; j.data.wfPomin = pomin; j.data.ord = ord;
+        return Object.keys(pomin);
+    }
+    // Pozycje Wayfaira dla listy „Zwroty" ze znakiem minus — liczone z danych zlecenia i ze sladu oddanych potracen, nie trzymane
+    // osobno: wayfApply podmienia cale j.data, a slad oddania zyje we wlasnym kluczu (mkt_credits_done). Dwa zrodla:
+    //   * faktura na oplacony auftrag (wfPomin)                       — rodzaj „Invoice"
+    //   * oddane potracenie przeniesione z sekcji 5 (slad 'lista')    — rodzaj „Deduction Payback"
+    function wfDoTicketuPozycje(j){
+        const out = [];
+        if (!j || j.kind !== 'wayf' || !j.data) return out;
+        const pom = j.data.wfPomin || {};
+        Object.keys(pom).forEach(function (id){
+            const x = pom[id];
+            if (!x || !(x.amt > 0)) return;
+            out.push({ id: id, amt: -x.amt, note: x.note || '', rodzaj: MK_WF_FAKT_RODZAJ, data: '', typ: '' });
+        });
+        const cs = (j.data.credits || []).filter(function (c){ return c && c.id && c.amt > 0; });
+        if (cs.length){
+            const slad = crdLoad();
+            cs.forEach(function (c){
+                const s = slad[crKlucz(j, c)];
+                if (!s || s.jak !== 'lista') return;
+                out.push({ id: c.ff || c.id, amt: -Math.abs(c.amt), note: c.text || '', rodzaj: MK_CR_LISTA_RODZAJ, data: '', typ: '' });
+            });
+        }
+        return out;
+    }
+    function wfImportBlokada(j){
+        const jd = (j && j.data) || {};
+        if (!j || j.kind !== 'wayf' || !Array.isArray(jd.wfKand) || !jd.wfKand.length) return '';
+        const auf = jd.wfAuf || {};
+        const brak = jd.wfKand.filter(function (id){ const w = auf[id]; return !w || w.stan === 'blad'; });
+        // Wszystkie faktury poszly do ticketu: plik importu bylby pusty. Rzadkie (rozliczenie z jedna faktura) — nie importujemy pustej paczki.
+        if (!brak.length && Object.keys(jd.wfPomin || {}).length && !Object.keys(jd.ord || {}).length)
+            return 'wszystkie faktury tego rozliczenia idą do ticketu na minus (auftragi bez open amount) — nie ma czego importować; '
+                 + 'zaksięguj je z listy „Zwroty”';
+        if (!brak.length) return '';
+        return brak.length + ' z ' + jd.wfKand.length + ' zamówień z fakturą i potrąceniem w tym rozliczeniu bez sprawdzonego auftragu ('
+             + brak.join(', ') + ') — open amount decyduje, czy faktura idzie do importu, czy do ticketu na minus. Kliknij „🔍 Sprawdź auftragi”.';
+    }
+    // Co wyszlo ze sprawdzenia — przy zleceniu, pod lista (gotowe / wymaga sprawdzenia).
+    function wfOpisHtml(j){
+        const jd = (j && j.data) || {};
+        if (!j || j.kind !== 'wayf' || !Array.isArray(jd.wfKand) || !jd.wfKand.length) return '';
+        const auf = jd.wfAuf || {}, pom = jd.wfPomin || {};
+        const lin = jd.wfKand.map(function (id){
+            const w = auf[id];
+            if (!w) return esc(id) + ': nie sprawdzone';
+            if (pom[id]) return '<b>' + esc(id) + '</b>: auftrag ' + esc(w.num) + ' bez open amount → faktura ' + f2(pom[id].amt)
+                              + ' do ticketu ' + esc(pom[id].rma) + ' na minus (lista „Zwroty”), nie do importu';
+            if (w.stan === 'ok') return esc(id) + ': auftrag ' + esc(w.num) + ', open ' + f2(w.open)
+                                     + ((w.tickety || []).length ? '' : ', bez ticketu') + ' → faktura do importu';
+            return esc(id) + ': ' + esc(w.opis || w.stan) + (w.stan === 'blad' ? ' — ponów sprawdzenie' : ' → faktura do importu');
+        });
+        return '<div style="font-size:11px;color:#374151;margin:2px 0 4px 0">Faktura i potrącenie w tym rozliczeniu: ' + lin.join(' · ') + '</div>';
+    }
+    // Z guzika i po wczytaniu pliku: odczyty, a zapis na SWIEZYM magazynie — w trakcie zlecenie moglo sie zmienic (import, „Wyczyść").
+    let wfBieg = false;
+    async function wfSprawdzIZapisz(kj, btn){
+        if (wfBieg){ say('Wayfair: sprawdzanie auftragów już trwa.', '#c47f00'); return; }
+        const jobs0 = jobsLoad();
+        // Klucz z guzika to mkKlucz zlecenia; w magazynie bywa inny (mkKluczPamieci) — szukamy po nim, jak wfbDomknij.
+        const kk = jobs0[kj] ? kj : (Object.keys(jobs0).filter(function (k){ return jobs0[k] && mkKlucz(jobs0[k]) === kj; })[0] || kj);
+        const j0 = jobs0[kk];
+        const lista = (j0 && j0.data && j0.data.wfKand) || [];
+        if (!lista.length){ say('Wayfair: nie ma czego sprawdzać.', '#c47f00'); return; }
+        wfBieg = true; if (btn) btn.disabled = true;
+        try {
+            say('Wayfair — sprawdzam auftragi zamówień z fakturą i potrąceniem (' + lista.length + ')…');
+            const wyn = await wfSprawdz(lista);
+            const jobs = jobsLoad(), t = jobs[kk];
+            if (!t || !t.data || !t.data.wayf || (t.status !== 'ready' && t.status !== 'partial')){
+                say('Wayfair: zlecenie zmieniło stan w trakcie sprawdzania (zaimportowane albo usunięte) — wyniku nie zapisuję.', '#c47f00');
+                return;
+            }
+            const dt = wfZastosuj(t, wyn);
+            jobsSave(jobs);
+            const bl = lista.filter(function (id){ return (t.data.wfAuf[id] || {}).stan === 'blad'; });
+            mkLog('wayfair', (t.remit || kk) + ': sprawdzone auftragi ' + lista.join(', ') + (dt.length ? (' — do ticketu na minus: ' + dt.join(', ')) : '')
+                  + (bl.length ? (' — bez odczytu: ' + bl.join(', ')) : ''));
+            say('Wayfair: sprawdzone ' + lista.length + ' auftragów'
+                + (dt.length ? (' · faktura do ticketu na minus (auftrag bez open amount): ' + dt.join(', ')) : ' · wszystkie faktury idą do importu')
+                + (bl.length ? (' · NIE odczytałem: ' + bl.join(', ') + ' — import czeka, ponów') : ''), bl.length ? '#c47f00' : '#0a7a2f');
+        } finally {
+            wfBieg = false;
+            if (btn) btn.disabled = false;
+            try { render(); } catch (e){}
+        }
     }
 
     // ================= BOL.COM (Bol NL) =================
@@ -62991,7 +64543,7 @@
     // Ktory uklad dla ktorego zlecenia.
     function csvFor(j){
         if (j.kind === 'galx' && j.data && j.data.galx) return mkCsvGalx(j.data.galx);
-        if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf).text;
+        if (j.kind === 'wayf' && j.data && j.data.wayf) return mkCsvWayf(j.data.wayf, j.data.wfPomin || null).text;
         if (j.kind === 'lim'  && j.data && j.data.lim)  return mkCsvLimango(j.data.lim);
         if (j.kind === 'vtex' && j.data && Array.isArray(j.data.raw)) return mkCsvObi(j.data.raw);
         if (j.kind === 'obich' && j.data && j.data.obich) return mkCsvObiCh(j.data.obich);
@@ -68809,6 +70361,7 @@
         if (j.kind === 'tm') return tmImportBlokada(j) || '';
         if (j.kind === 'hd') return hdImportBlokada(j) || '';
         if (j.kind === 'rd') return rdImportBlokada(j) || '';
+        if (j.kind === 'wayf') return wfImportBlokada(j) || '';
         return '';
     }
     function selOn(j){
@@ -69927,10 +71480,18 @@
                   +  ((st === 'ready' && j.kind === 'hd' && hdImportBlokada(j))
                         ? '<div style="font-size:11px;color:#c47f00;margin:2px 0 4px 0">⏳ Import czeka: '
                           + esc(hdImportBlokada(j)) + '</div>' : '')
+                  // Wayfair: faktura i potracenie jednego zamowienia w rozliczeniu — co wyszlo z auftragu i czy import czeka.
+                  +  (j.kind === 'wayf' ? wfOpisHtml(j) : '')
+                  +  ((st === 'ready' && j.kind === 'wayf' && wfImportBlokada(j))
+                        ? '<div style="font-size:11px;color:#c47f00;margin:2px 0 4px 0">⏳ Import czeka: '
+                          + esc(wfImportBlokada(j)) + '</div>' : '')
                   // 5.59.1: najpierw to, co jest CZYNNOSCIA (sprawdzenie auftragow, lista do wyjasnienia), potem pliki
                   // i kopiowanie jako odnosniki — to drogi reczne i wygladaly dotad jak kroki obowiazkowe.
                   +  ((j.kind === 'hd' && jd.hd && hdDoSprawdzenia(jd.hd).length)
                         ? '<button class="mk-hdauf" data-k="' + esc(mkKlucz(j)) + '" title="Dla zamówień, których nie da się rozstrzygnąć z pliku, sprawdza auftrag: czy jest, czy ma open amount i czy wisi na nim ticket" style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">\ud83d\udd0d Sprawdź auftragi (' + hdDoSprawdzenia(jd.hd).length + ')</button>'
+                        : '')
+                  +  ((j.kind === 'wayf' && (jd.wfKand || []).length)
+                        ? '<button class="mk-wfauf" data-k="' + esc(mkKlucz(j)) + '" title="Zamówienia z fakturą i potrąceniem w tym rozliczeniu: czyta auftrag. Bez open amount i z ticketem — faktura idzie do ticketu na minus (lista „Zwroty”), nie do importu. Same odczyty." style="padding:4px 10px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px;margin-right:6px">🔍 Sprawdź auftragi (' + jd.wfKand.length + ')</button>'
                         : '')
                   +  ((jd.amz && jd.amz.doWyj && jd.amz.doWyj.length)
                         ? '<button class="mk-cpw" data-k="' + esc(mkKlucz(j)) + '" title="Pozycje, których nie da się przypiąć do auftragu — do arkusza, w którym marketing dopisuje właściwe zamówienie" style="padding:4px 10px;border:1px solid #c47f00;border-radius:6px;background:#fffbeb;color:#92400e;cursor:pointer;font-size:11px">📋 Do wyjaśnienia (' + jd.amz.doWyj.length + ')</button> '
@@ -70019,6 +71580,7 @@
         out.querySelectorAll('.mk-wfraw').forEach(function (b){ b.onclick = function(){ doWayfRaw(b.getAttribute('data-k')); }; });
         out.querySelectorAll('.mk-hdnz').forEach(function (b){ b.onclick = function(){ doHdNieZaks(b.getAttribute('data-k')); }; });
         out.querySelectorAll('.mk-hdauf').forEach(function (b){ b.onclick = function(){ doHdAuftragi(b.getAttribute('data-k'), b); }; });
+        out.querySelectorAll('.mk-wfauf').forEach(function (b){ b.onclick = function(){ wfSprawdzIZapisz(b.getAttribute('data-k'), b); }; });
         // Furniture 1: zlecenie wraca do kolejki (pliki na Drive poprawione, niejednoznacznosc wyjasniona).
         // Na swiezym odczycie i tylko ze stanu „gotowe"/„wymaga sprawdzenia" — zaimportowanego nie cofamy.
         // Mirakl: powrot ze statusu 'partial' do kolejki parowania.
@@ -72928,6 +74490,8 @@
         f1KorektyDoTicketu(j).forEach(function (x){ out.push(x); });
         // Trademax: jedna nota na korekte i fulfilment (tmKorektyDoTicketu).
         tmKorektyDoTicketu(j).forEach(function (x){ out.push(x); });
+        // Wayfair: wplata na auftrag bez open amount — faktura i oddane potracenie — do ticketu na minus (18.11.2026).
+        wfDoTicketuPozycje(j).forEach(function (x){ out.push(x); });
         return out;
     }
     function refIle(j){ return refPozycje(j).length; }
@@ -72989,7 +74553,9 @@
             // (same SAFE-T albo sam Goodwill, bez ani jednego zwyklego zwrotu).
             // Warunek na samym ref[] wyrzucalby wtedy cale zlecenie z listy zwrotow.
             const ids = Object.keys(j.data.ref || {});
-            if (!ids.length && !((j.data.refExtra || []).length) && !(mkDrv(j) && refIle(j))) return;
+            // Wayfair: rozliczenie bez zwrotow, ale z oddaniem przeniesionym do ticketu na minus (wfDoTicketuPozycje) — tez na liste.
+            if (!ids.length && !((j.data.refExtra || []).length) && !(mkDrv(j) && refIle(j))
+                && !(j.kind === 'wayf' && wfDoTicketuPozycje(j).length)) return;
             const c = sets[setKey(j.mp, j.data.shop)] || {};
             const key = mkRefKluczZ(j, c);
             if (!g[key]){
@@ -74500,6 +76066,7 @@
                      ff: x.ff, amt: x.amt, date: x.date, remit: x.remit || '',
                      num: (dane && dane.num) || '', sure: !(dane && dane.sure === false) };
         if (dane && dane.nPrzed != null) all[x.k].nPrzed = dane.nPrzed;
+        if (dane && dane.rma) all[x.k].rma = String(dane.rma);
         crdSave(all);
     }
     // Slad „wyslane, niepotwierdzone" BLOKUJE guzik (zeby nie wyslac drugi raz), ale NIE
@@ -74512,6 +76079,20 @@
         delete all[k];
         crdSave(all);
         return true;
+    }
+    // ---------- oddanie na auftrag BEZ open amount: do ticketu na minus ----------
+    // Decyzja uzytkownika 18.11.2026 (auftrag 15946898 = UK685388321, ticket 725602): gdy auftrag nie ma juz open amount,
+    // oddane potracenie NIE idzie na auftrag (robiloby nadplate), tylko do ticketu NA MINUS — tak, jak zespol robil to recznie.
+    // Wlasnej drogi zapisu tu nie ma: pozycja przechodzi na liste „Zwroty" (wfDoTicketuPozycje -> refPozycje) z rodzajem
+    // „Deduction Payback" i ujemna kwota, a ksieguje ja modul ticketa razem z potraceniami tej daty i tego konta — jedna nota,
+    // na pierwszej pozycji, jak claim. Slad 'lista' jest PEWNY od razu, bo to przeniesienie, nie zapis; o zapisie mowi lista zwrotow.
+    // Auftrag bez open amount i BEZ ticketu: jak dotad, na auftrag (decyzja uzytkownika — nie ma gdzie dac noty).
+    const MK_CR_LISTA_RODZAJ = 'Deduction Payback';
+    function crBezOpen(open){ return open != null && Math.abs(open) <= 0.005; }
+    function crDoListy(x, num, tickety){
+        crdMark(x, 'lista', { num: num, rma: (tickety || []).join('/'), sure: true });
+        mkLog('wayfair', 'oddane potracenie ' + x.ff + ' ' + f2(x.amt) + ' (' + x.date + '): auftrag ' + num
+              + ' bez open amount, ticket ' + (tickety || []).join('/') + ' — na liste „Zwroty", do ticketu na minus');
     }
     function crList(){
         const out = [], sets = setLoad(), slad = crdLoad();
@@ -74800,7 +76381,7 @@
         if (!list.length) return;
         b.disabled = true;
         say('Szukam auftragów dla ' + list.length + ' oddanych potrąceń…');
-        let rozstrzygniete = 0;
+        let rozstrzygniete = 0, doListy = 0;
         for (let i = 0; i < list.length; i++){
             const x = list[i], st = mkCrState[x.k] || (mkCrState[x.k] = {});
             // Zapis wyslany, ale niepotwierdzony: rozstrzyga odczyt auftragu, na ktory poszedl.
@@ -74826,12 +76407,16 @@
             const r = await crRead(f.nums[0]);
             if (!r.ok){ st.err = r.err; st.num = f.nums[0]; renderCr(); continue; }
             st.num = f.nums[0]; st.open = r.open; st.nPay = r.nPay; st.deleted = r.deleted; st.err = '';
+            st.tickety = r.tickety || [];
+            // Auftrag bez open amount z ticketem: oddanie idzie do ticketu na minus (lista „Zwroty"), nie na auftrag.
+            if (crBezOpen(r.open) && st.tickety.length && !r.deleted && !crdLoad()[x.k]){ crDoListy(x, st.num, st.tickety); doListy++; }
             renderCr();
         }
         b.disabled = false;
-        if (rozstrzygniete) render();               // podpowiedz przy zleceniu tez sie zmienila
-        say('Sprawdzone.' + (rozstrzygniete ? (' Rozstrzygnięte zapisy niepotwierdzone: ' + rozstrzygniete + '.') : ''), '#0a7a2f');
-        if (rozstrzygniete) wfbPoSladzie('Sprawdzone.');
+        if (rozstrzygniete || doListy) render();    // podpowiedz przy zleceniu i lista zwrotow tez sie zmienily
+        say('Sprawdzone.' + (rozstrzygniete ? (' Rozstrzygnięte zapisy niepotwierdzone: ' + rozstrzygniete + '.') : '')
+            + (doListy ? (' Na liście „Zwroty” (auftrag bez open amount — do ticketu na minus): ' + doListy + '.') : ''), '#0a7a2f');
+        if (rozstrzygniete || doListy) wfbPoSladzie('Sprawdzone.');
     }
     async function crDoBook(x, b){
         const st = mkCrState[x.k] || (mkCrState[x.k] = {});
@@ -74855,7 +76440,15 @@
                 kom = ['Nie księguję — nie odczytałem auftragu ' + st.num + ' przed zapisem: ' + przed.err, '#c00'];
                 return;
             }
-            st.open = przed.open; st.nPay = przed.nPay; st.deleted = przed.deleted;
+            st.open = przed.open; st.nPay = przed.nPay; st.deleted = przed.deleted; st.tickety = przed.tickety || [];
+            // Od „Sprawdź auftragi" auftrag mogl sie domknac (import, inne oddanie). Bez open amount, z ticketem — nie na auftrag.
+            if (crBezOpen(przed.open) && st.tickety.length && !przed.deleted){
+                if (crdLoad()[x.k]){ kom = ['To oddane potrącenie zostało w międzyczasie odhaczone — nie księguję.', '#c47f00']; return; }
+                crDoListy(x, st.num, st.tickety);
+                kom = ['Auftrag ' + st.num + ' nie ma open amount — na nim nie księguję. Oddanie przeszło na listę „Zwroty” i pójdzie do ticketu '
+                       + st.tickety.join('/') + ' na minus.', '#0a7a2f'];
+                return;
+            }
             const rozn = (st.open == null) ? null : r2(st.open - x.amt);
             if (!confirm('Zaksięgować oddane potrącenie na auftragu?\n\n'
                 + '  fulfilment : ' + x.ff + '\n'
@@ -74925,10 +76518,13 @@
                 if (!j || j.status !== 'ready' || j.booked || !wfBezImp(j)) continue;
                 const cs = jl.data.credits, slad = crdLoad();
                 const nAuf = cs.filter(function (c){ return (slad[crKlucz(jl, c)] || {}).jak === 'auftrag'; }).length;
+                const nLis = cs.filter(function (c){ return (slad[crKlucz(jl, c)] || {}).jak === 'lista'; }).length;
                 const suma = r2(cs.reduce(function (a, c){ return a + c.amt; }, 0));
                 j.status = 'done'; j.booked = true; j.checked = true; j.wfbKiedy = mkNfaTeraz();
                 j.msg = 'zaksięgowane bez importu (rozliczenie bez faktur): oddane potrącenia ' + cs.length + ' na ' + f2(suma)
-                      + (nAuf ? (' · na auftragu ' + nAuf) : '') + ((cs.length - nAuf) ? (' · w tickecie (odhaczone) ' + (cs.length - nAuf)) : '');
+                      + (nAuf ? (' · na auftragu ' + nAuf) : '')
+                      + (nLis ? (' · do ticketu na minus (lista „Zwroty”) ' + nLis) : '')
+                      + ((cs.length - nAuf - nLis) ? (' · w tickecie (odhaczone) ' + (cs.length - nAuf - nLis)) : '');
                 jobsSave(jobs);
                 mkLog('wayfair', '■ ' + (j.remit || j.ref || kj) + ' zamknięte bez importu: ' + j.msg);
                 try { await shAfterBook(jobs, kj); } catch (e){}
@@ -74955,12 +76551,14 @@
         let h = '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #ede9fe">'
               + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">'
               + '<span class="mk-kn" style="margin-right:2px">5</span>'
-              + '<b style="font-size:12px;color:#5b21b6">Oddane potrącenia (Wayfair) — księgowanie na auftragu</b>'
+              + '<b style="font-size:12px;color:#5b21b6">Oddane potrącenia (Wayfair) — na auftrag albo do ticketu na minus</b>'
               + '<span style="font-size:11px;font-weight:700;color:' + (zost ? '#c47f00' : '#0a7a2f') + '">'
               + (zost ? ('zostało ' + zost + ' z ' + list.length) : ('wszystkie załatwione (' + list.length + ')')) + '</span>'
               + '<button id="mk-cr-chk" style="padding:5px 12px;border:none;border-radius:6px;background:#5b21b6;color:#fff;font-weight:700;cursor:pointer;font-size:11px">🔍 Sprawdź auftragi</button></div>'
               + '<div style="font-size:10px;color:#888;margin-bottom:6px">To nie zwroty — Wayfair oddaje wcześniej potrąconą kwotę, więc pieniądze wracają do nas. '
               + 'Guzik księguje wprost na auftragu: szukam go po numerze fulfilmentu i porównuję z jego „open amount". '
+              + 'Gdy auftrag nie ma już open amount, a wisi na nim ticket, oddanie nie idzie na auftrag — przechodzi na listę „Zwroty” '
+              + 'i księguje się w tickecie na minus (bez ticketu — na auftrag, jak dotąd). '
               + 'Jeśli oddanie księgujesz ręcznie, notą ujemną w tickecie — odhacz je tutaj, żeby nie wisiało. Ślad zostaje po przeładowaniu strony.</div>';
         list.forEach(function (x, i){
             const st = mkCrState[x.k] || {};
@@ -74968,7 +76566,8 @@
             const niep = crNiepewny(x.slad);           // ...ale to jeszcze nie „zalatwione"
             const ok = st.num && !st.err;
             const mozna = ok && !zr && x.acct && !st.wToku;
-            const rozn = (ok && st.open != null) ? r2(st.open - x.amt) : null;
+            const naLiscie = !!(x.slad && x.slad.jak === 'lista');
+            const rozn = (ok && st.open != null && !naLiscie) ? r2(st.open - x.amt) : null;
             h += '<div style="margin:6px 0;padding:6px 8px;border-radius:6px;'
               +  (niep ? 'background:#fffbeb;border:1px solid #f5d98b'
                        : (zr ? 'background:#f4f4f5;border:1px solid #e4e4e7;opacity:.72' : 'background:#faf9ff;border:1px solid #ede9fe')) + '">'
@@ -74987,7 +76586,9 @@
                           + ' — niepotwierdzony; „Sprawdź auftragi" rozstrzygnie</span>')
                        : (zr ? ('<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ '
                                 + (x.slad.jak === 'reczne' ? 'zrobione w tickecie'
-                                                           : ('zaksięgowane na auftragu' + (x.slad.num ? (' ' + esc(x.slad.num)) : '')))
+                                   : (naLiscie ? ('do ticketu' + (x.slad.rma ? (' ' + esc(x.slad.rma)) : '') + ' na minus — lista „Zwroty”'
+                                                  + (x.slad.num ? (' (auftrag ' + esc(x.slad.num) + ' bez open amount)') : ''))
+                                               : ('zaksięgowane na auftragu' + (x.slad.num ? (' ' + esc(x.slad.num)) : ''))))
                                 + ' ' + esc(mkCzasLok(x.slad.at)) + '</span>'
                                 + (x.slad.jak === 'reczne' ? '<span style="font-size:11px;color:#c47f00">(oznaczone ręcznie)</span>' : ''))
                              : ''))
@@ -75029,7 +76630,11 @@
                             : (jest.jak === 'auftrag'
                                 ? ('⚠ Ta pozycja została zaksięgowana guzikiem na auftragu ' + (jest.num || '') + '.\n'
                                    + 'Cofnięcie NIE usuwa płatności — ponowne „Zaksięguj" dopisałoby ją drugi raz.\n\n')
-                                : ''))
+                                : (jest.jak === 'lista'
+                                    ? ('⚠ Ta pozycja przeszła na listę „Zwroty” (do ticketu ' + (jest.rma || '') + ' na minus) i z niej zniknie.\n'
+                                       + 'Jeśli lista już ją zaksięgowała, nota ujemna w tickecie ZOSTAJE — ponowne „Zaksięguj” tutaj\n'
+                                       + 'dopisałoby oddanie drugi raz (na auftragu).\n\n')
+                                    : '')))
                         + 'W prologistics nic się nie zmieni — pozycja wróci tylko na listę do zrobienia.')) return;
                     crdUnmark(k);
                     render();
@@ -78835,6 +80440,9 @@
                 const j = jobs[hit[0]];
                 const bad = wayfApply(j, p, 'plik ' + f.name);
                 jobsSave(jobs); render();
+                // Faktura i potracenie jednego zamowienia: auftrag czytamy od razu (po komunikacie nizej), zapis na swiezym magazynie.
+                const kWf = hit[0];
+                if ((j.data.wfKand || []).length) setTimeout(function (){ wfSprawdzIZapisz(kWf); }, 800);
                 say('Rozliczenie ' + (p.remit || f.name) + ' wczytane: ' + Object.keys(p.ord).length
                     + ' zamówień brutto ' + f2(p.gross)
                     + (p.refund ? (', zwrotów ' + Object.keys(p.ref).length + ' na ' + f2(p.refund)) : '')
@@ -80077,6 +81685,14 @@
                     const p = mkParseWayf(await wayfCsv(w.paymentId));
                     if (p.err) throw new Error(p.err);
                     wayfApply(j, p, 'remittance ' + (w.displayRemittanceNumber || w.paymentId));
+                    // Faktura i potracenie jednego zamowienia: auftrag czytamy od razu, zanim ktos kliknie import (wfImportBlokada).
+                    // Na obiekcie z petli — zapis idzie nizej, razem z reszta (jobsSave).
+                    if ((j.data.wfKand || []).length){
+                        say('Wayfair — sprawdzam auftragi zamówień z fakturą i potrąceniem (' + j.data.wfKand.length + ')…');
+                        const dt = wfZastosuj(j, await wfSprawdz(j.data.wfKand));
+                        mkLog('wayfair', (j.remit || '') + ': sprawdzone auftragi ' + j.data.wfKand.join(', ')
+                              + (dt.length ? (' — do ticketu na minus: ' + dt.join(', ')) : ''));
+                    }
                     ok++;
                 } catch (e){ j.status = 'err'; j.msg = withLogin(j, (e && e.message) || String(e)); }
                 jobsSave(jobs); render();
@@ -120722,7 +122338,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'b085c58 · 18.11.2026 10:03';
+    const HUB_BUDOWA = '4af8e2e · 19.11.2026 08:24';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
