@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.18
+// @version      5.63.19
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -12035,6 +12035,10 @@
         const t = String(s == null ? '' : s);
         if (t.indexOf('€') >= 0) return 'EUR';
         if (t.indexOf('£') >= 0) return 'GBP';
+        // Strona auftragu CZK/HUF/PLN pisze symbol, nie kod (19.11.2026: „Total of Payments : Kč 3,816.62”, „Ft 694,025.00”).
+        if (t.indexOf('Kč') >= 0) return 'CZK';
+        if (/(^|[^A-Za-z])Ft([^A-Za-z]|$)/.test(t)) return 'HUF';
+        if (t.indexOf('zł') >= 0) return 'PLN';
         const m = t.match(/\b(EUR|USD|GBP|PLN|CHF|CZK|HUF|SEK|NOK|DKK|RON|BGN)\b/);
         return m ? m[1] : '';
     }
@@ -12197,11 +12201,13 @@
             if (m && tix.indexOf(m[1]) < 0) tix.push(m[1]);
         });
         // Pierwsze „Total of Payments :" na stronie bywa „(0.00)" — bierzemy to, po ktorym stoi waluta.
-        const cm = (doc.body ? doc.body.textContent : '').match(/Total of Payments\s*:\s*([€£]|[A-Z]{3})(?![A-Za-z])/);
+        const cm = (doc.body ? doc.body.textContent : '').match(/Total of Payments\s*:\s*([€£]|Kč|Ft|zł|[A-Z]{3})(?![A-Za-z])/);
+        // Waluta bywa symbolem: „Kč” (CZK), „Ft” (HUF), „zł” — bez tego open amount auftragow CZ i HU nie czytal sie wcale
+        // (19.11.2026: kolumna pusta i brak porownania z kwota zwrotu dla Unicredit HU i Raiffeisen CZ).
         // Open amount = „Auftrag value - Total of Payments". Na stronie stoi DWA razy; pierwsze bywa „0.00"
         // bez waluty — bierzemy to, po ktorym stoi waluta (tak jak przy ccy). Ujemny = auftrag NADPLACONY.
         // Apostrof/nbsp jako separator tysiecy (CHF „-1'234.50") — zdejmujemy przed numOf, ktory ich nie zna.
-        const om = (doc.body ? doc.body.textContent : '').match(/Auftrag value\s*-\s*Total of Payments\s*:\s*(?:€|£|[A-Z]{3})\s*(-?\d[\d.,'   ]*)/i);
+        const om = (doc.body ? doc.body.textContent : '').match(/Auftrag value\s*-\s*Total of Payments\s*:\s*(?:€|£|Kč|Ft|zł|[A-Z]{3})\s*(-?\d[\d.,'   ]*)/i);
         const ov = om ? numOf(om[1].replace(/['   ]/g, '')) : NaN;
         const inv = chkFaktury(doc), pay = chkPlatnosci(doc), dks = chkDokumenty(doc);
         return { st: 'ok', konta: chkKonta(doc), docs: dks || [], docsBrak: !dks, deleted: dv === '1' || dv === 'true', reqs: chkReqs(doc), eu: chkEupago(doc), tix: tix.slice(0, 6),
@@ -47820,7 +47826,13 @@
         // tytule: numery z tytulu ida do docs, a tytul uciety albo bez numerow dobiera brakujace dokumenty po kwocie
         // i czeka na potwierdzenie czlowieka. Wplaty sprzed TM_OD_KIEDY odcina mkWczytajWyciagi (tylko arkusz).
         { mp: 'Trademax',       ok: true,  payer: /HOME\s*FURNISHING\s*NORDIC/i, kind: 'tm', brand: 'Trademax', short: 'Trademax',
-          shop: 'Trademax SE', ark: 'Trademax SE', cur: 'SEK' }
+          shop: 'Trademax SE', ark: 'Trademax SE', cur: 'SEK' },
+        // Homedeco NL (19.11.2026): wyplata „ECHTZEITGUTSCHRIFT DREAMDECO BV NL38ABNA… 20260965 AUFTRAG UM …" na podkoncie
+        // HVB 36476036. Za IBAN-em stoi numer rozliczenia z panelu (= nazwa pliku CSV), kwota = suma to_receive co do grosza.
+        // Kind 'hd': zlecenie czeka na plik rozliczenia i dopina go po kwocie (hdCzekajacyPrzelew), a przelew z wyciagu
+        // liczy sie jak przelew z arkusza (hdMaPrzelew) — data importu = data wplywu.
+        { mp: 'Homedeco',       ok: true,  payer: /DREAMDECO/i, kind: 'hd', brand: 'Homedeco', short: 'Homedeco',
+          shop: 'Homedeco NL', ark: 'Homedeco NL', cur: 'EUR' }
     ];
     // Marka, ktora ma WIECEJ NIZ JEDEN panel. Regula wyciagu niesie jeden host, bo
     // platnik i wzorzec referencji sa dla obu rynkow wspolne — a instancje Mirakla sa
@@ -52116,13 +52128,62 @@
         });
         return pas.length === 1 ? pas[0] : '';
     }
-    // Wiersz z arkusza -> plik wczytany wczesniej, jeszcze bez przelewu.
+    // Czy zlecenie ma juz przelew — z wiersza arkusza ALBO z wyciagu (podkonto HVB 36476036, regula DREAMDECO,
+    // 19.11.2026). Do tego dnia liczyl sie tylko arkusz, wiec zlecenie z wyciagu po dopieciu pliku stawalo na
+    // „Brak przelewu z arkusza", choc data wplywu byla znana co do dnia.
+    // Trzecia droga (19.11.2026): data wplywu wpisana RECZNIE w kolumnie daty zlecenia (hdDataRecznie) —
+    // czlowiek widzi przelew na wyciagu i podaje jego dzien. Kwota to wtedy suma to_receive z pliku.
+    function hdMaPrzelew(j){
+        return !!(j && ((j.zArkusza && j.zArkusza.row)
+                        || ((j.hdZWyciagu || j.hdDataRecznie) && j.amount != null && j.date)));
+    }
+    // Uwagi przy zleceniu Homedeco („N zamówień do rozstrzygnięcia ręcznie", „N bez sprawdzonego auftragu",
+    // korekty prowizji) i status partial/ready — liczone ZE STANU BIEZACEGO. Do 19.11.2026 tylko przy wczytaniu
+    // pliku: po „🔍 Sprawdź auftragi" podsumowanie mowilo „28 z 28", a wiersz zlecenia dalej „2 zamówień bez
+    // sprawdzonego auftragu". Jedno miejsce dla hdPrzyjmij i doHdAuftragi.
+    function hdUstawUwagi(t, p){
+        if (!t || !p) return;
+        const sm = hdPodsumowanie(p);
+        const uw = [];
+        if (sm){
+            if (sm.nRecznie) uw.push(sm.nRecznie + ' zamówień do rozstrzygnięcia ręcznie');
+            if (sm.nDoSprawdzenia > sm.nSprawdzonych)
+                uw.push((sm.nDoSprawdzenia - sm.nSprawdzonych) + ' zamówień bez sprawdzonego auftragu');
+        }
+        if (p.pominiete && p.pominiete.length) uw.push(p.pominiete.length + ' wierszy pominiętych (korekty prowizji)');
+        t.hdUwagi = uw.join(' · ');
+        if (t.status === 'done') return;
+        // Data poprawiona recznie PRZED ta wersja (bez znacznika hdDataRecznie): rozni sie od daty z raportu
+        // i lezy w oknie wplywu — to czlowiek wpisal dzien przelewu. Pole daty nie zglosi zmiany przy tej
+        // samej wartosci, wiec bez tego trzeba by ja zmieniac w te i z powrotem.
+        if (!hdMaPrzelew(t) && t.dateSrc && t.date && t.date !== t.dateSrc && hdWOknie(t.date, p.doo)){
+            if (t.amount == null && p.sumaNetto != null) t.amount = r2(p.sumaNetto);
+            t.hdDataRecznie = true;
+        }
+        // Bez przelewu import CZEKA: jego data ma byc data wplywu, a tej plik nie zna. Szedl dotad
+        // z ostatnia data z pliku (miesiac wczesniej) i dopisywal do arkusza wiersz z kwota 0,
+        // a prawdziwy wiersz przelewu zostawal nieodhaczony.
+        if (!hdMaPrzelew(t)){
+            t.hdBezPrzelewu = true;
+            t.status = 'partial';
+            t.msg = (t.hdUwagi ? (t.hdUwagi + ' · ') : '')
+                  + 'Brak przelewu na ' + f2(p.sumaNetto) + ' EUR (wpływa zwykle 25–27 dni po '
+                  + (p.doo || '?') + '). Import czeka, bo jego datą ma być data wpływu: wpisz ją w kolumnie daty '
+                  + 'tego zlecenia, wgraj wyciąg HVB 36476036 (Bank Import albo „Wrzuć pliki” tutaj) albo załóż '
+                  + 'zlecenie z wiersza „Homedeco NL” na liście „Niezaksięgowane z arkusza”.';
+        } else {
+            t.hdBezPrzelewu = false;
+            t.status = 'ready';
+            t.msg = t.hdUwagi;
+        }
+    }
+    // Wiersz z arkusza albo wplata z wyciagu -> plik wczytany wczesniej, jeszcze bez przelewu.
     function hdCzekajacyPlik(jobs, kwota, dataPrzelewu){
         if (kwota == null || !isFinite(kwota)) return '';
         const pas = Object.keys(jobs || {}).filter(function (k){
             const o = jobs[k], p = o && o.data && o.data.hd;
             if (!p || o.kind !== 'hd' || o.status === 'done') return false;
-            if (o.zArkusza && o.zArkusza.row) return false;
+            if (hdMaPrzelew(o)) return false;
             if (p.sumaNetto == null || Math.abs(p.sumaNetto - kwota) > 0.005) return false;
             return hdWOknie(dataPrzelewu, p.doo);
         });
@@ -52275,7 +52336,7 @@
         // Przelew z arkusza czekajacy na ten plik. Zlecenie z samego pliku, zalozone
         // wczesniej i jeszcze niezaksiegowane, ustepuje mu miejsca — inaczej zostalyby
         // dwa zlecenia na te sama wyplate.
-        const bezArk = !k || (k === ref && jobs[k].status !== 'done' && !(jobs[k].zArkusza && jobs[k].zArkusza.row));
+        const bezArk = !k || (k === ref && jobs[k].status !== 'done' && !hdMaPrzelew(jobs[k]));
         if (kluczDocelowy && k && !bezArk && k !== kluczDocelowy){
             return { ok: false, err: (jobs[k].status === 'done')
                 ? 'to rozliczenie jest już zaksięgowane' : 'to rozliczenie jest już dopięte do innej wpłaty' };
@@ -52321,7 +52382,7 @@
         hdDoJob(j, p, 'plik ' + nazwa);
         // Blokada od PIERWSZEGO zapisu, nie dopiero po sprawdzeniu auftragow — inaczej przez
         // czas sprawdzania zlecenie bylo „gotowe" i dalo sie je zaimportowac z data z pliku.
-        j.hdBezPrzelewu = !(j.zArkusza && j.zArkusza.row);
+        j.hdBezPrzelewu = !hdMaPrzelew(j);
         j.status = j.hdBezPrzelewu ? 'partial' : 'ready';
         j.msg = '';
         jobsSave(jobs); render();
@@ -52347,11 +52408,6 @@
         // decyzja podjeta na podstawie auftragu, nie usterka — a wszystko, co zostalo
         // poza importem, widac w osobnym pliku „niezaksięgowane" razem z powodem.
         const sm = hdPodsumowanie(p);
-        const uw = [];
-        if (sm.nRecznie) uw.push(sm.nRecznie + ' zamówień do rozstrzygnięcia ręcznie');
-        if (sm.nDoSprawdzenia > sm.nSprawdzonych)
-            uw.push((sm.nDoSprawdzenia - sm.nSprawdzonych) + ' zamówień bez sprawdzonego auftragu');
-        if (p.pominiete.length) uw.push(p.pominiete.length + ' wierszy pominiętych (korekty prowizji)');
         // Stan mogl sie zmienic w trakcie sprawdzania auftragow: wiersz z arkusza mogl sie
         // dopiac (shZaloz), a zlecenie — zaimportowac. Scalamy w SWIEZY zapis; nadpisanie
         // obiektem sprzed sprawdzenia kasowalo dopiecie i cofalo „done" na „partial".
@@ -52360,24 +52416,7 @@
         // Paczka mogla w tym czasie pojsc. Nowy plan zapisujemy, ale roznica wobec tego,
         // CO NAPRAWDE POSZLO, ma byc widoczna — do 5.52 znikala tu bez sladu.
         hdZapiszPlan(t, j.data);
-        t.hdUwagi = uw.join(' · ');
-        if (t.status !== 'done'){
-            // Bez przelewu z arkusza import CZEKA: jego data ma byc data wplywu, a tej plik nie
-            // zna. Szedl dotad z ostatnia data z pliku (miesiac wczesniej) i dopisywal do arkusza
-            // wiersz z kwota 0, a prawdziwy wiersz przelewu zostawal nieodhaczony.
-            if (!(t.zArkusza && t.zArkusza.row)){
-                t.hdBezPrzelewu = true;
-                t.status = 'partial';
-                t.msg = (t.hdUwagi ? (t.hdUwagi + ' · ') : '')
-                      + 'Brak przelewu z arkusza na ' + f2(p.sumaNetto) + ' EUR (wpływa zwykle 25–27 dni po '
-                      + (p.doo || '?') + '). Import czeka, bo jego datą ma być data wpływu: załóż zlecenie z wiersza '
-                      + '„Homedeco NL" na liście „Niezaksięgowane z arkusza" — plik dopnie się sam.';
-            } else {
-                t.hdBezPrzelewu = false;
-                t.status = 'ready';
-                t.msg = t.hdUwagi;
-            }
-        }
+        hdUstawUwagi(t, p);
         jz[k] = t; jobsSave(jz); render();
         say('Homedeco NL · ' + zakres + ' · zamówień ' + p.nZam
             + ' · do auftragów ' + p.nWpl + ' poz. na ' + f2(p.sumaWpl)
@@ -53060,8 +53099,22 @@
         if (!st || !st.stan) return { tryb: 'netto', opis: 'nie sprawdzone', nieSprawdzone: true };
         if (st.stan === 'brak')
             return { tryb: 'nic', opis: 'nie ma auftragu o tym numerze' + (st.err ? (' (' + st.err + ')') : '') };
-        const zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.skreslony && !c.err; });
+        let zywe = (st.kand || []).filter(function (c){ return !c.deleted && !c.skreslony && !c.err; });
         const skre = (st.kand || []).filter(function (c){ return c.skreslony; }).length;
+        // Kilka zywych auftragow, ale WSZYSTKIE bez open amount i tylko JEDEN z ticketem: nie ma
+        // czego rozstrzygac — nic nie idzie do auftragu, a rabat i zwroty ida do ticketu, ktory
+        // jest jeden (26412561: 15859829 zamiennik „Generated from Ticket#" bez ticketu, 14212048
+        // z ticketem 616541; uzytkownik 19.11.2026: „niech samo przypisze rabat do ticketu").
+        // Przy open > 0 w ktoryms z nich albo przy dwoch ticketach zostaje dawne „recznie".
+        let wybranoPoTickecie = '';
+        if (zywe.length > 1 && zywe.every(function (c){ return c.open != null && Math.abs(c.open) <= 0.005; })){
+            const zt = zywe.filter(function (c){ return (c.tickety || []).length > 0; });
+            if (zt.length === 1){
+                wybranoPoTickecie = ' [' + zywe.length + ' auftragi o tym numerze, wszystkie bez open amount; ticket ma tylko '
+                                  + zt[0].num + ', więc to on]';
+                zywe = zt;
+            }
+        }
         // Ile odpadlo — dopisujemy do opisu, zeby bylo widac, ze cos zostalo pominiete,
         // a nie ze wyszukiwarka nagle znajduje mniej.
         const pominiete = skre ? (' (pominięto ' + skre + ' przekreślonych w wyszukiwarce)') : '';
@@ -53113,10 +53166,10 @@
                 return { tryb: z.rabSuma > 0.005 ? 'rabat' : 'nic', num: c.num, tickety: c.tickety,
                          opis: 'auftrag ' + c.num + ' bez open amount, wpłata i zwrot znoszą się do zera'
                              + (z.rabSuma > 0.005 ? (' — księgujemy tylko rabat ' + f2(z.rabSuma) + ' w tickecie ' + tick)
-                                                  : ' — nic nie księgujemy') };
+                                                  : ' — nic nie księgujemy') + wybranoPoTickecie };
             return { tryb: 'ticket', num: c.num, tickety: c.tickety,
                      opis: 'auftrag ' + c.num + ' bez open amount, ticket ' + tick
-                         + ' — wszystko do ticketu: wpłaty ' + f2(z.pelna) + ' na minus, zwroty i rabaty ' + f2(naTicket) };
+                         + ' — wszystko do ticketu: wpłaty ' + f2(z.pelna) + ' na minus, zwroty i rabaty ' + f2(naTicket) + wybranoPoTickecie };
         }
         const bezTicketu = (naTicket > 0.005 && !maTicket)
             ? ' — UWAGA: nie ma ticketu, zwroty ' + f2(naTicket) + ' nie mają gdzie się zaksięgować' : '';
@@ -71471,7 +71524,7 @@
                 h += '<tr><td colspan="7" style="padding:2px 5px 8px 5px;background:#faf9ff">'
                   +  ((j.kind === 'hd' && jd.hd) ? hdPodsumowanieHtml(jd.hd) : '')
                   +  ((mkDrv(j) && j.data && Array.isArray(jd.faktury)) ? mkDrvPodsumowanieHtml(j) : '')
-                  +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">' + ((j.kind === 'hd' && j.hdBezPrzelewu) ? 'Import i zwroty czekają na przelew z arkusza. Podgląd działa.'
+                  +  (st === 'partial' ? '<span style="font-size:11px;color:#c47f00">' + ((j.kind === 'hd' && j.hdBezPrzelewu) ? 'Import i zwroty czekają na przelew (z wyciągu albo z arkusza). Podgląd działa.'
                         // Furniture 1 przy „wymaga sprawdzenia" nie puszcza tez korekt do ticketow (f1KorektyDoTicketu).
                         : (j.kind === 'tm' && jd.tmDobor) ? 'Import i korekty do ticketów czekają — potwierdź dobrane dokumenty (wyżej) albo wgraj brakujące pliki i „↻ Sprawdź pliki ponownie”.'
                         : mkDrv(j) ? 'Import i korekty do ticketów zablokowane — wyjaśnij powyższe, potem „↻ Sprawdź pliki ponownie”.'
@@ -71777,9 +71830,25 @@
                 // Pierwotna date z raportu zapamietujemy raz, zeby bylo widac, co podal
                 // portal, a co poprawil czlowiek.
                 if (!j.dateSrc) j.dateSrc = j.date;
-                if (j.date === v) return;
+                // Homedeco: data wpisana przy pliku bez przelewu = data wplywu (decyzja 19.11.2026). Musi lezec
+                // 0–40 dni po ostatniej dacie rozliczenia, inaczej to nie ten przelew. Kwota = suma to_receive
+                // (co do grosza rowna przelewowi). Bez kwoty wiersz w arkuszu szedl z 0 — tak bylo do 5.50.
+                const hdP = (j.kind === 'hd' && j.data && j.data.hd) || null;
+                const hdWpis = !!hdP && (!hdMaPrzelew(j) || j.hdDataRecznie);
+                if (hdWpis && !hdWOknie(v, hdP.doo)){
+                    say('Homedeco: przelew za to rozliczenie wpływa 0–' + MK_HD_OKNO_DNI + ' dni po ' + (hdP.doo || '?')
+                        + ' (zwykle 25–27) — ' + v + ' do tego nie pasuje. Daty nie zmieniam.', '#c47f00');
+                    render();
+                    return;
+                }
+                if (j.date === v && !(hdWpis && !j.hdDataRecznie)) return;
                 const stara = j.date;
                 j.date = v;
+                if (hdWpis){
+                    if (j.amount == null && hdP.sumaNetto != null) j.amount = r2(hdP.sumaNetto);
+                    j.hdDataRecznie = true;
+                    hdUstawUwagi(j, hdP);
+                }
                 jobsSave(jobs); render();
                 say('Data wpłaty ' + (j.shop || j.mp || '') + ' ' + f2(j.amount) + ' ' + (j.cur || '')
                     + ': ' + stara + ' → ' + v + '. Ta data pójdzie do księgowania.', '#0a7a2f');
@@ -76283,7 +76352,18 @@
         if (!d) return tick;
         d.querySelectorAll('a[href*="rma.php"][href*="rma_id="]').forEach(function (a){
             const m = (a.getAttribute('href') || '').match(/[?&]rma_id=(\d+)/i);
-            if (m && tick.indexOf(m[1]) < 0) tick.push(m[1]);
+            if (!m || tick.indexOf(m[1]) >= 0) return;
+            // Link „Generated from Ticket# N" w naglowku auftragu to ZAMIENNIK utworzony z ticketu,
+            // a nie ticket tego auftragu (15859829 vs 14212048, ticket 616541, 19.11.2026): HUB
+            // uznawal oba za auftragi z ticketem. Prawdziwy ticket stoi w sekcji ticketow na
+            // oryginale; jesli ten sam numer pojawi sie tez tam, zostanie dodany z tamtego linku.
+            try {
+                const td = a.closest('td') || a.parentNode;
+                const r = d.createRange();
+                r.setStart(td, 0); r.setEndBefore(a);
+                if (/generated\s+from\s*(?:ticket)?\s*#?\s*$/i.test(r.toString().replace(/\s+/g, ' '))) return;
+            } catch (e){}
+            tick.push(m[1]);
         });
         return tick;
     }
@@ -78062,11 +78142,45 @@
                                 tmPoImporcie.push(String(r.date || '') + ' ' + f2(r.amount) + ' ' + (r.cur || ''));
                             } else tmTytulZWyciagu(kj, jobs[kj], r);
                         }
+                        // Homedeco: plik rozliczenia mogl przyjsc PIERWSZY i czekac na przelew. Wplata z wyciagu dopina sie
+                        // wtedy do niego (ta sama kwota co do grosza, okno 0–40 dni — hdCzekajacyPlik), zamiast zakladac
+                        // drugie zlecenie tej samej wyplaty. Data i kwota ida z wyciagu, jak przy wierszu z arkusza.
+                        if (r.kind === 'hd' && !jobs[kj] && r.amount != null){
+                            // Ten sam wyciag wgrany drugi raz: wplata siedzi juz w zleceniu pliku (inny klucz niz kj).
+                            // Takze zlecenie z data wplywu wpisana recznie (hdDataRecznie): ta sama kwota, data ±3 dni —
+                            // czlowiek mogl wpisac dzien zlecenia zamiast dnia ksiegowania. Bez tego wyciag wgrany po
+                            // recznej dacie zakladal drugie zlecenie tej samej wyplaty.
+                            const juzHd = Object.keys(jobs).filter(function (x){
+                                const o = jobs[x];
+                                if (!o || o.kind !== 'hd' || uzyte[x] || o.amount == null) return false;
+                                if (Math.abs(o.amount - r.amount) >= 0.005) return false;
+                                if (o.hdZWyciagu) return String(o.date || '') === String(r.date || '');
+                                if (o.hdDataRecznie){
+                                    const a = mkDay(o.date), b = mkDay(r.date);
+                                    return a != null && b != null && Math.abs(a - b) <= 3 * 86400000;
+                                }
+                                return false;
+                            });
+                            if (juzHd.length === 1){
+                                scal(juzHd[0]);
+                                const o = jobs[juzHd[0]];
+                                if (o.hdDataRecznie && o.status !== 'done'){ o.date = r.date; o.hdZWyciagu = true; }
+                            }
+                        }
+                        if (r.kind === 'hd' && !jobs[kj] && r.amount != null){
+                            const kP = hdCzekajacyPlik(jobs, r2(Number(r.amount)), r.date);
+                            if (kP && !uzyte[kP]){
+                                scal(kP);
+                                const o = jobs[kP];
+                                o.amount = r2(Number(r.amount)); o.date = r.date; o.hdZWyciagu = true;
+                                if (o.hdBezPrzelewu){ o.hdBezPrzelewu = false; o.status = 'ready'; o.msg = o.hdUwagi || ''; }
+                            }
+                        }
                         // Do pamieci wplat takze zlecenia juz zaimportowane — czy wiersz trzeba
                         // dopisac, rozstrzyga pozniej mkBrakiKandydaci (zaksiegowanych nie dopisuje).
                         wplNowe.push(wplZWiersza(r, kj));
                         if (jobs[kj] && jobs[kj].status === 'done') return;
-                        if (!jobs[kj]){ add++; jobs[kj] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, docs: r.docs || null, payDate: r.payDate || '', payer: r.payer, txId: r.txId, status: 'new', msg: '' }; }
+                        if (!jobs[kj]){ add++; jobs[kj] = { ref: r.ref, date: r.date, amount: r.amount, cur: r.cur, mp: r.mp, brand: r.brand, short: r.short, host: r.host, kind: r.kind, shop: r.shop, docs: r.docs || null, payDate: r.payDate || '', payer: r.payer, txId: r.txId, status: 'new', msg: '' }; if (r.kind === 'hd') jobs[kj].hdZWyciagu = true; }
                     });
                     if (!opcje.tylkoPamiec) jobsSave(jobs);
                     addT += add; knownT += known; otherT += other;
@@ -83055,6 +83169,7 @@
         // Ten sam strazenik co w hdPrzyjmij: ponowne sprawdzenie auftragow po imporcie potrafi
         // zmienic tryby, a wiec i plan — roznica wobec wyslanej paczki idzie na wierzch.
         if (jj[ref]) hdZapiszPlan(jj[ref], j.data); else jj[ref] = j;
+        hdUstawUwagi(jj[ref], p);
         jobsSave(jj);
         try { render(); } catch (e){}
 
@@ -105433,7 +105548,9 @@
         id: 'hvb',
         nazwa: 'HVB',
         opis: 'Umsatzliste z HypoVereinsbank — trzy konta naraz (DE, EU, Europe). Konto rozpoznaję z kolumny '
-            + 'Kontonummer, a powtórki wobec paczek wgranych wcześniej wyjmuję sam; wierszy z minusem nie ruszam',
+            + 'Kontonummer, a powtórki wobec paczek wgranych wcześniej wyjmuję sam; wierszy z minusem nie ruszam. '
+            + 'Podkonto 36476036 (wypłaty marketplace’ów, np. Homedeco) nie idzie do importu — przekazuję je od razu '
+            + 'do „Księgowanie Marketplace’s”, który dopisuje wypłaty do arkusza',
         // Pelna obsluga siedzi w bloku „HVB" nizej (hvbAnaliza, hvbDedup, hvbWyslij) — tu zostaje
         // tylko wpis, zeby format byl na liscie i mial swoje ustawienia. Plik skladamy sami,
         // wiec „surowy"/„kwoty"/„daty" sa tu bez znaczenia.
@@ -106000,6 +106117,14 @@
                       bankNazwa: 'HVB Europe',    szukaj: /^hvb\s*europe$/i }
     };
     var BK_HVB_SLOTY = ['DE', 'EU', 'Europe'];
+    // Podkonta HVB BEZ ustawienia importu — wplywaja na nie wyplaty marketplace'ow i nic wiecej
+    // (36476036: Homedeco/DREAMDECO BV; w prologistics zadna paczka importu tego konta nie istnieje,
+    // sprawdzone 19.11.2026 na 25 ostatnich paczkach „hvb…"). Plik nie idzie do importu: caly trafia
+    // od razu do „Ksiegowanie Marketplace's", ktory zaklada zlecenia i dopisuje wplaty do arkusza.
+    // Czego tamten modul nie rozpozna, wypisujemy — nie ma gdzie tego zaimportowac.
+    var BK_HVB_MKT_KONTA = {
+        '36476036': { nazwa: 'HVB 36476036 (wypłaty marketplace’ów)' }
+    };
     // Czego z wyciagu HVB NIE ksiegujemy tym importem (decyzje uzytkownika 26.10.2026:
     // „american express nie ksiegujemy my przez import", potem „odloz tak samo przelewy
     // wychodzace, oplaty banku i zwroty podatku"). Wiersze ZOSTAJA w pliku, bo zespol tez
@@ -106135,12 +106260,16 @@
                 out.bledy.push('wiersz ' + (i + 1) + ': nie odczytałem daty albo kwoty („' + w.bu + '”, „' + w.kw + '”)');
                 continue;
             }
-            if (!BK_HVB_KONTA[w.ko]){
-                out.bledy.push('wiersz ' + (i + 1) + ': konto „' + w.ko + '” nie jest jednym z trzech znanych ('
-                               + Object.keys(BK_HVB_KONTA).join(', ') + ')');
+            if (!BK_HVB_KONTA[w.ko] && !BK_HVB_MKT_KONTA[w.ko]){
+                out.bledy.push('wiersz ' + (i + 1) + ': konto „' + w.ko + '” nie jest jednym ze znanych ('
+                               + Object.keys(BK_HVB_KONTA).concat(Object.keys(BK_HVB_MKT_KONTA)).join(', ') + ')');
                 continue;
             }
-            if (!out.konto){ out.konto = w.ko; out.slot = BK_HVB_KONTA[w.ko].slot; }
+            if (!out.konto){
+                out.konto = w.ko;
+                out.slot = BK_HVB_KONTA[w.ko] ? BK_HVB_KONTA[w.ko].slot : '';
+                out.tylkoMkt = !!BK_HVB_MKT_KONTA[w.ko];
+            }
             else if (w.ko !== out.konto){
                 out.bledy.push('wiersz ' + (i + 1) + ': drugie konto w jednym pliku (' + w.ko + ' obok ' + out.konto + ')');
                 continue;
@@ -109298,7 +109427,7 @@
     async function hvbWczytaj(pliki){
         if (!pliki.length) return;
         say('czytam ' + pliki.length + ' ' + (pliki.length === 1 ? 'plik' : 'pliki') + '…', '#666');
-        var nowe = {}, bledy = [];
+        var nowe = {}, bledy = [], mktPliki = [];
         for (var i = 0; i < pliki.length; i++){
             var f = pliki[i];
             try {
@@ -109308,6 +109437,8 @@
                 if (!an.wiersze.length){
                     bledy.push(f.name + ': ' + (an.bledy[0] || 'nie ma w nim ani jednej transakcji')); continue;
                 }
+                // Podkonto wyplat marketplace'ow (BK_HVB_MKT_KONTA): bez importu, caly plik do Marketplace's.
+                if (an.tylkoMkt){ mktPliki.push({ plik: f.name, an: an, buf: buf }); continue; }
                 if (nowe[an.slot]){
                     bledy.push(f.name + ': drugi plik konta ' + an.konto + ' (pierwszy: ' + nowe[an.slot].plik
                                + ') — jeden plik na konto'); continue;
@@ -109341,14 +109472,65 @@
             var s2 = sloty[k2], x2 = nowe[s2], kt = hvbZloz(x2);
             if (kt){ delete nowe[s2]; bledy.push(x2.plik + ': nie wyślę — ' + kt + '. Zgłoś to z tym plikiem.'); }
         }
+        var mktOpis = '';
+        if (mktPliki.length){
+            say('przekazuję podkonto wypłat marketplace’ów do „Księgowanie Marketplace’s”…', '#666');
+            mktOpis = await hvbTylkoMkt(mktPliki);
+        }
         S.hvb = nowe;
         rysuj();
         var ok = BK_HVB_SLOTY.filter(function (s){ return nowe[s]; });
         say((ok.length ? ('Wczytane: ' + ok.map(function (s){
                 return s + ' (' + nowe[s].zostaje.length + ' z ' + nowe[s].an.wiersze.length + ')';
             }).join(', ') + '. Sprawdź, co idzie do importu, i wyślij.') : '')
+            + (mktOpis ? ((ok.length ? '<br>' : '') + mktOpis) : '')
             + (bledy.length ? (' <span style="color:#c00">Nie przyjąłem: ' + esc(bledy.join(' · ')) + '</span>') : ''),
-            bledy.length && !ok.length ? '#c00' : '#0a7a2f');
+            bledy.length && !ok.length && !mktOpis ? '#c00' : '#0a7a2f');
+    }
+    // Podkonto bez ustawienia importu (BK_HVB_MKT_KONTA): najpierw pytamy Marketplace's, ktore wplaty
+    // przejmie (tryb „rozpoznaj" — nic nie zaklada), potem oddajemy mu plik naprawde: zaklada zlecenia
+    // i dopisuje wplaty do arkusza w tle. Wplaty, ktorych nie rozpozna, wypisujemy z nazwy — do importu
+    // nie ma ich jak wyslac, a bez tej listy zniknelyby bez sladu. Wierszy z minusem nie ruszamy.
+    async function hvbTylkoMkt(pliki){
+        var konta = [], wplaty = [], obciazen = 0;
+        pliki.forEach(function (x){
+            if (konta.indexOf(x.an.konto) < 0) konta.push(x.an.konto);
+            x.an.wiersze.forEach(function (w){ if (w.lb > 0) wplaty.push(w); else obciazen++; });
+        });
+        var naglowek = 'Podkonto ' + esc(konta.join(', ')) + ' (wypłaty marketplace’ów, bez importu): ';
+        var lista = pliki.map(function (x){ return { nazwa: x.plik, buf: x.buf }; });
+        var roz;
+        try { roz = await bkDoMarketplace(lista, { tryb: 'rozpoznaj', czas: 15000 }); }
+        catch (e){
+            return '<span style="color:#c00">' + naglowek + 'moduł Marketplace’s nie odpowiedział ('
+                 + esc((e && e.message) || e) + '). Wgraj ten plik w „Księgowanie Marketplace’s” → „Wrzuć pliki”.</span>';
+        }
+        var podzial = hvbOdejmijMkt(wplaty, roz.wiersze || []);
+        var o;
+        try { o = await bkDoMarketplace(lista); }
+        catch (e2){
+            return '<span style="color:#c00">' + naglowek + 'nie przekazałem pliku do Marketplace’s ('
+                 + esc((e2 && e2.message) || e2) + ').</span>';
+        }
+        var nazwy = {};
+        podzial.mkt.forEach(function (m){ nazwy[m.nazwa] = (nazwy[m.nazwa] || 0) + 1; });
+        var ar = o.arkusz || {};
+        var t = naglowek + 'wpłat ' + wplaty.length + ', przejął Marketplace’s <b>' + podzial.mkt.length + '</b>'
+              + (podzial.mkt.length ? (' (' + Object.keys(nazwy).map(function (n){
+                    return esc(n) + (nazwy[n] > 1 ? (' ×' + nazwy[n]) : ''); }).join(', ') + ')') : '')
+              + ' · nowych zleceń ' + (o.nowych || 0)
+              + (ar.wTle ? ' · dopis do arkusza trwa w tle (wynik na pasku modułu Marketplace’s)'
+                         : (ar.dodane ? (' · do arkusza dopisane ' + ar.dodane) : ''))
+              + (ar.blad ? (' · <span style="color:#c00">ARKUSZ: ' + esc(ar.blad) + '</span>') : '')
+              + (obciazen ? (' · obciążeń pominiętych: ' + obciazen) : '');
+        if (podzial.zostaje.length)
+            t += ' · <span style="color:#c47f00">nierozpoznane ' + podzial.zostaje.length
+               + ' — to konto nie ma ustawienia importu, zajmij się nimi ręcznie: '
+               + podzial.zostaje.slice(0, 5).map(function (w){
+                     return esc(w.bu + ' ' + f2(w.lb) + ' ' + String(w.op || '').replace(/\s+/g, ' ').slice(0, 60));
+                 }).join('; ')
+               + (podzial.zostaje.length > 5 ? ' …' : '') + '</span>';
+        return t;
     }
 
     async function hvbWyslij(b){
@@ -122338,7 +122520,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '4af8e2e · 19.11.2026 08:24';
+    const HUB_BUDOWA = 'a13765c · 19.11.2026 09:57';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
