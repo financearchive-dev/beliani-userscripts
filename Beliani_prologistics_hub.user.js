@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.21
+// @version      5.63.22
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -8056,8 +8056,9 @@
             let o = null;
             try { o = JSON.parse(localStorage.getItem(BOOKED_KEY) || 'null'); } catch (e) {}
             const lista = (o && Array.isArray(o.rows)) ? o.rows : [];
+            // Dubel = ten sam klucz I ta sama data ksiegowania (20.11.2026) — patrz `d` nizej.
             const maja = {};
-            lista.forEach(function (r) { if (r && r.k) maja[r.k] = 1; });
+            lista.forEach(function (r) { if (r && r.k) maja[r.k + '#' + (r.d || '')] = 1; });
             let nowe = 0;
             (rows || []).forEach(function (r) {
                 if (!r || (!r.booked && !r.alreadyBooked)) return;
@@ -8070,9 +8071,13 @@
                 // tego samego zamowienia mialy jeden klucz i wpis zwrotu zamykal niezaksiegowany claim.
                 const kl = ksRodzajKlucz(r.kind);
                 const k = id + '|' + kw.toFixed(2) + (kl ? '|' + kl : '');
-                if (maja[k]) return;
-                maja[k] = 1;
-                lista.push({ k: k, at: new Date().toISOString().slice(0, 10) });
+                // 20.11.2026: data ksiegowania pozycji (d) obok klucza. Modul marketplace'ow (ksZapisMa) odroznia po niej drugi
+                // zwrot TEJ SAMEJ kwoty tego samego zamowienia z innego rozliczenia — bez niej taki zwrot wygladal tam na
+                // zaksiegowany, a tutaj (findBookedOtherDate) czeka na decyzje czlowieka. Klucz k zostaje bez daty, jak dotad.
+                const d = String(r.bookingDate || '');
+                if (maja[k + '#' + d]) return;
+                maja[k + '#' + d] = 1;
+                lista.push({ k: k, d: d, at: new Date().toISOString().slice(0, 10) });
                 nowe++;
             });
             if (!nowe) return;
@@ -27448,6 +27453,9 @@
         var _confDocs = {}, _poprz = {}, _confDocsWsz = {};
         // Depozyt: ostatni przelew do dostawcy z INNEGO zamowienia (runPoprzDepo). Klucz: company_id.
         var _poprzDost = {};
+        // Z komentarzy zamowienia (checkOneBal / checkOnePI, 20.11.2026): zwroty przelewu (pcZwrotyKom)
+        // i „new beneficiary name: …" (pcNowaNazwaKom). Klucz: numer zamowienia.
+        var _ordZwrot = {}, _ordNowaNazwa = {};
         try { _cid = JSON.parse(GM_getValue('chn_order_cid', '{}')) || {}; } catch(e){ _cid = {}; }
         try { _acc = JSON.parse(GM_getValue('chn_cid_acc', '{}')) || {}; } catch(e){ _acc = {}; }
         // SWIFT i nazwa banku z pola karty dostawcy (swift_no / beneficiary_bank_name) — klucz:
@@ -29735,7 +29743,9 @@
         // Lili 2335, Dowell 3259, Parpinelli 2545). pcSupAdres go pomija, bo bez miasta nie zlozy elementow — ale skoro
         // ktos wpisal adres beneficjenta, to biuro / magazyn / fabryka wchodza tylko wtedy, gdy to TO SAMO miejsce co ta
         // strefa (Parpinelli: biuro = beneficjent). Inaczej adres z P/I, a bez adresu w P/I — sama strefa jako tekst.
-        function painAdrWybierz(G, b){
+        // tylkoBen (20.11.2026): nazwa do pliku nie jest beneficjentem z P/I — wchodzi tylko blok „beneficiary" karty
+        // (albo sama strefa z niego); biuro, magazyn i fabryka to adresy dostawcy, nie tej firmy.
+        function painAdrWybierz(G, b, tylkoBen){
             var ben = null, pierwszy = null, benStrefa = '';
             pcKartyGrupy(G).forEach(function (c){
                 var a = pcAdrOf(c);
@@ -29745,6 +29755,7 @@
                 if (!benStrefa && a.benStrefa) benStrefa = a.benStrefa;
             });
             if (ben) return { kartaA: ben, adrPI: false, inny: null };
+            if (tylkoBen) return { kartaA: null, adrPI: true, inny: null, benStrefa: benStrefa };
             if (pierwszy && benStrefa && painAdrTenSam(pierwszy, benStrefa) !== true)
                 return { kartaA: null, adrPI: true, inny: null, benStrefa: benStrefa };
             if (pierwszy && painAdrTenSam(pierwszy, b && b.addr) === false) return { kartaA: null, adrPI: true, inny: pierwszy };
@@ -30347,35 +30358,9 @@
                 // Przy koncie wpisanym recznie w oknie przelewow — jak dotad bez uwagi (decyzja czlowieka).
                 var blokInne = accSrc !== 'reczne' && b.acc && accV && !accTenSam(b.acc, accV)
                     && !(ed.bic != null && String(ed.bic) !== '') ? String(b.acc) : '';
-                // Adres z KARTY DOSTAWCY ma pierwszenstwo przed wyprowadzaniem z P/I (tam miasto stoi
-                // w osobnym polu i nie trzeba go zgadywac) — ale tylko blok beneficjenta albo blok, ktory
-                // opisuje to samo miejsce co adres beneficjenta z P/I (painAdrWybierz, 16.11.2026).
-                var adrWyb = painAdrWybierz(G, b);
-                var kartaA = painKartaPrzestaw(adrWyb.kartaA);
-                // P/I bez adresu beneficjenta, a na karcie blok „beneficiary" z sama strefa — strefa jako tekst adresu.
-                // Kopia bloku: b idzie dalej do nazwy, SWIFT-u i banku, tam adres nie ma nic do rzeczy.
-                if (!kartaA && adrWyb.benStrefa && !String(b.addr || '').trim()){
-                    var b2 = {}; for (var kb in b) if (Object.prototype.hasOwnProperty.call(b, kb)) b2[kb] = b[kb];
-                    b2.addr = adrWyb.benStrefa; b = b2;
-                }
-                if (!kartaA) geo = painGeoZPI(b);
-                var karta = kartaA ? {
-                    town: kartaA.city,
-                    ctry: pbFindCtry(kartaA.country) || pbFindCtry(kartaA.city) || '',
-                    addr: [kartaA.linia, kartaA.zip].filter(Boolean).join(', ')
-                } : null;
-                // Reczna poprawka > karta dostawcy > wyprowadzenie z P/I. Adres strukturalny (04.11.2026):
-                // z karty pola rozpisane, z P/I reszta tekstu w StrtNm; kod sprawdzany z tabela GeoNames.
-                var townV = String(V('town', (karta && karta.town) || geo.town || ''));
-                var ctryV = String(V('ctry', (karta && karta.ctry) || geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
-                var adrS = kartaA ? painAdrZKarty(kartaA, b.addr || '', [b.name, G.sup, G.cid && _sup[G.cid] ? _sup[G.cid].nazwa : ''])
-                                  : painAdrZTekstu(b.addr || '', townV, ctryV, geo.sub || '');
                 // Bez nazwy beneficjenta w bloku P/I (Paras, 16.11.2026: blok bez „BENEFICIARY'S NAME") — nazwa z karty
                 // albo z naglowka P/I (painNazwaZapas). Reczna poprawka w oknie dalej wygrywa.
                 var nazwaZ = !String(b.name || '').trim() ? painNazwaZapas(G, b, accV) : null;
-                var pstV = String(V('pstCd', adrS.pstCd || ''));
-                var subV = String(V('sub', adrS.sub || ''));
-                var pnaV = pnaSprawdz(ctryV, pstV, townV, subV);
                 var amtBase = (ds || 0) + (bs || 0);
                 var amt = (ed.amount != null && ed.amount !== '' && isFinite(Number(ed.amount))) ? Number(ed.amount) : amtBase;
                 var _cf = pcConfEval(G), hint = (_cf && _cf.hint) || null;
@@ -30389,9 +30374,49 @@
                 var poprzDW = poprzDG ? pcPoprzDepoWerdykt(poprzDG, accV, _cf) : null;
                 // Kilka nazw beneficjenta — wybor w oknie, domyslnie nazwa ostatniego przelewu na to samo konto (18.11.2026).
                 var poprzN = [poprzG, poprzDG].filter(function (p){ return p && !p.blad && p.nazwa; })[0] || null;
-                var nazwaWar = painNazwyWarianty(G, b.name, nazwaZ, poprzN);
-                var nazwaWyb = painNazwaWybor(G, nazwaWar, poprzN, accV);
+                // Komentarz „new beneficiary name: …" nowszy od ostatniego przelewu, ktory DOSZEDL (20.11.2026, Moen).
+                var nowaN = pcNowaNazwaDla(G, (poprzN && !poprzN.zwrot) ? poprzN.dzien : '');
+                var nazwaWar = painNazwyWarianty(G, b.name, nazwaZ, poprzN, nowaN);
+                var nazwaWyb = painNazwaWybor(G, nazwaWar, poprzN, accV, nowaN);
                 if (nazwaWyb && nazwaWyb.v.src.indexOf('zapas') < 0) nazwaZ = null;   // uwaga „P/I bez nazwy" mowilaby o innej nazwie
+                var nazwaV = String(V('name', nazwaWyb ? nazwaWyb.v.nazwa : (b.name || (nazwaZ ? nazwaZ.name : ''))));
+                /* Adres z P/I to adres BENEFICJENTA Z P/I (20.11.2026). Moen 19383: P/I z marca podaje TEXTILE i jego adres
+                   („3.YUNNAN ROAD"), przelew idzie na konto i nazwe KINFUNG — do pliku poszedl adres innej firmy. Gdy nazwa
+                   do pliku nie jest nazwa beneficjenta z P/I (ani podobna), adresu z P/I nie bierzemy wcale; z karty wchodzi
+                   wtedy tylko blok „Beneficiary's Address" (biuro/magazyn/fabryka sa adresem dostawcy, nie beneficjenta).
+                   Bez takiego bloku adres zostaje pusty i wiersz ma blad — trzeba go wpisac (painRowUwagi).                  */
+                var piNazwaAdr = String((b.nameZKarty ? b.nameP : b.name) || '').trim();
+                var adrObcy = (String(b.addr || '').trim() && piNazwaAdr && nazwaV.trim()
+                               && !pcNazwaTaSama(nazwaV, piNazwaAdr) && !bcNazwaPodobna(nazwaV, piNazwaAdr)
+                               && !pcNazwaLiterowka(nazwaV, piNazwaAdr)) ? piNazwaAdr : '';
+                // bA — blok do ADRESU (kopia b); b idzie dalej do nazwy, SWIFT-u i banku.
+                var bA = b;
+                if (adrObcy){ bA = {}; for (var ka in b) if (Object.prototype.hasOwnProperty.call(b, ka)) bA[ka] = b[ka]; bA.addr = ''; }
+                // Adres z KARTY DOSTAWCY ma pierwszenstwo przed wyprowadzaniem z P/I (tam miasto stoi
+                // w osobnym polu i nie trzeba go zgadywac) — ale tylko blok beneficjenta albo blok, ktory
+                // opisuje to samo miejsce co adres beneficjenta z P/I (painAdrWybierz, 16.11.2026).
+                var adrWyb = painAdrWybierz(G, bA, !!adrObcy);
+                var kartaA = painKartaPrzestaw(adrWyb.kartaA);
+                // P/I bez adresu beneficjenta, a na karcie blok „beneficiary" z sama strefa — strefa jako tekst adresu.
+                if (!kartaA && adrWyb.benStrefa && !String(bA.addr || '').trim()){
+                    var b2 = {}; for (var kb in bA) if (Object.prototype.hasOwnProperty.call(bA, kb)) b2[kb] = bA[kb];
+                    b2.addr = adrWyb.benStrefa; bA = b2;
+                }
+                if (!kartaA) geo = painGeoZPI(bA);
+                var karta = kartaA ? {
+                    town: kartaA.city,
+                    ctry: pbFindCtry(kartaA.country) || pbFindCtry(kartaA.city) || '',
+                    addr: [kartaA.linia, kartaA.zip].filter(Boolean).join(', ')
+                } : null;
+                // Reczna poprawka > karta dostawcy > wyprowadzenie z P/I. Adres strukturalny (04.11.2026):
+                // z karty pola rozpisane, z P/I reszta tekstu w StrtNm; kod sprawdzany z tabela GeoNames.
+                var townV = String(V('town', (karta && karta.town) || geo.town || ''));
+                var ctryV = String(V('ctry', (karta && karta.ctry) || geo.ctry || '')).toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
+                var adrS = kartaA ? painAdrZKarty(kartaA, bA.addr || '', [b.name, G.sup, G.cid && _sup[G.cid] ? _sup[G.cid].nazwa : ''])
+                                  : painAdrZTekstu(bA.addr || '', townV, ctryV, geo.sub || '');
+                var pstV = String(V('pstCd', adrS.pstCd || ''));
+                var subV = String(V('sub', adrS.sub || ''));
+                var pnaV = pnaSprawdz(ctryV, pstV, townV, subV);
                 // Konto od dostawcy idzie wprost do banku — zmiana numeru na karcie ma byc widoczna
                 // w samym oknie przelewow, nie tylko w naglowku grupy.
                 var kartaZm = [], kontoChg = '';
@@ -30430,9 +30455,16 @@
                     key: G.key, gi: i, sup: G.sup, korzen: G.korzen || G.key,
                     amount: amt, amountBase: amtBase, amountEdited: amt !== amtBase,
                     title: String(V('title', pcTitleFor(G)) || ''),
-                    name: String(V('name', nazwaWyb ? nazwaWyb.v.nazwa : (b.name || (nazwaZ ? nazwaZ.name : '')))),
+                    name: nazwaV,
                     nazwaWar: nazwaWar, nazwaWyb: nazwaWyb ? nazwaWyb.v.nazwa : '', nazwaWybJak: nazwaWyb ? nazwaWyb.jak : '',
-                    nazwaPoprz: poprzN ? { nazwa: poprzN.nazwa, dzien: poprzN.dzien || '', order: poprzN.order || '', acct: poprzN.acct || '' } : null,
+                    nazwaPoprz: poprzN ? { nazwa: poprzN.nazwa, dzien: poprzN.dzien || '', order: poprzN.order || '', acct: poprzN.acct || '',
+                                           zwrot: poprzN.zwrot || null } : null,
+                    nazwaKom: nowaN,
+                    // Przelew-wzor wrocil (pcZwrotPo) i zamowienia z tego zwrotu, ktorych nie ma w paczce (20.11.2026).
+                    poprzZwrot: (poprzG && poprzG.zwrot) ? { opis: pcZwrotOpis(poprzG.zwrot, poprzG), brak: pcZwrotBrakujace(poprzG) } : pcDepoZwrot(G),
+                    // Adres z P/I nalezy do innej firmy niz nazwa do pliku — z karty tylko blok beneficjenta (20.11.2026).
+                    adrObcy: adrObcy ? { piNazwa: adrObcy, zKarty: !!kartaA, strefa: !!adrWyb.benStrefa,
+                                         reczny: ed.street != null && String(ed.street).trim() !== '' } : null,
                     nazwaZapas: (ed.name != null && String(ed.name) !== '') ? null : nazwaZ,
                     // Nazwa a karta dostawcy (painNazwaZKarty, 09.11.2026): czy nazwa jest z karty zamiast z P/I,
                     // jaka nazwe mial P/I i jakiego konta dotyczyl, oraz beneficjent karty do porownania.
@@ -30459,7 +30491,7 @@
                     town: townV,
                     ctry: ctryV,
                     // addr — tekst zrodlowy (do logu i dymka); do pliku ida street / bldg / pstCd / sub.
-                    addr: String((karta && karta.addr) || b.addr || ''),
+                    addr: String((karta && karta.addr) || bA.addr || ''),
                     street: String(V('street', adrS.street || '')),
                     bldg: String(V('bldg', adrS.bldg || '')),
                     pstCd: pstV, pna: pnaV, sub: subV,
@@ -30560,6 +30592,19 @@
                 + ' znaków, a do pain.001 wchodzi najwyżej 34 — popraw zapis konta.');
             if (!painBicOk(r.bic)) errs.push('BIC „' + r.bic + '” niepoprawny.');
             if (r.acctHintBad) warns.push('⛔ ' + (r.why.filter(function (w){ return /^komentarz z /.test(w); })[0] || 'komentarz wskazuje inne konto') + ' — wiersz jest ODZNACZONY; zaznacz go ręcznie dopiero po sprawdzeniu, na który numer ma iść przelew.');
+            // Ponowna platnosc po zwrocie (20.11.2026, Moen 19383/19384) — powod zwrotu i zamowienia z tego zwrotu spoza paczki.
+            if (r.poprzZwrot){
+                var zo = r.poprzZwrot.opis || '';
+                warns.push((r.poprzZwrot.brak && r.poprzZwrot.brak.length ? '⛔ ' : '↩ ') + zo.charAt(0).toUpperCase() + zo.slice(1)
+                    + ' — to ponowna płatność: sprawdź nazwę i konto beneficjenta, zanim wyślesz.'
+                    + (r.poprzZwrot.brak && r.poprzZwrot.brak.length
+                        ? ' Zwrot obejmował też zamówienia spoza tej paczki: ' + r.poprzZwrot.brak.join(', ') + ' — dopisz je do przelewu albo wyjaśnij, czemu ich nie ma.' : ''));
+            }
+            // Adres z P/I to adres innej firmy niz nazwa do pliku, a na karcie nie ma bloku beneficjenta (20.11.2026).
+            if (r.adrObcy && !r.adrObcy.zKarty && !r.adrObcy.strefa && !r.adrObcy.reczny)
+                errs.push('adres beneficjenta: P/I podaje adres firmy „' + r.adrObcy.piNazwa + '”, a przelew idzie na „' + r.name
+                    + '” — to adres innej firmy, nie biorę go. Wpisz adres beneficjenta w oknie (Ulica, Miasto) albo na karcie dostawcy '
+                    + 'w bloku „Beneficiary\'s Address” i odśwież.');
             if (r.juzZapl && r.juzZapl.length) warns.push('⛔ balans wygląda na JUŻ ZAPŁACONY: ' + pcJuzZaplaconeTxt(r.juzZapl)
                 + ' — nie wysyłaj, dopóki nie sprawdzisz, że to inna płatność (usuń wiersz 🗑, jeśli to ten sam balans).');
             if (!painTxt(r.town, 35, strict)) errs.push(ustr ? 'brak miasta beneficjenta — w adresie niestrukturalnym stoi w drugiej linii AdrLine; bez niego adres jest niepełny.'
@@ -32330,7 +32375,7 @@
                     try { var sk = await fetchCompany(cid); if (sk && !sk.failed) karta = { benef: sk.benef || '', nazwa: sk.nazwa || '', acc: sk.acc || '' }; }
                     catch (e){ karta = null; }
                 }
-                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom,
+                out.dane[o] = { order: o, pi: pi || {}, accSys: accSys, naj: part, pen: pen, kom: kom, zwroty: pcZwrotyKom(cs),
                                 cid: cid || '', slady: bcSladyKonta(o, cid), docs: docs, karta: karta };
                 zrobione++;
                 if (say) say('Sprawdzam zamówienia: ' + zrobione + '/' + wszystkie.length + '…', '#666');
@@ -32676,6 +32721,23 @@
                     // Pod kontem — wiersz nazwy (bcPoprzNazwa); jego wynik zbiera ostN dla bloku „Kilka nazw".
                     if (ppZ && (ppZ.dzien || ppZ.blad) && (potrzebne[o] || ppZ.blad)){
                         var pw = bcPoprzWynik(ppZ, q.acct, q.name, wyjZm);
+                        // Przelew, ktory WROCIL (20.11.2026, Moen 19383): komentarz o zwrocie po poprzednim potwierdzeniu, a przed
+                        // dniem tego przelewu. Wtedy poprzedni przelew nie jest wzorem — ta sama nazwa i to samo konto co przy
+                        // zwrocie to BLAD (bank odrzuci tak samo), cokolwiek innego to uwaga „ponowna platnosc". Do „Kilka nazw"
+                        // (ostN) zwrocony przelew nie wchodzi — „poszlo jak ostatnio" nie moze go uznac za wzor.
+                        var zwZ = (ppZ.dzien && !ppZ.blad) ? pcZwrotZListy(d.zwroty, ppZ.dzien, dataPl, o) : null;
+                        if (zwZ){
+                            var opZ = pcZwrotOpis(zwZ, ppZ);
+                            var tsN = !!(ppZ.nazwa && q.name && (pcNazwaTaSama(ppZ.nazwa, q.name) || bcNazwaPodobna(ppZ.nazwa, q.name)));
+                            var tsK = bcKontoEq(ppZ.acct, q.acct).ok;
+                            kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, '↩ ' + opZ, (tsN && tsK) ? 'zle' : 'uwaga');
+                            if (tsN && tsK) w.bledy.push(o + ': ' + opZ + ' — a ten przelew idzie znowu na tę samą nazwę „' + q.name
+                                + '” i to samo konto, więc bank może go odrzucić tak samo');
+                            else w.uwagi.push(o + ': ' + opZ + ' — ten przelew to ponowna płatność ('
+                                + (tsK ? 'to samo konto, inna nazwa' : (tsN ? 'ta sama nazwa, inne konto' : 'inna nazwa i inne konto'))
+                                + '); sprawdź dane beneficjenta');
+                            if (pw.nazwa) kon(o, 'nazwa na poprzednim (zwróconym) przelewie ↔ nazwa na tym przelewie', pw.nazwa.lewo, pw.nazwa.prawo, tsN ? 'zle' : 'uwaga');
+                        } else {
                         kon(o, 'poprzedni przelew z tego zamówienia', pw.lewo, pw.prawo, pw.lv);
                         if (pw.uwaga) w.uwagi.push(o + ': ' + pw.uwaga);
                         if (pw.blad) w.bledy.push(o + ': ' + pw.blad);
@@ -32683,6 +32745,7 @@
                             kon(o, 'nazwa na poprzednim przelewie ↔ nazwa na tym przelewie', pw.nazwa.lewo, pw.nazwa.prawo, pw.nazwa.lv);
                             ostN.push({ nazwa: ppZ.nazwa || '', rozna: pw.nazwa.rozna, konto: bcKontoEq(ppZ.acct, q.acct).ok,
                                         op: 'poprzedni przelew ' + o + ' z ' + ppZ.dzien });
+                        }
                         }
                     }
                     if (!(ppZ && ppZ.dzien && !ppZ.blad) && d.cid){
@@ -34295,10 +34358,16 @@
            w pisowni z P/I. Domyslnie wariant ostatniego przelewu — TYLKO gdy szedl na to samo konto co ten (Stallion 18957:
            depozyt na konto Nisheel, balance na nowe konto Stallion — stara nazwa nie moze wejsc sama). Wybor trzyma sie
            platnosci (state.pcNazwaWyb), schodzi przy „Przetwórz"; nazwa wpisana recznie dalej wygrywa.                      */
-        var PAIN_NAZWA_SRC = { poprz: 'ostatni przelew', pi: 'P/I', zapas: 'nagłówek P/I / karta', karta: 'karta: beneficjent', firma: 'karta: nazwa firmy' };
-        function painNazwyWarianty(G, nazwaPI, nazwaZ, poprz){
+        /* 20.11.2026 (Moen 19383): ostatni przelew WROCIL („account holder do not match"), a jego nazwa (TEXTILE) zaznaczyla
+           sie sama i do pliku poszla jeszcze raz. Teraz: przelew, ktory wrocil (poprz.zwrot), nigdy nie zaznacza nazwy sam;
+           pierwszenstwo przed ostatnim przelewem ma komentarz w zamowieniu „new beneficiary name: …" nowszy od ostatniego
+           przelewu, ktory doszedl (pcNowaNazwaDla). Kolejnosc: wybor reczny > komentarz > ostatni przelew na to samo konto.  */
+        var PAIN_NAZWA_SRC = { poprz: 'ostatni przelew', pi: 'P/I', zapas: 'nagłówek P/I / karta', karta: 'karta: beneficjent', firma: 'karta: nazwa firmy',
+                               kom: 'komentarz w zamówieniu' };
+        function painNazwyWarianty(G, nazwaPI, nazwaZ, poprz, nowa){
             var zr = [], out = [];
             if (poprz && poprz.nazwa) zr.push({ n: poprz.nazwa, src: 'poprz' });
+            if (nowa && nowa.nazwa) zr.push({ n: nowa.nazwa, src: 'kom' });
             if (nazwaPI) zr.push({ n: nazwaPI, src: 'pi' });
             if (nazwaZ && nazwaZ.name) zr.push({ n: nazwaZ.name, src: 'zapas' });
             var sk = G && G.cid && _sup[G.cid];
@@ -34314,12 +34383,16 @@
             });
             return out.length > 1 ? out : [];
         }
-        // -> { v: wariant, jak: 'wybor' | 'auto' } albo null (regula jak dotad)
-        function painNazwaWybor(G, war, poprz, accV){
+        // -> { v: wariant, jak: 'wybor' | 'kom' | 'auto' } albo null (regula jak dotad)
+        function painNazwaWybor(G, war, poprz, accV, nowa){
             if (!war || war.length < 2) return null;
             var w = state.pcNazwaWyb && G ? state.pcNazwaWyb[G.key] : '';
             if (w){ var x = war.filter(function (v){ return v.nazwa === w; })[0]; if (x) return { v: x, jak: 'wybor' }; }
-            if (poprz && poprz.nazwa && poprz.acct && normAcc(accV || '') && accTenSam(poprz.acct, accV)){
+            if (nowa && nowa.nazwa){
+                var k = war.filter(function (v){ return v.src.indexOf('kom') >= 0; })[0];
+                if (k) return { v: k, jak: 'kom' };
+            }
+            if (poprz && !poprz.zwrot && poprz.nazwa && poprz.acct && normAcc(accV || '') && accTenSam(poprz.acct, accV)){
                 var y = war.filter(function (v){ return v.src.indexOf('poprz') >= 0; })[0];
                 if (y) return { v: y, jak: 'auto' };
             }
@@ -34329,9 +34402,14 @@
             var w = (r && r.nazwaWar) || [];
             if (w.length < 2) return '';
             var p = r.nazwaPoprz, gdzie = p ? ((p.order ? 'zam. ' + p.order + ', ' : '') + (p.dzien || '?')) : '';
+            var nk = r.nazwaKom;
             var tyt = 'Dostawca ma kilka nazw. Do pliku pain.001 idzie nazwa zaznaczona tutaj.'
+                + (nk ? ('\nKomentarz w zamówieniu ' + (nk.order || '') + ' z ' + (nk.dzien || '?') + (nk.autor ? ' (' + nk.autor + ')' : '')
+                         + ' podaje nową nazwę beneficjenta: „' + nk.nazwa + '”'
+                         + (r.nazwaWybJak === 'kom' ? ' — ta nazwa jest zaznaczona sama.' : '.')) : '')
                 + (p ? ('\nOstatni przelew (' + gdzie + ') poszedł na nazwę: „' + p.nazwa + '” — konto ' + (p.acct || '—')
-                        + (r.nazwaWybJak === 'auto' ? '\nTa nazwa jest zaznaczona sama, bo przelew szedł na to samo konto.'
+                        + (p.zwrot ? '\nTEN PRZELEW WRÓCIŁ' + (p.zwrot.powod ? ' (powód banku: „' + p.zwrot.powod + '”)' : '') + ' — jego nazwy nie zaznaczam sama.'
+                           : r.nazwaWybJak === 'auto' ? '\nTa nazwa jest zaznaczona sama, bo przelew szedł na to samo konto.'
                            : (accTenSam(p.acct || '', r.acc || '') ? '' : '\nTamten przelew szedł na INNE konto — nazwy nie zaznaczam sama.')))
                      : '\nNie znam nazwy z ostatniego przelewu — zostaje nazwa z P/I (jak dotąd).')
                 + '\nWpisanie nazwy ręcznie w polu wyżej ma pierwszeństwo; kliknięcie wariantu zdejmuje ręczny wpis.';
@@ -34344,6 +34422,8 @@
                         + ' data-val="' + pcAttr(v.nazwa) + '"' + (v.nazwa === zazn ? ' checked' : '') + '> ' + painEsc(String(v.nazwa).slice(0, 60))
                         + ' <span style="color:#888">(' + painEsc(v.src.map(function (s){ return PAIN_NAZWA_SRC[s] || s; }).join(', ')) + ')</span>'
                         + (v.src.indexOf('poprz') >= 0 && r.nazwaWybJak === 'auto' ? ' <span style="color:#0a7a2f;font-weight:700">✓ ostatnio</span>' : '')
+                        + (v.src.indexOf('kom') >= 0 && r.nazwaWybJak === 'kom' ? ' <span style="color:#0a7a2f;font-weight:700">✓ z komentarza</span>' : '')
+                        + (v.src.indexOf('poprz') >= 0 && p && p.zwrot ? ' <span style="color:#a10000;font-weight:700">↩ ten przelew wrócił</span>' : '')
                         + '</label>';
                   }).join('')
                 + '</div>';
@@ -34725,14 +34805,161 @@
         // znaczy (depozyt juz przeszedl na obecny numer) — to usuwa falszywy alarm ze
         // starego wpisu w logu (np. 2016). Rozne konto liczy sie tylko z wyjasnieniem
         // DATOWANYM PO depozycie (log zmiany albo komentarz „new account").
-        function pcPoprzDlaGrupy(G){
-            if (!G) return null;
-            var best = null;
-            (G.bal || []).forEach(function (r){
-                var p = _poprz[String(r && r.order)];
-                if (p && p.dzien && (!best || p.dzien > best.dzien)) best = p;
+        /* ===== Przelew, ktory WROCIL (20.11.2026) =====
+           Moen 19383/19384: balance z 06.11 poszedl na konto KINFUNG z nazwa TEXTILE i 13.11 wrocil („ACCOUNT NUMBER AND
+           ACCOUNT HOLDER DO NOT MATCH"). 20.11 HUB wzial ten zwrocony przelew za wzor: sam zaznaczyl jego nazwe (painNazwaWybor),
+           pokazal „⛔ balans juz zaplacony", a zwrot obejmowal tez 19384, ktorego we wklejce nie bylo. Komentarz o zwrocie
+           (tekst banku albo „pieniadze wrocily") z dnia potwierdzenia albo pozniejszy uniewaznia to potwierdzenie jako wzor:
+           nazwa nie zaznacza sie sama, nie ma ⛔, jest ostrzezenie z powodem zwrotu i z zamowieniami, ktore zwrot obejmowal.
+           „Waiting for a refund" (zwrot w drodze) dziala tak samo, tylko bez listy zamowien.                                 */
+        var PC_ZWROT_RE = /return(?:ed)?\s+of\s+(?:your\s+)?payment|payment\s+(?:has\s+been\s+|was\s+)?returned|returned\s+payment|pieni(?:ą|a)dze\s+(?:do\s+nas\s+)?wr(?:ó|o)ci(?:ł|l)y|przelew\s+(?:do\s+nas\s+)?wr(?:ó|o)ci(?:ł|l)|zwr(?:ó|o)cony\s+przelew|zwrot\s+przelewu/i;
+        var PC_ZWROT_CZEKA_RE = /waiting\s+for\s+(?:a\s+|the\s+)?refund|czekamy\s+na\s+zwrot/i;
+        function pcZwrotyKom(cs){
+            var out = [];
+            (cs || []).forEach(function (c){
+                var t = String((c && c.text) || '').replace(/\s+/g, ' ').trim();
+                var pelny = PC_ZWROT_RE.test(t), czeka = !pelny && PC_ZWROT_CZEKA_RE.test(t);
+                if (!pelny && !czeka) return;
+                var e = { date: String((c && c.date) || ''), dzien: bcDzien(String((c && c.date) || '').slice(0, 10)), autor: (c && c.author) || '',
+                          czeka: czeka, powod: '', dzienPrzelewu: '', ordery: [], kont: [], tekst: t.slice(0, 400) };
+                // „REASON: ACCOUNT NUMBER AND ACCOUNT HOLDER DO NOT MATCHNF ID 4863561" — tekst banku bywa sklejony z numerem.
+                var pm = t.match(/REASON\s*:\s*(.*?)(?=NF\s*ID\b|\d|$)/i);
+                if (pm) e.powod = pm[1].replace(/[\s,;.:-]+$/, '').trim().slice(0, 120);
+                var dm = t.match(/payment\s+of\s+(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i);
+                if (dm) e.dzienPrzelewu = bcDzien(dm[1]);
+                // „COMMENTS: ORDER 19383, 19384, HMMU4186803, CA IU4435873 REFERENCES: …" — kontener bywa rozciety spacja.
+                var km = t.match(/COMMENTS?\s*:\s*(.*?)(?=REFERENCES?\s*:|REASON\s*:|$)/i), src = km ? km[1] : '';
+                (src.match(/(^|[^0-9])\d{5}(?![0-9])/g) || []).forEach(function (x){
+                    var o = x.replace(/\D/g, ''); if (e.ordery.indexOf(o) < 0) e.ordery.push(o);
+                });
+                (src.replace(/\s+/g, '').toUpperCase().match(/[A-Z]{4}\d{7}/g) || []).forEach(function (x){
+                    if (e.kont.indexOf(x) < 0) e.kont.push(x);
+                });
+                out.push(e);
+            });
+            return out;
+        }
+        // Zwrot, ktory uniewaznia potwierdzenie z dnia `dzien` (komentarz z tego dnia albo pozniejszy) w zamowieniu `order`.
+        // Pelny zwrot wygrywa z „czekamy na zwrot"; z kilku — najnowszy, z powodem i zamowieniami zebranymi ze wszystkich.
+        function pcZwrotPo(order, dzien){
+            return pcZwrotZListy(_ordZwrot[String(order == null ? '' : order)], dzien, '', order);
+        }
+        // Wspolne z Sprawdzaniem: zwroty z listy L z dnia `od` albo pozniej, a gdy podane `doDnia` — najpozniej z tego dnia
+        // (Sprawdzanie: zwrot po dniu sprawdzanego przelewu dotyczy JEGO, a nie przelewu poprzedniego).
+        function pcZwrotZListy(L, od, doDnia, order){
+            var d = bcDzien(od), dd = bcDzien(doDnia);
+            var tr = (L || []).filter(function (e){ return e.dzien && (!d || e.dzien >= d) && (!dd || e.dzien <= dd); });
+            if (!tr.length) return null;
+            var pel = tr.filter(function (e){ return !e.czeka; }), lst = pel.length ? pel : tr;
+            var z = lst[lst.length - 1], o = {};
+            for (var k in z) if (Object.prototype.hasOwnProperty.call(z, k)) o[k] = z[k];
+            o.ordery = []; o.kont = [];
+            lst.forEach(function (e){
+                if (!o.powod && e.powod) o.powod = e.powod;
+                if (!o.dzienPrzelewu && e.dzienPrzelewu) o.dzienPrzelewu = e.dzienPrzelewu;
+                e.ordery.forEach(function (x){ if (o.ordery.indexOf(x) < 0) o.ordery.push(x); });
+                e.kont.forEach(function (x){ if (o.kont.indexOf(x) < 0) o.kont.push(x); });
+            });
+            o.zOrderu = String(order);
+            return o;
+        }
+        function pcZwrotOpis(z, p){
+            if (!z) return '';
+            return 'poprzedni przelew' + (p && p.dzien ? ' (potwierdzenie z ' + p.dzien + ')' : '')
+                + (z.czeka ? ' NIE DOSZEDŁ — w zamówieniu ' + z.zOrderu + ' czekają na jego zwrot (komentarz z ' + z.dzien + ')'
+                           : ' WRÓCIŁ — komentarz w zamówieniu ' + z.zOrderu + ' z ' + z.dzien + (z.autor ? ' (' + z.autor + ')' : ''))
+                + (z.powod ? '; powód banku: „' + z.powod + '”' : '');
+        }
+        /* „new beneficiary name: TIANJIN KINFUNG IMPORT AND EXPORT CO., LTD" (Moen 19383/19384, 10.11.2026) — dyspozycja
+           PM-a w komentarzu zamowienia. Do 20.11 HUB jej nie czytal. Bierzemy najnowszy taki komentarz; nazwa konczy sie
+           przed „balance/deposit/account… to be paid" albo na koncu zdania.                                              */
+        var PC_NOWA_NAZWA_RE = /(?:new\s+(?:beneficiary(?:'s)?\s+)?name|nowa\s+nazwa(?:\s+beneficjenta)?)\s*[:\-]\s*(.+?)(?=\s+(?:balance|deposit|depo|account|bank|please|pls|to\s+be\s+paid)\b|[;\n]|$)/i;
+        function pcNowaNazwaKom(cs){
+            var out = null;
+            (cs || []).forEach(function (c){
+                var t = String((c && c.text) || '').replace(/\s+/g, ' ').trim(), m = t.match(PC_NOWA_NAZWA_RE);
+                if (!m) return;
+                var n = m[1].replace(/[\s,;:.-]+$/, '').trim();
+                if (n.length < 5 || n.length > 140 || !/[A-Za-z]{3}/.test(n)) return;
+                var d = bcDzien(String((c && c.date) || '').slice(0, 10));
+                if (!out || (d && d >= out.dzien)) out = { nazwa: n, dzien: d, autor: (c && c.author) || '' };
+            });
+            return out;
+        }
+        // Ta sama nazwa z literowka (Linfeng: „ZHEJIANAG" w P/I, „ZHEJIANG" poprawione recznie) — najwyzej 2 litery roznicy
+        // po zdjeciu znakow innych niz litery i cyfry. Uzywane tylko do adresu (painRows: adres innej firmy).
+        function pcNazwaLiterowka(a, b){
+            var x = pbNorm(a).replace(/[^A-Z0-9]/g, ''), y = pbNorm(b).replace(/[^A-Z0-9]/g, '');
+            if (x.length < 8 || y.length < 8 || Math.abs(x.length - y.length) > 2) return false;
+            var prev = [], cur, i, j;
+            for (j = 0; j <= y.length; j++) prev.push(j);
+            for (i = 1; i <= x.length; i++){
+                cur = [i]; var min = i;
+                for (j = 1; j <= y.length; j++){
+                    cur.push(Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x.charAt(i - 1) === y.charAt(j - 1) ? 0 : 1)));
+                    if (cur[j] < min) min = cur[j];
+                }
+                if (min > 2) return false;
+                prev = cur;
+            }
+            return prev[y.length] <= 2;
+        }
+        // Najnowsza dyspozycja nazwy z zamowien grupy, nie starsza niz `poDniu` (ostatni przelew, ktory DOSZEDL).
+        function pcNowaNazwaDla(G, poDniu){
+            var best = null, d0 = bcDzien(poDniu);
+            (G && (G.dep || []).concat(G.bal || []) || []).forEach(function (r){
+                var o = String((r && r.order) || ''), x = _ordNowaNazwa[o];
+                if (!x || (d0 && x.dzien && x.dzien < d0)) return;
+                if (!best || (x.dzien || '') > (best.dzien || '')){ best = { nazwa: x.nazwa, dzien: x.dzien, autor: x.autor, order: o }; }
             });
             return best;
+        }
+        // Zamowienia, ktore obejmowal ZWROCONY przelew, a ktorych nie ma w paczce (Moen 20.11.2026: zwrot 19383 + 19384,
+        // we wklejce tylko 19383). Zrodla: tekst zwrotu („COMMENTS: ORDER …") i tytul/nazwa pliku potwierdzenia.
+        function pcZwrotBrakujace(poprz){
+            if (!poprz || !poprz.zwrot || poprz.zwrot.czeka) return [];
+            var ord = {}, wkl = {};
+            (poprz.zwrot.ordery || []).forEach(function (o){ ord[o] = 1; });
+            var tyt = String(poprz.tytul || '') + ' ' + String(poprz.plik || '');
+            Object.keys(pcTytulOrdery(tyt.replace(/(?:penalty|overpayment|claim)(?:\s+no\.?)?\s*[\d,\s]+/gi, ' '))).forEach(function (o){
+                if (/^\d{5}$/.test(o)) ord[o] = 1;
+            });
+            ['dep', 'bal'].forEach(function (s){
+                ((state[s] && state[s].order) || []).forEach(function (sup){
+                    ((state[s].groups && state[s].groups[sup]) || []).forEach(function (r){ wkl[String((r && r.order) || '').trim()] = 1; });
+                });
+            });
+            return Object.keys(ord).filter(function (o){ return !wkl[o]; }).sort();
+        }
+        // Depozyt placony ponownie po zwrocie (Fondlive 22323: przelew z 10.11 wrocil 17.11) — najswiezsze potwierdzenie
+        // w TYM zamowieniu i komentarz o zwrocie po nim. -> { opis, brak: [] } albo null.
+        function pcDepoZwrot(G){
+            var out = null;
+            (G && G.dep || []).forEach(function (r){
+                if (out) return;
+                var o = String((r && r.order) || ''), d = ((_confDocsWsz[o] || []).map(function (x){ return (x && x.date) || ''; }).sort().pop()) || '';
+                if (!d) return;
+                var z = pcZwrotPo(o, d);
+                if (z) out = { opis: pcZwrotOpis(z, { dzien: d }), brak: [] };
+            });
+            return out;
+        }
+        function pcPoprzDlaGrupy(G){
+            if (!G) return null;
+            var best = null, bestO = '';
+            (G.bal || []).forEach(function (r){
+                var p = _poprz[String(r && r.order)];
+                if (p && p.dzien && (!best || p.dzien > best.dzien)){ best = p; bestO = String(r.order); }
+            });
+            if (!best) return null;
+            // Kopia — wpis w _poprz jest wspolny dla wszystkich zamowien jednego pliku potwierdzenia.
+            var o = {};
+            for (var k in best) if (Object.prototype.hasOwnProperty.call(best, k)) o[k] = best[k];
+            if (!o.order) o.order = bestO;
+            var zw = null;
+            if (!best.blad) (G.bal || []).forEach(function (r){ if (!zw) zw = pcZwrotPo(r && r.order, best.dzien); });
+            if (zw) o.zwrot = zw;
+            return o;
         }
         /* ===== Balans juz zaplacony? (16.11.2026) =====
            Yancheng 20078: balans 33 930,40 (HDMU4960402) zaplacony 13.11 — kwota w komentarzu, potwierdzenie
@@ -34755,6 +34982,8 @@
             (G && G.bal || []).forEach(function (r){
                 var p = _poprz[String(r && r.order)];
                 if (!p || p.blad) return;
+                // Przelew, ktory wrocil (pcZwrotPo), to nie zaplata — balans trzeba zaplacic jeszcze raz (Moen 20.11.2026).
+                if (pcZwrotPo(r && r.order, p.dzien)) return;
                 var txt = String(p.tytul || '') + ' ' + String(p.plik || '');
                 var cont = String((r && r.container) || '').toUpperCase().match(/[A-Z]{4}\s?\d{7}/g) || [];
                 var traf = cont.filter(function (c){
@@ -34773,8 +35002,17 @@
                     + ': „' + (z.tytul || z.plik || '') + '”';
             }).join('; ');
         }
-        // -> { lv: 'ok'|'info'|'warn'|'brak', txt, suppressChg }
+        // -> { lv: 'ok'|'info'|'warn'|'brak', txt, suppressChg, zwrot }
+        // Przelew, ktory wrocil (pcPoprzDlaGrupy -> .zwrot), nie jest wzorem: zawsze ostrzezenie z powodem zwrotu, a zgodnosc
+        // konta z nim niczego nie dowodzi (Moen 20.11.2026: konto to samo, wrocil przez nazwe), wiec nie gasi lampki zmiany konta.
         function pcPoprzWerdykt(poprz, accPay, cf){
+            var w = pcPoprzWerdykt0(poprz, accPay, cf);
+            if (!poprz || !poprz.zwrot) return w;
+            return { lv: 'warn', zwrot: true, suppressChg: false,
+                     txt: pcZwrotOpis(poprz.zwrot, poprz) + ' — nie biorę go za wzór (ani nazwy, ani konta); sprawdź dane beneficjenta przed wysłaniem.'
+                          + (w && w.txt ? ' ' + w.txt.charAt(0).toUpperCase() + w.txt.slice(1) + '.' : '') };
+        }
+        function pcPoprzWerdykt0(poprz, accPay, cf){
             if (!poprz || !poprz.dzien) return { lv: 'brak', txt: '' };
             if (poprz.blad) return { lv: 'brak', txt: 'poprzednie potwierdzenie depozytu jest, ale ' + poprz.blad + ' — konta z niego nie porównałem' };
             if (!normAcc(poprz.acct || '')) return { lv: 'brak', txt: 'w potwierdzeniu depozytu (' + (poprz.plik || '?') + ') nie znalazłem numeru konta' };
@@ -34855,7 +35093,10 @@
             var w = pcPoprzWerdykt(poprz, accUsed, pcConfEval(G));
             var M = { ok: ['✓ konto = depozyt', '#0a7a2f'], info: ['konto zmienione po depozycie', '#0a58ca'],
                       warn: ['⚠ inne konto niż depozyt', '#c47f00'], brak: ['? poprzedni przelew', '#888'] };
-            var m = M[w.lv] || M.brak;
+            var m = w.zwrot ? (poprz.zwrot.czeka ? ['↩ poprzedni przelew czeka na zwrot', '#a10000'] : ['↩ poprzedni przelew wrócił', '#a10000'])
+                            : (M[w.lv] || M.brak);
+            var brak = pcZwrotBrakujace(poprz);
+            if (brak.length) w = { lv: w.lv, txt: w.txt + '\n\nZwrot obejmował też zamówienia spoza tej paczki: ' + brak.join(', ') + '.' };
             var t = 'Poprzedni przelew (depozyt' + (poprz.dzien ? ' z ' + poprz.dzien : '') + (poprz.plik ? '\n' + poprz.plik : '') + '):'
                 + '\nkonto: ' + (poprz.acct || '—') + (poprz.nazwa ? ('\nnazwa: ' + poprz.nazwa) : '')
                 + '\n\nTen przelew (balance) idzie na konto: ' + (accUsed || '—')
@@ -36233,9 +36474,12 @@
         var PC_BARE_RE = "\\d{1,3}(?:[ '’,]\\d{3})+[.,]\\d{1,2}|\\d+[.,]\\d{1,2}";
         function pcNormCont(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
         function pcMoneyTokens(text){
-            var s = String(text == null ? '' : text), out = [];
+            // „8018.120 USD" (Top Grace 20111, 20.11.2026): trzy miejsca po kropce, zero na koncu — to 8018.12. Do 5.63.21
+            // wzorzec nie mial lewej granicy i bral z konca „120 USD" (kwota ≠ 120.00). Teraz kwota nie moze zaczac sie
+            // w srodku innej liczby, a zapis z zerem na trzecim miejscu (4+ cyfry przed kropka, bez separatorow) skracamy.
+            var s = String(text == null ? '' : text).replace(/(^|[^\d.,'’])(\d{4,})\.(\d{2})0(?![\d.,])/g, '$1$2.$3'), out = [];
             function add(raw){ var v = parseMoney(raw); if (isFinite(v) && v > 0 && out.indexOf(v) === -1) out.push(v); }
-            var re = new RegExp('(?:' + PC_CUR_RE + ')\\s*(' + PC_NUM_RE + ')|(' + PC_NUM_RE + ')\\s*(?:' + PC_CUR_RE + ')', 'gi'), m;
+            var re = new RegExp('(?:' + PC_CUR_RE + ')\\s*(' + PC_NUM_RE + ')(?![\\d]|[.,]\\d)|(?<![\\d.,\'’])(' + PC_NUM_RE + ')\\s*(?:' + PC_CUR_RE + ')', 'gi'), m;
             while ((m = re.exec(s)) !== null) add(m[1] != null ? m[1] : m[2]);
             // Drugie przejscie: liczby bez waluty. Procenty wycinamy, zeby „deposit 30%" nie
             // wchodzilo jako kwota. Osloniecie z obu stron pilnuje, zeby nie wyciac kawalka
@@ -36459,6 +36703,15 @@
             for (var k = 0; k < (adjs || []).length; k++){
                 if (rowne(Math.abs(d), Math.abs(adjs[k].sum)))
                     return wst + 'o ' + pcPenLabel(adjs[k]);
+            }
+            // Penalty plus kilka groszy (Sunwell 21428, 20.11.2026: komentarz 19427.51, penalty 1393 −1000.00, wklejono 18427.52).
+            // Do 5.63.21 komunikat mowil „roznica 999.99 nie odpowiada zadnej penalty", a chodzilo o 0.01 w arkuszu.
+            for (var j = 0; j < lista.length; j++){
+                var pj = lista[j], rj = d - pj.amt;
+                if (Math.abs(rj) >= 0.005 && Math.abs(rj) <= 0.05 + 1e-9)
+                    return ' — po ' + ((pj.nos && pj.nos[0]) || 'penalty') + ' (' + (pj.amt > 0 ? '+' : '−') + Math.abs(pj.amt).toFixed(2)
+                        + ') wklejona kwota jest ' + (rj > 0 ? 'WIĘKSZA' : 'MNIEJSZA') + ' o ' + Math.abs(rj).toFixed(2)
+                        + ' niż wynika z komentarza — popraw grosze w arkuszu';
             }
             return ' — różnica ' + ile + ' nie odpowiada żadnej penalty z tego zamówienia, sprawdź samą kwotę';
         }
@@ -38644,6 +38897,7 @@
             // Potwierdzenie / zmiana danych bankowych z komentarzy tego zamowienia — czytamy
             // z juz pobranego HTML-a, wiec nie kosztuje to ani jednego zapytania wiecej.
             _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
+            _ordZwrot[String(order)] = pcZwrotyKom(cs); _ordNowaNazwa[String(order)] = pcNowaNazwaKom(cs);
             try { _confDocsWsz[String(order)] = bcDocsIn(bcDocSection(h, BC_DOC_TYPE)); } catch (e0){}
             var com = extractDepoComment(h, cs), banks = extractBankAccts(h);
             // „var base" MUSI stac przed pierwszym uzyciem. Stalo za nim, a ponizsza
@@ -38746,6 +39000,7 @@
             if (!h) { dg.err = 1; dlog('BALANCE ' + order + ': nie otwarto ordera'); return { cands: [], pens: [], pi: { ok: false, msg: 'nie otwarto ordera' }, err: 1 }; }
             var cs = pcComments(h), cands = pcBalCands(cs), pens = pcPenComments(cs);
             _ordConf[String(order)] = pcScanBankComments(cs, 'zamówienie ' + order);
+            _ordZwrot[String(order)] = pcZwrotyKom(cs); _ordNowaNazwa[String(order)] = pcNowaNazwaKom(cs);
             // Lista potwierdzen „Payment conformation" z JUZ pobranej strony — do odczytu
             // poprzedniego przelewu (depozytu) bez drugiego pobrania strony zamowienia.
             try { _confDocs[String(order)] = bcDocsIn(bcDocSection(h, BC_DOC_TYPE)); } catch (e0){ _confDocs[String(order)] = []; }
@@ -38854,13 +39109,18 @@
             if (!inne.length) return { brak: true, sprawdzone: [], txt: 'dostawca nie ma w prologistics innych zamówień niż te z wklejki' };
             var sprawdzone = [], doc = null, zOrd = '';
             for (var i = 0; i < inne.length && sprawdzone.length < PC_POPRZD_MAX && !doc; i++){
-                var o = inne[i], docs = _confDocsWsz[o];
+                var o = inne[i], docs = _confDocsWsz[o], cidO = (_cid[o] != null && _cid[o] !== '') ? String(_cid[o]) : '';
                 if (!docs){
                     var h = await fetchT('/op_order.php?id=' + encodeURIComponent(o), 60000);
                     if (!pcStronaOrderu(h)){ sprawdzone.push(o + ' (nie otworzyłem)'); continue; }
+                    // Wyszukiwarka po firmie zwraca tez zamowienia INNYCH kart (20.11.2026: Jingxin 2317 dostal 20530 karty 2316
+                    // Beauty Shadow i 20419 karty 2599 — i „inne konto niz poprzedni przelew"). Karta z naglowka strony zamowienia.
+                    var mc = String(h).match(/id=["']sup_a["'][^>]*href=["'][^"']*company_id=(\d+)/i) || String(h).match(/op_suppliers\.php\?company_id=(\d+)/i);
+                    if (mc){ cidO = mc[1]; _cid[o] = cidO; }
                     try { docs = _confDocsWsz[o] = bcDocsIn(bcDocSection(h, BC_DOC_TYPE)); } catch (e){ docs = []; }
                     h = null;
                 }
+                if (cidO && cid && cidO !== String(cid)){ sprawdzone.push(o + ' (inna karta: ' + cidO + ')'); continue; }
                 sprawdzone.push(o);
                 var d0 = (docs || []).filter(function (d){ return d && d.date && (!przed || d.date < przed); }).sort(function (a, b){
                     var x = a.date + ' ' + (a.time || ''), y = b.date + ' ' + (b.time || '');
@@ -45901,7 +46161,8 @@
                         : (s.odb === 'blad' ? ('nieudane: ' + esc(s.odbErr || '')) : 'jeszcze nie poszło')) + '</span>';
             else if (s.f === 'wysl')
                 stan = '<span style="color:#c00">zapis −' + kw + ' na auftragu ' + esc(s.num) + ' wysłany bez potwierdzenia — '
-                     + 'kliknij guzik, HUB rozstrzygnie odczytem auftragu; nie księguj go ręcznie</span>';
+                     + 'kliknij guzik, HUB rozstrzygnie odczytem auftragu (płatność potwierdzi od razu, „nie weszło” najwcześniej po '
+                     + esc(mkNfaRozstrzygnijPo(s)) + '); nie księguj go ręcznie</span>';
             else stan = '<span style="color:#666">' + (j.booked ? 'do zrobienia' : 'po zaksięgowaniu paczki') + '</span>';
             return '<div style="margin-top:3px;font-size:11px"><span style="font-family:monospace">' + esc(p.nr) + '</span>'
                  + ' faktura z ' + esc(p.data || '?') + ' · OBI potrąciło ' + kw + ' ' + cur + ' brutto (Abzug '
@@ -45974,6 +46235,14 @@
                         obiChPotrZapisz(k, kl, { f: 'ok', open: rr.open, kiedy: mkNfaTeraz() });
                         mkLog('obich', '✔ ' + p.nr + ' → ' + num + ': zapis potrącenia potwierdzony odczytem (płatności '
                               + s.nPrzed + ' → ' + rr.nPay + ')');
+                    } else if (!mkNfaMoznaRozstrzygnac(s)){
+                        // Za wczesnie na „nie weszlo" (20.11.2026, jak przy NOT FOUND): platnosc bywa widoczna z opoznieniem, a do tej pory
+                        // slad schodzil tu od razu i ten sam przebieg wysylal minus drugi raz. Faktura czeka; zaprzeczyc wolno dopiero po
+                        // MK_NFA_ROZSTRZ_MIN minutach od wyslania.
+                        uwagi.push(p.nr + ' → auftrag ' + num + ': zapis z ' + mkCzasLok(s.kiedy) + ' jeszcze bez widocznej płatności — nie wysyłam drugi raz; '
+                                   + '„nie weszło” uznam najwcześniej po ' + mkNfaRozstrzygnijPo(s));
+                        mkLog('obich', '· ' + p.nr + ' → ' + num + ': zapis bez potwierdzenia, płatności jeszcze nie widać — za wcześnie na „nie weszło”');
+                        continue;
                     } else {
                         obiChPotrZapisz(k, kl, null);
                         mkLog('obich', '· ' + p.nr + ' → ' + num + ': wcześniejszy zapis potrącenia nie wszedł (płatności bez zmian) — od nowa');
@@ -46047,7 +46316,8 @@
                     odbic.push({ p: x.p, kl: x.kl, num: x.num, rr: po });
                 } else {
                     uwagi.push(x.p.nr + ' → auftrag ' + x.num + ': ' + (r.ok ? 'wysłane, ale' : ('błąd wysyłki (' + (r.err || '?') + '),'))
-                               + ' na auftragu nie widać nowej płatności — kliknij guzik jeszcze raz, HUB rozstrzygnie odczytem');
+                               + ' na auftragu jeszcze nie widać nowej płatności — NIE WIEM, czy weszło; nie księguj ręcznie. Kliknij guzik później:'
+                               + ' płatność potwierdzi od razu, „nie weszło” uzna najwcześniej po ' + mkNfaRozstrzygnijPo({ kiedy: mkNfaTeraz() }));
                     mkLog('obich', '⚠ ' + x.p.nr + ' → ' + x.num + ': zapis bez potwierdzenia (' + (r.ok ? 'HTTP OK' : (r.err || '?')) + ')');
                 }
             }
@@ -67193,7 +67463,8 @@
                                                   + (s.tickBlad ? (' (' + s.tickBlad + ')') : '') + ' — nie dopisuj jej ręcznie: „🔍 Sprawdź” rozstrzygnie z ticketu, '
                                                   + 'a „▶ Zaksięguj” dokończy samą notę, jeśli jej nie ma' });
                 if (s.auf === 'ok') return z({ stan: 'czesc', opis: 'płatność na auftragu ' + (s.num || '') + ' weszła, noty w tickecie ' + (s.rma || '') + ' nie ma' + (s.tickBlad ? (' (' + s.tickBlad + ')') : '') + ' — „▶ Zaksięguj” dokończy samą notę' });
-                if (s.auf === 'wysl') return z({ stan: 'niepewne', opis: 'płatność wysłana ' + mkCzasLok(s.kiedy) + ' bez potwierdzenia — „🔍 Sprawdź” rozstrzygnie z auftragu ' + (s.num || '') });
+                if (s.auf === 'wysl') return z({ stan: 'niepewne', opis: 'płatność wysłana ' + mkCzasLok(s.aufKiedy || s.kiedy) + ' bez potwierdzenia — „🔍 Sprawdź” rozstrzygnie z auftragu ' + (s.num || '')
+                                                  + ' (płatność potwierdzi od razu, „nie weszło” najwcześniej po ' + mkNfaRozstrzygnijPo({ kiedy: s.aufKiedy || s.kiedy }) + ')' });
             } else {
                 if (s.tick === 'ok' && Number(p.kwota) > Number(s.kwota || 0) + 0.005)
                     return z({ stan: 'reka', opis: 'HUB zaksięgował ' + f2(s.kwota) + ' (' + mkCzasLok(s.kiedy) + ', ticket ' + (s.rma || '') + '), a w raporcie jest już '
@@ -67758,8 +68029,11 @@
         if (p.typ === 'S' && s.auf === 'wysl' && s.num){
             const a = await kflAuf(s.num);
             if (!a.ok) return;
-            if (a.nPay > (Number(s.nPrzed) || 0)) kflSladUstaw(p.k, { auf: 'ok' });
-            else kflSladUstaw(p.k, { auf: null, nPrzed: null });
+            if (a.nPay > (Number(s.nPrzed) || 0)) kflSladUstaw(p.k, { auf: 'ok', aufKiedy: null });
+            // Za wczesnie na „nie weszlo" (20.11.2026, jak przy NOT FOUND): platnosc bywa widoczna z opoznieniem — slad zostaje.
+            // Slad sprzed tej zmiany nie ma aufKiedy — liczymy od ostatniego zapisu sladu (kiedy), czyli ostrozniej.
+            else if (!mkNfaMoznaRozstrzygnac({ kiedy: s.aufKiedy || s.kiedy })) return;
+            else kflSladUstaw(p.k, { auf: null, nPrzed: null, aufKiedy: null });
         }
         const s2 = kflSladLoad()[p.k] || {};
         const sNota = (s2.tick === 'wysl' || s2.tick === 'blad') || (p.typ === 'S' && s2.auf === 'ok' && s2.tick !== 'ok' && s2.tick !== 'niezg');
@@ -68206,16 +68480,21 @@
                                     + ' — nic nie wysłałem; „▶ Zaksięguj” jeszcze raz');
                 throw new Error('przed płatnością sprawdzenie dało „' + (sw.stan === 'reka' ? 'ręcznie' : sw.stan) + '”: ' + sw.opis + ' — nic nie wysłałem');
             }
-            kflSladUstaw(p.k, { typ: 'S', ff: p.ff, num: a.num, kwota: sp.kwota, data: data, rma: sp.rma, auf: 'wysl', nPrzed: a.nPay });
+            // aufKiedy — chwila wyslania platnosci (`kiedy` sladu zmienia kazdy zapis sladu); po niej kflRozstrzygnij liczy, czy wolno
+            // juz uznac „nie weszlo" (MK_NFA_ROZSTRZ_MIN, 20.11.2026).
+            kflSladUstaw(p.k, { typ: 'S', ff: p.ff, num: a.num, kwota: sp.kwota, data: data, rma: sp.rma, auf: 'wysl', nPrzed: a.nPay, aufKiedy: kflTeraz() });
             const w = await crBook(a.num, data, acct, sp.kwota, '');
             if (!w.ok){
-                if (w.nieWyslane) kflSladUstaw(p.k, { auf: null, nPrzed: null });
-                throw new Error('płatność na auftragu ' + a.num + ': ' + (w.err || 'nie poszła'));
+                if (w.nieWyslane) kflSladUstaw(p.k, { auf: null, nPrzed: null, aufKiedy: null });
+                throw new Error('płatność na auftragu ' + a.num + ': ' + (w.err || 'nie poszła') + (w.nieWyslane ? '' : ' — NIE WIEM, czy weszła; „🔍 Sprawdź” rozstrzygnie'));
             }
             await kflSen(400);
             const po = await kflAuf(a.num);
             if (po.ok && po.nPay > a.nPay) kflSladUstaw(p.k, { auf: 'ok' });
-            else if (po.ok){ kflSladUstaw(p.k, { auf: null, nPrzed: null }); throw new Error('płatność nie weszła — na auftragu ' + a.num + ' nie przybyło płatności'); }
+            // 200, a platnosci jeszcze nie widac: slad 'wysl' ZOSTAJE (20.11.2026) — dotad schodzil po 0,4 s i nastepne „▶ Zaksięguj"
+            // wysylalo platnosc drugi raz, gdy pierwsza pokazywala sie z opoznieniem. Rozstrzyga „🔍 Sprawdź" (kflRozstrzygnij).
+            else if (po.ok) throw new Error('płatność wysłana, ale na auftragu ' + a.num + ' jeszcze jej nie widać — NIE WIEM, czy weszła; nie księguj ręcznie,'
+                                            + ' „🔍 Sprawdź” rozstrzygnie (płatność potwierdzi od razu, „nie weszło” najwcześniej po ' + mkNfaRozstrzygnijPo({ kiedy: kflTeraz() }) + ')');
             else throw new Error('nie potwierdziłem płatności (auftrag ' + a.num + ' nieczytelny) — „🔍 Sprawdź” rozstrzygnie');
             s = kflSladLoad()[p.k] || {};
         }
@@ -75585,6 +75864,22 @@
         if (prev.net && prev.net.length) all[key].net = prev.net;       // potwierdzenia „znosi się" — patrz rdMarkNet
         const bzPrev = (prev.bz || []).filter(function (id){ return list.indexOf(id) < 0; });
         if (bzPrev.length) all[key].bz = bzPrev;                        // zamowienia nieznane prologistics — patrz rdMarkBz
+        // Pozycje oznaczone BEZ potwierdzenia, bo log ticketa o nich milczal (rdMarkBp). Zdejmuje je potwierdzenie albo reczne odhaczenie.
+        const bpPrev = (prev.bp || []).filter(function (id){ return !(sure || reczne) || ids.indexOf(id) < 0; });
+        if (bpPrev.length) all[key].bp = bpPrev;
+        rdSave(all);
+    }
+    // 20.11.2026: pozycje, o ktorych log modulu ticketa MILCZAL (albo logu nie bylo), oznaczamy jak dotad „bez potwierdzenia"
+    // — lista ich nie pokazuje jako do zrobienia — ale zapamietujemy je osobno (bp). Przebieg zostawia ich wiersz w arkuszu na
+    // „Nie", a dopilnowanie po fakcie (refArkKandydaci) przestawialo go potem na „Tak", choc nic nie potwierdzilo zapisu.
+    function rdMarkBp(key, ids){
+        if (!key || !ids || !ids.length) return;
+        rdMark(key, ids, false);
+        const all = rdLoad(), w = all[key];
+        if (!w) return;
+        const bp = (w.bp || []).slice();
+        ids.forEach(function (id){ if (bp.indexOf(id) < 0) bp.push(id); });
+        w.bp = bp;
         rdSave(all);
     }
     // Auftrag ze statusem Deleted nigdy sie nie zaksieguje — modul ticketa go pomija
@@ -75605,6 +75900,8 @@
         };
         if (prev.net && prev.net.length) all[key].net = prev.net;
         if (prev.bz && prev.bz.length) all[key].bz = prev.bz;
+        const bpZ = (prev.bp || []).filter(function (id){ return list.indexOf(id) < 0; });
+        if (bpZ.length) all[key].bp = bpZ;
         rdSave(all);
     }
     // POTWIERDZENIE, ze wplata i zwrot zamowienia sie znosza: wiersz wplaty w paczce importu stoi jako
@@ -75688,16 +75985,61 @@
         const kl = ksRodzajKlucz(r && r.rodzaj);
         return String(r && r.id) + '|' + Math.abs(Number(r && r.amt) || 0).toFixed(2) + (kl ? '|' + kl : '');
     }
+    // Wpisy zapisu modulu ticketa RAZEM Z DATA (20.11.2026): { klucz: [ { d, at } ] }. Sam klucz numer|kwota|rodzaj nie ma daty,
+    // wiec drugi zwrot TEJ SAMEJ kwoty tego samego zamowienia z innego rozliczenia wygladal na zaksiegowany: grupa gasla „wg zapisu
+    // modułu ticketa", przelot zbiorczy ja pomijal, a arkusz dostawal Refunded „Tak" — choc modul ticketa takiej pozycji sam nie
+    // ksieguje (ta sama kwota z inna data idzie do sprawdzenia przez czlowieka). d — data ksiegowania pozycji (ledgerAdd zapisuje ja
+    // od 20.11.2026, zapis wznawiania ma ja od dawna jako bookingDate); at — dzien przebiegu (UTC), jedyna data starych wpisow.
+    // ksZapis() zostaje dla czytelnikow, ktorym wystarcza numer i kwota (OBI CH).
+    function ksZapisWpisy(){
+        const o = {};
+        const dodaj = function (k, d, at){ (o[k] = o[k] || []).push({ d: String(d || ''), at: String(at || '') }); };
+        let p = null;
+        try { p = JSON.parse(localStorage.getItem(MK_TPROG) || 'null'); } catch (e){ p = null; }
+        if (p && Array.isArray(p.rows)) p.rows.forEach(function (r){
+            if (!r || (!r.booked && !r.alreadyBooked)) return;
+            const id = String(r.orderNumber == null ? '' : r.orderNumber).trim();
+            if (!id) return;
+            const kw = Math.abs(Number(String(r.amount == null ? '' : r.amount).replace(',', '.')) || 0);
+            const kl = ksRodzajKlucz(r.kind);
+            dodaj(id + '|' + kw.toFixed(2) + (kl ? '|' + kl : ''), r.bookingDate, '');
+        });
+        let b = null;
+        try { b = JSON.parse(localStorage.getItem(MK_TBOOKED) || 'null'); } catch (e){ b = null; }
+        if (b && Array.isArray(b.rows)) b.rows.forEach(function (r){ if (r && r.k) dodaj(r.k, r.d, r.at); });
+        return o;
+    }
+    // Data, z ktora modul ticketa ksieguje pozycje grupy: data grupy, a przy liscie Allegro (refTsv: kazdy wiersz z data i typem
+    // B2B/B2C) — data wiersza.
+    function ksDataPozycji(x, r){
+        const rows = (x && x.rows) || [];
+        const alle = rows.length && rows.every(function (y){ return y.data && /^B2[BC]$/i.test(String(y.typ || '')); });
+        return String((alle && alleYmd(r && r.data)) || (x && x.date) || '');
+    }
+    // Pozycja jest w zapisie modulu ticketa Z TA DATA. Wpis z data (d) — tylko ta sama data. Wpis bez daty (sprzed 20.11.2026) —
+    // gdy dzien przebiegu nie jest wczesniejszy od daty pozycji: zwrotu nie ksieguje sie przed wplywem, wiec wpis z dnia sprzed tej
+    // daty dotyczy innego rozliczenia. Pomylka w te strone zostawia grupe otwarta, a ponowny przebieg potwierdzi ja jako „już zaksięgowane".
+    function ksZapisMa(wpisy, r, data){
+        const w = (wpisy || {})[ksZapisKlucz(r)];
+        if (!w || !w.length) return false;
+        const d = String(data || '');
+        return w.some(function (e){
+            if (!d) return true;
+            if (e.d) return e.d === d;
+            return !e.at || e.at >= d;
+        });
+    }
     function rdState(key, x){
         const d = rdLoad()[key];
-        const zap = ksZapis();
+        const zap = ksZapisWpisy();
         const zLogu = [];
         // Numer liczy sie z zapisu modulu ticketa dopiero, gdy jest tam KAZDA jego pozycja (numer + kwota + rodzaj,
         // ksZapisKlucz): zwrot i claim tego samego zamowienia to dwie pozycje, a wpis zwrotu zamykal dotad i claim (5.59.8).
+        // 20.11.2026: i z data tej grupy (ksZapisMa) — wpis zwrotu z innego rozliczenia nie zamyka drugiego zwrotu tej samej kwoty.
         (x.rows || []).forEach(function (r){
             if (zLogu.indexOf(r.id) >= 0) return;
             const rr = x.rows.filter(function (y){ return y.id === r.id; });
-            if (rr.every(function (y){ return zap[ksZapisKlucz(y)]; })) zLogu.push(r.id);
+            if (rr.every(function (y){ return ksZapisMa(zap, y, ksDataPozycji(x, y)); })) zLogu.push(r.id);
         });
         const ids = ((d && d.ids) || []).slice();
         zLogu.forEach(function (id){ if (ids.indexOf(id) < 0) ids.push(id); });
@@ -75724,6 +76066,8 @@
                  zLogu: zLogu.length,
                  zaks: ids.length, pominiete: del.length - znosi.length, znosi: znosi.length,
                  delIds: del, znosiIds: znosi, bezZam: bz.length, bzIds: bz,
+                 // oznaczone bez potwierdzenia, bo log ticketa o nich milczal (rdMarkBp), i dalej niepotwierdzone zapisem modulu ticketa
+                 bpIds: ((d && d.bp) || []).filter(function (id){ return zLogu.indexOf(id) < 0 && x.rows.some(function (r){ return r.id === id; }); }),
                  done: x.rows.length - left.length, left: left };
     }
     // Zamowienia zlecenia, przy ktorych wplata i zwrot z TEGO SAMEGO rozliczenia znosza sie, a auftrag jest
@@ -75741,7 +76085,12 @@
     function mkZwrotWszedl(j, id){
         if (!j || !j.data) return false;
         const rf = (j.data.ref || {})[id];
-        if (rf != null && ksZapis()[id + '|' + Math.abs(Number(rf)).toFixed(2)]) return true;
+        // Zapis modulu ticketa z data tego rozliczenia (ksZapisMa, 20.11.2026); Allegro ksieguje zwrot z data wiersza.
+        if (rf != null){
+            const wp = ksZapisWpisy(), poz = { id: id, amt: rf, rodzaj: '' };
+            const dW = (j.kind === 'alle') ? alleYmd((j.data.refData || {})[id]) : '';
+            if (ksZapisMa(wp, poz, j.date) || (dW && ksZapisMa(wp, poz, dW))) return true;
+        }
         const d = rdLoad()[mkRefKluczZ(j, setLoad()[setKey(j.mp, j.data.shop)] || {})];
         return !!(d && !d.reczne && (d.ids || []).indexOf(id) >= 0);
     }
@@ -76537,7 +76886,7 @@
             if (!poz.length) return;
             const notatki = [], otwarte = [];
             poz.forEach(function (r){
-                if (done.indexOf(r.id) >= 0 || zapis[ksZapisKlucz(r)]) return;
+                if (done.indexOf(r.id) >= 0 || ksZapisMa(zapis, r, ksDataPozycji(x, r))) return;
                 if (usuniete.indexOf(r.id) >= 0) return;
                 if (powody[r.id] === 'brak ticketu'){
                     const au = linki[r.id] || [];
@@ -76580,13 +76929,20 @@
     }
     // Grupy domkniete (nic do zrobienia), bez rozstrzygnietego Refunded — z wierszami arkusza do przestawienia.
     function refArkKandydaci(){
-        const g = refGroups(), znane = refArkLoad(), zap = ksZapis(), jobs = jobsLoad(), sets = setLoad();
+        const g = refGroups(), znane = refArkLoad(), zap = ksZapisWpisy(), jobs = jobsLoad(), sets = setLoad(), rd = rdLoad();
         const out = [];
         Object.keys(g).forEach(function (key){
             const x = g[key];
             if (znane[key] || !x.acct || String(x.date || '') < MK_REF_ARK_OD) return;
             const st = rdState(key, x);
             if (!st || st.left.length) return;
+            // Pozycje oznaczone bez potwierdzenia (log ticketa o nich milczal, rdMarkBp): przebieg zostawil ich wiersz na „Nie"
+            // i tu tego nie odwracamy, dopoki nie potwierdzi ich zapis modulu ticketa albo czlowiek nie odhaczy grupy (20.11.2026).
+            const bp = (rd[key] && rd[key].bp) || [];
+            if (bp.some(function (id){
+                const rr = x.rows.filter(function (r){ return r.id === id; });
+                return rr.length && !rr.every(function (r){ return ksZapisMa(zap, r, ksDataPozycji(x, r)); });
+            })) return;
             const del = st.delIds || [];
             const plan = refDoArkusza(x, x.rows.map(function (r){ return r.id; }).filter(function (id){ return del.indexOf(id) < 0; }),
                                       del, {}, zap, {});
@@ -76712,7 +77068,11 @@
                         + (s.znosi ? (' <span style="font-weight:400">· znoszące się z wpłatą z tego samego rozliczenia: ' + s.znosi + '</span>') : '')
                         + (s.pominiete ? (' <span style="font-weight:400;color:#c47f00">· ' + s.pominiete
                              + ' pominięte (auftrag Deleted)</span>') : '')
-                        + (s.bezZam ? (' <span style="font-weight:400;color:#c47f00">· bez zamówienia w prologistics: ' + s.bezZam + '</span>') : '') + '</span>';
+                        + (s.bezZam ? (' <span style="font-weight:400;color:#c47f00">· bez zamówienia w prologistics: ' + s.bezZam + '</span>') : '')
+                        // 20.11.2026: o tych pozycjach log ticketa milczal — Refunded w arkuszu zostaje „Nie", dopoki ich nie potwierdzi
+                        // zapis modulu ticketa albo ponowny przebieg („↻ Zaksięguj ponownie” — modul ticketa potwierdzi je jako „już zaksięgowane”).
+                        + ((s.bpIds && s.bpIds.length) ? (' <span style="font-weight:400;color:#c47f00">· bez śladu w logu ticketa: ' + esc(s.bpIds.join(', '))
+                             + ' — Refunded zostaje „Nie”; „↻ Zaksięguj ponownie” sprawdzi je w ticketach</span>') : '') + '</span>';
                     return '<span style="font-size:11px;color:#c47f00;font-weight:700">częściowo: ' + (s.zaks == null ? s.done : s.zaks) + ' z ' + x.rows.length
                         + (s.znosi ? (' · znoszące się z wpłatą: ' + s.znosi) : '')
                         + (s.pominiete ? (' · ' + s.pominiete + ' pominięte (Deleted)') : '')
@@ -77289,7 +77649,11 @@
         try {
             const res = await fetch('/auction.php', { method: 'POST', credentials: 'same-origin',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: b.join('&') });
-            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?') };
+            // Kod odpowiedzi idzie dalej (20.11.2026, ta sama regula co w Bank Imporcie i „Ksiegowaniu w auftragu" od 19.11):
+            // 4xx = serwer odmowil wprost; 5xx i zerwane polaczenie = zapis MOGL wejsc (504 z bramki, a serwer pracuje dalej)
+            // — o tym rozstrzyga odczyt auftragu, i to nie od razu.
+            if (!res || !res.ok) return { ok: false, err: 'HTTP ' + (res ? res.status : '?'), status: res ? res.status : 0,
+                                          odmowa: !!(res && res.status >= 400 && res.status < 500) };
             return { ok: true };
         } catch (e){ return { ok: false, err: (e && e.message) || 'błąd wysyłki' }; }
     }
@@ -77310,9 +77674,11 @@
                 if (!rr.ok){ st.err = rr.err; st.num = num || ''; renderCr(); continue; }
                 st.num = num; st.open = rr.open; st.nPay = rr.nPay; st.deleted = rr.deleted; st.err = '';
                 if (x.slad.nPrzed != null){
-                    if (rr.nPay > x.slad.nPrzed) crdMark(x, 'auftrag', { num: num, sure: true });
-                    else crdUnmark(x.k);
-                    rozstrzygniete++;
+                    if (rr.nPay > x.slad.nPrzed){ crdMark(x, 'auftrag', { num: num, sure: true }); rozstrzygniete++; }
+                    // Za wczesnie na „nie weszlo" (20.11.2026, jak przy NOT FOUND): zapis bywa widoczny z opoznieniem — slad zostaje.
+                    else if (!mkNfaMoznaRozstrzygnac({ kiedy: x.slad.at }))
+                        st.err = 'płatności jeszcze nie widać — „nie weszło” uznam najwcześniej po ' + mkNfaRozstrzygnijPo({ kiedy: x.slad.at });
+                    else { crdUnmark(x.k); rozstrzygniete++; }
                 }
                 renderCr();
                 continue;
@@ -77388,13 +77754,28 @@
             const r = await crBook(st.num, x.date, x.acct, x.amt, x.text);
             // Potwierdzamy odczytem, a nie samym HTTP 200 — strona oddaje 200 takze wtedy,
             // gdy formularz odrzucil dane.
+            // Zapytanie w ogole nie wyszlo (zla data) — nie ma czego rozstrzygac.
+            if (!r.ok && r.nieWyslane){
+                crdUnmark(x.k);
+                kom = ['Nie księguję: ' + (r.err || 'zapytanie nie wyszło') + ' — nic nie wysłałem.', '#c00'];
+                return;
+            }
             const after = await crRead(st.num);
             if (after.ok){ st.open = after.open; st.nPay = after.nPay; st.deleted = after.deleted; }
-            // Odczyt sie udal i platnosci NIE przybylo: zapis nie wszedl, slad zdejmujemy.
-            if (after.ok && !(after.nPay > przed.nPay)){
+            // Platnosci NIE przybylo, a serwer odmowil wprost (4xx): zapis nie wszedl, slad zdejmujemy. Przy 200 bez widocznej platnosci,
+            // 5xx i zerwanym polaczeniu slad niepotwierdzony ZOSTAJE (20.11.2026): zapis bywa widoczny z opoznieniem, a do tej pory
+            // slad schodzil tu od razu — guzik wracal i nastepne klikniecie dopisywalo druga platnosc. Rozstrzyga „Sprawdź auftragi"
+            // (najwczesniej po MK_NFA_ROZSTRZ_MIN minutach) albo czlowiek („↺ Cofnij oznaczenie").
+            if (after.ok && !(after.nPay > przed.nPay) && !r.ok && r.odmowa){
                 crdUnmark(x.k);
-                kom = [(r.ok ? 'Wysłałem zapis, ale' : ('Zapis nie przeszedł (' + r.err + ') i'))
-                       + ' na auftragu ' + st.num + ' nie przybyła płatność — nie odhaczam. Sprawdź auftrag.', '#c00'];
+                kom = ['Zapis nie przeszedł (' + r.err + ', serwer odmówił) i na auftragu ' + st.num + ' nie przybyła płatność — nie odhaczam. Sprawdź auftrag.', '#c00'];
+                return;
+            }
+            if (after.ok && !(after.nPay > przed.nPay)){
+                kom = [(r.ok ? 'Wysłałem zapis, ale' : ('Zapis zwrócił błąd (' + r.err + ') i'))
+                       + ' na auftragu ' + st.num + ' jeszcze nie widać płatności — NIE WIEM, czy weszło. Nie księguj ponownie; pozycja zostaje jako'
+                       + ' niepotwierdzona, „Sprawdź auftragi" rozstrzygnie (płatność potwierdzi od razu, „nie weszło” najwcześniej po '
+                       + mkNfaRozstrzygnijPo({ kiedy: (crdLoad()[x.k] || {}).at }) + ').', '#c47f00'];
                 return;
             }
             if (after.ok){
@@ -77500,7 +77881,8 @@
               +  (st.err ? ('<span style="font-size:11px;color:#c47f00">' + esc(st.err) + '</span>') : '')
               +  (niep ? ('<span style="font-size:11px;color:#c47f00;font-weight:700">⚠ zapis wysłany na auftrag'
                           + (x.slad.num ? (' ' + esc(x.slad.num)) : '') + ' ' + esc(mkCzasLok(x.slad.at))
-                          + ' — niepotwierdzony; „Sprawdź auftragi" rozstrzygnie</span>')
+                          + ' — niepotwierdzony; „Sprawdź auftragi" rozstrzygnie (płatność potwierdzi od razu, „nie weszło” najwcześniej po '
+                          + esc(mkNfaRozstrzygnijPo({ kiedy: x.slad.at })) + ')</span>')
                        : (zr ? ('<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ '
                                 + (x.slad.jak === 'reczne' ? 'zrobione w tickecie'
                                    : (naLiscie ? ('do ticketu' + (x.slad.rma ? (' ' + esc(x.slad.rma)) : '') + ' na minus — lista „Zwroty”'
@@ -77627,6 +78009,40 @@
             });
         });
     }
+    // Slad zapisu na auftragu przy zleceniu (20.11.2026): { f: 'wysl', num, kwota, nPrzed, kiedy } — PRZED zapisem, zdejmowany po
+    // potwierdzeniu (przybyl wiersz platnosci), po odmowie 4xx albo po rozstrzygnieciu w „🔍 Sprawdź auftragi". Do 20.11.2026 Joybuy nie
+    // mial sladu wcale: po bledzie 5xx guzik zostawal czynny (drugie klikniecie = druga platnosc), a po HTTP 200 zlecenie dostawalo
+    // „zaksięgowane" bez sprawdzenia, czy platnosc przybyla.
+    function joySlad(j){ return (j && j.joyWisi && typeof j.joyWisi === 'object') ? j.joyWisi : null; }
+    function joySwiezy(j){ const jobs = jobsLoad(); return jobs[mkKluczPamieci(jobs, j) || String((j && j.ref) || '')] || null; }
+    function joyZapiszSlad(j, wpis){
+        const jobs = jobsLoad(), cur = jobs[mkKluczPamieci(jobs, j) || String((j && j.ref) || '')];
+        if (!cur) return false;
+        cur.joyWisi = wpis || null;
+        jobsSave(jobs);
+        return true;
+    }
+    // Po potwierdzonym zapisie (przybyl wiersz platnosci): „zaksięgowane" i wiersz do arkusza — wspolne dla „▶ Zaksięguj" i rozstrzygniecia
+    // sladu w „🔍 Sprawdź auftragi". Arkusz to KROK OSOBNY — jego niepowodzenie nie cofa ksiegowania, trafia tylko do opisu przy zleceniu.
+    async function joyZaksiegowane(j, c, num, after){
+        const jobs = jobsLoad(), cur = jobs[mkKluczPamieci(jobs, j) || String((j && j.ref) || '')];
+        if (!cur) return null;
+        cur.booked = true;
+        cur.joyWisi = null;
+        cur.msg = 'zaksięgowane na auftragu ' + num + (after && after.ok && after.open != null ? (', open amount po księgowaniu ' + f2(after.open)) : '');
+        jobsSave(jobs);
+        const cfg = shCfg();
+        if (cfg.on && cfg.url && cfg.secret){
+            try {
+                const res = await shZapisz(j, c);
+                const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
+                cur.msg += shSlowo(res) + (res.added ? tb : '');
+                cur.arkDoReki = shDoReki(res);
+            } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); cur.arkDoReki = true; }
+            jobsSaveScal(jobs);                // po zapytaniu do arkusza — scalony, nie caly obiekt sprzed niego
+        }
+        return cur;
+    }
     async function joyCheck(b){
         const list = joyJobs().filter(function (j){ return !j.booked; });
         if (!list.length) return;
@@ -77635,6 +78051,21 @@
         for (let i = 0; i < list.length; i++){
             const j = list[i], st = mkJoyState[j.ref] || (mkJoyState[j.ref] = {});
             say('Faktura ' + j.ref + ' (' + (i + 1) + '/' + list.length + ')…');
+            // Zapis bez potwierdzenia: rozstrzyga odczyt auftragu, na ktory poszedl. Przybyla platnosc — zaksiegowane; nie przybyla —
+            // zapis nie wszedl, ale uznajemy to dopiero po MK_NFA_ROZSTRZ_MIN minutach (platnosc bywa widoczna z opoznieniem).
+            const sl = joySlad(joySwiezy(j) || j);
+            if (sl && sl.num){
+                const rr = await crRead(sl.num);
+                if (!rr.ok){ st.err = rr.err || ('nie odczytałem auftragu ' + sl.num); st.num = sl.num; renderJoy(); continue; }
+                st.num = sl.num; st.open = rr.open; st.nPay = rr.nPay; st.deleted = rr.deleted; st.err = '';
+                if (sl.nPrzed != null && rr.nPay > sl.nPrzed)
+                    await joyZaksiegowane(j, setLoad()[setKey(j.mp, j.shop || MK_JOY_SHOP)] || {}, sl.num, rr);
+                else if (!mkNfaMoznaRozstrzygnac(sl))
+                    st.err = 'zapis z ' + mkCzasLok(sl.kiedy) + ' jeszcze bez widocznej płatności — „nie weszło” uznam najwcześniej po ' + mkNfaRozstrzygnijPo(sl);
+                else joyZapiszSlad(j, null);   // nie przybylo i minelo dosc czasu — zapis nie wszedl, mozna zaksiegowac jeszcze raz
+                renderJoy();
+                continue;
+            }
             const f = await joyFind(j.ref);
             if (!f.nums.length){ st.err = f.err || 'nie znajduję auftragu'; st.num = ''; renderJoy(); continue; }
             if (f.nums.length > 1){ st.err = 'kilka auftragów (' + f.nums.join(', ') + ') — zaksięguj ręcznie'; st.num = ''; renderJoy(); continue; }
@@ -77645,59 +78076,81 @@
             renderJoy();
         }
         b.disabled = false;
+        render();                                      // rozstrzygniete slady moga zamknac zlecenie
         say('Sprawdzone.', '#0a7a2f');
     }
     async function joyDoBook(j, b){
-        const st = mkJoyState[j.ref] || {};
+        const st = mkJoyState[j.ref] || (mkJoyState[j.ref] = {});
         const c = setLoad()[setKey(j.mp, j.shop || MK_JOY_SHOP)] || {};
         if (!st.num){ say('Najpierw „Sprawdź auftragi".', '#c47f00'); return; }
         if (!c.acct){ say('Nie ma konta dla ' + (j.shop || MK_JOY_SHOP) + ' — uzupełnij w ⚙ Konta.', '#c47f00'); return; }
-        const rozn = (st.open == null) ? null : r2(st.open - j.amount);
-        if (!confirm('Zaksięgować wpłatę Joybuy na auftragu?\n\n'
-            + '  faktura    : ' + j.ref + '\n'
-            + '  auftrag    : ' + st.num + '\n'
-            + '  kwota      : ' + f2(j.amount) + ' ' + (j.cur || '') + '\n'
-            + '  open amount: ' + (st.open == null ? 'nie odczytałem' : f2(st.open))
-            + (rozn ? ('   ⚠ różnica ' + f2(rozn)) : (st.open != null ? '   (zgadza się)' : '')) + '\n'
-            + '  konto      : ' + c.acct + '\n'
-            + '  data       : ' + j.date + '\n'
-            + '  komentarz  : ' + joyComment(j) + '\n'
-            + (st.deleted ? '\n⚠ AUFTRAG MA STATUS DELETED.\n' : '')
-            + (st.nPay ? ('\nNa tym auftragu są już ' + st.nPay + ' płatności.\n') : '')
-            + '\nTego się nie cofa jednym kliknięciem.')) return;
-        b.disabled = true;
-        const r = await crBook(st.num, j.date, c.acct, j.amount, joyComment(j));
-        b.disabled = false;
-        if (!r.ok){ say('Nie zaksięgowano: ' + r.err, '#c00'); return; }
-        // Potwierdzamy odczytem, a nie samym HTTP 200 — strona oddaje 200 takze wtedy,
-        // gdy formularz odrzucil dane.
-        const after = await crRead(st.num);
-        st.open = after.ok ? after.open : st.open;
-        st.nPay = after.ok ? after.nPay : st.nPay;
-        const jobs = jobsLoad(), cur = jobs[j.ref];
-        if (cur){
-            cur.booked = true;
-            cur.msg = 'zaksięgowane na auftragu ' + st.num
-                    + (after.ok && after.open != null ? (', open amount po księgowaniu ' + f2(after.open)) : '');
-            jobsSave(jobs);
+        // Jedno ksiegowanie tej wplaty naraz, a stan zlecenia na swiezo — guzik narysowano z lista, ktora mogla sie zestarzec (druga karta,
+        // poprzedni zapis bez potwierdzenia).
+        if (st.wToku) return;
+        const j1 = joySwiezy(j);
+        if (!j1){ say('Nie odnalazłem tego zlecenia w pamięci — odśwież stronę.', '#c00'); return; }
+        if (j1.booked){ render(); say('Ta wpłata Joybuy jest już zaksięgowana.', '#c47f00'); return; }
+        const sl1 = joySlad(j1);
+        if (sl1){
+            render();
+            say('Faktura ' + j.ref + ': zapis z ' + mkCzasLok(sl1.kiedy) + ' na auftrag ' + (sl1.num || '') + ' jest bez potwierdzenia — nie wysyłam drugi raz;'
+                + ' „🔍 Sprawdź auftragi” rozstrzygnie (płatność potwierdzi od razu, „nie weszło” najwcześniej po ' + mkNfaRozstrzygnijPo(sl1) + ').', '#c47f00');
+            return;
         }
-        // Dopisek do arkusza jest KROKIEM OSOBNYM — dokladnie jak przy imporcie: jego
-        // niepowodzenie NIE cofa ksiegowania, trafia tylko do opisu przy zleceniu, zebys
-        // wiedzial, co ewentualnie dopisac recznie. Duplikat wychwytuje sam arkusz
-        // (klucz data + konto + kwota) i wtedy oddaje „w arkuszu już było".
-        const cfg = shCfg();
-        if (cur && cfg.on && cfg.url && cfg.secret){
-            try {
-                const res = await shZapisz(j, c);
-                const tb = (res.tabs && res.tabs.length) ? (' ' + res.tabs.join(', ')) : '';
-                cur.msg += shSlowo(res) + (res.added ? tb : '');
-                cur.arkDoReki = shDoReki(res);
-            } catch (e){ cur.msg += ' · ARKUSZ: ' + ((e && e.message) || e); cur.arkDoReki = true; }
-            jobsSave(jobs);
+        st.wToku = true;
+        if (b) b.disabled = true;
+        let kom = null;
+        try {
+            // Odczyt PRZED zapisem (20.11.2026): stan ze „Sprawdź auftragi" mogl sie zestarzec, a od niego zalezy i pytanie, i kontrola
+            // „czy przybyla platnosc". Przy wygaslej sesji nie ma formularza platnosci — konczymy, zanim cokolwiek pojdzie.
+            const przed = await crRead(st.num);
+            if (!przed.ok){ kom = ['Nie księguję — nie odczytałem auftragu ' + st.num + ' przed zapisem: ' + (przed.err || '?'), '#c00']; return; }
+            st.open = przed.open; st.nPay = przed.nPay; st.deleted = przed.deleted;
+            const rozn = (st.open == null) ? null : r2(st.open - j.amount);
+            if (!confirm('Zaksięgować wpłatę Joybuy na auftragu?\n\n'
+                + '  faktura    : ' + j.ref + '\n'
+                + '  auftrag    : ' + st.num + '\n'
+                + '  kwota      : ' + f2(j.amount) + ' ' + (j.cur || '') + '\n'
+                + '  open amount: ' + (st.open == null ? 'nie odczytałem' : f2(st.open))
+                + (rozn ? ('   ⚠ różnica ' + f2(rozn)) : (st.open != null ? '   (zgadza się)' : '')) + '\n'
+                + '  konto      : ' + c.acct + '\n'
+                + '  data       : ' + j.date + '\n'
+                + '  komentarz  : ' + joyComment(j) + '\n'
+                + (st.deleted ? '\n⚠ AUFTRAG MA STATUS DELETED.\n' : '')
+                + (st.nPay ? ('\nNa tym auftragu są już ' + st.nPay + ' płatności.\n') : '')
+                + '\nTego się nie cofa jednym kliknięciem.')) return;
+            const j2 = joySwiezy(j);
+            if (!j2 || j2.booked || joySlad(j2)){ kom = ['W międzyczasie ta wpłata została zaksięgowana albo wysłana (inna karta?) — nic nie wysyłam.', '#c47f00']; return; }
+            // Slad PRZED zapisem: przerwany zapis nie moze zostawic platnosci na auftragu i czynnego guzika obok.
+            if (!joyZapiszSlad(j, { f: 'wysl', num: String(st.num), kwota: r2(j.amount), nPrzed: przed.nPay, kiedy: mkNfaTeraz() })){
+                kom = ['Nie odnalazłem tego zlecenia w pamięci (wyczyszczone w innej karcie?) — nic nie wysyłam.', '#c00']; return;
+            }
+            const r = await crBook(st.num, j.date, c.acct, j.amount, joyComment(j));
+            if (!r.ok && r.nieWyslane){ joyZapiszSlad(j, null); kom = ['Nie zaksięgowano: ' + (r.err || '?') + ' — nic nie wysłałem.', '#c00']; return; }
+            // Potwierdzamy odczytem, a nie samym HTTP 200 — strona oddaje 200 takze wtedy, gdy formularz odrzucil dane.
+            const after = await crRead(st.num);
+            if (after.ok){ st.open = after.open; st.nPay = after.nPay; }
+            if (after.ok && after.nPay > przed.nPay){
+                const cur = await joyZaksiegowane(j, c, st.num, after);
+                kom = ['Zaksięgowane na auftragu ' + st.num + ', open amount po księgowaniu ' + f2(after.open)
+                       + (cur && /arkusz/i.test(cur.msg || '') ? (' · ' + cur.msg.split('·').pop().trim()) : ''), '#0a7a2f'];
+                return;
+            }
+            if (after.ok && !r.ok && r.odmowa){
+                joyZapiszSlad(j, null);                  // 4xx i nic nie przybylo — zapis nie wszedl, mozna ponowic
+                kom = ['Nie zaksięgowano: ' + r.err + ' (serwer odmówił), na auftragu ' + st.num + ' nic nie przybyło.', '#c00'];
+                return;
+            }
+            // 200 bez widocznej platnosci, 5xx, zerwane polaczenie albo nieczytelny odczyt: slad ZOSTAJE, „zaksięgowane" NIE stoi.
+            kom = [(r.ok ? 'Wysłałem zapis, ale' : ('Zapis zwrócił błąd (' + r.err + ') i')) + ' na auftragu ' + st.num + ' jeszcze nie widać płatności'
+                   + (after.ok ? '' : (' (odczyt: ' + (after.err || '?') + ')')) + ' — NIE WIEM, czy weszło. Nie księguj ponownie; „🔍 Sprawdź auftragi” rozstrzygnie'
+                   + ' (płatność potwierdzi od razu, „nie weszło” najwcześniej po ' + mkNfaRozstrzygnijPo({ kiedy: mkNfaTeraz() }) + ').', '#c47f00'];
+        } finally {
+            st.wToku = false;
+            if (b) b.disabled = false;
+            render();
+            if (kom) say(kom[0], kom[1]);
         }
-        render();
-        say('Zaksięgowane na auftragu ' + st.num + (after.ok ? (', open amount po księgowaniu ' + f2(after.open)) : '')
-            + (cur && /arkusz/i.test(cur.msg) ? (' · ' + cur.msg.split('·').pop().trim()) : ''), '#0a7a2f');
     }
     function renderJoy(){
         const box = $('#mk-joy'); if (!box) return;
@@ -77720,7 +78173,8 @@
             const c = setLoad()[setKey(j.mp, j.shop || MK_JOY_SHOP)] || {};
             const ok = st.num && !st.err;
             const rozn = (ok && st.open != null) ? r2(st.open - j.amount) : null;
-            const can = ok && !j.booked && c.acct;
+            const slJ = joySlad(j);                    // zapis bez potwierdzenia — guzik zgaszony, rozstrzyga „🔍 Sprawdź auftragi"
+            const can = ok && !j.booked && c.acct && !slJ;
             h += '<div style="margin:6px 0;padding:6px 8px;background:#faf9ff;border:1px solid #ede9fe;border-radius:6px">'
               +  '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
               +  '<b style="font-size:11px;font-family:monospace">' + esc(j.ref) + '</b>'
@@ -77733,6 +78187,9 @@
               +  (st.deleted ? '<span style="font-size:11px;color:#c00;font-weight:700">DELETED</span>' : '')
               +  (st.err ? ('<span style="font-size:11px;color:#c47f00">' + esc(st.err) + '</span>') : '')
               +  (j.booked ? '<span style="font-size:11px;color:#0a7a2f;font-weight:700">✔ zaksięgowane</span>' : '')
+              +  ((slJ && !j.booked) ? ('<span style="font-size:11px;color:#c47f00;font-weight:700">⚠ zapis wysłany na auftrag ' + esc(slJ.num || '') + ' '
+                                        + esc(mkCzasLok(slJ.kiedy)) + ' bez potwierdzenia — „🔍 Sprawdź auftragi” rozstrzygnie (płatność potwierdzi od razu,'
+                                        + ' „nie weszło” najwcześniej po ' + esc(mkNfaRozstrzygnijPo(slJ)) + ')</span>') : '')
               +  '<button class="mk-joy-b" data-i="' + i + '"' + (can ? '' : ' disabled')
               +  ' style="padding:3px 10px;border:none;border-radius:6px;background:' + (can ? '#5b21b6' : '#c7c7c7')
               +  ';color:#fff;font-weight:700;cursor:' + (can ? 'pointer' : 'default') + ';font-size:11px">▶ Zaksięguj na auftragu</button>'
@@ -77826,7 +78283,8 @@
             if (sl.f === 'ok') return { st: 'zrob', num: sl.num, why: 'zaksięgowane na auftragu ' + sl.num + ' ' + mkCzasLok(sl.kiedy) };
             if (sl.f === 'juz') return { st: 'zrob', num: sl.num, why: 'było już na auftragu ' + sl.num + ' (płatność ' + f2(o.kwota) + ', open 0) — nic nie wysłałem' };
             if (sl.f === 'reczne') return { st: 'zrob', num: sl.num || '', why: 'oznaczone jako zrobione ręcznie ' + mkCzasLok(sl.kiedy) };
-            return { st: 'niep', num: sl.num, why: 'wysłane na auftrag ' + sl.num + ' ' + mkCzasLok(sl.kiedy) + ' bez potwierdzenia — „🔍 Sprawdź auftragi” rozstrzygnie' };
+            return { st: 'niep', num: sl.num, why: 'wysłane na auftrag ' + sl.num + ' ' + mkCzasLok(sl.kiedy) + ' bez potwierdzenia — „🔍 Sprawdź auftragi” rozstrzygnie'
+                                                + ' (płatność potwierdza od razu, „nie weszło” najwcześniej po ' + mkNfaRozstrzygnijPo(sl) + ')' };
         }
         if (!(o.kwota > 0)) return { st: 'reka', why: 'kwota ' + f2(o.kwota) + ' — tylko ręcznie' };
         const s = (mkEpcStan[epcKluczStanu(j)] || {})[o.id];
@@ -77884,6 +78342,10 @@
                     if (rr.ok && rr.nPay > (sl.nPrzed || 0)){
                         epcZapiszSlad(job, o.id, Object.assign({}, sl, { f: 'ok', potw: mkNfaTeraz() }));
                         mkLog('eprice', '✔ ' + o.id + ': zapis potwierdzony odczytem (wierszy płatności ' + (sl.nPrzed || 0) + ' → ' + rr.nPay + ')');
+                    } else if (rr.ok && !mkNfaMoznaRozstrzygnac(sl)){
+                        // Za wczesnie na „nie weszlo" (20.11.2026, jak przy NOT FOUND): zapis bywa widoczny z opoznieniem. Slad zostaje,
+                        // zamowienie nie wraca do zrobienia; zaprzeczyc wolno dopiero po MK_NFA_ROZSTRZ_MIN minutach od wyslania.
+                        mkLog('eprice', '· ' + o.id + ': na auftragu ' + sl.num + ' jeszcze nie widać płatności — za wcześnie na „nie weszło” (rozstrzygnę po ' + mkNfaRozstrzygnijPo(sl) + ')');
                     } else if (rr.ok){
                         epcZapiszSlad(job, o.id, null);
                         mkLog('eprice', '↻ ' + o.id + ': na auftragu ' + sl.num + ' nie przybyła płatność — zapis nie wszedł, wraca do zrobienia');
@@ -77983,15 +78445,18 @@
                     epcZapiszSlad(job, o.id, Object.assign({}, wpis, { f: 'ok', potw: mkNfaTeraz() }));
                     mkLog('eprice', '✔ ' + o.id + ': zaksięgowane, wierszy płatności ' + (rr.nPay || 0) + ' → ' + po.nPay + ', open ' + f2(po.open));
                     ok++;
-                } else if (!r.ok && po.ok){
-                    epcZapiszSlad(job, o.id, null);       // nie wyszlo i nie przybylo — zamowienie wraca do zrobienia
-                    bad.push(o.id + ': nie zaksięgowało (' + (r.err || '?') + ')');
-                    mkLog('eprice', '✖ ' + o.id + ': ' + (r.err || '?'));
+                } else if (!r.ok && r.odmowa && po.ok){
+                    // 4xx: serwer odmowil wprost i nie przybylo — zamowienie wraca do zrobienia. 5xx i zerwane polaczenie ida nizej:
+                    // zapis mogl wejsc z opoznieniem (do 20.11.2026 slad schodzil tu przy kazdym bledzie — druga platnosc przy ponowieniu).
+                    epcZapiszSlad(job, o.id, null);
+                    bad.push(o.id + ': serwer odmówił (' + (r.err || '?') + ') — nie zaksięgowało');
+                    mkLog('eprice', '✖ ' + o.id + ': serwer odmówił, ' + (r.err || '?'));
                 } else {
-                    // Wyslane, a wiersza platnosci nie widac (albo auftragu nie dalo sie przeczytac): slad 'wysl' zostaje —
-                    // zamowienie NIE wraca do zrobienia, dopoki „Sprawdź auftragi" albo czlowiek tego nie rozstrzygnie.
-                    bad.push(o.id + ': wysłane na auftrag ' + num + ', ale NIE potwierdziłem wiersza płatności — sprawdź auftrag');
-                    mkLog('eprice', '⚠ ' + o.id + ': wysłane bez potwierdzenia (wierszy płatności ' + (rr.nPay || 0) + ' → ' + (po.ok ? po.nPay : '?') + ')');
+                    // Wyslane, a wiersza platnosci nie widac (albo auftragu nie dalo sie przeczytac, albo odpowiedz byla bledem 5xx):
+                    // slad 'wysl' zostaje — zamowienie NIE wraca do zrobienia, dopoki „Sprawdź auftragi" albo czlowiek tego nie rozstrzygnie.
+                    const blT = r.ok ? '' : ('odpowiedź z błędem (' + (r.err || '?') + '), ');
+                    bad.push(o.id + ': wysłane na auftrag ' + num + ', ' + blT + 'ale NIE potwierdziłem wiersza płatności — sprawdź auftrag');
+                    mkLog('eprice', '⚠ ' + o.id + ': wysłane bez potwierdzenia' + (r.ok ? '' : (' (' + (r.err || '?') + ')')) + ' (wierszy płatności ' + (rr.nPay || 0) + ' → ' + (po.ok ? po.nPay : '?') + ')');
                 }
             }
         } finally {
@@ -78152,6 +78617,22 @@
     function ksLimit(ile){
         const fal = Math.max(1, Math.ceil((Number(ile) || 1) / 5));
         return Math.min(30 * 60 * 1000, (4 + 10 * fal) * 60 * 1000);
+    }
+    // Czy log modulu ticketa pochodzi z TEGO przebiegu (20.11.2026). Tamten modul czysci swoja liste dopiero PO swoim pytaniu
+    // i walidacji; gdy nie wystartowal („Anuluj" w jego oknie, blad walidacji, pusta wklejka), na liscie zostaja linie
+    // POPRZEDNIEGO przebiegu — a ksDone bralo z nich potwierdzenia dla tej grupy: ten sam numer z innej grupy dawal
+    // „zaksięgowane", rdMark, komentarz w tickecie i Refunded „Tak", chociaz nic nie poszlo. Pamietamy wezly listy sprzed
+    // klikniecia: dopoki ktorykolwiek z nich wisi na liscie, log jest stary. Lista bez nowych linii tez nie jest logiem
+    // tego przebiegu (tamten modul pisze co najmniej jedna linie na pozycje).
+    function ksLogPrzed(){
+        const list = document.getElementById('tm-t-progress-list');
+        return { list: list, wezly: list ? Array.prototype.slice.call(list.children) : [] };
+    }
+    function ksLogSwiezy(przed){
+        const list = document.getElementById('tm-t-progress-list');
+        if (!list || !list.children.length) return false;
+        if (przed && przed.list === list && przed.wezly.some(function (n){ return n.parentNode === list; })) return false;
+        return true;
     }
     function ksWait(btn, ile){
         const limit = ksLimit(ile);
@@ -78493,12 +78974,13 @@
         xs = xs || x; znP = znP || [];
         // Bez wysylki nie czytamy logu modulu ticketa: zostal w nim poprzedni przebieg.
         const bezTicketa = !xs.rows.length;
-        let r = 'ok';
+        let r = 'ok', swiezy = true;
         if (!bezTicketa){
             say('Księguję zwroty: ' + xs.rows.length + ' poz. na ' + f2(xs.sum) + ', konto ' + x.acct + '…');
             ksMirror(x.date + ' · konto ' + x.acct + (x.accNm ? (' — ' + x.accNm) : ''), xs.rows.length);
             const tKs = Date.now();
             mkLog('ticket', '▶ oddaje sterowanie modulowi „Ksiegowanie w tickecie"');
+            const logPrzed = ksLogPrzed();             // przed kliknieciem — po tym poznamy, czy log jest z tego przebiegu
             const prob = ksProbki();
             ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
             r = await ksWait(ksBtn(), xs.rows.length);
@@ -78515,6 +78997,23 @@
                   + (nW > 1 ? ('; ' + nW + ' workerow rownolegle, wiec to SREDNIA, a nie czas jednej pozycji') : '')
                   + ')');
             ksMirror(null);
+            swiezy = ksLogSwiezy(logPrzed);
+        }
+        // Modul ticketa nie wystartowal z ta grupa — jego log jest z poprzedniego przebiegu (ksLogSwiezy). Nic z niego nie
+        // czytamy: zadnych potwierdzen, opisow ani arkusza. Grupa zostaje do zrobienia; w przelocie zbiorczym wraca w drugim podejsciu.
+        if (!bezTicketa && !swiezy){
+            const tN = 'moduł „Księgowanie w tickecie” nie ruszył z tą grupą (' + (r === 'ok' ? 'nic nie napisał w logu' : r)
+                     + ' — np. „Anuluj” w jego oknie albo błąd danych). Jego log jest z poprzedniego przebiegu, więc nic nie oznaczam,'
+                     + ' nie dopisuję opisów i nie ruszam arkusza — puść tę grupę jeszcze raz';
+            mkLog('ticket', '✖ ' + tN);
+            say(tN.charAt(0).toUpperCase() + tN.slice(1) + '.', '#c47f00');
+            return r === 'ok' ? 'moduł ticketa nie ruszył' : r;
+        }
+        // Log jest z tego przebiegu, a zablokowanego guzika nie widzielismy: tamten modul przeszedl cala paczke miedzy dwoma
+        // odczytami (co 400 ms) — przebieg skonczony, nie „anulowany".
+        if (!bezTicketa && r === 'anulowane'){
+            mkLog('ticket', '  (zablokowanego guzika modułu ticketa nie widziałem, ale jego log jest z tego przebiegu — uznaję przebieg za zakończony)');
+            r = 'ok';
         }
         // Koniec czekania to NIE jest dowod, ze nic nie weszlo — 28.08 modul ticketa
         // zaksiegowal o +427 s, a my przestalismy czekac o +356 s i powiedzielismy
@@ -78641,16 +79140,17 @@
             // „zaksięgowane (bez potwierdzenia z logu)".
             const txtL = bezTicketa ? null : ksLogLinie(100000);
             const blK = bezTicketa ? {} : ksBledy(x);
-            const nieWeszly = [];
-            rdMark(x.key, x.rows.map(function (rr){ return rr.id; })
-                               .filter(function (id, n, a){
-                                   if (a.indexOf(id) !== n || usuniete.indexOf(id) >= 0 || bezZam.indexOf(id) >= 0) return false;
-                                   if (!txtL || blK[id] === 'brak ticketu') return true;
-                                   const rr = xs.rows.filter(function (y){ return y.id === id; });
-                                   if (!rr.some(function (y){ return ksMaLinie(txtL, y); })) return true;
-                                   nieWeszly.push(id);
-                                   return false;
-                               }), false);
+            const nieWeszly = [], brakTicketu = [], milczy = [];
+            x.rows.map(function (rr){ return rr.id; }).forEach(function (id, n, a){
+                if (a.indexOf(id) !== n || usuniete.indexOf(id) >= 0 || bezZam.indexOf(id) >= 0) return;
+                if (txtL && blK[id] === 'brak ticketu'){ brakTicketu.push(id); return; }
+                const rr = xs.rows.filter(function (y){ return y.id === id; });
+                if (!txtL || !rr.some(function (y){ return ksMaLinie(txtL, y); })){ milczy.push(id); return; }
+                nieWeszly.push(id);
+            });
+            // „Brak ticketu" arkusz zalatwia notatka (refDoArkusza) — zwykle „bez potwierdzenia". Cisza logu — ze sladem bp (rdMarkBp).
+            if (brakTicketu.length) rdMark(x.key, brakTicketu, false);
+            if (milczy.length) rdMarkBp(x.key, milczy);
             if (nieWeszly.length)
                 mkLog('ticket', '    NIE oznaczam — log ticketa ma linie, ale nie potwierdza zapisu (zostaja do zrobienia): '
                       + nieWeszly.join(', '));
@@ -78660,7 +79160,7 @@
         let ark = '';
         const tArk = Date.now();
         try {
-            const plan = refDoArkusza(x, done, usuniete, bezTicketa ? {} : ksBledy(x), ksZapis(),
+            const plan = refDoArkusza(x, done, usuniete, bezTicketa ? {} : ksBledy(x), ksZapisWpisy(),
                                       bezTicketa ? {} : ksLinkiAuftragow(x));
             plan.zostaje.forEach(function (z){
                 const kz = z.klucz;
@@ -85104,16 +85604,29 @@
     async function impSameFile(j){
         try {
             const base = fileBase(j);
-            const amt = isFinite(j.amount) ? Number(j.amount).toFixed(2) : '';
+            // isFinite(null) to w JavaScripcie PRAWDA — bez sprawdzenia `!= null` zlecenie bez kwoty (Allegro) szukalo „0.00" i prawdziwy
+            // duplikat pliku dostawal tylko ostrzezenie „na inną kwotę" (przeglad 20.11.2026, U8). Ta sama pulapka co w fileName.
+            const amt = (j.amount != null && isFinite(j.amount)) ? Number(j.amount).toFixed(2) : '';
+            const pelna = fileName(j);
             const c = setLoad()[setKey(j.mp, j.data && j.data.shop)] || {};
             const L = await impListaDoSzukania(c.bank);
             const hit = L.lista.filter(function (x){ return base && String(x.filename || '').indexOf(base) >= 0; });
-            if (!hit.length) return null;
-            const exact = amt ? hit.filter(function (x){ return String(x.filename || '').indexOf(amt) >= 0; }) : [];
+            if (!hit.length){
+                // Brak trafienia przy liscie banku, ktora nie przyszla, to „nie wiem", nie „czysto" (przeglad 20.11.2026).
+                if (L.bladBanku) return { niesprawdzone: true,
+                    opis: L.lista.length ? ('lista paczek ustawienia ' + (c.bank || '?') + ' nie przyszła — sprawdziłem tylko ostatnią dobę')
+                                         : 'listy paczek importu nie przyszły' };
+                return null;
+            }
+            // Pewny duplikat: ta sama kwota w nazwie albo — przy zleceniu bez kwoty — cala nazwa pliku, ktora HUB nadaje sam (U8).
+            const exact = hit.filter(function (x){
+                const fn = String(x.filename || '');
+                return (amt && fn.indexOf(amt) >= 0) || (!amt && pelna && fn.indexOf(pelna) >= 0);
+            });
             const out = exact.length ? exact[0] : hit[0];
             out.exact = !!exact.length;
             return out;
-        } catch (e){ return null; }
+        } catch (e){ return { niesprawdzone: true, opis: (e && e.message) || String(e) }; }
     }
     // Paczki do szukania po nazwie pliku. Lista BANKU zlecenia (impListaBanku) siega wstecz dalej niz ostatnia
     // doba: stara /api/importPayments/index/? oddaje 500 najnowszych paczek WSZYSTKICH bankow (17.09.2026 —
@@ -85124,6 +85637,9 @@
     async function impListaDoSzukania(bank){
         const lista = [], byla = {};
         let bledow = 0;
+        // bladBanku: lista BANKU (siega wstecz) nie przyszla albo nie bylo o co zapytac — wtedy „nie znalazlem" znaczy najwyzej
+        // „nie w ostatniej dobie" (przeglad 20.11.2026: impSameFile milczalo przy bledzie list jak przy czystym wyniku).
+        let bladBanku = true;
         const dodaj = function (x){
             if (!x || x.file_id == null) return;
             const k = String(x.file_id);
@@ -85132,7 +85648,7 @@
             lista.push(x);
         };
         if (/^\d+$/.test(String(bank == null ? '' : bank).trim())){
-            try { (await impListaBanku(bank)).lista.forEach(dodaj); }
+            try { (await impListaBanku(bank)).lista.forEach(dodaj); bladBanku = false; }
             catch (e){ bledow++; }
         }
         try {
@@ -85144,7 +85660,18 @@
             } else bledow++;
         } catch (e){ bledow++; }
         lista.sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
-        return { lista: lista, bledow: bledow };
+        return { lista: lista, bledow: bledow, bladBanku: bladBanku };
+    }
+    // Paczka pliku `fname` na ustawieniu `bank`, nowsza niz `przed` (-1 = bez progu) — WYLACZNIE po nazwie pliku, bez zapasu
+    // „jedyna nowa paczka banku" (po bledzie importu ta nowa moglaby byc cudza). pewne = lista banku przyszla, wiec „nie ma"
+    // znaczy „nie ma", a nie „nie udalo sie sprawdzic". Import po bledzie 5xx / zerwanym polaczeniu (przeglad 20.11.2026).
+    async function impPaczkaPoNazwie(fname, bank, przed){
+        const L = await impListaDoSzukania(bank);
+        const hit = L.lista.filter(function (x){
+            return String(x.bank_id || '') === String(bank) && (przed == null || przed < 0 || (Number(x.file_id) || 0) > przed)
+                && fname && String(x.filename || '').indexOf(fname) >= 0;
+        });
+        return { imp: hit.length ? String(hit[0].file_id || '') : '', pewne: !L.bladBanku };
     }
 
     // Odpowiedz na import NIE zawiera numeru paczki — serwer oddaje szkielet strony React,
@@ -85241,6 +85768,7 @@
     //  3. swiezy odczyt tuz przed zapisem: do zapisu ida tylko wiersze o statusie OK, ktore NIE maja jeszcze platnosci
     //     (payment_id = 0 albo platnosc usunieta: payment_deleted = 1; wiersz zaksiegowany ma payment_id i amount_booked). Bez odczytu
     //     nic nie wysylamy.
+    // Po zapisie na koncie glownym (20.11.2026) — mkKsPotwierdz w impBook: wyslane wiersze bez platnosci = wyjatek, bez „zaksiegowane".
     const MK_KSL_PREF = 'mkt_ksieg_lock_';     // + numer paczki: { token, karta, od, bij, opis }
     const MK_KSW_PREF = 'mkt_ksieg_wisi_';     // + numer paczki: { od, n, karta, opis } — zapis wyslany, wyniku nie znamy
     const MK_KSL_WAZNA = 90000;
@@ -85318,6 +85846,13 @@
     // wiersz jest znowu do ksiegowania i nie wolno go pomijac jako „juz zaksiegowanego".
     function mkKsWierszZaks(x){ return Number(x && x.payment_id) > 0 && String(x && x.payment_deleted) !== '1'; }
     function mkKsZaks(rows){ return (rows || []).filter(mkKsWierszZaks).length; }
+    // Odcisk open amount wybranych wierszy (id:open) — do testu spokoju przy zapisie koncowek (mkKsPrzygotuj, 20.11.2026).
+    function mkKsOpenPodpis(rows, ids){
+        const chce = {};
+        (ids || []).forEach(function (id){ chce[String(id)] = 1; });
+        return (rows || []).filter(function (x){ return x && chce[String(x.id)]; })
+            .map(function (x){ return String(x.id) + ':' + String(x.open_amount == null ? '' : x.open_amount); }).sort().join('|');
+    }
     // Zapis KONCOWKI na subkoncie to z zalozenia DRUGA platnosc tego wiersza: glowna kwota stoi juz na auftragu,
     // a na 8100 idzie sama reszta. Straz „juz zaksiegowany" (ktora chroni zwykly zapis paczki przed dublem) musi
     // tu wiec ustapic — jej miejsce bierze OPEN AMOUNT: po zaksiegowaniu reszty jest on zerem, wiec drugi zapis
@@ -85377,6 +85912,13 @@
             let d = await impRows(impId);
             const wisi = mkKsGM(MK_KSW_PREF + impId);
             const zaks0 = mkKsZaks(d.rows);
+            // Zapis koncowek (resztka): wiersze maja juz platnosc glowna, wiec liczba zaksiegowanych sie nie zmienia — test spokoju patrzy
+            // wtedy takze na open amount wierszy z tego zapisu (przeglad 20.11.2026: sam licznik przy koncowkach nie mierzyl niczego).
+            const resztkaZ = !!(opcje && opcje.resztka);
+            const open0 = resztkaZ ? mkKsOpenPodpis(d.rows, ids) : '';
+            // Poprzedni zapis KONCOWEK tej paczki bez odpowiedzi, mlodszy niz MK_NFA_ROZSTRZ_MIN: jego wiersze nie ida drugi raz (nizej),
+            // a slad zostaje do tej pory — zapis mogl wejsc, a open amount pokazac to z opoznieniem.
+            const wisiMlodaResztka = !!(wisi && wisi.resztka && Array.isArray(wisi.ids) && Date.now() - Number(wisi.od || 0) < MK_NFA_ROZSTRZ_MIN * 60000);
             let powod = '';
             if (wisi) powod = 'poprzedni zapis tej paczki (' + mkKsGodz(wisi.od) + ') nie zwrócił odpowiedzi — serwer mógł dalej księgować';
             else if (bazowy && Date.now() - bazowy.t >= 2000 && zaks0 > bazowy.zaks)
@@ -85392,7 +85934,13 @@
                     throw new Error('prologistics dalej księguje paczkę ' + impId + ': w ciągu ' + Math.round(MK_KS_SPOKOJ / 1000) + ' s przybyło '
                         + Math.abs(zaks1 - zaks0) + ' zaksięgowanych wierszy (razem ' + zaks1 + '). Nie dokładam drugiego zapisu — poczekaj kilka minut i kliknij „↻ Odśwież".');
                 }
-                if (wisi) mkKsGMUstaw(MK_KSW_PREF + impId, null);
+                if (resztkaZ && mkKsOpenPodpis(d1.rows, ids) !== open0){
+                    mkLog('book', '✖ paczka ' + impId + ': w czasie testu spokoju zmienił się open amount końcówek — nie piszę');
+                    throw new Error('prologistics dalej księguje paczkę ' + impId + ': w ciągu ' + Math.round(MK_KS_SPOKOJ / 1000) + ' s zmienił się open amount'
+                        + ' końcówek. Nie dokładam drugiego zapisu — poczekaj kilka minut i kliknij „↻ Odśwież".');
+                }
+                // Slad z lista wierszy „wyslane, a bez platnosci" (mkKsPotwierdz) zostaje do decyzji nizej; mlody slad koncowek — do swojego terminu.
+                if (wisi && !(Array.isArray(wisi.brak) && wisi.brak.length) && !wisiMlodaResztka) mkKsGMUstaw(MK_KSW_PREF + impId, null);
                 d = d1;
             }
             const poId = {};
@@ -85411,6 +85959,41 @@
                         + ' — nie ma już reszty do zaksięgowania albo wyszła poza tolerancję ' + f2(tolR) });
                 else idsOk.push(id);
             });
+            // Koncowki z mlodego zapisu bez odpowiedzi (wisiMlodaResztka): nie ida drugi raz przed uplywem MK_NFA_ROZSTRZ_MIN od tamtego zapisu.
+            if (resztka && wisiMlodaResztka){
+                const poprz = {};
+                wisi.ids.forEach(function (id){ poprz[String(id)] = 1; });
+                const poKiedy = mkKsGodz(Number(wisi.od) + MK_NFA_ROZSTRZ_MIN * 60000);
+                for (let q = idsOk.length - 1; q >= 0; q--){
+                    if (!poprz[String(idsOk[q])]) continue;
+                    pominiete.push({ id: String(idsOk[q]), powod: 'zapis końcówek z ' + mkKsGodz(wisi.od) + ' bez odpowiedzi — drugi raz najwcześniej po ' + poKiedy });
+                    idsOk.splice(q, 1);
+                }
+            }
+            // Wiersze, ktore poprzedni zapis tej paczki juz wyslal, a po nim nie mialy platnosci (mkKsPotwierdz, przeglad poprawek
+            // 20.11.2026): gdyby prologistics zaksiegowal je mimo to (platnosc na auftragu, w paczce bez payment_id), drugi zapis zrobilby
+            // dubel — idą tylko za zgoda czlowieka. Odmowa: zostaja pominiete, a slad z ich lista czeka na nastepna decyzje.
+            if (wisi && Array.isArray(wisi.brak) && wisi.brak.length){
+                const juzSzly = idsOk.filter(function (id){ return wisi.brak.indexOf(String(id)) >= 0; });
+                if (!juzSzly.length) mkKsGMUstaw(MK_KSW_PREF + impId, null);            // nic z tamtych wierszy nie czeka — slad rozstrzygniety
+                else {
+                    const tak = confirm('Paczka ' + impId + ': ' + juzSzly.length + ' z wierszy do zapisu wysłałem już o ' + mkKsGodz(wisi.od)
+                        + ' i po tamtym zapisie nie miały płatności.\n\nJeśli prologistics jednak je zaksięgował (płatność stoi na auftragu,'
+                        + ' a w paczce wiersz nie ma numeru płatności), drugi zapis zrobi DUBEL. Sprawdź paczkę i auftragi tych wierszy.\n\n'
+                        + 'Wysłać je jeszcze raz?');
+                    // Okno mogło stać długo — blokada paczki musi być dalej nasza (zegar odnawiania nie chodzi w czasie okna).
+                    const zt = mkKsGM(MK_KSL_PREF + impId);
+                    if (!zt || zt.token !== token)
+                        throw new Error('w czasie pytania paczkę ' + impId + ' zajął inny przebieg księgowania — nic nie wysyłam; kliknij „↻ Odśwież".');
+                    if (tak){ zt.bij = Date.now(); mkKsGMUstaw(MK_KSL_PREF + impId, zt); }
+                    else {
+                        const odrz = {};
+                        juzSzly.forEach(function (id){ odrz[String(id)] = 1; pominiete.push({ id: String(id), czeka: true, powod: 'wysłany już o ' + mkKsGodz(wisi.od) + ' i bez płatności — bez zgody nie wysyłam drugi raz' }); });
+                        for (let q = idsOk.length - 1; q >= 0; q--) if (odrz[String(idsOk[q])]) idsOk.splice(q, 1);
+                        mkKsGMUstaw(MK_KSW_PREF + impId, Object.assign({}, wisi, { brak: juzSzly.map(String) }));
+                    }
+                }
+            }
             return { token: token, ids: idsOk, pominiete: pominiete };
         } catch (e){ mkKsZwolnij(impId, token); throw e; }
     }
@@ -85420,7 +86003,7 @@
         let p;
         try { p = await mkKsPrzygotuj(impId, ids, opis, opcje); }
         catch (e){ mkKsTrwaKoniec(impId); throw e; }
-        mkKsRaport[impId] = { pominiete: p.pominiete, wyslane: p.ids.length };
+        mkKsRaport[impId] = { pominiete: p.pominiete, wyslane: p.ids.length, ids: p.ids.map(String) };   // ids — do mkKsPotwierdz
         let tik = null, poll = null;
         try {
             if (p.pominiete.length)
@@ -85433,7 +86016,9 @@
             const body = 'file_id=' + encodeURIComponent(impId) + '&block=' + block
                        + p.ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join('');
             // Slad „wyslane, wyniku nie znamy" stoi do powrotu odpowiedzi — blad HTTP i urwane polaczenie go zostawiaja.
-            mkKsGMUstaw(MK_KSW_PREF + impId, { od: Date.now(), n: p.ids.length, karta: mkKsKarta, opis: opis });
+            // ids + resztka: zapis koncowek bez odpowiedzi nie powtorzy tych wierszy przez MK_NFA_ROZSTRZ_MIN (mkKsPrzygotuj, 20.11.2026).
+            mkKsGMUstaw(MK_KSW_PREF + impId, { od: Date.now(), n: p.ids.length, karta: mkKsKarta, opis: opis,
+                                               ids: p.ids.map(String), resztka: !!(opcje && opcje.resztka) });
             mkLog('book', '▶ paczka ' + impId + ' (' + opis + '): wysyłam ' + p.ids.length + ' wierszy');
             const t0 = Date.now();
             // Duza paczka ksieguje sie kilka minut bez zadnego sygnalu — w paczce 2259365 po ok. 46 s ruszyl drugi zapis
@@ -85494,6 +86079,69 @@
         const x = mkKsRaport[String(impId)];
         return (x && x.pominiete && x.pominiete.length)
             ? ('paczka ' + impId + ': ' + x.pominiete.length + ' poz. pominięte (' + x.pominiete.slice(0, 2).map(function (q){ return q.powod; }).join('; ') + (x.pominiete.length > 2 ? ' …' : '') + ')') : '';
+    }
+    // Po „Book on main account" (przeglad 20.11.2026): HTTP 200 nie dowodzi, ze wiersze weszly — prologistics potrafi oddac 200 bez
+    // zmiany albo {"success":false,…} (tak odmawia importu przy zablokowanej dacie). Do 20.11.2026 zlecenie dostawalo „zaksiegowane",
+    // a arkusz „Tak", na samym kodzie odpowiedzi, i nic dalej nie liczylo wierszy OK bez platnosci. Teraz liczymy wiersze WYSLANE w tym
+    // zapisie (mkKsRaport.ids), ktore maja platnosc. Wszystkie — dobrze. Brakuje choc jednego — wyjatek, wolajacy NIE stawia
+    // „zaksiegowane" (decyzja uzytkownika 20.11.2026: przy czesciowym tez nie), a kolejny zapis wysle tylko brakujace (swiezy odczyt
+    // w mkKsPrzygotuj). Bez jawnej odmowy wraca slad „wyslane, wyniku nie znamy": zapis mogl sie tylko spoznic, wiec kolejny przejdzie
+    // najpierw test spokoju. Wiersze bez pola payment_id — sprawdzic sie nie da, zostaje jak dotad (zaksiegowane po HTTP 200).
+    async function mkKsPotwierdz(impId, txt){
+        const rap = mkKsRaport[String(impId)] || {};
+        const ids = (rap.ids || []).map(String);
+        // Wiersze, ktorych czlowiek nie pozwolil wyslac drugi raz (mkKsPrzygotuj) — paczka nie jest wtedy zaksiegowana w calosci.
+        const czeka = (rap.pominiete || []).filter(function (x){ return x && x.czeka; }).length;
+        const czekaBlad = function (zaks){
+            const t = 'paczka ' + impId + ': ' + czeka + ' wierszy bez płatności czeka na decyzję (wysłane już raz, drugi raz bez zgody nie idą)'
+                    + (zaks ? (' · w tym zapisie zaksięgowane ' + zaks) : '') + ' — paczki NIE oznaczam jako zaksięgowanej.';
+            mkLog('book', '⚠ ' + t);
+            return Object.assign(new Error(t), { poZapisie: true });
+        };
+        if (!ids.length){
+            if (czeka) throw czekaBlad(0);
+            return { wyslane: 0, zaks: 0, brak: [] };
+        }
+        const odm = impBladSerwera(txt);
+        if (odm){
+            mkLog('book', '✖ paczka ' + impId + ': prologistics odmówił księgowania — „' + odm + '”');
+            throw Object.assign(new Error('prologistics odmówił księgowania paczki ' + impId + ': „' + odm + '” — paczki NIE oznaczam jako zaksięgowanej'),
+                                { poZapisie: true });
+        }
+        let wynik = null, blad = '';
+        for (let proba = 0; proba < 3; proba++){
+            if (proba) await mkKsCzekaj(4000);
+            let rows;
+            try { rows = (await impRows(impId)).rows; } catch (e){ blad = (e && e.message) || String(e); continue; }
+            const poId = {};
+            rows.forEach(function (x){ if (x) poId[String(x.id)] = x; });
+            const moje = ids.map(function (id){ return poId[id]; }).filter(Boolean);
+            if (moje.length && !moje.some(function (x){ return Object.prototype.hasOwnProperty.call(x, 'payment_id'); })){
+                mkLog('book', '· paczka ' + impId + ': wiersze bez pola payment_id — zapisu nie da się potwierdzić odczytem');
+                if (czeka) throw czekaBlad(0);
+                return { wyslane: ids.length, zaks: null, brak: [] };
+            }
+            const brak = ids.filter(function (id){ return !poId[id] || !mkKsWierszZaks(poId[id]); });
+            wynik = { wyslane: ids.length, zaks: ids.length - brak.length, brak: brak };
+            if (!brak.length){
+                mkLog('book', '✔ paczka ' + impId + ': odczyt po zapisie — płatność ma ' + wynik.zaks + ' z ' + ids.length + ' wysłanych wierszy');
+                if (czeka) throw czekaBlad(wynik.zaks);
+                return wynik;
+            }
+        }
+        // Kolejny zapis tej paczki najpierw sprawdzi, czy prologistics nie skonczyl (test spokoju w mkKsPrzygotuj).
+        // brak — wiersze wyslane w tym zapisie, ktore po nim nie maja platnosci: kolejny zapis wysle je tylko za zgoda (mkKsPrzygotuj),
+        // bo gdyby prologistics ksiegowal jakis rodzaj wiersza bez payment_id, kazde ponowienie dokladaloby platnosc.
+        mkKsGMUstaw(MK_KSW_PREF + impId, { od: Date.now(), n: wynik ? wynik.brak.length : ids.length, karta: mkKsKarta, opis: 'po zapisie bez płatności',
+                                           brak: (wynik ? wynik.brak : ids).map(String) });
+        const tekst = wynik
+            ? ('prologistics przyjął zapis paczki ' + impId + ', ale ' + wynik.brak.length + ' z ' + ids.length + ' wysłanych wierszy nie ma płatności'
+               + (wynik.zaks ? (' (zaksięgowane ' + wynik.zaks + ')') : '') + ' — paczki NIE oznaczam jako zaksięgowanej. Sprawdź paczkę w prologistics'
+               + ' (zablokowana data?); kolejne „▶ Zaksięguj” wyśle tylko wiersze bez płatności.')
+            : ('nie odczytałem paczki ' + impId + ' po zapisie (' + blad + ') — paczki NIE oznaczam jako zaksięgowanej; kolejne „▶ Zaksięguj”'
+               + ' najpierw sprawdzi, czy prologistics skończył, i wyśle tylko wiersze bez płatności.');
+        mkLog('book', '✖ ' + tekst);
+        throw Object.assign(new Error(tekst), { poZapisie: true });
     }
     // ---------- wyplata zaimportowana recznie (kontrola po tresci) ----------
     // Pozostale zapory nie widza paczki zalozonej RECZNIE: impSameFile szuka nazwy „data + sklep", a reczna
@@ -85607,9 +86255,11 @@
         }
         return { dalej: (sel || []).filter(function (j){ return !zatrz[mkKlucz(j)]; }), stop: stop, uwaga: uwaga };
     }
-    // „Book on main account" — ochrona przed podwojnym zapisem: mkKsZapis (blokada, swiezy odczyt, slad „wyslane").
+    // „Book on main account" — ochrona przed podwojnym zapisem: mkKsZapis (blokada, swiezy odczyt, slad „wyslane"); po zapisie
+    // mkKsPotwierdz: wyjatek, gdy ktorys z wyslanych wierszy nie ma platnosci (wtedy wolajacy nie stawia „zaksiegowane").
     async function impBook(id, ids){
-        return mkKsZapis(id, ids, MK_BLOCK, 'na koncie głównym');
+        const txt = await mkKsZapis(id, ids, MK_BLOCK, 'na koncie głównym');
+        return mkKsPotwierdz(id, txt);
     }
     // Open amount przychodzi raz jako „0.00", a raz jako „CHF 0.01" — z waluta w srodku
     // Number() zwracalo NaN i kolumna pokazywala kreske zamiast kwoty. Odsiewamy wiec
@@ -85967,7 +86617,7 @@
         const r = await crBook(num, mkDataNf(job, ff), c.acct, kwota,
                                String(job.short || job.mp || '') + ' ' + ff);
         if (!r.ok){
-            let opis = '';
+            let opis = '', pocz = 'nie zaksięgowało: ';
             if (r.nieWyslane) mkNfaZapisz(job, ff, null);        // zapytanie nie wyszlo — nie ma czego rozstrzygac
             else {
                 // Blad wysylki nie mowi, ze nic nie weszlo (zapytanie moglo dojsc) — rozstrzyga odczyt auftragu.
@@ -85975,10 +86625,21 @@
                 if (po0.ok && przed != null && po0.nPay > przed){
                     mkNfaZapisz(job, ff, Object.assign({}, wpis, { f: 'ok', kiedy: mkNfaTeraz() }));
                     opis = ' — ale na auftragu przybył wiersz płatności, sprawdź go';
-                } else if (po0.ok && przed != null) mkNfaZapisz(job, ff, null);
-                else { st.wyslane = true; opis = ' — nie wiem, czy weszło: rozstrzygnij w „🔎 NOT FOUND na auftragach” (krok ④)'; }
+                } else if (po0.ok && przed != null && r.odmowa){
+                    // 4xx: serwer odmowil wprost i platnosci nie przybylo — nic nie weszlo, slad schodzi (pozycja do ponowienia).
+                    mkNfaZapisz(job, ff, null);
+                    opis = ' — serwer odmówił, na auftragu nic nie przybyło';
+                } else {
+                    // 5xx albo zerwane polaczenie: zapis mogl wejsc i pokazac sie dopiero za chwile (przeciazony serwer, 16.11.2026).
+                    // Slad ZOSTAJE — guzik nie wraca, a „nie weszlo" rozstrzyga „🔎 NOT FOUND na auftragach" najwczesniej po
+                    // MK_NFA_ROZSTRZ_MIN minutach albo czlowiek. Do 20.11.2026 slad schodzil tu od razu (przy 5xx tez), a nastepne
+                    // klikniecie wysylalo druga platnosc na ten sam auftrag.
+                    st.wyslane = true;
+                    pocz = 'zapis zwrócił błąd: ';
+                    opis = ' — NIE WIEM, czy weszło (płatności jeszcze nie widać): nie księguj ponownie; rozstrzyga „🔎 NOT FOUND na auftragach” (krok ④)';
+                }
             }
-            st.err = 'nie zaksięgowało: ' + (r.err || '?') + opis;
+            st.err = pocz + (r.err || '?') + opis;
             mkLog('notfound', '✖ ' + ff + ': ' + st.err);
             say(st.err, '#c00'); btn.disabled = false;
             try { rysuj(); } catch (e){}
@@ -85991,7 +86652,10 @@
         const po = await crRead(num);
         if (po.ok && przed != null && po.nPay > przed){
             st.zaks = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            st.zaksP = String(job.impId || '');        // „zaksięgowane" dotyczy TEJ paczki (mkNfZaks, U6)
             st.err = '';
+            // Kandydat ze stanem PO zapisie — ten sam numer w innej paczce zobaczy platnosc, a nie stan sprzed niej.
+            Object.assign(kand, { open: po.open, nPay: po.nPay });
             mkNfaZapisz(job, ff, Object.assign({}, wpis, { f: 'ok', kiedy: st.zaks }));
             mkLog('notfound', '✔ ' + ff + ': zaksięgowane, wierszy płatności ' + przed + ' → ' + po.nPay);
             say('Zaksięgowane — na auftragu ' + num + ' przybył wiersz płatności.', '#0a7a2f');
@@ -86052,7 +86716,7 @@
         t.hdOdbite = j.hdOdbite;
         hdZapiszPlan(t, j.data);
         jz[k] = t; jobsSave(jz);
-        if (mkNfState[ff]) mkNfState[ff].zaks = 'przeniesione do ticketu na minus';
+        if (mkNfState[ff]){ mkNfState[ff].zaks = 'przeniesione do ticketu na minus'; mkNfState[ff].zaksP = String((j && j.impId) || ''); }
         say('Homedeco \u2014 ' + ff + ': wp\u0142ata ' + f2(kwota) + ' idzie do ticketu na minus.'
           + ' Zaksi\u0119gujesz j\u0105 przez list\u0119 zwrot\u00f3w („\ud83d\udccb Kopiuj zwroty do ticketa").', '#0a7a2f');
         try { render(); } catch (e){}
@@ -86090,7 +86754,7 @@
             if (pNf && pNf.kolejka && pNf.kolejka[ff]) return '<span style="color:#888">w kolejce…</span>';
             return '<span style="color:#888">' + ((pNf && ff) ? 'niesprawdzony — „sprawdź pozostałe” po zakończeniu' : '—') + '</span>';
         }
-        if (st.zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(mkCzasLok(st.zaks)) + '</span>';
+        if (mkNfZaks(st, job)) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane ' + esc(mkCzasLok(st.zaks)) + '</span>';
         if (st.err)  return '<span style="color:#c00">' + esc(st.err) + '</span>';
         // Allegro: anulowane przed eksportem — brak auftragu i zwrot calej kwoty w tym cyklu to „znosi się" (mkNfBrakAuf).
         if (st.stan === 'brak' && rv != null && kwota != null && mkZwrotRownyWplacie(kwota, rv, alleDost6(job, ff))
@@ -86215,6 +86879,14 @@
     }
     // Wynik sprawdzenia, ktorego NIE wolno wyrzucic przy ponowieniu: zapis poszedl albo mogl pojsc.
     function mkNfChroniony(st){ return !!(st && (st.zaks || st.wyslane)); }
+    // Wpis mkNfState jest po samym numerze — wspolny dla paczek w karcie. „Zaksięgowane / przeniesione" dotyczy jednak paczki, z ktorej
+    // poszedl zapis (zaksP). Ten sam numer NOT FOUND w innej paczce (np. sztuki Kauflanda z innego tygodnia) to inna wplata — przeglad
+    // 20.11.2026, U6: dotad wygladala na zaksiegowana i znikala z zestawienia „🔎" do F5. Wpis bez zaksP (sprzed zmiany) — jak dotad.
+    function mkNfZaks(st, job){
+        if (!st || !st.zaks) return '';
+        if (st.zaksP && job && job.impId != null && String(job.impId) !== String(st.zaksP)) return '';
+        return st.zaks;
+    }
     // Sprawdzenie sie nie udalo (siec, strona logowania, nieodczytany kandydat) albo zostalo przerwane.
     function mkNfNieudane(st){
         if (!st || mkNfChroniony(st)) return false;
@@ -86466,8 +87138,12 @@
               +  '<span style="font-size:10px;color:#666">grosze do wyrównania: do</span>'
               +  '<input id="mk-tol" value="' + tol.toFixed(2) + '" style="width:46px;font-size:10px;text-align:right">'
               +  '<button id="mk-tol-set" style="padding:2px 7px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:10px">zastosuj</button>'
-              +  '<button id="mk-fix"' + (near.length ? '' : ' disabled')
-              +  ' style="padding:4px 10px;border:none;border-radius:6px;background:' + (near.length ? '#0a7a2f' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + (near.length ? 'pointer' : 'default') + ';font-size:11px">✔ Ustaw OK i zaksięguj na subkoncie (' + near.length + ')</button>'
+              // Tylko paczka zaksiegowana (20.11.2026, U7): ta sama zasada co zbiorcze „💰 Końcówki” (decyzja 06.10.2026) — koncowka to reszta
+              // PO zapisie na koncie glownym; wiersz przestawiony na OK przed nim i nieskonczony poszedlby potem na konto glowne cala kwota.
+              +  ((near.length && !(jobsK0[kluczJob] || job).booked)
+                    ? '<span style="font-size:10px;color:#6b7280">końcówki na subkonto — po „▶ Zaksięguj OK” tej paczki</span>' : '')
+              +  '<button id="mk-fix"' + ((near.length && (jobsK0[kluczJob] || job).booked) ? '' : ' disabled')
+              +  ' style="padding:4px 10px;border:none;border-radius:6px;background:' + ((near.length && (jobsK0[kluczJob] || job).booked) ? '#0a7a2f' : '#c7c7c7') + ';color:#fff;font-weight:700;cursor:' + ((near.length && (jobsK0[kluczJob] || job).booked) ? 'pointer' : 'default') + ';font-size:11px">✔ Ustaw OK i zaksięguj na subkoncie (' + near.length + ')</button>'
               +  '<span id="mk-fix-msg" style="font-size:11px;color:#666"></span></div></div>';
         }
         // Allegro: numer operacji z pliku zrodlowego, po ktorym szuka sie w panelu
@@ -86808,12 +87484,18 @@
         if (fx) fx.onclick = async function(){
             const m = box.querySelector('#mk-fix-msg');
             if (mkWid.book || mkKsiegBieg){ say('Trwa księgowanie — kliknij „↻ Odśwież” po jego zakończeniu.', '#c47f00'); return; }
+            // Tylko paczka zaksiegowana — stan na swiezo (guzik mogl zostac narysowany przed „▶ Zaksięguj”).
+            if (!(jobsLoad()[kluczJob] || jbNow).booked){
+                say('Końcówki na subkonto — dopiero po zaksięgowaniu paczki („▶ Zaksięguj OK”); końcówka to reszta po zapisie na koncie głównym.', '#c47f00');
+                return;
+            }
             if (!confirm('Ustawić status OK i zaksięgować ' + near.length + ' pozycji na subkoncie?\n\n'
                 + near.map(function (x){ return '  • ' + x.payment_descr + '  open ' + f2(impNum(x.open_amount)); }).join('\n')
                 + '\n\nOdpowiada to ręcznej zmianie statusu na OK, a potem przyciskowi „Book on sub-account".'
                 + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
             fx.disabled = true; m.style.color = '#666'; m.textContent = 'ustawiam statusy…';
             mkImpBieg++; mkKsiegBieg++;
+            let faza = '';
             try {
                 // Swiezy odczyt: guzik narysowany wczesniej nie wie, ze te wiersze poszly juz na subkonto (np. przez
                 // „💰 Końcówki na subkonto") — drugi zapis by przeszedl (przeglad 06.10.2026).
@@ -86821,17 +87503,63 @@
                 near.forEach(function (x){ idsN[String(x.id)] = 1; });
                 const nearNow = (await impRows(job.impId)).rows.filter(function (x){ return String(x.state) === 'CHECK' && idsN[String(x.id)]; });
                 if (!nearNow.length){ m.textContent = 'tych wierszy nie ma już jako CHECK — odczytuję paczkę…'; await impCheck(kluczJob); return; }
+                // Slad przy zleceniu PRZED pierwszym zapytaniem — jak w zbiorczych „💰 Końcówki" (koncWisi; przeglad 20.11.2026, U7): dotad
+                // przerwany zapis zostawial wiersz OK z groszem na auftragu, ktorego nie pokazywala zadna lista.
+                const ids = nearNow.map(function (x){ return String(x.id); });
+                const jsA = jobsLoad(), jA = jsA[kluczJob];
+                if (jA){
+                    const wA = mkKoncWisi(jA);
+                    nearNow.forEach(function (y){ wA[String(y.id)] = { d: String(y.payment_descr == null ? '' : y.payment_descr), f: 'stan' }; });
+                    jA.koncWisi = wA; jobsSave(jsA);
+                }
+                faza = 'stan';
                 for (let i = 0; i < nearNow.length; i++){
                     m.textContent = 'ustawiam statusy… ' + (i + 1) + '/' + nearNow.length;
                     await impState(job.impId, nearNow[i].id, 'OK');
                 }
+                const jsB = jobsLoad(), jB = jsB[kluczJob];
+                if (jB){
+                    const wB = mkKoncWisi(jB), odSub = Date.now();
+                    ids.forEach(function (id){ wB[id] = { d: (wB[id] && wB[id].d) || '', f: 'sub', od: odSub }; });
+                    jB.koncWisi = wB; jobsSave(jsB);
+                }
+                faza = 'sub';
                 m.textContent = 'księguję na subkoncie…';
-                await impBookSub(job.impId, nearNow.map(function (x){ return x.id; }), { resztka: true, tol: tol });
-                m.style.color = '#0a7a2f'; m.textContent = 'wysłane — odczytuję paczkę jeszcze raz…';
+                await impBookSub(job.impId, ids, { resztka: true, tol: tol });
+                faza = 'po';
+                // Slad ze swiezego odczytu (mkKoncSladPo): bez reszty — schodzi; wyslany z reszta — „nie wiem"; pominiety — „do dokonczenia".
+                let po = null;
+                try { po = (await impRows(job.impId)).rows; } catch (e){}
+                let niep = 0;
+                const jsC = jobsLoad(), jC = jsC[kluczJob];
+                if (jC && po){
+                    niep = mkKoncSladPo(jC, job.impId, ids, po, tol);
+                    if (niep) mkProblemUstawW(jC, 'koncowki', 'końcówki na subkonto, paczka ' + job.impId,
+                        'subkonto wysłane (' + niep + ' poz.), a reszty na auftragu jeszcze nie widać zdjętej — nie wysyłam drugi raz; sprawdź paczkę'
+                        + ' i odhacz w „💰 Końcówki na subkonto” (gdy reszta zejdzie, ślad zniknie sam przy następnym zestawieniu)');
+                    else if (!Object.keys(mkKoncWisi(jC)).length) mkProblemZdejmijZ(jC, 'koncowki');
+                    jobsSave(jsC);
+                }
+                m.style.color = niep ? '#c47f00' : '#0a7a2f';
+                m.textContent = niep ? ('wysłane, ale reszty ' + niep + ' poz. jeszcze nie widać zdjętej — NIE WIEM, czy weszło; drugi raz nie wysyłam (sekcja „💰 Końcówki”)')
+                                     : 'wysłane — odczytuję paczkę jeszcze raz…';
                 await impCheck(kluczJob);
             } catch (e){
-                m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
+                const opis = (e && e.message) || String(e);
+                m.style.color = '#c00';
+                m.textContent = 'nie poszło: ' + opis + (faza === 'sub' ? ' — NIE WIEM, czy subkonto weszło: sprawdź paczkę i rozstrzygnij w „💰 Końcówki na subkonto”'
+                                                     : (faza === 'stan' ? ' — status OK mógł zostać ustawiony; dokończysz w „💰 Końcówki na subkonto”' : ''));
                 fx.disabled = false;
+                // Zostawiony slad = pozycja w „💰 Końcówki” (do dokonczenia albo „nie wiem”) i notatka przy zleceniu — a nie wiersz bez sladu.
+                try {
+                    const jsE = jobsLoad(), jE = jsE[kluczJob];
+                    if (jE && Object.keys(mkKoncWisi(jE)).length){
+                        mkProblemUstawW(jE, 'koncowki', 'końcówki na subkonto, paczka ' + job.impId,
+                            faza === 'sub' ? ('subkonto wysłane bez potwierdzenia (' + opis + ') — sprawdź paczkę w prologistics i odhacz w „💰 Końcówki na subkonto”')
+                                           : ('status OK ustawiony, subkonto nie poszło (' + opis + ') — dokończ w „💰 Końcówki na subkonto”'));
+                        jobsSave(jsE);
+                    }
+                } catch (e2){}
             } finally { mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1); }
         };
         const bb = box.querySelector('#mk-book');
@@ -87311,6 +88039,27 @@
     // Slad zapisu: id wiersza -> { d: numer, f: 'stan' | 'sub' }. 'stan' — statusy szly, subkonto NIE zostalo wyslane
     // (dokonczenie jest bezpieczne); 'sub' — zapytanie o subkonto wyszlo i nie wiadomo, czy weszlo (rozstrzyga czlowiek).
     function mkKoncWisi(j){ return (j && j.koncWisi && typeof j.koncWisi === 'object') ? j.koncWisi : {}; }
+    // Slad koncowek po zapisie na subkonto, ze swiezego odczytu `po` (przeglad 20.11.2026, U5): wiersz bez reszty — slad schodzi; wiersz
+    // WYSLANY w tym zapisie (mkKsRaport.ids), a dalej z reszta — 'sub' („nie wiem, czy weszlo": zapis mogl sie tylko spoznic, rozstrzyga
+    // czlowiek albo zestawienie, gdy reszta zejdzie); wiersz pominiety przy zapisie (nie poszedl) — 'stan' („do dokonczenia"). Do 20.11.2026
+    // wyslany wiersz z reszta dostawal 'stan', a samoczynne „Końcówki" po nastepnym „▶ Zaksięguj paczki" wysylaly go drugi raz.
+    // Zmienia j.koncWisi (zapis robi wolajacy). Oddaje liczbe wierszy 'sub' z tego zapisu.
+    function mkKoncSladPo(j, imp, ids, po, tol){
+        const w = mkKoncWisi(j);
+        const poszly = {}, poId = {};
+        ((mkKsRaport[String(imp)] || {}).ids || []).forEach(function (id){ poszly[String(id)] = 1; });
+        (po || []).forEach(function (y){ if (y) poId[String(y.id)] = y; });
+        let niep = 0;
+        (ids || []).forEach(function (id0){
+            const id = String(id0), y = poId[id];
+            if (!y || !mkKsResztka(y, tol)){ delete w[id]; return; }
+            const d = String(y.payment_descr == null ? '' : y.payment_descr);
+            if (poszly[id]){ w[id] = { d: d, f: 'sub', od: (w[id] && w[id].od) || Date.now() }; niep++; }
+            else w[id] = { d: d, f: 'stan' };
+        });
+        if (Object.keys(w).length) j.koncWisi = w; else delete j.koncWisi;
+        return niep;
+    }
     function mkKoncJob(jobs, p){ const kk = mkKluczPamieci(jobs, p.j) || p.k; return { k: kk, j: jobs[kk] || null }; }
     // Zaksiegowane zlecenia do zestawienia: z notatka „ksiegowanie" z CHECK albo ze sladem przerwanego zapisu. Paczka
     // sprawdzona przy tej samej tolerancji i tej samej notatce, bez koncowek, nie wraca do licznika w kroku 4.
@@ -87354,6 +88103,19 @@
             if (p.err) return;
             const jj = mkKoncJob(jobs, p).j;
             if (!jj) return;
+            // Slad 'sub' (subkonto wyslane, wynik nieznany), a wiersz ma juz open 0 — zapis wszedl (albo reszte domknal ktos inny): slad
+            // schodzi sam (20.11.2026). Inny stan wiersza zostaje dla czlowieka („✓ weszło / ↻ nie weszło").
+            const wS = mkKoncWisi(jj), poIdS = {};
+            (p.rows || []).forEach(function (y){ if (y) poIdS[String(y.id)] = y; });
+            let zdjete = 0;
+            Object.keys(wS).forEach(function (id){
+                const y = poIdS[id], o = y ? impNum(y.open_amount) : null;
+                if (wS[id] && wS[id].f === 'sub' && y && o != null && Math.abs(o) < 0.005){ delete wS[id]; zdjete++; }
+            });
+            if (zdjete){
+                if (Object.keys(wS).length) jj.koncWisi = wS; else { delete jj.koncWisi; mkProblemZdejmijZ(jj, 'koncowki'); }
+                mkLog('book', '✔ paczka ' + p.j.impId + ': ' + zdjete + ' końcówek „bez potwierdzenia” ma już open 0 — ślad zdjęty');
+            }
             const pr = mkProblemyZ(jj).ksiegowanie;
             jj.koncSpr = { n: mkKoncWiersze(p.rows, tol).length, tol: tol, notka: pr ? pr.tekst : '' };
             zm = true;
@@ -87497,6 +88259,13 @@
                 const jobs2 = jobsLoad(), jj = jobs2[g.getAttribute('data-k')];
                 if (!jj) return;
                 const w = mkKoncWisi(jj);
+                // „Nie weszło" kilka minut po zapisie bywa zludzeniem — reszta na auftragu schodzi z opoznieniem (20.11.2026). Pytamy.
+                if (!weszlo){
+                    const mlode = Object.keys(w).filter(function (id){ return w[id].f === 'sub' && w[id].od && Date.now() - Number(w[id].od) < MK_NFA_ROZSTRZ_MIN * 60000; });
+                    if (mlode.length && !confirm('Zapis na subkonto poszedł ' + mlode.length + ' poz. niecałe ' + MK_NFA_ROZSTRZ_MIN + ' min temu (o '
+                        + mkKsGodz(Math.min.apply(null, mlode.map(function (id){ return Number(w[id].od); }))) + '). Reszta na auftragu bywa widoczna z opóźnieniem'
+                        + ' — jeśli zapis jednak wszedł, dołączenie wyśle go drugi raz.\n\nDołączyć te wiersze do zapisu mimo to?')) return;
+                }
                 Object.keys(w).forEach(function (id){ if (w[id].f === 'sub'){ if (weszlo) delete w[id]; else w[id].f = 'stan'; } });
                 if (Object.keys(w).length) jj.koncWisi = w; else { delete jj.koncWisi; mkProblemZdejmijZ(jj, 'koncowki'); }
                 jobsSave(jobs2);
@@ -87569,7 +88338,8 @@
                     const js2 = jobsLoad(), z2 = mkKoncJob(js2, x.p);
                     if (z2.j){
                         const w2 = mkKoncWisi(z2.j);
-                        ids.forEach(function (id){ w2[id] = { d: (w2[id] && w2[id].d) || '', f: 'sub' }; });
+                        const odSub = Date.now();     // chwila wyslania — „↻ nie weszło" pyta, gdy od niej minelo malo czasu
+                        ids.forEach(function (id){ w2[id] = { d: (w2[id] && w2[id].d) || '', f: 'sub', od: odSub }; });
                         z2.j.koncWisi = w2; jobsSave(js2);
                     }
                     faza = 'sub';
@@ -87589,21 +88359,18 @@
                     try { po = (await impRows(imp)).rows; } catch (e){}
                     const js3 = jobsLoad(), z3 = mkKoncJob(js3, x.p);
                     if (z3.j){
-                        const w3 = mkKoncWisi(z3.j);
-                        // Slad zdejmujemy TYLKO z wierszy, ktore wedlug swiezego odczytu nie maja juz reszty. Wiersz
-                        // pominiety przy zapisie zostaje jako „do dokonczenia" — inaczej stalby w paczce ze statusem OK
-                        // (ustawilismy go chwile wczesniej), z groszem na auftragu i bez jednego sladu w HUB-ie.
-                        // Gdy odczytu nie bylo, nie ruszamy niczego: slad 'sub' mowi „nie wiem, czy weszlo".
-                        if (po){
-                            const poId3 = {};
-                            po.forEach(function (y){ poId3[String(y.id)] = y; });
-                            ids.forEach(function (id){
-                                const y = poId3[String(id)];
-                                if (!y || !mkKsResztka(y, tol)) delete w3[id];
-                                else w3[id] = { d: String(y.payment_descr == null ? '' : y.payment_descr), f: 'stan' };
-                            });
+                        // Slad zdejmujemy TYLKO z wierszy, ktore wedlug swiezego odczytu nie maja juz reszty (mkKoncSladPo): wiersz pominiety
+                        // przy zapisie zostaje „do dokonczenia", wiersz WYSLANY, a dalej z reszta — „nie wiem, czy weszlo". Gdy odczytu nie bylo,
+                        // nie ruszamy niczego: slad 'sub' mowi „nie wiem, czy weszlo".
+                        const niep3 = po ? mkKoncSladPo(z3.j, imp, ids, po, tol) : 0;
+                        if (niep3){
+                            wierszy = Math.max(0, wierszy - niep3);
+                            bad.push(imp + ': ' + niep3 + ' poz. wysłane, a reszty na auftragu jeszcze nie widać zdjętej — NIE WIEM, czy weszło; drugi raz nie wysyłam');
+                            mkProblemUstawW(z3.j, 'koncowki', 'końcówki na subkonto, paczka ' + imp,
+                                'subkonto wysłane (' + niep3 + ' poz.), a reszty na auftragu jeszcze nie widać zdjętej — nie wysyłam drugi raz; sprawdź paczkę'
+                                + ' i odhacz w „💰 Końcówki na subkonto” (gdy reszta zejdzie, ślad zniknie sam przy następnym zestawieniu)');
                         }
-                        if (Object.keys(w3).length) z3.j.koncWisi = w3; else { delete z3.j.koncWisi; mkProblemZdejmijZ(z3.j, 'koncowki'); }
+                        if (!Object.keys(mkKoncWisi(z3.j)).length){ delete z3.j.koncWisi; mkProblemZdejmijZ(z3.j, 'koncowki'); }
                         if (po){
                             const nChk = po.filter(function (r){ return String(r.state) === 'CHECK'; }).length;
                             const nNf = impNfZostaje(z3.j, po);
@@ -87868,7 +88635,7 @@
         if (sl && sl.f !== 'ok') return '⚠ wysłane na auftrag ' + lnk(sl.num) + ' bez potwierdzenia — rozstrzyga „🔎 NOT FOUND na auftragach"';
         const st = ff ? mkNfState[ff] : null;
         if (!st) return '<span style="color:#6b7280">niesprawdzony — „🔍 sprawdź auftrag" (przycisk obok) szuka go po numerze</span>';
-        if (st.zaks) return '✔ zaksięgowane ' + esc(mkCzasLok(st.zaks));
+        if (mkNfZaks(st, j)) return '✔ zaksięgowane ' + esc(mkCzasLok(st.zaks));
         if (st.err) return esc(st.err);
         // Kwota zwrotu przy braku auftragu tez — do 16.11.2026 widac ja bylo tylko przy auftragu Deleted.
         if (st.stan === 'brak'){
@@ -87921,7 +88688,7 @@
         };
         if (!st || mkNfNieudane(st) || (!st.stan && !st.err && !(st.kand || []).length))
             return przycisk('mk-prob-nfspr', '#5b21b6', '🔍 sprawdź auftrag', 'Szuka auftragu po numerze fulfilmentu i czyta jego stan (open amount, płatności, DELETED).');
-        if (st.stan !== 'sprawdzone' || (st.kand || []).length !== 1 || st.zaks || st.wyslane || st.f1Blokuj) return '';
+        if (st.stan !== 'sprawdzone' || (st.kand || []).length !== 1 || mkNfZaks(st, j) || st.wyslane || st.f1Blokuj) return '';
         const c = st.kand[0];
         if (mkNfFfInny(j, ff, c) || (!c.ok && !c.deleted)) return '';
         if (j.kind === 'hd' && !c.deleted && c.open != null && Math.abs(c.open) <= 0.005 && (c.tickety || []).length) return '';   // Homedeco: wpłata na minus w tickecie (widok paczki)
@@ -88090,7 +88857,9 @@
             const opis = (e && e.message) || String(e);
             mkLog('book', '✖ lista „do wyjaśnienia": paczka ' + imp + ' wiersz ' + id + ': ' + opis);
             say('Księgowanie z listy nie poszło: ' + opis
-                + (faza === 'book' ? ' — NIE WIEM, czy weszło; wiersz zostaje w sekcji „do dokończenia”, sprawdź paczkę w prologistics.'
+                // e.poZapisie: odczyt po zapisie (mkKsPotwierdz) juz powiedzial, co sie stalo — opis wyzej, bez „nie wiem".
+                + (faza === 'book' && e && e.poZapisie ? ' Wiersz zostaje w sekcji „do dokończenia”.'
+                   : faza === 'book' ? ' — NIE WIEM, czy weszło; wiersz zostaje w sekcji „do dokończenia”, sprawdź paczkę w prologistics.'
                    : faza === 'stan' ? ' — status mógł zostać zmieniony na OK; wiersz zostaje w sekcji „do dokończenia”, jeśli tak.' : ''), '#c00');
         } finally {
             mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1);
@@ -88328,6 +89097,25 @@
         return j;
     }
     function mkNfaTeraz(){ return new Date().toISOString().slice(0, 16).replace('T', ' '); }
+    // Zapis na auftragu bez widocznego wiersza platnosci (slad 'wysl'): odczyt POTWIERDZA od razu, ale „nie weszlo" HUB uznaje sam
+    // najwczesniej po tylu minutach od wyslania (decyzja uzytkownika 20.11.2026). Wczesniej rozstrzyga tylko czlowiek guzikiem.
+    const MK_NFA_ROZSTRZ_MIN = 15;
+    // Chwila wyslania ze sladu: `kiedy` to czas UTC z dokladnoscia do minuty (mkNfaTeraz). 0 = nie da sie odczytac.
+    function mkNfaWyslanyMs(e){
+        const m = String((e && e.kiedy) || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+        return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : 0;
+    }
+    // +1 minuta: `kiedy` jest obciete do minuty, wiec zapis mogl wyjsc do 59 s pozniej. Slad bez czytelnej chwili — jak dotad (stare slady).
+    function mkNfaMoznaRozstrzygnac(e){
+        const t = mkNfaWyslanyMs(e);
+        return !t || Date.now() - t >= (MK_NFA_ROZSTRZ_MIN + 1) * 60000;
+    }
+    function mkNfaRozstrzygnijPo(e){
+        const t = mkNfaWyslanyMs(e);
+        if (!t) return 'teraz';
+        const d = new Date(t + (MK_NFA_ROZSTRZ_MIN + 1) * 60000);
+        return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
     function mkNfaWisi(j){ const sl = mkNfaSlad(j); return Object.keys(sl).filter(function (id){ return sl[id].f !== 'ok'; }); }
     // Czy wiersz NOT FOUND wolno zaksiegowac z zestawienia. Te same warunki co guzik w widoku paczki (nfKom) i kilka
     // ostrzejszych, bo zestawienie ksieguje wiele naraz: numer fulfilmentu auftragu DOKLADNIE rowny numerowi z paczki
@@ -88346,7 +89134,7 @@
         if (mkCodNieWiem(j)) return { ok: false, why: MK_COD_NIEWIEM };
         const st = mkNfState[id];
         // Zalatwione w widoku paczki w tej sesji (zapis na auftragu albo Homedeco: przeniesione do ticketu na minus).
-        if (st && st.zaks) return { ok: false, zrob: true, why: 'załatwione w widoku paczki: ' + mkCzasLok(st.zaks) };
+        if (mkNfZaks(st, j)) return { ok: false, zrob: true, why: 'załatwione w widoku paczki: ' + mkCzasLok(st.zaks) };
         if (kwota == null || kwota <= 0) return { ok: false, why: 'kwota ' + (kwota == null ? '?' : f2(kwota)) + ' — tylko ręcznie' };
         if (String(x.already_imported) === '1' || String(x.already_imported_flag) === '1')
             return { ok: false, why: 'prologistics zna już tę płatność (możliwy dubel) — ręcznie' };
@@ -88433,6 +89221,12 @@
                 if (rr.nPay > e.nPrzed){
                     mkNfaZapisz(p.j, id, Object.assign({}, e, { f: 'ok', potw: 'odczyt ' + mkNfaTeraz() }));
                     mkLog('notfound', '✔ ' + id + ': zapis na auftragu ' + e.num + ' potwierdzony odczytem (wierszy płatności ' + e.nPrzed + ' → ' + rr.nPay + ')');
+                } else if (!mkNfaMoznaRozstrzygnac(e)){
+                    // Za wczesnie na „nie weszlo" (przeglad 20.11.2026): przeciazony serwer pokazuje zapis z opoznieniem (16.11.2026 noty
+                    // w tickecie byly niewidoczne ok. 5 minut). Slad zostaje 'wysl' — guzik nie wraca; potwierdzic wolno od razu,
+                    // zaprzeczyc dopiero po MK_NFA_ROZSTRZ_MIN minutach od wyslania. Do 20.11.2026 „↻ sprawdź jeszcze raz" kilka sekund
+                    // po zapisie zdejmowal slad i wiersz wracal do „💾 Zaksięguj na auftragach".
+                    mkLog('notfound', '· ' + id + ': na auftragu ' + e.num + ' jeszcze nie widać wiersza płatności — za wcześnie, żeby uznać „nie weszło” (rozstrzygnę po ' + mkNfaRozstrzygnijPo(e) + ')');
                 } else {
                     mkNfaZapisz(p.j, id, null);
                     const s0 = mkNfState[id];
@@ -88604,7 +89398,8 @@
                           + ' · ' + f2(e.kwota) + ' · wysłane ' + esc(mkCzasLok(e.kiedy)) + ' — '
                           + (e.nPrzed == null
                                ? 'auftrag bez formularza płatności (skasowany): odczyt tego nie rozstrzygnie — sprawdź auftrag i wybierz'
-                               : '„↻ sprawdź jeszcze raz” odczyta auftrag; gdy odczyt się nie udaje — sprawdź auftrag i wybierz')
+                               : ('„↻ sprawdź jeszcze raz” odczyta auftrag (wiersz płatności potwierdza od razu; „nie weszło” uznaję najwcześniej '
+                                  + MK_NFA_ROZSTRZ_MIN + ' min po wysłaniu, czyli po ' + mkNfaRozstrzygnijPo(e) + '); gdy odczyt się nie udaje — sprawdź auftrag i wybierz'))
                           + ' <button class="mk-nfa-roz mk-lnk" data-k="' + kk + '" data-id="' + esc(id) + '" data-co="tak">✓ jest na auftragu</button>'
                           + ' <button class="mk-nfa-roz mk-lnk" data-k="' + kk + '" data-id="' + esc(id) + '" data-co="nie">↻ nie weszło — zdejmij ślad</button></div>';
                  }).join('');
@@ -88714,7 +89509,7 @@
                 const jT = mkKoncJob(jobsLoad(), w.p).j;
                 if (!jT){ bad.push(o.id + ': zlecenia nie ma już na liście'); continue; }
                 if (mkNfaSlad(jT)[o.id]){ bad.push(o.id + ': HUB już wysłał tę wpłatę na auftrag ' + mkNfaSlad(jT)[o.id].num); continue; }
-                if (mkNfState[o.id] && mkNfState[o.id].zaks){ bad.push(o.id + ': zaksięgowane w międzyczasie w widoku paczki'); continue; }
+                if (mkNfZaks(mkNfState[o.id], job)){ bad.push(o.id + ': zaksięgowane w międzyczasie w widoku paczki'); continue; }
                 const k0 = mkNfState[o.id] && (mkNfState[o.id].kand || [])[0];
                 if (k0 && rr.ok) Object.assign(k0, { open: rr.open, nPay: rr.nPay, deleted: !!rr.deleted, ffy: rr.ffy || k0.ffy });
                 if (!rr.ok){ bad.push(o.id + ': ' + (rr.err || 'nie odczytałem auftragu ' + o.num)); continue; }
@@ -88741,21 +89536,25 @@
                     const kiedy = mkNfaTeraz();
                     mkNfaZapisz(job, o.id, Object.assign({}, wpis, { f: 'ok', kiedy: kiedy }));
                     const st = mkNfState[o.id] || (mkNfState[o.id] = { kand: [] });
-                    st.zaks = kiedy; st.err = '';
+                    st.zaks = kiedy; st.zaksP = imp; st.err = '';                 // „zaksięgowane" dotyczy TEJ paczki (mkNfZaks, U6)
+                    if (k0) Object.assign(k0, { open: po.open, nPay: po.nPay });  // kandydat ze stanem PO zapisie (ten sam numer w innej paczce)
                     mkLog('notfound', '✔ ' + o.id + ': zaksięgowane, wierszy płatności ' + rr.nPay + ' → ' + po.nPay);
                     ok++; paczki[imp] = w.p;
-                } else if (!r.ok && po.ok){
-                    mkNfaZapisz(job, o.id, null);     // nie wyszlo i nie przybylo — pozycja wraca do zestawienia
-                    bad.push(o.id + ': nie zaksięgowało (' + (r.err || '?') + ')');
-                    mkLog('notfound', '✖ ' + o.id + ': ' + (r.err || '?'));
+                } else if (!r.ok && r.odmowa && po.ok){
+                    // 4xx: serwer odmowil wprost i nie przybylo — pozycja wraca do zestawienia. 5xx i zerwane polaczenie ida nizej:
+                    // zapis mogl wejsc z opoznieniem (do 20.11.2026 slad schodzil tu przy kazdym bledzie — druga platnosc).
+                    mkNfaZapisz(job, o.id, null);
+                    bad.push(o.id + ': serwer odmówił (' + (r.err || '?') + ') — nie zaksięgowało');
+                    mkLog('notfound', '✖ ' + o.id + ': serwer odmówił, ' + (r.err || '?'));
                 } else {
-                    // Wyslane, a wiersza platnosci nie widac (albo auftragu nie dalo sie przeczytac): slad 'wysl' zostaje —
-                    // pozycja NIE wraca do zestawienia, dopoki odczyt auftragu albo czlowiek tego nie rozstrzygnie.
+                    // Wyslane, a wiersza platnosci nie widac (albo auftragu nie dalo sie przeczytac, albo odpowiedz byla bledem 5xx):
+                    // slad 'wysl' zostaje — pozycja NIE wraca do zestawienia, dopoki odczyt auftragu albo czlowiek tego nie rozstrzygnie.
                     const st = mkNfState[o.id] || (mkNfState[o.id] = { kand: [] });
+                    const blT = r.ok ? '' : ('odpowiedź z błędem (' + (r.err || '?') + '), ');
                     st.wyslane = true;
-                    st.err = 'wysłane, ale NIE potwierdziłem wiersza płatności — sprawdź auftrag ' + o.num + '; rozstrzyga „🔎 NOT FOUND na auftragach” (krok ④)';
-                    bad.push(o.id + ': wysłane na auftrag ' + o.num + ', ale NIE potwierdziłem wiersza płatności — sprawdź auftrag');
-                    mkLog('notfound', '⚠ ' + o.id + ': wysłane bez potwierdzenia (wierszy płatności ' + rr.nPay + ' → ' + (po.ok ? po.nPay : '?') + ')');
+                    st.err = 'wysłane, ' + blT + 'ale NIE potwierdziłem wiersza płatności — sprawdź auftrag ' + o.num + '; rozstrzyga „🔎 NOT FOUND na auftragach” (krok ④)';
+                    bad.push(o.id + ': wysłane na auftrag ' + o.num + ', ' + blT + 'ale NIE potwierdziłem wiersza płatności — sprawdź auftrag');
+                    mkLog('notfound', '⚠ ' + o.id + ': wysłane bez potwierdzenia' + (r.ok ? '' : (' (' + (r.err || '?') + ')')) + ' (wierszy płatności ' + rr.nPay + ' → ' + (po.ok ? po.nPay : '?') + ')');
                     const js = jobsLoad(), z = mkKoncJob(js, w.p);
                     if (z.j){
                         mkProblemUstawW(z.j, 'nfauft', 'wpłata NOT FOUND na auftragu ' + o.num,
@@ -89131,6 +89930,7 @@
         // Trzy zapory przed powtorzeniem cudzej pracy — sprawdzane PRZED wyslaniem.
         b.disabled = true; say('Sprawdzam, czy to już nie zostało zrobione…');
         let dupSheet = [], dupFile = [], shErr = '';
+        const plikNiespr = [];          // { j, opis } — listy paczek nie przyszly: „nie znalazlem pliku" to tu „nie wiem" (20.11.2026)
         // Stare wyniki kasujemy, zeby po nieudanym sprawdzeniu nie zostal na ekranie
         // wynik z poprzedniego przebiegu — czyli zeby „nie wiem" nie udawalo „czysto".
         sel.forEach(function (j){ delete mkSheet[mkJobId(j)]; });
@@ -89145,7 +89945,8 @@
             const tf0 = shTrafienie(sel[i], s);
             if (tf0 && tf0.zaks) dupSheet.push(sel[i]);
             const f = await impSameFile(sel[i]);
-            if (f) dupFile.push({ j: sel[i], f: f });
+            if (f && f.niesprawdzone) plikNiespr.push({ j: sel[i], opis: f.opis });
+            else if (f) dupFile.push({ j: sel[i], f: f });
         }
         b.disabled = false;
         render();
@@ -89176,6 +89977,16 @@
             if (df) flag += df.f.exact
                 ? ('   ⚠ TEN PLIK BYŁ JUŻ IMPORTOWANY (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ')')
                 : ('   ⚠ tego dnia szedł już import z tego sklepu, ale na inną kwotę (paczka ' + df.f.file_id + ', ' + df.f.import_datetime_from + ') — sprawdź');
+            const pn = plikNiespr.filter(function (x){ return mkJobId(x.j) === mkJobId(j); })[0];
+            if (pn) flag += '   ⚠ NIE SPRAWDZIŁEM, czy tego pliku nie importowano (' + pn.opis + ')';
+            // Poprzednia proba skonczyla sie bledem 5xx / zerwanym polaczeniem (slad impWisi z sendImport).
+            if (j.impWisi && j.impWisi.blad){
+                let kiedyW = '';
+                try { kiedyW = new Date(j.impWisi.kiedy).toLocaleString('pl-PL'); } catch (e){ kiedyW = String(j.impWisi.kiedy || ''); }
+                flag += '   ⚠ POPRZEDNI IMPORT (' + kiedyW + ') skończył się błędem „' + j.impWisi.blad + '” i nie wiadomo, czy paczka powstała'
+                      + ' — tuż przed wysłaniem poszukam jej jeszcze raz: jeśli jest, pliku drugi raz nie wyślę; jeśli jej nie widać, wyślę go'
+                      + ' najwcześniej ' + MK_IMP_KARENCJA_MIN + ' min po tamtej próbie';
+            }
             if (tUwaga[mkKlucz(j)]) flag += '   ⚠ ' + tUwaga[mkKlucz(j)];
             return '  • ' + j.data.shop + '  ' + j.date + '  ' + n + ' zam.  ' + f2(mkKwotaImportu(j)) + ' ' + j.cur + '  → konto ' + (c.acct || '?') + ' (bank_setting ' + c.bank + ')' + flag
                  + (j.kind === 'f1' ? f1LinieImportu(j) : '')
@@ -89190,7 +90001,11 @@
             ? ('\n\n⛔ NIE SPRAWDZIŁEM ARKUSZA: ' + shErr
                + '\nNie wiem więc, czy ktoś już tego nie zaksięgował. Brak ostrzeżeń NIE znaczy, że jest czysto.')
             : '';
-        const warn = brakArk + ((dupSheet.length || dupFile.length)
+        const brakPlik = plikNiespr.length
+            ? ('\n\n⛔ NIE SPRAWDZIŁEM PACZEK IMPORTU (' + plikNiespr.length + ' zest.): ' + plikNiespr[0].opis
+               + '\nBrak ostrzeżenia „TEN PLIK BYŁ JUŻ IMPORTOWANY” NIE znaczy, że jest czysto.')
+            : '';
+        const warn = brakArk + brakPlik + ((dupSheet.length || dupFile.length)
             ? ('\n\n⚠ UWAGA: ' + (dupSheet.length ? (dupSheet.length + ' pozycji jest w arkuszu ZAKSIĘGOWANYCH albo z Booked „Brak”') : '')
                + (dupSheet.length && dupFile.length ? ', ' : '')
                + (dupFile.length ? (dupFile.length + ' plików było już importowanych') : '')
@@ -89217,7 +90032,10 @@
             if (r === true) ok++;
             else {
                 err.push(j.data.shop + ': ' + r);
-                try { mkUstawProblem(mkKluczPamieci(jobsLoad(), j), 'import', 'import do prologistics', r); } catch (e){}
+                // „⏳ …" — zrobione albo trwa w innej karcie: to nie problem tego zlecenia, notatki „import" nie stawiamy.
+                if (!/^⏳/.test(String(r))){
+                    try { mkUstawProblem(mkKluczPamieci(jobsLoad(), j), 'import', 'import do prologistics', r); } catch (e){}
+                }
             }
             render();
         }
@@ -89226,6 +90044,11 @@
             : '. Paczki są wgrane, jeszcze niezaksięgowane — teraz krok 4: „▶ Zaksięguj paczki” albo „🔍 Otwórz paczkę” przy zleceniu.'), err.length ? '#c00' : '#0a7a2f');
     }
 
+    // Zamek importu jednego zlecenia, wspolny dla kart (mkZamekTrzymaj) — klucz + klucz zlecenia w pamieci (20.11.2026).
+    const MK_IMP_ZAMEK = 'mkt_import_zamek_';
+    // Po nieudanej probie (5xx / zerwane polaczenie, slad impWisi) bez widocznej paczki plik idzie ponownie najwczesniej po tylu
+    // minutach — paczka po bledzie bywa widoczna z opoznieniem (przeglad poprawek 20.11.2026; ta sama miara co MK_NFA_ROZSTRZ_MIN).
+    const MK_IMP_KARENCJA_MIN = 15;
     // Wspolna wysylka — uzywana i przez pojedynczy import, i przez zbiorczy.
     // Zwraca true albo tresc bledu.
     async function sendImport(j, c){
@@ -89258,7 +90081,9 @@
         }
         if (!cur) return 'nie znajduję tego zlecenia w pamięci modułu (klucz „' + (j.ref || '—')
                        + '") — odśwież stronę i wgraj wyciąg jeszcze raz';
-        if (cur.status === 'done') return 'już zaimportowane';
+        // „⏳ " na poczatku = nie blad tego importu, tylko „nie teraz" (zrobione albo trwa gdzie indziej) — doImportAll nie stawia
+        // wtedy notatki „import" (przeglad poprawek 20.11.2026: notatka z drugiej karty zostawala przy zaimportowanym zleceniu).
+        if (cur.status === 'done') return '⏳ już zaimportowane';
         // Trademax: plik idzie z migawki z chwili zaznaczenia — zlecenie, ktore w miedzyczasie cofnieto albo przeliczono, nie idzie.
         if (cur.kind === 'tm' && (cur.status !== 'ready' || !cur.data || !Array.isArray(cur.data.faktury)))
             return 'zlecenie zmieniło się od zaznaczenia (dziś: ' + (cur.status || 'new') + ') — sprawdź je i zaimportuj jeszcze raz';
@@ -89286,52 +90111,150 @@
         // (sprawdzone 15.10.2026: payment_date = booking_date w 4146 z 4146 wierszy paczek banku 55).
         const dateIso = (j.kind === 'alle' || j.kind === 'kfl') ? '' : (d[1] + '-' + d[2] + '-' + d[3]);
         const pairs = pairsOf(j);
+        // Jeden import tego zlecenia naraz, takze miedzy kartami (przeglad 20.11.2026): „done" stoi dopiero po powrocie importu,
+        // wiec druga karta klikajaca w tym czasie wysylala plik drugi raz — druga paczka tej samej wyplaty. Zamek „lekki" (5.53):
+        // po wzieciu sprawdzamy po chwili, czy dalej jest nasz (GM nie jest atomowy).
+        const zamekK = MK_IMP_ZAMEK + (kCur || mkKlucz(j));
+        if (mkZamekInny(zamekK)) return '⏳ ten import trwa właśnie w innej karcie — poczekaj na jego koniec i odśwież listę';
+        const oddajZamek = mkZamekTrzymaj(zamekK, 120000);
         try {
+            await mkKsCzekaj(400);
+            if (mkZamekCzyj(zamekK) !== MK_KARTA) return '⏳ ten sam import ruszył w tej samej chwili w innej karcie — nie wysyłam drugi raz';
+            // Po zamku stan zlecenia na swiezo: inna karta mogla import wlasnie skonczyc albo zostawic slad nieudanej proby.
+            const swiezy = kCur ? jobsLoad()[kCur] : null;
+            if (swiezy && swiezy.status === 'done') return '⏳ już zaimportowane (w innej karcie)';
+            const wisiImp = (swiezy && swiezy.impWisi) || cur.impWisi || null;
+            const plik = fileName(j);
             const fd = new FormData();
             // Furniture 1: plik liczony raz — do wysylki i do kontroli paczki po imporcie.
             const f1Csv = mkDrv(j) ? mkDrvPlikImportu(j) : null;
-            fd.append('imgs[]', f1Csv ? f1Blob(f1Csv) : csvBlob(j), fileName(j));
+            fd.append('imgs[]', f1Csv ? f1Blob(f1Csv) : csvBlob(j), plik);
             fd.append('data', JSON.stringify({ booking_setting: c.booking, date_overwrite_to: dateIso, bank_setting: c.bank, import_type: 'manual' }));
-            // Stan banku PRZED importem — po nim nowa paczka to wylacznie paczka o wyzszym numerze (impZnajdzNowa).
-            const przed = await impNajwyzszy(c.bank);
-            const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
-            const txt = await r.text();
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            // Endpoint oddaje STRONE paczki, nie JSON — to normalne. Numer paczki bierzemy
-            // z adresu po przekierowaniu, a gdyby go tam nie bylo, szukamy w tresci.
-            // Bez niego nie da sie sprawdzic ani zaksiegowac tego, co weszlo.
-            let imp = '';
-            const mu = String(r.url || '').match(/import_payments\/(\d+)/);
-            if (mu) imp = mu[1];
-            if (!imp){ const mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
-            // Numeru nie ma ani w adresie, ani w tresci: szukamy NOWEJ paczki tego banku (po nazwie albo jedynej nowszej
-            // niz przed importem). Do 5.60.06 zlecenie dostawalo „done" takze wtedy, gdy paczki nie bylo wcale, a zapas
-            // impFind bral „pierwsza paczke banku" — czyli cudza, starsza. 14.10.2026 Hobbybox SE na 259: „zaimportowane
-            // 32 zamówień", a w prologistics ani jednej paczki banku 259. Teraz brak paczki = blad: zlecenie zostaje
-            // „gotowe do importu", a opis mowi, co oddal serwer (np. strona logowania przy wygaslej sesji).
-            if (!imp){
-                try { imp = await impZnajdzNowa(fileName(j), c.bank, przed); } catch (e){}
-                if (!imp){
-                    await new Promise(function (res){ setTimeout(res, 2000); });
-                    try { imp = await impZnajdzNowa(fileName(j), c.bank, przed); } catch (e){}
+            let imp = '', uwagaImp = '';
+            // Paczka znaleziona po bledzie mogla sie jeszcze wczytywac albo urwac w polowie (przeglad poprawek 20.11.2026). Liczba
+            // wierszy dwa razy w odstepie 5 s: zero, rosnie albo nie da sie odczytac = zlecenie NIE dostaje „done", zostaje slad z numerem
+            // paczki, nastepny „Importuj" sprawdzi ja jeszcze raz (pliku nie wysle). Stoi = bierzemy ja, ale z notatka „import": czy ma
+            // wszystkie wiersze, rozstrzyga czlowiek — liczby wierszy pliku HUB nie zna dla kazdego rynku (kontrole ma tylko Furniture 1).
+            let notkaPoBledzie = '';
+            const przyjmijPoBledzie = async function (impX, blad){
+                let a = null, b = null;
+                try { a = (await impRows(impX)).rows.length; } catch (e){ a = null; }
+                await mkKsCzekaj(5000);
+                try { b = (await impRows(impX)).rows.length; } catch (e){ b = null; }
+                if (a == null || b == null || !b || a !== b) return { ok: false, a: a, b: b };
+                notkaPoBledzie = 'paczka ' + impX + ' powstała mimo odpowiedzi „' + blad + '” i ma ' + b + ' wierszy; w pliku było ' + pairs.length
+                               + ' zamówień — sprawdź w Import payments, czy weszły wszystkie, zanim zaksięgujesz';
+                return { ok: true, n: b };
+            };
+            const czekaNaPaczke = function (impX, blad, przedX, st){
+                cur.impWisi = { kiedy: (wisiImp && wisiImp.kiedy) || new Date().toISOString(), plik: plik, bank: String(c.bank), przed: przedX,
+                                blad: blad, imp: String(impX) };
+                zapiszScal();
+                const stan = (st.a == null || st.b == null) ? 'nie odczytałem jej wierszy' : ('jeszcze się wczytuje (wierszy ' + st.a + ' → ' + st.b + ')');
+                try { mkLog('import', '⚠ import „' + plik + '”: paczka ' + impX + ' po odpowiedzi „' + blad + '” — ' + stan + ', bez „zaimportowane”'); } catch (e){}
+                return blad + ' — paczka ' + impX + ' powstała, ale ' + stan + '. Nie oznaczam zlecenia jako zaimportowanego; kliknij „Importuj” za kilka minut'
+                     + ' — HUB sprawdzi ją jeszcze raz i podepnie, pliku drugi raz nie wyśle.';
+            };
+            // Poprzednia proba skonczyla sie bledem 5xx / zerwanym polaczeniem i nie wiadomo, czy paczka powstala (slad impWisi):
+            // najpierw jej szukamy po nazwie pliku, na ustawieniu z tamtej proby. Jest — zlecenie dostaje ja jako swoja i plik NIE idzie
+            // drugi raz. Lista banku nie przyszla — nie wysylamy, bo „nie widze" nie znaczy wtedy „nie ma". Nie ma, a od proby minelo
+            // mniej niz MK_IMP_KARENCJA_MIN — tez nie: paczka po bledzie bywa widoczna z opoznieniem.
+            if (wisiImp){
+                const bladW = wisiImp.blad || 'błąd';
+                const bankW = String(wisiImp.bank || c.bank);
+                const zn = await impPaczkaPoNazwie(wisiImp.plik || plik, bankW, Number(wisiImp.przed == null ? -1 : wisiImp.przed));
+                if (zn.imp){
+                    const st = await przyjmijPoBledzie(zn.imp, bladW);
+                    if (!st.ok) return czekaNaPaczke(zn.imp, bladW, wisiImp.przed, st);
+                    imp = zn.imp; uwagaImp = ' · paczka z poprzedniej próby (' + bladW + ') — pliku nie wysyłałem drugi raz';
                 }
-                if (!imp){
-                    const opis = impOpisOdpowiedzi(r, txt);
-                    try { mkLog('import', 'brak paczki po imporcie „' + fileName(j) + '” na ustawieniu ' + c.bank + ' — ' + opis); } catch (e){}
-                    // Zablokowana data: osobny, czytelny komunikat (paczki szukalismy wyzej tak samo jak przy kazdej odmowie).
-                    const blad = impBladSerwera(txt);
-                    if (impDataZablokowana(blad))
-                        return impOpisDatyZablokowanej(dateIso, impRadaDatyZablokowanej(cur), blad) + ' Zlecenie zostaje „gotowe do importu”.';
-                    return 'prologistics nie założył paczki — na ustawieniu ' + c.bank + ' nie ma pliku „' + fileName(j)
-                         + '”, więc import NIE wszedł (zlecenie zostaje „gotowe do importu”). ' + opis;
+                else if (!zn.pewne)
+                    return 'poprzedni import tego zlecenia skończył się błędem (' + bladW + '), a listy paczek ustawienia ' + bankW
+                         + ' teraz nie odczytałem — nie wiem, czy paczka powstała, więc pliku drugi raz nie wysyłam; spróbuj za chwilę';
+                else {
+                    const t = Date.parse(String(wisiImp.kiedy || '')) || 0;
+                    if (t && Date.now() < t + MK_IMP_KARENCJA_MIN * 60000){
+                        const dk = new Date(t + MK_IMP_KARENCJA_MIN * 60000), dt = new Date(t);
+                        return 'poprzedni import tego zlecenia (' + pad2(dt.getHours()) + ':' + pad2(dt.getMinutes()) + ') skończył się błędem (' + bladW
+                             + '), a paczki „' + (wisiImp.plik || plik) + '” jeszcze nie widzę — paczka po błędzie bywa widoczna z opóźnieniem, więc pliku'
+                             + ' ponownie nie wysyłam przed ' + pad2(dk.getHours()) + ':' + pad2(dk.getMinutes()) + '.';
+                    }
+                }
+            }
+            if (!imp){
+                // Stan banku PRZED importem — po nim nowa paczka to wylacznie paczka o wyzszym numerze (impZnajdzNowa).
+                const przed = await impNajwyzszy(c.bank);
+                let r = null, txt = '', bladSieci = '';
+                try {
+                    r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
+                    txt = await r.text();
+                } catch (e){ bladSieci = (e && e.message) || String(e) || 'zerwane połączenie'; }
+                if (bladSieci || !r.ok){
+                    const blad = bladSieci ? ('błąd połączenia: ' + bladSieci) : ('HTTP ' + r.status);
+                    // 4xx = serwer odmowil, paczki nie zalozyl — jak dotad: blad, zlecenie zostaje „gotowe do importu".
+                    if (r && r.status >= 400 && r.status < 500) throw new Error(blad);
+                    // 5xx / zerwane polaczenie: paczka MOGLA powstac (504 z bramki przy duzym pliku, a serwer importuje dalej). Do 20.11.2026
+                    // zlecenie zostawalo wtedy „gotowe" bez slowa o tym, a ponowny import robil druga paczke. Szukamy jej po nazwie pliku.
+                    let zn = { imp: '', pewne: false };
+                    for (let proba = 0; proba < 2 && !zn.imp; proba++){
+                        if (proba) await mkKsCzekaj(3000);
+                        try { zn = await impPaczkaPoNazwie(plik, c.bank, przed); } catch (e){ zn = { imp: '', pewne: false }; }
+                    }
+                    if (zn.imp){
+                        const st = await przyjmijPoBledzie(zn.imp, blad);
+                        if (!st.ok) return czekaNaPaczke(zn.imp, blad, przed, st);
+                        imp = zn.imp; uwagaImp = ' · serwer odpowiedział błędem (' + blad + '), ale paczka powstała (' + st.n + ' wierszy)';
+                    }
+                    else {
+                        // Nie wiem, czy paczka powstala: slad przy zleceniu (status zostaje „gotowe"). Nastepny import najpierw jej szuka (wyzej),
+                        // a okno potwierdzenia mowi o poprzedniej probie.
+                        cur.impWisi = { kiedy: new Date().toISOString(), plik: plik, bank: String(c.bank), przed: przed, blad: blad };
+                        zapiszScal();
+                        try { mkLog('import', '⚠ import „' + plik + '” na ustawieniu ' + c.bank + ': ' + blad + ' — paczki o tej nazwie nie widzę, NIE WIEM, czy powstała'); } catch (e){}
+                        return blad + ' — NIE WIEM, czy paczka powstała (paczki „' + plik + '” na ustawieniu ' + c.bank + ' jeszcze nie widzę). '
+                             + 'Nie importuj ręcznie; przy następnym „Importuj” HUB najpierw jej poszuka — jeśli jest, pliku drugi raz nie wyśle, a jeśli jej'
+                             + ' nie ma, wyśle go ponownie najwcześniej ' + MK_IMP_KARENCJA_MIN + ' min po tej próbie.';
+                    }
+                } else {
+                    // Endpoint oddaje STRONE paczki, nie JSON — to normalne. Numer paczki bierzemy
+                    // z adresu po przekierowaniu, a gdyby go tam nie bylo, szukamy w tresci.
+                    // Bez niego nie da sie sprawdzic ani zaksiegowac tego, co weszlo.
+                    const mu = String(r.url || '').match(/import_payments\/(\d+)/);
+                    if (mu) imp = mu[1];
+                    if (!imp){ const mt = String(txt).match(/import_payments\/(\d+)/); if (mt) imp = mt[1]; }
+                    // Numeru nie ma ani w adresie, ani w tresci: szukamy NOWEJ paczki tego banku (po nazwie albo jedynej nowszej
+                    // niz przed importem). Do 5.60.06 zlecenie dostawalo „done" takze wtedy, gdy paczki nie bylo wcale, a zapas
+                    // impFind bral „pierwsza paczke banku" — czyli cudza, starsza. 14.10.2026 Hobbybox SE na 259: „zaimportowane
+                    // 32 zamówień", a w prologistics ani jednej paczki banku 259. Teraz brak paczki = blad: zlecenie zostaje
+                    // „gotowe do importu", a opis mowi, co oddal serwer (np. strona logowania przy wygaslej sesji).
+                    if (!imp){
+                        try { imp = await impZnajdzNowa(plik, c.bank, przed); } catch (e){}
+                        if (!imp){
+                            await new Promise(function (res){ setTimeout(res, 2000); });
+                            try { imp = await impZnajdzNowa(plik, c.bank, przed); } catch (e){}
+                        }
+                        if (!imp){
+                            const opis = impOpisOdpowiedzi(r, txt);
+                            try { mkLog('import', 'brak paczki po imporcie „' + plik + '” na ustawieniu ' + c.bank + ' — ' + opis); } catch (e){}
+                            // Zablokowana data: osobny, czytelny komunikat (paczki szukalismy wyzej tak samo jak przy kazdej odmowie).
+                            const blad = impBladSerwera(txt);
+                            if (impDataZablokowana(blad))
+                                return impOpisDatyZablokowanej(dateIso, impRadaDatyZablokowanej(cur), blad) + ' Zlecenie zostaje „gotowe do importu”.';
+                            return 'prologistics nie założył paczki — na ustawieniu ' + c.bank + ' nie ma pliku „' + plik
+                                 + '”, więc import NIE wszedł (zlecenie zostaje „gotowe do importu”). ' + opis;
+                        }
+                    }
                 }
             }
             cur.impId = imp;
             cur.status = 'done';
+            cur.impWisi = null;                               // slad nieudanej proby rozstrzygniety (null, nie delete — scalanie trojstronne)
             mkProblemZdejmijZ(cur, 'import');                 // import sie udal — jego notatka schodzi
+            // …chyba ze paczka przyszla po odpowiedzi z bledem: wtedy notatka mowi, co sprawdzic przed ksiegowaniem.
+            if (notkaPoBledzie) mkProblemUstawW(cur, 'import', 'import do prologistics — paczka po błędzie serwera', notkaPoBledzie);
             cur.msg = 'zaimportowane ' + pairs.length + ' zamówień, konto ' + (c.acct || c.bank)
                     + (imp ? (' · paczka ' + imp + ' — jeszcze NIEZAKSIĘGOWANA')
-                           : ' · nie odczytałem numeru paczki — wejdź na Import payments ręcznie');
+                           : ' · nie odczytałem numeru paczki — wejdź na Import payments ręcznie') + uwagaImp;
             // Furniture 1: slad wyslanego pliku idzie w TYM SAMYM zapisie co „done". Brak f1Plik to jedyny znak,
             // po ktorym bookList, widok paczki i blokada ksiegowania poznaja paczke znaleziona przez zapore —
             // zapisany dopiero po kontroli paczki (do kilkunastu sekund) ginal przy zamknieciu karty i paczka
@@ -89431,6 +90354,7 @@
             }
             return true;
         } catch (e){ return (e && e.message) || String(e); }
+        finally { oddajZamek(); }
     }
 
     // Jednorazowe przeliczenie zwrotow OBI CH na BRUTTO. Zlecenie, ktore ma juz wczytane
@@ -123852,7 +124776,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '2305534 · 20.11.2026 07:52';
+    const HUB_BUDOWA = '36cb3b7 · 20.11.2026 11:03';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
