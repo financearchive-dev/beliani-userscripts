@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.20
+// @version      5.63.21
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -88,6 +88,7 @@
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_listValues
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
@@ -4617,17 +4618,56 @@
         if (open == null) return { ok: false, vatRefund: false, error: 'Brak "Auftrag value - Total of Payments" w tabeli' };
         const diff = Math.abs(open) - expectedAbs;
         const rowsBefore = payments.rows.length;
+        // „MAKE PAYMENT" NAJWYZEJ RAZ (przeglad 19.11.2026) — to samo, co Update w tickecie (bookOne, ucodTicketRaz).
+        // Dotad po zapisie byl JEDEN odczyt po 0,7 s; gdy wiersza nie bylo widac, wynik byl bledem, a nastepny przebieg
+        // (reczny albo „drugie podejście") wysylal Make payment jeszcze raz — kontrola na wejsciu widzi tylko wiersz,
+        // ktory juz widac. Teraz: slad w KS_UPD_SLAD (osobny klucz „vat|…"), dluzsze czekanie na wiersz, a bez wiersza
+        // wynik „niepotwierdzone" i przez KS_UPD_BLOKADA_MS bez drugiego zapisu.
+        const sladK = 'vat|' + String(auctionUrl).replace(/^https?:\/\/[^/]+/, '') + '|' + expectedAbs.toFixed(2) + '|' + bookingDate + '|' + accountNum;
+        const slad = ksUpdWez(sladK);
+        // Ile wierszy TEJ kwoty stoi na auftragu. Slad pamieta ich liczbe sprzed zapisu: za „nasz" uchodzi dopiero wiersz
+        // ponad nia — nie wczesniejsza wplata tej samej kwoty (np. podwojna wplata, ktora robi nadplate) i nie inny nowy
+        // wiersz auftragu (przeglad 20.11.2026: samo „wierszy przybylo + jest wiersz tej kwoty" lapalo jedno i drugie).
+        const ileTej = (rows) => (rows || []).filter(r => Math.abs(Math.abs(r.amountNum) - expectedAbs) < 0.005).length;
+        if (slad && Date.now() - slad.t < KS_UPD_BLOKADA_MS) {
+            // Wiersz tej kwoty przybyl od tamtego zapisu (data mogla wyjsc inna) — to tamten zapis.
+            const przybyl = (slad.m != null)
+                ? ileTej(payments.rows) > (Number(slad.m) || 0)
+                : (payments.rows.length > (Number(slad.n) || 0) && ileTej(payments.rows) > 0);
+            if (przybyl) {
+                ksUpdUsun(sladK);
+                return { ok: true, alreadyBooked: true, vatRefund: true, openAmount: payments.openAmount,
+                         message: `wiersz z Make payment o ${ksGodz(slad.t)} jest — drugi raz nie wysyłam` };
+            }
+            return { ok: false, vatRefund: false, niepotwierdzone: true, czeka: true, ponowOd: slad.t + KS_UPD_BLOKADA_MS,
+                     error: 'Make payment (zwrot VAT) na tym auftragu poszedł o ' + ksGodz(slad.t) + ', wiersza dalej nie widać — '
+                          + 'NIE wysyłam drugi raz przed ' + ksGodz(slad.t + KS_UPD_BLOKADA_MS) + ' (byłby dubel). Nie dopisuj ręcznie; '
+                          + 'puść pozycję po tej godzinie — gdy wiersz się pojawi, HUB go rozpozna.' };
+        }
         const mainSigned = (-Math.abs(expectedAbs)).toFixed(2);
+        const tWysl = Date.now();
+        ksUpdUstaw(sladK, { t: tWysl, n: rowsBefore, m: ileTej(payments.rows), nr: 'zwrot VAT ' + expectedAbs.toFixed(2) });
         const r1 = await submitBookPayment(ctx, mainSigned, accountNum, bookingDate,
                                           (opisPlatnosci === undefined ? 'VAT refund' : opisPlatnosci));
-        if (!r1.ok) return { ok: false, vatRefund: false, error: r1.error };
-        await loadInFrame(auctionUrl, 20000, ctx);
-        await sleep(700);
-        payments = parsePaymentsTable(getFrameDoc(ctx));
-        const mainBooked = payments.rows.some(r => r.date === bookingDate && Math.abs(Math.abs(r.amountNum) - expectedAbs) < 0.005);
-        if (!mainBooked && payments.rows.length <= rowsBefore) {
-            return { ok: false, vatRefund: false, error: 'Po Make payment nie pojawił się wiersz VAT refund w tabeli Payments' };
+        if (!r1.ok) { ksUpdUsun(sladK); return { ok: false, vatRefund: false, error: r1.error }; }
+        let mainBooked = false;
+        const przerwy = [700, 3000, 6000, 10000, 20000, 30000];
+        for (let i = 0; i < przerwy.length && !mainBooked; i++) {
+            try {
+                if (i === 0) { await loadInFrame(auctionUrl, 20000, ctx); await sleep(przerwy[0]); }
+                else { await sleep(przerwy[i]); if (!await loadForRead(auctionUrl, 25000, ctx)) await sleep(700); }
+            } catch (e) { /* zly odczyt = dluzsze czekanie, nie drugi zapis */ }
+            payments = parsePaymentsTable(getFrameDoc(ctx));
+            mainBooked = payments.rows.some(r => r.date === bookingDate && Math.abs(Math.abs(r.amountNum) - expectedAbs) < 0.005)
+                      || payments.rows.length > rowsBefore;
         }
+        if (!mainBooked) {
+            return { ok: false, vatRefund: false, niepotwierdzone: true, ponowOd: tWysl + KS_UPD_BLOKADA_MS,
+                     error: 'Make payment (zwrot VAT) wysłany o ' + ksGodz(tWysl) + ', ale wiersza w tabeli Payments nie widać — '
+                          + 'NIE wysłałem drugi raz (byłby dubel). Sprawdź auftrag; gdy wiersza nie ma, puść pozycję po '
+                          + ksGodz(tWysl + KS_UPD_BLOKADA_MS) + '.' };
+        }
+        ksUpdUsun(sladK);
         log.push(`VAT refund ${mainSigned} -> konto ${accountNum}, data ${bookingDate}`);
         const remainder = payments.openAmount;
         let info8100 = null;
@@ -4644,16 +4684,27 @@
         // 8100 tylko gdy realnie wysyłana kwota (zaokrąglona do 2 miejsc) != 0.
         if (remSigned != null && parseFloat(remSigned) !== 0) {
             const rowsBefore2 = payments.rows.length;
-            const r2 = await submitBookPayment(ctx, remSigned, '8100', todayYmd(), '');
+            // Zapis reszty idzie przez okno ramki. Po szybkim odczycie (fetch) strona zyje w dokumencie odlaczonym, a
+            // getFrameWin rzuca wtedy wyjatkiem — caly wiersz wychodzil jako „❌ nie zaksięgowano", choc zwrot VAT juz
+            // wszedl, a slad byl zdjety (przeglad 20.11.2026). Najpierw zywa ramka; kazdy blad od tego miejsca dotyczy
+            // juz tylko reszty na 8100, nie zwrotu.
+            let r2;
+            try {
+                if (ctx._doc) { await loadInFrame(auctionUrl, 20000, ctx); await sleep(600); }
+                r2 = await submitBookPayment(ctx, remSigned, '8100', todayYmd(), '');
+            } catch (e) { r2 = { ok: false, error: (e && e.message) || String(e) }; }
             if (!r2.ok) {
                 return { ok: true, vatRefund: true, verified: true, partial: true, openAmount: open, diff,
                     info8100: { amount: remSigned, booked: false, overTolerance: false },
                     error8100: r2.error, log, message: `VAT refund OK, reszta na 8100 NIE: ${r2.error}` };
             }
             // CZYSTY ODCZYT — potwierdzenie po zaksiegowaniu reszty na 8100.
-            if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(700);
-            payments = parsePaymentsTable(getFrameDoc(ctx));
-            const remBooked = payments.rows.some(r => r.account === '8100' && Math.abs(Math.abs(r.amountNum) - Math.abs(remainder)) < 0.005) || payments.rows.length > rowsBefore2;
+            let remBooked = false;
+            try {
+                if (!await loadForRead(auctionUrl, 20000, ctx)) await sleep(700);
+                payments = parsePaymentsTable(getFrameDoc(ctx));
+                remBooked = payments.rows.some(r => r.account === '8100' && Math.abs(Math.abs(r.amountNum) - Math.abs(remainder)) < 0.005) || payments.rows.length > rowsBefore2;
+            } catch (e) { remBooked = false; }
             info8100 = { amount: remSigned, booked: remBooked, overTolerance: false };
             log.push(`reszta ${remSigned} -> konto 8100, data ${todayYmd()}`);
         }
@@ -6407,10 +6458,22 @@
         const href = `${BASE}/rma.php?rma_id=${encodeURIComponent(rmaId)}`;
         const ctx = createFrameCtx();
         const w = { ok: false, href: href, ksieg: null, komentarz: null, reassign: null,
-                    status: '', bylZamkniety: false, error: null };
+                    status: '', bylZamkniety: false, error: null, updateWyslany: false, niepotwierdzone: false };
+        // UPDATE NAJWYZEJ RAZ (jak bookOne od 5.63.14). Do teraz most klikal Update do CZTERECH razy: dwie proby tutaj
+        // i drugie wywolanie calosci w __TM_UCOD_TICKET, a kazda proba po nieudanej kontroli klikala znowu. Nota po Update
+        // bywa niewidoczna przez kilka minut (16.11.2026: trzy noty jednej kwoty na 730338 i 727640). Teraz po kliknieciu
+        // Update nie ma drugiego — czekamy dluzej, a gdy noty dalej nie widac, wynik jest „niepotwierdzone".
+        // Slad „Update wyslany" jest TEN SAM co w bookOne (KS_UPD_SLAD, klucz ksUpdKlucz): przez KS_UPD_BLOKADA_MS od
+        // klikniecia kolejny przebieg — z tego mostu albo z „Księgowania w tickecie" — Update nie klika.
+        // Nota ujemna (Kaufland EN) dostaje w kluczu znak, bo ksUpdKlucz liczy kwote bez znaku.
+        const ujemna = Number(normalizeAmount(kwota)) < 0;
+        const sladRow = { amount: kwota, bookingDate: data, accountNum: konto, kind: '', dupTotal: 1, dupIndex: 1 };
+        const sladK = ksUpdKlucz(sladRow, rmaId, href) + (ujemna ? '|-' : '');
         try {
             let ostatniBlad = '';
             let kliknietoUpdate = false;
+            let tKlik = 0;                            // kiedy poszedl Update (przedUpdate z fillTicket)
+            let niepotw = '';                         // Update poszedl, noty nie widac — powod do wyniku
             let wyslane = null;                       // komentarz+odbicie wysylamy RAZ
             for (let proba = 1; proba <= 2; proba++) {
                 await loadInFrame(href, 20000, ctx);
@@ -6425,9 +6488,45 @@
                 // (rozbij) zostaja z sumami: zwrot rozbity na pozycje ma sie rozpoznac przy ponowieniu.
                 const juz = findBookedRefundEntry(getFrameDoc(ctx), kwota, data, false, !rozbij);
                 if (juz) {
+                    ksUpdUsun(sladK);
                     w.ksieg = { ok: true, alreadyBooked: !kliknietoUpdate,
                                 opis: juz.text || juz.amount || '' };
                     break;
+                }
+
+                // UPDATE Z WCZESNIEJSZEGO PRZEBIEGU (slad KS_UPD_SLAD) — przed wszystkim, co moze kliknac Update.
+                // Nota spoza tamtego zdjecia o tej kwocie → tamten zapis wszedl, widac go dopiero teraz.
+                // Noty nie ma, a od klikniecia minelo mniej niz KS_UPD_BLOKADA_MS → nie klikamy (moglby byc dubel).
+                // Minelo wiecej → tamten zapis przepadl, Update wolno (nowe klikniecie zapisze nowy slad).
+                if (proba === 1) {
+                    const slad = ksUpdWez(sladK);
+                    if (slad) {
+                        const minelo = Date.now() - slad.t;
+                        let nasza = ksUpdNotaZeSladu(getFrameDoc(ctx), slad, sladRow);
+                        // ksUpdNotaZeSladu porownuje kwoty bez znaku — nota ujemna nie potwierdza dodatniej i odwrotnie.
+                        if (nasza && !(nasza.entries || []).every(function (e) { return (Number(e.amount) < 0) === ujemna; })) nasza = null;
+                        if (nasza) {
+                            ksUpdUsun(sladK);
+                            w.ksieg = { ok: true, alreadyBooked: true, zeSladu: true,
+                                        opis: (nasza.text || '') + ' (nota z Update o ' + ksGodz(slad.t) + ')' };
+                            try { ksLog('zapis', '✔ ticket ' + rmaId + ' (' + kwota + '): nota z Update o ' + ksGodz(slad.t)
+                                        + ' jest — ' + (nasza.text || '?') + ' — Update NIE idzie drugi raz'); } catch (e) {}
+                            break;
+                        }
+                        if (minelo < KS_UPD_BLOKADA_MS) {
+                            const od = slad.t + KS_UPD_BLOKADA_MS;
+                            w.updateWyslany = true;
+                            w.ksieg = { ok: false, niepotwierdzone: true, czeka: true, ponowOd: od,
+                                        error: 'Update na tym tickecie poszedł o ' + ksGodz(slad.t) + ' ('
+                                             + Math.max(0, Math.round(minelo / 60000)) + ' min temu), nowej noty dalej nie widać. '
+                                             + 'NIE klikam drugi raz przed ' + ksGodz(od) + ' (byłby dubel, gdyby serwer zapisał tamten '
+                                             + 'Update z opóźnieniem). Nie dopisuj noty ręcznie — puść pozycję po ' + ksGodz(od)
+                                             + '; gdy nota się pojawi, HUB ją rozpozna.' };
+                            try { ksLog('zapis', '❓ ticket ' + rmaId + ' (' + kwota + '): Update z ' + ksGodz(slad.t)
+                                        + ', noty nie widać — NIE klikam Update przed ' + ksGodz(od)); } catch (e) {}
+                            break;
+                        }
+                    }
                 }
 
                 const st = getTicketStatus(getFrameDoc(ctx));
@@ -6454,9 +6553,21 @@
                 let fill;
                 try {
                     fill = await fillTicket(kwota, data, konto, ctx, null,
-                                            rozbij ? null : { pierwszaPozycja: true });
+                                            Object.assign(rozbij ? {} : { pierwszaPozycja: true }, {
+                        // Woła je fillTicket TUZ przed kliknieciem Update (nie woła, gdy Update nie idzie).
+                        przedUpdate: function (info) {
+                            tKlik = Date.now();
+                            w.updateWyslany = true;
+                            ksUpdUstaw(sladK, { t: tKlik, ids: [...numeryPrzed.ids], bez: numeryPrzed.bezNumeru || 0, nr: 'ticket ' + rmaId });
+                            try { ksLog('zapis', '▶ Update ticket ' + rmaId + ' (most): ' + kwota + ' · data ' + data + ' · konto ' + konto
+                                        + ' · próba ' + proba + ' · noty przed: ' + ksNumeryTekst(numeryPrzed)
+                                        + ' · pozycja ' + ((info && info.articleId) || '?')); } catch (e) {}
+                        }
+                    }));
                 } catch (e) {
                     ostatniBlad = (e && e.message) || String(e);
+                    // Wyjatek PO kliknieciu Update — zapis mogl wejsc. Drugiej proby (= drugiego Update) nie ma.
+                    if (tKlik) { niepotw = ostatniBlad; break; }
                     await sleep(900);
                     continue;
                 }
@@ -6516,20 +6627,31 @@
 
                 // ODCZYT, wiec szybka droga. Ten JEDEN odczyt potwierdza i ksiegowanie,
                 // i odbicie — sleep dotyczy zwloki SERWERA, nie renderowania strony.
-                await loadForRead(href, 20000, ctx);
+                // Odczyt po Update juz nie wyrzuca z proby — wyjatek tutaj konczyl sie dotad drugim Update.
+                try { await loadForRead(href, 20000, ctx); } catch (e) { /* kontrola nizej i tak cos powie */ }
                 await sleep(900);
-                let ver = ksPotwierdzNowaNota(verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId),
-                                              numeryPrzed, getFrameDoc(ctx), fill);
+                // ksSprawdzPoUpdate (jak bookOne): nota, ktorej numeru przed Update nie bylo, jest NASZA — choc kwota
+                // rozbila sie na pozycje albo data wyszla inna. Bez drugiego klikniecia musi ja rozpoznac ta kontrola.
+                let ver = ksSprawdzPoUpdate(getFrameDoc(ctx), sladRow, fill, numeryPrzed);
                 let odb = osobaId ? ucodOdbijSprawdz(getFrameDoc(ctx), getFrameHtml(ctx), tekst, osobaId, osoba, wyslane) : null;
-                const backoff = [3000, 6000, 10000];
+                // Trzy odczyty jak dotad (3/6/10 s) — na note i na odbicie. Gdy noty dalej nie widac, czekamy dluzej
+                // (KS_PO_UPDATE_PRZERWY), najwyzej KS_PO_UPDATE_MAX_MS od Update — zamiast drugiego klikniecia.
+                const backoff = KS_PO_UPDATE_PRZERWY;
+                const tUpd = tKlik || Date.now();
                 for (let i = 0; i < backoff.length && !(ver.ok && (!odb || odb.ok)); i++) {
+                    if (i >= 3 && (ver.ok || Date.now() - tUpd > KS_PO_UPDATE_MAX_MS)) break;
+                    if (i === 3) {
+                        try { ksLog('zapis', 'ticket ' + rmaId + ' (most): nowej noty po Update nie widać — czekam dłużej, '
+                                    + 'Update NIE idzie drugi raz · noty przed: ' + ksNumeryTekst(numeryPrzed)
+                                    + ' · teraz: ' + ksNumeryTekst(ksNumeryNot(getFrameDoc(ctx)))); } catch (e) {}
+                    }
                     await sleep(backoff[i]);
                     try { await loadForRead(href, 25000, ctx); await sleep(1500); } catch (e) { /* nizej i tak cos powiemy */ }
-                    ver = ksPotwierdzNowaNota(verifyTicketBooking(getFrameDoc(ctx), kwota, data, konto, fill.articleId),
-                                              numeryPrzed, getFrameDoc(ctx), fill);
+                    ver = ksSprawdzPoUpdate(getFrameDoc(ctx), sladRow, fill, numeryPrzed);
                     if (osobaId) odb = ucodOdbijSprawdz(getFrameDoc(ctx), getFrameHtml(ctx), tekst, osobaId, osoba, wyslane);
                 }
                 if (ver.ok) {
+                    ksUpdUsun(sladK);
                     // fill.fallbackUsed jest tu ZAWSZE — sami prosimy o ksiegowanie na
                     // pierwszej pozycji — wiec nie meldujemy tego jako odstepstwa.
                     w.ksieg = { ok: true, metoda: ver.method || 'after-update',
@@ -6545,7 +6667,20 @@
                     break;
                 }
                 ostatniBlad = ver.error || 'nie potwierdziło się księgowanie w tickecie';
-                await sleep(900);
+                // Update poszedl, nowej noty nie widac — kolejnej proby (= drugiego Update) nie ma.
+                niepotw = ostatniBlad;
+                break;
+            }
+            if (!w.ksieg && niepotw) {
+                // Celowo bez slowa „zaksiegowan…": modul Marketplace czyta log ticketa i takie slowo (KS_POTW)
+                // liczy jako potwierdzenie pozycji.
+                const od = tKlik ? tKlik + KS_UPD_BLOKADA_MS : 0;
+                w.ksieg = { ok: false, niepotwierdzone: true, ponowOd: od,
+                            error: 'Update wysłany' + (tKlik ? ' o ' + ksGodz(tKlik) : '') + ', ale nowej noty na tickecie nie widać — '
+                                 + 'Update NIE poszedł drugi raz (byłby dubel). Nie dopisuj noty ręcznie: sprawdź ticket za kilka minut; '
+                                 + 'gdy noty dalej nie ma, puść pozycję jeszcze raz' + (od ? ' po ' + ksGodz(od) : '') + '. ' + niepotw };
+                try { ksLog('zapis', '❓ ticket ' + rmaId + ' (most, ' + kwota + '): Update wysłany raz'
+                            + (tKlik ? ' o ' + ksGodz(tKlik) : '') + ', nowej noty nie widać — ' + niepotw); } catch (e) {}
             }
             if (!w.ksieg) w.ksieg = { ok: false, error: ostatniBlad || 'nie udało się zaksięgować w tickecie' };
 
@@ -6560,9 +6695,17 @@
                 } catch (e) { w.status = 'NIE udało się zamknąć z powrotem — sprawdź ticket'; }
             }
             w.ok = !!(w.ksieg && w.ksieg.ok);
+            w.niepotwierdzone = !!(w.ksieg && w.ksieg.niepotwierdzone);
             return w;
         } catch (e) {
             w.error = (e && e.message) || String(e);
+            // Wyjatek PO Update (np. przy przywracaniu statusu) — zapis mogl wejsc; wolajacy nie moze uslyszec „nie poszlo".
+            if (w.updateWyslany && !(w.ksieg && w.ksieg.ok)) {
+                w.niepotwierdzone = true;
+                if (!w.ksieg) w.ksieg = { ok: false, niepotwierdzone: true,
+                                          error: 'Update wysłany, potem błąd (' + w.error + ') — nowej noty nie sprawdziłem. '
+                                               + 'Nie dopisuj noty ręcznie: sprawdź ticket za kilka minut.' };
+            }
             return w;
         } finally {
             destroyFrameCtx(ctx);
@@ -6570,13 +6713,15 @@
     }
     // Jedno powtorzenie, tak jak przy komentarzach: najczestsze porazki sa przejsciowe
     // (ticket nie zdazyl sie wyrenderowac, serwer oddal 500, ramka padla na przeladowaniu).
-    // Powtorzenie nie grozi drugim ksiegowaniem — ucodTicketRaz zaczyna od sprawdzenia,
-    // czy wpisu przypadkiem juz tam nie ma.
+    // Powtorzenie TYLKO wtedy, gdy Update nie poszedl. Kontrola na wejsciu ucodTicketRaz widzi wylacznie note,
+    // ktora juz widac — a nota po Update bywa niewidoczna przez kilka minut, wiec drugie wywolanie po wyslanym
+    // Update robilo dubel (do 5.63.20 most klikal Update nawet cztery razy).
     window.__TM_UCOD_TICKET = async function (o) {
         let r1;
         try { r1 = await ucodTicketRaz(o); }
         catch (e) { r1 = { ok: false, error: (e && e.message) || String(e) }; }
         if (r1 && r1.ok) return r1;
+        if (r1 && (r1.updateWyslany || r1.niepotwierdzone || (r1.ksieg && r1.ksieg.niepotwierdzone))) return r1;
         if (r1 && /brak numeru ticketu|zła data|brak konta|brak kwoty/i.test(r1.error || '')) return r1;
         // Powodu „nie ma na czym zaksiegowac" druga proba nie naprawi — to stan ticketu,
         // nie awaria przejsciowa.
@@ -7042,7 +7187,7 @@
         if (row.bookTo === 'auftrag' && row.wyborAuctionUrl) {
             const resA = await bookVatRefund(ctx, row.wyborAuctionUrl, row.amount, row.accountNum, row.bookingDate, '');
             return {
-                ok: !!resA.ok, vatRefund: true, naAuftragu: true,
+                ok: !!resA.ok, vatRefund: true, naAuftragu: true, niepotwierdzone: !!resA.niepotwierdzone, ponowOd: resA.ponowOd || 0,
                 verified: resA.verified === true,
                 alreadyBooked: !!resA.alreadyBooked,
                 info8100: resA.info8100 || null, partial: !!resA.partial, vatLog: resA.log || [],
@@ -7054,7 +7199,7 @@
             const res = await bookVatRefund(ctx, row.vatAuctionUrl, row.amount, row.accountNum, row.bookingDate);
             const absAmt = Math.abs(parseFloat(normalizeAmount(row.amount))).toFixed(2);
             return {
-                ok: !!res.ok, vatRefund: true,
+                ok: !!res.ok, vatRefund: true, niepotwierdzone: !!res.niepotwierdzone, ponowOd: res.ponowOd || 0,
                 verified: res.verified === true,
                 alreadyBooked: !!res.alreadyBooked,
                 existingRefund: res.alreadyBooked ? { matchType: 'single', amount: absAmt, date: row.bookingDate, entries: [{ amount: absAmt, date: row.bookingDate }] } : null,
@@ -7480,6 +7625,9 @@
                         }
                     }
 
+                    // Czy ticket NAPRAWDE wrocil na Closed — log pisal „ticket zamknięty ponownie" po samym kliknieciu
+                    // Update statusu, bez odczytu (przeglad 19.11.2026). null = nie sprawdzano (ticket nie byl zamkniety).
+                    let zamknietyPonownie = null;
                     if (wasClosedAtStart) {
                         // v3.19: revert do inline reload+setStatus (jak v3.13)
                         try {
@@ -7487,11 +7635,18 @@
                             await sleep(600);
                             if (getTicketStatus(getFrameDoc(ctx)) !== 'Closed') {
                                 await setTicketStatus('Closed', ctx);
-                            }
+                                // Odczyt Z SERWERA, nie z ramki: setTicketStatus sam ustawil select na Closed w zywym
+                                // dokumencie, wiec gdy Update nie przeladowal ramki, ramka „mowi" Closed niezaleznie od tego,
+                                // co zapisal serwer (przeglad 20.11.2026). Odczyt sie nie udal — 'nieznany', nie „zamknięty".
+                                let stPo = '';
+                                try { await loadForRead(ticketHref, 20000, ctx); stPo = getTicketStatus(getFrameDoc(ctx)); } catch (e2) {}
+                                zamknietyPonownie = (stPo === 'Closed') ? true : (stPo ? false : 'nieznany');
+                            } else zamknietyPonownie = true;
                         } catch (e) {
                             return {
                                 ok: true,
                                 wasClosed: true,
+                                zamknietyPonownie: false,
                                 closeError: e.message,
                                 ticketHref,
                                 ticketId,
@@ -7513,6 +7668,7 @@
                     return {
                         ok: true,
                         wasClosed: wasClosedAtStart,
+                        zamknietyPonownie: zamknietyPonownie,
                         ticketHref,
                         ticketId,
                         bookingAttempts: attempt,
@@ -7825,7 +7981,10 @@
         const tdV = document.createElement('td');
         tdV.id = `tm-t-vstat-${row.orderNumber}`;
         tdV.style.cssText = 'padding:4px 6px;border:1px solid #e5e7eb;text-align:center;white-space:normal;word-break:break-word;min-width:130px;';
-        if (row.bookError) {
+        if (row.bookError && row.bookNiepotw) {
+            // Zapis poszedl raz i nie wiadomo, czy wszedl — nie „❌ nie zaksięgowano" (to zachecalo do recznego dopisania = dubel).
+            tdV.innerHTML = `<span style="color:#b45309">❓ niepotwierdzone: ${row.bookError}</span>`;
+        } else if (row.bookError) {
             tdV.innerHTML = `<span style="color:#dc2626">❌ nie zaksięgowano: ${row.bookError}</span>`;
         } else if (row.alreadyBooked && row.existingRefund) {
             tdV.innerHTML = `<span style="color:#2563eb">ℹ️ już zaksięgowane: ${describeExistingRefund(row.existingRefund)}</span>`;
@@ -8042,13 +8201,21 @@
         html += `<div style="font-weight:bold;color:#b45309;margin-bottom:6px;">📋 Do wykonania ręcznie (${noTicket.length + manualReassign.length + niepotw.length})</div>`;
 
         if (niepotw.length) {
-            html += `<div style="font-weight:bold;color:#92400e;margin-top:4px;">❓ Update wysłany, noty nie widać (${niepotw.length}) — `
-                  + `najpierw zajrzyj do ticketu; gdy noty nie ma, puść pozycję jeszcze raz po godzinie podanej przy niej `
-                  + `(${Math.round(KS_UPD_BLOKADA_MS / 60000)} min od Update — wcześniej HUB sam nie kliknie drugi raz; gdy nota się pojawi, rozpozna ją):</div>`
+            html += `<div style="font-weight:bold;color:#92400e;margin-top:4px;">❓ Zapis wysłany, nie widać go (${niepotw.length}) — `
+                  + `najpierw zajrzyj do ticketu (nota) albo — przy zwrocie VAT — do auftragu (wiersz w Payments); gdy go nie ma, `
+                  + `puść pozycję jeszcze raz po godzinie podanej przy niej `
+                  + `(${Math.round(KS_UPD_BLOKADA_MS / 60000)} min od zapisu — wcześniej HUB sam nie wyśle drugi raz; gdy zapis się pojawi, rozpozna go):</div>`
                   + `<ul style="margin:4px 0 6px 18px;padding:0;">`;
             for (const row of niepotw) {
                 const kwota = row.amount != null ? String(row.amount) : '';
-                html += `<li style="margin:2px 0;"><strong>${row.orderNumber}</strong> — ${ticketLink(row)} — <strong>${kwota}</strong> — ${row.bookingDate || ''}`
+                let gdzie = ticketLink(row);
+                if (row.bookNiepotwVat) {
+                    const u = row.wyborAuctionUrl || row.vatAuctionUrl || '';
+                    const mA = String(u).match(/number=(\d+)/);
+                    gdzie = (u ? `<a href="${u}" target="_blank" style="color:#7c3aed;text-decoration:none;">Auftrag #${mA ? mA[1] : '?'}</a>` : 'auftrag')
+                          + ' (zwrot VAT)';
+                }
+                html += `<li style="margin:2px 0;"><strong>${row.orderNumber}</strong> — ${gdzie} — <strong>${kwota}</strong> — ${row.bookingDate || ''}`
                       + (row.ponowOd ? ` — puść ponownie po ${ksGodz(row.ponowOd)}` : '') + `</li>`;
             }
             html += '</ul>';
@@ -8366,7 +8533,9 @@
                         logRow.style.color = '#2563eb';
                         already++;
                     } else {
-                        logRow.innerHTML = `✅ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — zaksięgowano (Ticket #${previewRows[i].ticketId}, ${row.amount}, ${row.bookingDate})${describeSplitInfo(bookResult.verifySplitInfo)}${bookResult.wasClosed ? ' | ticket zamknięty ponownie' : ''}`;
+                        logRow.innerHTML = `✅ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — zaksięgowano (Ticket #${previewRows[i].ticketId}, ${row.amount}, ${row.bookingDate})${describeSplitInfo(bookResult.verifySplitInfo)}${bookResult.wasClosed ? (bookResult.zamknietyPonownie === false ? ' | ⚠ ticket NIE wrócił na Closed — zamknij go ręcznie'
+                            : bookResult.zamknietyPonownie === 'nieznany' ? ' | ⚠ nie odczytałem statusu ticketu po zamknięciu — sprawdź, czy jest Closed'
+                            : ' | ticket zamknięty ponownie') : ''}`;
                         logRow.style.color = '#16a34a';
                         ok++;
                     }
@@ -8376,11 +8545,16 @@
                     // W tekscie NIE moze stac „zaksiegowan…" — modul Marketplace liczy to jako potwierdzenie.
                     previewRows[i].bookError = bookResult.error; previewRows[i].booked = false;
                     previewRows[i].bookNiepotw = true;
+                    // Zwrot VAT na auftragu (Make payment) — nie Update na tickecie: wlasny opis, bez „Ticket #null" i noty,
+                    // ktorej tam nigdy nie bedzie (przeglad 20.11.2026). Tekst bledu z bookVatRefund jest bez „zaksiegowan…".
+                    previewRows[i].bookNiepotwVat = !!bookResult.vatRefund;
                     if (bookResult.ticketHref) previewRows[i].ticketHref = bookResult.ticketHref;
                     if (bookResult.ticketId) previewRows[i].ticketId = bookResult.ticketId;
                     previewRows[i].ponowOd = bookResult.ponowOd || 0;
                     const odG = bookResult.ponowOd ? ksGodz(bookResult.ponowOd) : '';
-                    logRow.innerHTML = `❓ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} | ${row.amount} — `
+                    if (bookResult.vatRefund) logRow.innerHTML = `❓ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — zwrot VAT na auftragu | ${row.amount} — `
+                        + (bookResult.error || ('Make payment wysłany, wiersza nie widać. NIE wysyłam drugi raz (byłby dubel).' + (odG ? ' Puść pozycję po ' + odG + '.' : '')));
+                    else logRow.innerHTML = `❓ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — Ticket #${previewRows[i].ticketId} | ${row.amount} — `
                         + (bookResult.czeka
                            ? `Update na tym tickecie poszedł o ${ksGodz(bookResult.tKlik)}, nowej noty dalej nie widać. NIE klikam drugi raz przed ${odG} (byłby dubel). `
                              + `Puść pozycję po ${odG}; gdy nota się pojawi, HUB ją rozpozna.`
@@ -8390,12 +8564,14 @@
                     fail++;
                 } else {
                     previewRows[i].bookError = bookResult.error; previewRows[i].booked = false;
+                    previewRows[i].bookNiepotw = false; previewRows[i].bookNiepotwVat = false;
                     logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${bookResult.error}`;
                     logRow.style.color = '#dc2626';
                     fail++;
                 }
             } catch (e) {
                 previewRows[i].bookError = e.message; previewRows[i].booked = false;
+                previewRows[i].bookNiepotw = false; previewRows[i].bookNiepotwVat = false;
                 logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${e.message}`;
                 logRow.style.color = '#dc2626';
                 fail++;
@@ -15095,9 +15271,10 @@
     // UWAGA na przyszlosc: fastChange zmienia SAM TYP i nie rusza platnosci. Po zmianie
     // platnosc zostaje na dotychczasowym koncie sprzedazy — wychwytuje to kontrola
     // ksiegowania w Saldach, sekcja „Zle konto sprzedazy".
-    // absoluteUrl JUZ ISTNIEJE na poziomie modulu (przy stalej BASE, ta sama wartosc) —
-    // drugiej kopii tu nie stawiamy. Deklaracje funkcji sie wynosza, wiec kopia
-    // przeslonilaby oryginal wszystkim, ktorzy go dzis uzywaja.
+    // Adresy z odnosnikow skladamy przez `new URL(h, KL_BASE).href` — dokladnie to robi absoluteUrl w init_ksieg.
+    // Do 5.63.20 stalo tu wywolanie absoluteUrl, a komentarz twierdzil, ze istnieje ona „na poziomie modulu" —
+    // ale zyje WEWNATRZ init_ksieg, wiec stad byla niewidoczna: cichy ReferenceError, ktory .catch zamienial na
+    // „nie znaleziono zamowienia" przy kazdym zamowieniu z kilkoma auftragami (przeglad 19.11.2026).
     const KL_BASE = 'https://www.prologistics.info';
     function fastFetchU(u, prob){
         var n = prob || 3;
@@ -15165,7 +15342,7 @@
             .then(function(o){
                 var auctionUrl = null;
                 if (/auction\.php\?number=/.test(o.finalUrl)) auctionUrl = o.finalUrl;
-                if (!auctionUrl) { var d = new DOMParser().parseFromString(o.html, 'text/html'); var a = d.querySelector('a[href*="auction.php?number="]'); if (a) auctionUrl = absoluteUrl(a.getAttribute('href')); }
+                if (!auctionUrl) { var d = new DOMParser().parseFromString(o.html, 'text/html'); var a = d.querySelector('a[href*="auction.php?number="]'); if (a) auctionUrl = new URL(a.getAttribute('href'), KL_BASE).href; }
                 if (!auctionUrl) return { ok:false, error:'nie znaleziono zamowienia' };
                 return fetch(auctionUrl, { credentials:'same-origin' }).then(function(r){ return r.text(); }).then(function(ah){
                     var ad = new DOMParser().parseFromString(ah, 'text/html');
@@ -15204,7 +15381,7 @@
                     Array.prototype.forEach.call(d.querySelectorAll('a[href*="auction.php?number="]'), function(a){
                         var h = a.getAttribute('href') || '';
                         if (h.indexOf('shipping_auction.php') >= 0) return;
-                        var u = absoluteUrl(h), mm = u.match(/number=(\d+)/);
+                        var u = new URL(h, KL_BASE).href, mm = u.match(/number=(\d+)/);
                         if (!mm) return;
                         if (!urls.some(function(x){ return x.indexOf('number=' + mm[1]) >= 0; })) urls.push(u);
                     });
@@ -20542,11 +20719,24 @@
             + '\n\nHUB nic nie zapisuje w prologistics — po złożeniu pliku w issue nie zostaje ślad.'
             + '\nPrzed drugą zapłatą broni kontrola dubli przy sprawdzaniu faktur i sprawdzenie przy banku.')) return;
         S.pb.pracuje = true; rysuj();
+        // Blad w polowie (zestawienie xlsx, ZIP, pobieranie faktur) zostawial S.pb.pracuje = true — guzik martwy do F5,
+        // a pain001.xml juz zapisany. Teraz kazdy blad zdejmuje „pracuje" i mowi, czy plik do banku juz powstal
+        // (drugie zlozenie = drugi plik na te same przelewy; przeglad 19.11.2026).
+        var zapisanyXml = false, nazwaXml = '';
+        var padlo = function (e){
+            S.pb.pracuje = false; S.pb.postep = '';
+            say('Składanie paczki przerwane: ' + ((e && e.message) || e)
+                + (zapisanyXml ? ' — UWAGA: ' + nazwaXml + ' JEST JUŻ ZAPISANY. Nie składaj paczki drugi raz, zanim nie usuniesz '
+                                 + 'tamtego pliku albo nie upewnisz się, że nie trafi do banku.' : ' — plik do banku NIE powstał.'), 'err');
+            rysuj();
+        };
+        try {
         var przod = pbDataPL(plan.data.data) + ' ';
         var xml = pbXml(plan), zle = pbSprawdzXml(xml, plan);
         if (zle){ S.pb.pracuje = false; say('Pliku nie składam — kontrola gotowego XML-a: ' + zle, 'err'); rysuj(); return; }
-        var nazwaXml = przod + 'pain001.xml';
+        nazwaXml = przod + 'pain001.xml';
         pbZapisz(pbUtf8(xml), nazwaXml, 'application/xml');
+        zapisanyXml = true;
         // zestawienie całej wypłaty — to, co dotąd składał Claude jako „faktury_w_platnosci.xlsx”;
         // składane własnym zapisem xlsx, bo kolory i ramki mają być jak we wzorze użytkownika
         pbZapisz(pbXlsx(pbZestawienieArk(plan)), przod + 'faktury w platnosci.xlsx',
@@ -20599,7 +20789,8 @@
                 + (k.uwagi.length ? ' Uwagi: ' + k.uwagi.join(' · ') : ''),
                 bledy.length || bezSt.length || uwagiSt.length || k.uwagi.length ? 'warn' : 'ok');
             rysuj();
-        });
+        }).catch(padlo);
+        } catch (e){ padlo(e); }
     }
 
     // ---------- ekran ----------
@@ -25302,7 +25493,9 @@
     // Kwota z komorki tabeli: bierzemy PIERWSZY token liczbowy (komorka moze zawierac
     // i wartosc <input>, i ten sam tekst obok, wiec sklejanie calosci dawaloby smieci).
     function parseAmountCell(text) {
-        const t = String(text || '').replace(/ /g, ' ').replace(/[€$£]/g, ' ');
+        // Spacje poziome (NBSP, waska U+202F z PDF-ow, U+2007, U+2009) jako zwykla — U+202F dotad zostawala: „1 234,56” dawalo 1
+        // (przeglad 19.11.2026). Grupa tysiecy ponizej zna tylko zwykla spacje i apostrofy.
+        const t = String(text || '').replace(/[\u00a0\u2007\u2009\u202f]/g, ' ').replace(/[€$£]/g, ' ');
         const m = t.match(/-?\d{1,3}(?:[ '’]\d{3})+(?:[.,]\d+)?|-?\d+(?:[.,]\d+)?/);
         if (!m) return null;
         const n = parseFloat(m[0].replace(/[ '’]/g, '').replace(',', '.'));
@@ -25584,7 +25777,22 @@
             const body = 'fn=change_op_container&field=status_id&container_id=' + encodeURIComponent(cid) + '&value=' + encodeURIComponent(targetVal);
             const resp = await fetch('/js_backend.php', { method:'POST', credentials:'same-origin', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With':'XMLHttpRequest' }, body: body });
             if (!resp.ok) return { html: ' <span style="color:#dc2626">| status: BLAD zmiany (HTTP ' + resp.status + ')</span>' };
-            return { html: ' <span style="color:#16a34a">| status: kontener ' + cid + ' zmieniony na waiting for SM (było: ' + curLabel + ')</span>' };
+            // HTTP 200 z js_backend.php to jeszcze nie dowod — backend oddaje 200 takze wtedy, gdy nic nie zmienil (tak samo
+            // przy typie klienta). Dotad kazde 200 bylo meldowane jako „zmieniony" (przeglad 19.11.2026). Jeden odczyt strony
+            // orderu po zmianie (raz na order, nie na wiersz) mowi, jaki status kontener naprawde ma.
+            let teraz = null;
+            try {
+                const d2 = await fetchOrderDoc(orderId);
+                const s2 = Array.from(d2.querySelectorAll('select[data-field="status_id"], select[id^="status_id["]')).find(function (s) {
+                    return (s.getAttribute('data-container-id') || ((s.id.match(/status_id\[(\d+)\]/) || [])[1]) || '') === String(cid);
+                });
+                if (s2) { const o2 = s2.options[s2.selectedIndex]; teraz = ((o2 ? o2.textContent : s2.value) || '').trim(); }
+            } catch (e2) { teraz = null; }
+            if (teraz == null)
+                return { html: ' <span style="color:#b45309">| status: kontener ' + cid + ' — serwer przyjął zmianę na waiting for SM (było: ' + curLabel + '), odczytem nie sprawdziłem</span>' };
+            if (!/^waiting for SM$/i.test(teraz))
+                return { html: ' <span style="color:#dc2626">| status: kontener ' + cid + ' — serwer odpowiedział OK, a status dalej „' + teraz + '" — ustaw ręcznie</span>' };
+            return { html: ' <span style="color:#16a34a">| status: kontener ' + cid + ' zmieniony na waiting for SM (było: ' + curLabel + ', sprawdzone odczytem)</span>' };
         } catch (e) {
             return { html: ' <span style="color:#dc2626">| status: blad (' + e.message + ')</span>' };
         }
@@ -26876,11 +27084,16 @@
         chooser.querySelector('#ch-sprawdz').onclick = function(){ chooser.style.display = 'none'; hideDeposit(); wp.style.display = 'none'; sp.style.display = 'flex'; };
 
         function norm(s){ return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
-        function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+        // Takze cudzyslow i apostrof: esc trafia do atrybutow (title="…", href="…"), a nazwa arkusza z pliku P/I dostawcy
+        // (pcPiTitle) z „"" w srodku wychodzila z atrybutu i mogla dopisac wlasny onmouseover (przeglad 19.11.2026).
+        // W tresci HTML &quot; i &#39; wygladaja tak samo jak „"" i „'"; wynik esc nie idzie nigdzie poza HTML.
+        function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
         function parseAmount(s){ if (s == null) return 0; var m = String(s).replace(/\s/g, '').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
         function parseMoney(raw){
             if (raw == null) return NaN;
-            var s = String(raw).replace(/[^0-9.,\s-]/g, ' ');
+            // Spacje poziome (NBSP z &nbsp;, waska U+202F z PDF-ow, U+2007, U+2009) jako zwykla — nie nowa linia ani tab — grupa tysiecy
+            // ponizej zna tylko zwykla spacje, wiec „1 234,56" z NBSP dawalo 1 (przeglad 19.11.2026).
+            var s = String(raw).replace(/[^0-9.,\s-]/g, ' ').replace(/[\u00a0\u2007\u2009\u202f]/g, ' ');
             var m = s.match(/-?\d{1,3}(?:[ .,]\d{3})+(?:[.,]\d{1,2})?|-?\d+[.,]\d{1,2}|-?\d+/);
             if (!m) return NaN;
             var t = m[0].replace(/\s+/g, ' ').trim();
@@ -53473,11 +53686,43 @@
         const d = String(j.date || '').match(/(\d{4})-(\d{2})-(\d{2})/);
         if (!d){ say('Nie umiem odczyta\u0107 daty wyp\u0142aty tego zlecenia.', '#c00'); return; }
         const dateIso = d[1] + '-' + d[2] + '-' + d[3];
+        // WYSLANIE BEZ ROZSTRZYGNIECIA (przeglad 19.11.2026). Dotad po bledzie sieci albo 5xx \u2014 kiedy paczka MOGLA powstac \u2014
+        // guzik wracal, a drugie klikniecie wysylalo te same korekty jako NOWA paczke. Teraz przed wyslaniem zostaje slad
+        // (hdWysylka: nazwa pliku, co poszlo, numer najwyzszej paczki banku sprzed importu), a kolejne klikniecie najpierw
+        // szuka paczki z tamtego wyslania po nazwie pliku.
+        if (j.hdWysylka && j.hdWysylka.nazwa){
+            const w = j.hdWysylka;
+            let impW = '';
+            // Tylko po nazwie pliku: slad bywa sprzed dni, a „jedyna nowa paczka banku" od tamtej chwili moze byc juz
+            // import nastepnej wyplaty Homedeco — braki uznane za dobite, korekta nigdy by nie poszla.
+            try { impW = await impZnajdzNowa(w.nazwa, c.bank, Number(w.przed), true); } catch (e){ impW = ''; }
+            if (impW){
+                hdZapiszDobicie(k, impW, w.nazwa, w);
+                say('Homedeco \u2014 paczka ' + impW + ' z poprzedniego wys\u0142ania (\u201e' + w.nazwa + '\u201d) jest na li\u015bcie import\u00f3w \u2014 '
+                  + 'zapisa\u0142em j\u0105, drugi raz NIE wysy\u0142am. Paczka jest NIEZAKSI\u0118GOWANA, zaksi\u0119guj j\u0105 w Import payments.', '#0a7a2f');
+                return;
+            }
+            if (!confirm('Poprzednie wys\u0142anie korekty (\u201e' + w.nazwa + '\u201d, ' + String(w.kiedy || '').replace('T', ' ').slice(0, 16)
+                       + ') nie potwierdzi\u0142o si\u0119, a na li\u015bcie import\u00f3w nie ma paczki o tej nazwie.\n\n'
+                       + 'Sprawd\u017a Import payments. Wys\u0142a\u0107 korekt\u0119 jeszcze raz?')) return;
+            const jz0 = jobsLoad();
+            if (jz0[k]){ delete jz0[k].hdWysylka; jobsSave(jz0); }
+        }
         const kwota = (kor.grosze / 100);
         const nazwa = fileBase(j) + ' korekta ' + kwota.toFixed(2) + ' ' + (j.cur || 'EUR') + ' do prolo.csv';
         if (!confirm('Dobi\u0107 ' + kor.wierszy + ' pozycji na ' + kwota.toFixed(2) + ' ' + (j.cur || 'EUR')
                    + ' drug\u0105 paczk\u0105 importu z dat\u0105 ' + dateIso + '?\n\nPierwsza paczka zostaje bez zmian.')) return;
         if (btn) btn.disabled = true;
+        let przed = -1;
+        try { przed = await impNajwyzszy(c.bank); } catch (e){ przed = -1; }
+        {
+            const jz1 = jobsLoad();
+            if (jz1[k]){
+                jz1[k].hdWysylka = { nazwa: nazwa, kiedy: new Date().toISOString(), przed: przed,
+                                     poz: kor.poz, wierszy: kor.wierszy, grosze: kor.grosze };
+                jobsSave(jz1);
+            }
+        }
         try {
             const fd = new FormData();
             fd.append('imgs[]', new Blob([kor.csv], { type: 'text/csv;charset=utf-8' }), nazwa);
@@ -53485,7 +53730,12 @@
                                                bank_setting: c.bank, import_type: 'manual' }));
             const r = await fetch('/api/importPayments/', { method: 'POST', credentials: 'same-origin', body: fd });
             const txt = await r.text();
-            if (!r.ok) throw new Error('HTTP ' + r.status);
+            if (!r.ok){
+                // 4xx = serwer odmowil (paczki nie ma); 5xx = nie wiadomo, czy powstala — rozstrzyga catch nizej.
+                const eh = new Error('HTTP ' + r.status);
+                eh.pewne = r.status >= 400 && r.status < 500;
+                throw eh;
+            }
             let imp = '';
             const mu = String(r.url || '').match(/import_payments\/(\d+)/);
             if (mu) imp = mu[1];
@@ -53495,14 +53745,53 @@
             const bladSrv = imp ? '' : impBladSerwera(txt);
             if (bladSrv){
                 try { imp = await impZnajdzNowa(nazwa, c.bank, -1); } catch (e){}
-                if (!imp) throw new Error(impDataZablokowana(bladSrv)
-                    ? impOpisDatyZablokowanej(dateIso, 'poproś o odblokowanie tej daty i dobij braki jeszcze raz'
-                        + ' (druga paczka idzie z tą samą datą wpływu co pierwsza, więc innej daty HUB tu nie da)', bladSrv)
-                    : ('prologistics odmówił importu, paczka nie powstała — odpowiedź serwera: „' + bladSrv + '”'));
+                if (!imp){
+                    const eo = new Error(impDataZablokowana(bladSrv)
+                        ? impOpisDatyZablokowanej(dateIso, 'poproś o odblokowanie tej daty i dobij braki jeszcze raz'
+                            + ' (druga paczka idzie z tą samą datą wpływu co pierwsza, więc innej daty HUB tu nie da)', bladSrv)
+                        : ('prologistics odmówił importu, paczka nie powstała — odpowiedź serwera: „' + bladSrv + '”'));
+                    eo.pewne = true;
+                    throw eo;
+                }
             }
+            hdZapiszDobicie(k, imp, nazwa, kor);
+            say('Homedeco — dobite ' + kor.wierszy + ' pozycji na ' + kwota.toFixed(2)
+              + (imp ? (' · paczka ' + imp + ' — jeszcze NIEZAKSIĘGOWANA, zaksięguj ją w Import payments')
+                     : ' · nie odczytałem numeru paczki — sprawdź Import payments'), '#0a7a2f');
+        } catch (e){
+            // Odmowa pewna (4xx, {"success":false} bez paczki) — slad zdejmujemy, mozna dobic jeszcze raz.
+            // Inaczej (blad sieci, limit czasu, 5xx) paczka MOGLA powstac: szukamy jej po nazwie pliku; jest — zapisujemy
+            // dobicie, nie ma — slad zostaje, a kolejne klikniecie najpierw jej poszuka i zapyta.
+            let impP = '';
+            if (!(e && e.pewne)){ try { impP = await impZnajdzNowa(nazwa, c.bank, przed, true); } catch (e2){ impP = ''; } }
+            if (impP){
+                hdZapiszDobicie(k, impP, nazwa, kor);
+                say('Homedeco — odpowiedź serwera: ' + ((e && e.message) || e) + ', ale paczka ' + impP + ' powstała — '
+                  + 'zapisałem dobicie. Paczka jest NIEZAKSIĘGOWANA, zaksięguj ją w Import payments.', '#c47f00');
+            } else if (e && e.pewne){
+                const jz2 = jobsLoad();
+                if (jz2[k]){ delete jz2[k].hdWysylka; jobsSave(jz2); }
+                say('Homedeco — nie udało się dobić braków: ' + ((e && e.message) || e), '#c00');
+            } else {
+                const jz3 = jobsLoad();
+                if (jz3[k] && jz3[k].hdWysylka){ jz3[k].hdWysylka.niepewne = String((e && e.message) || e); jobsSave(jz3); }
+                say('Homedeco — NIE WIEM, czy paczka korekty powstała (' + ((e && e.message) || e) + '), a po nazwie pliku '
+                  + 'jeszcze jej nie widać. Nie wysyłam drugi raz: sprawdź Import payments („' + nazwa + '”) — '
+                  + 'kolejne kliknięcie najpierw jej poszuka.', '#c00');
+            }
+        }
+        if (btn) btn.disabled = false;
+    }
+    // Zapis dobicia przy zleceniu: slad (co poszlo), notatka o drugiej paczce i plan — po udanym wyslaniu albo po
+    // odnalezieniu paczki z wyslania, ktorego wynik byl nieznany. „wys" = { poz, wierszy, grosze } (kor albo hdWysylka).
+    function hdZapiszDobicie(k, imp, nazwa, wys){
+        const kwota = (Number(wys.grosze) || 0) / 100;
+        {
             // Slad rosnie o to, co wlasnie poszlo — inaczej ten sam rozjazd wisialby w nieskonczonosc
             // i guzik proponowalby dobicie drugi raz.
-            const jz = jobsLoad(), t = jz[k] || j;
+            const jz = jobsLoad(), t = jz[k];
+            if (!t) return;
+            const kor = wys;
             // Slad rosnie o TO, CO WLASNIE POSZLO (kor.poz) — nigdy o dzisiejszy plan. Gdyby slad
             // znikl miedzy jednym a drugim odczytem zlecenia, zapisanie calego planu jako „wyslane"
             // byloby klamstwem, ktore zostawaloby przy zleceniu na trwale.
@@ -53522,15 +53811,10 @@
             t.hdDobicia = (t.hdDobicia || []).concat([{ imp: String(imp || ''), wierszy: kor.wierszy,
                                                         grosze: kor.grosze, kiedy: new Date().toISOString() }]);
             hdZapiszPlan(t, t.data);
+            delete t.hdWysylka;                    // wyslanie rozstrzygniete \u2014 slad z przed wyslania zdejmujemy
             jz[k] = t; jobsSave(jz);
             try { render(); } catch (e){}
-            say('Homedeco \u2014 dobite ' + kor.wierszy + ' pozycji na ' + kwota.toFixed(2)
-              + (imp ? (' \u00b7 paczka ' + imp + ' \u2014 jeszcze NIEZAKSI\u0118GOWANA, zaksi\u0119guj j\u0105 w Import payments')
-                     : ' \u00b7 nie odczyta\u0142em numeru paczki \u2014 sprawd\u017a Import payments'), '#0a7a2f');
-        } catch (e){
-            say('Homedeco \u2014 nie uda\u0142o si\u0119 dobi\u0107 brak\u00f3w: ' + ((e && e.message) || e), '#c00');
         }
-        if (btn) btn.disabled = false;
     }
     // Import Homedeco przed sprawdzeniem auftragow nie jest „troche mniej dokladny" — jest FALSZYWY:
     // o tym, czy wplata idzie do auftragu, czy do ticketu na minus, decyduje open amount, a tego
@@ -78180,6 +78464,15 @@
         if (xs !== x) mkLog('start', 'NIE wysylam do ticketa ' + (x.rows.length - xs.rows.length)
               + ' poz. (wplata NOT FOUND w paczce, auftrag Deleted albo — Allegro — brak auftragu, zwrot calej kwoty): ' + znP.join(', '));
         if (xs.rows.length){
+            // Modul ticketa jeszcze pracuje (np. poprzednia grupa skonczyla sie u nas „przerwane po czasie"): klikniecie
+            // w jego zablokowany guzik nic nie robi, a ksWait — widzac blokade — meldowal „ok", gdy konczyla sie TAMTA
+            // praca. Ta grupa wychodzila wtedy jako przetworzona, choc nie poszla wcale (przeglad 19.11.2026).
+            const kb = ksBtn();
+            if (kb && kb.disabled){
+                const eB = 'moduł „Księgowanie w tickecie” jeszcze pracuje nad poprzednią paczką — ta grupa NIE poszła; '
+                         + 'poczekaj, aż skończy, i puść ją jeszcze raz';
+                mkLog('start', '✖ nie ruszylo: ' + eB); say(eB, '#c47f00'); return eB;
+            }
             const err = ksFill(xs);
             if (err){ mkLog('start', '✖ nie ruszylo: ' + err); say(err, '#c47f00'); return err; }
             mkLog('start', 'formularz modulu ticketa wypelniony (' + xs.rows.length + ' wierszy TSV)');
@@ -78968,13 +79261,38 @@
                 mkLog('arkusz', 'most z Bank Importu — arkusz: ' + ((e && e.message) || e));
             }
         }
+        // Zlecenie z Bank Importu niesie caly plik (do kilku MB). Parsujemy je tylko, gdy napis sie zmienil — dotad kazda
+        // karta prologistics parsowala ten sam napis co 0,5 s, dopoki zlecenie wisialo (do 3 min). Logika bez zmian.
+        // ZLECENIE Z ADRESEM (przeglad 19.11.2026). Dotad zlecenie bralo pierwsza lepsza karta prologistics — takze karta
+        // w tle na STARYM kodzie, ktorej odpowiedz „rozpoznaj" decyduje, co wypada z pliku importu. Teraz Bank Import pisze
+        // do osobnego klucza (MKB_Z2) z identyfikatorem SWOJEJ karty, a bierze je wylacznie Marketplace w tej samej karcie
+        // (ten sam wzor co most Bank Import → INS). Karta na starym kodzie nowego klucza w ogole nie slucha. Stary klucz
+        // (MKB_Z, bez adresu) obslugujemy dalej — dla Bank Importu na starym kodzie.
+        const MKB_Z2 = 'bank_imp_do_mkt2';
+        const mkKartaDok = function (){
+            try {
+                let k = sessionStorage.getItem('hub_karta');
+                if (!k){ k = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); sessionStorage.setItem('hub_karta', k); }
+                if (!window.__hubDok) window.__hubDok = Math.random().toString(36).slice(2, 10);
+                return k + ':' + window.__hubDok;
+            } catch (e){ return ''; }
+        };
+        const mkbPamiec = {};                                   // klucz -> { s: napis, z: obiekt }
+        const mkbCzytaj = function (klucz){
+            let s = '';
+            try { s = GM_getValue(klucz, '') || ''; } catch (e){ s = ''; }
+            const c = mkbPamiec[klucz] || (mkbPamiec[klucz] = { s: null, z: null });
+            if (s !== c.s){ c.s = s; try { c.z = s ? JSON.parse(s) : null; } catch (e){ c.z = null; } }
+            return c.z;
+        };
         setInterval(async function (){
-            let z = null;
-            try { z = JSON.parse(GM_getValue(MKB_Z, '') || 'null'); } catch (e){ z = null; }
+            let klucz = MKB_Z2, z = mkbCzytaj(MKB_Z2);
+            if (z && z.karta !== mkKartaDok()) z = null;        // zlecenie innej karty
+            if (!z){ klucz = MKB_Z; z = mkbCzytaj(MKB_Z); }
             if (!z || !z.id || z.id === mkbOstatnie) return;
             if (Date.now() - (z.kiedy || 0) > 180000) return;    // przeterminowanego nie ruszamy
             mkbOstatnie = z.id;
-            try { GM_setValue(MKB_Z, ''); } catch (e){}
+            try { GM_setValue(klucz, ''); } catch (e){}
             if (z.tryb === 'rozpoznaj'){ mkMostRozpoznaj(z); return; }
             await mkMostObsluz(z);
         }, 500);
@@ -78985,17 +79303,27 @@
         // Kilka kart prologistics: wysyla jedna (zamek w mkProblemySync). Znacznika NIE zuzywamy,
         // gdy synchronizacja juz biegnie — tu albo w innej karcie — bo zmiana zapisana w jej
         // trakcie czekalaby wtedy do 10 minut (5.53).
-        let mkProbZnacznik = '', mkProbOstatnio = 0;
+        // Stan (znacznik + czas ostatniej proby) w MAGAZYNIE, wspolny dla kart — nie w pamieci karty. Dotad kazde wczytanie
+        // strony prologistics zaczynalo od pustego znacznika i zera, wiec 5 s po KAZDEJ nawigacji szla pelna synchronizacja
+        // (zamek, odczyt wszystkich zlecen mkt_jobs), choc nic sie nie zmienilo (przeglad 19.11.2026). Reguly bez zmian:
+        // nowy znacznik (po 3 s ciszy) albo 10 minut od ostatniej proby.
+        const MK_PROB_OST = 'mkt_ark_problemy_ost';
+        const mkProbOst = function (){
+            try { const o = JSON.parse(GM_getValue(MK_PROB_OST, '') || 'null'); return (o && typeof o === 'object') ? o : { t: 0, z: '' }; }
+            catch (e){ return { t: 0, z: '' }; }
+        };
         setInterval(async function (){
             if (MK_PROB_BIEGNIE || mkZamekInny(MK_PROB_ZAMEK)) return;
             let z = '';
             try { z = String(GM_getValue(MK_PROB_BRUD, '') || ''); } catch (e){}
-            const zmiana = !!z && z !== mkProbZnacznik && (Date.now() - Number(z) >= 3000);
-            const pora = Date.now() - mkProbOstatnio > 600000;
+            const ost = mkProbOst();
+            const zmiana = !!z && z !== String(ost.z || '') && (Date.now() - Number(z) >= 3000);
+            const pora = Date.now() - Number(ost.t || 0) > 600000;
             if (!zmiana && !pora) return;
-            mkProbOstatnio = Date.now();
+            const teraz = Date.now();
+            try { GM_setValue(MK_PROB_OST, JSON.stringify({ t: teraz, z: String(ost.z || '') })); } catch (e){}
             const wyn = await mkProblemySync();
-            if (wyn !== 'zajete') mkProbZnacznik = z;
+            if (wyn !== 'zajete'){ try { GM_setValue(MK_PROB_OST, JSON.stringify({ t: teraz, z: z })); } catch (e){} }
         }, 5000);
         $('#mk-file').onchange = function(){
             const fs = Array.prototype.slice.call(this.files || []);
@@ -84837,13 +85165,15 @@
     }
     // Paczka tego pliku na liscie banku: najpierw po nazwie pliku, potem — gdy znamy stan sprzed importu — JEDYNA nowa
     // paczka tego banku (numer wyzszy niz przed importem). Nigdy „pierwsza z brzegu" starsza paczka banku.
-    async function impZnajdzNowa(fname, bank, przed){
+    // tylkoPoNazwie: bez zapasu „jedyna nowa paczka banku" — tam, gdzie miedzy „przed" a odczytem mogla wejsc inna paczka
+    // tego samego banku (np. Homedeco: slad dobicia sprzed dni, a w miedzyczasie import kolejnej wyplaty, przeglad 20.11.2026).
+    async function impZnajdzNowa(fname, bank, przed, tylkoPoNazwie){
         const L = await impListaDoSzukania(bank);
         const zBanku = L.lista.filter(function (x){ return String(x.bank_id || '') === String(bank); });
         const poNazwie = (przed >= 0 ? zBanku.filter(function (x){ return (Number(x.file_id) || 0) > przed; }) : zBanku)
             .filter(function (x){ return fname && String(x.filename || '').indexOf(fname) >= 0; });
         if (poNazwie.length) return String(poNazwie[0].file_id || '');
-        if (przed < 0) return '';
+        if (przed < 0 || tylkoPoNazwie) return '';
         const nowe = zBanku.filter(function (x){ return (Number(x.file_id) || 0) > przed; });
         return nowe.length === 1 ? String(nowe[0].file_id || '') : '';
     }
@@ -89480,6 +89810,7 @@
         if (r.st === 'err')   return '<span style="color:#c00;font-weight:700">✗ błąd</span>';
         if (r.st === 'done')  return '<span style="color:#0a7a2f;font-weight:700">✓ zaksięgowane, open 0.00</span>';
         if (r.st === 'part')  return '<span style="color:#c47f00;font-weight:700">⚠ zaksięgowane, open ≠ 0</span>';
+        if (r.niepewne)       return '<span style="color:#c00;font-weight:700">❓ nie wiadomo, czy weszło</span>';
         if (r.st === 'fail')  return '<span style="color:#c00;font-weight:700">✗ nie zaksięgowano</span>';
         return '<span style="color:#888">—</span>';
     }
@@ -89627,7 +89958,7 @@
             + (diffs ? ('\n\nUWAGA: ' + diffs + ' z nich ma kwotę różną od open amount.') : '') + '\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
         S.busy = true; S.abort = false;
         $('#au-check').disabled = true; $('#au-book').disabled = true; $('#au-stop').disabled = false;
-        var ok = 0, part = 0, fail = 0, done = 0, par = parN();
+        var ok = 0, part = 0, fail = 0, niep = 0, done = 0, par = parN();
         // Wiersze celujace w TEN SAM auftrag ida po kolei, nie rownolegle. Weryfikacja po
         // ksiegowaniu czyta stan strony („czy przybylo ksiegowanie", „czy open = 0") —
         // dwa rownolegle zapisy do jednego auftraga daly by odczyt w polowie cudzej zmiany.
@@ -89635,20 +89966,55 @@
         todo.forEach(function(r){ if (!byNum[r.num]) { byNum[r.num] = []; groups.push(byNum[r.num]); } byNum[r.num].push(r); });
         var multi = groups.filter(function(g){ return g.length > 1; }).length;
         async function bookOne(r){
+            // Stan auftraga TUZ przed zapisem — punkt odniesienia dla kontroli po zapisie. Dotad bylo nim nPay
+            // z „Sprawdź", wiec drugi wiersz tego samego auftraga porownywal sie ze stanem sprzed zapisu PIERWSZEGO:
+            // „przybyło księgowanie" bylo prawda nawet wtedy, gdy jego wlasny zapis nie wszedl (przeglad 19.11.2026).
+            var a0 = await readAuftrag(r.num);
+            if (!a0.ok || a0.nPay == null){
+                done++; r.st = 'fail'; fail++;
+                r.msg = 'przed zapisem nie odczytałem auftraga (' + (a0.err || '?') + ') — nic nie wysłałem';
+                say('Zaksięgowane ' + done + '/' + todo.length + '…'); render(); return;
+            }
             var b = await book(r.num, date, acc, r.amount, com);
             done++;
-            if (!b.ok){ r.st = 'fail'; r.msg = b.err || 'nie wysłano'; fail++; say('Zaksięgowane ' + done + '/' + todo.length + '…'); render(); return; }
-            await sleep(300);
-            // Weryfikacja: platnosc ma sie pojawic w tabeli Payments, a open amount zejsc do zera.
-            var a = await readAuftrag(r.num);
+            var aPo = null;
+            if (!b.ok){
+                // Odmowa jest pewna tylko przy 4xx. Blad sieci, limit czasu i 5xx znacza „nie wiadomo" — zapis mogl
+                // wejsc. Dotad wiersz zostawal zaznaczony, a drugie klikniecie wysylalo POST jeszcze raz.
+                // Rozstrzyga liczba platnosci na auftragu: przybyla = zapis wszedl.
+                var kod = Number((String(b.err || '').match(/^HTTP (\d+)/) || [])[1] || 0);
+                await sleep(1200);
+                aPo = await readAuftrag(r.num);
+                var weszlo = !!aPo.ok && aPo.nPay != null && aPo.nPay > a0.nPay;
+                if (!weszlo && kod >= 400 && kod < 500){
+                    r.st = 'fail'; r.msg = (b.err || 'odmowa') + ' — serwer odmówił, nic nie zapisano'; fail++;
+                    say('Zaksięgowane ' + done + '/' + todo.length + '…'); render(); return;
+                }
+                if (!weszlo){
+                    // NIE WIADOMO. Wiersz wypada z ksiegowania (booked) — kolejna proba dopiero po swiezym „Sprawdź".
+                    r.st = 'fail'; r.niepewne = true; r.booked = true; r.sel = false; niep++;
+                    r.msg = 'NIE WIEM, czy zapis wszedł (' + (b.err || '?') + ') — sprawdź auftrag; drugi raz nie wysyłam '
+                          + '(ponownie dopiero po „Sprawdź")';
+                    say('Zaksięgowane ' + done + '/' + todo.length + '…'); render(); return;
+                }
+                r.msg = 'odpowiedź serwera: ' + (b.err || '?') + ', ale płatność przybyła';
+            }
+            if (!aPo){
+                await sleep(300);
+                // Weryfikacja: platnosc ma sie pojawic w tabeli Payments, a open amount zejsc do zera.
+                aPo = await readAuftrag(r.num);
+            }
+            var a = aPo;
             r.booked = true; r.sel = false;
             if (!a.ok){ r.st = 'part'; r.msg = 'wysłane, ale nie udało się odczytać auftraga do weryfikacji'; part++; }
             else {
-                var grew = a.nPay > r.nPay;
+                var grew = a.nPay > a0.nPay;
                 r.open = a.open; r.nPay = a.nPay;
+                // Gdy serwer odpowiedzial bledem, a platnosc przybyla — ta informacja zostaje przy wierszu.
+                var uwagaHttp = (b && !b.ok) ? (' (odpowiedź serwera: ' + (b.err || '?') + ', ale płatność przybyła)') : '';
                 if (!grew){ r.st = 'fail'; r.msg = 'w tabeli Payments nie przybyło księgowania — sprawdź ręcznie'; fail++; }
-                else if (eq(a.open, 0)){ r.st = 'done'; r.msg = ''; ok++; }
-                else { r.st = 'part'; r.msg = 'zaksięgowane, ale open amount = ' + f2(a.open) + ' (nie 0)'; part++; }
+                else if (eq(a.open, 0)){ r.st = 'done'; r.msg = uwagaHttp.trim(); ok++; }
+                else { r.st = 'part'; r.msg = 'zaksięgowane, ale open amount = ' + f2(a.open) + ' (nie 0)' + uwagaHttp; part++; }
             }
             say('Zaksięgowane ' + done + '/' + todo.length + '…');
             render();
@@ -89665,8 +90031,9 @@
             S.busy = false; $('#au-check').disabled = false; $('#au-stop').disabled = true;
             $('#au-book').disabled = !S.rows.filter(function(r){ return r.sel && bookable(r); }).length;
             say((S.abort ? ('Przerwane po ' + done + '/' + todo.length + '. ') : '')
-                + 'Zaksięgowane: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '') + '.',
-                fail ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
+                + 'Zaksięgowane: ✓ ' + ok + (part ? ('  ·  ⚠ do sprawdzenia ' + part) : '') + (fail ? ('  ·  ✗ nieudane ' + fail) : '')
+                + (niep ? ('  ·  ❓ nie wiadomo, czy weszło: ' + niep + ' — sprawdź te auftragi, zanim wyślesz je jeszcze raz') : '') + '.',
+                (fail || niep) ? '#c00' : (part ? '#c47f00' : '#0a7a2f'));
             render();
         }
     };
@@ -103959,20 +104326,39 @@
                     });
                 });
         }
-        setInterval(function (){
+        // DWA KANALY (przeglad 19.11.2026): Salda (stary klucz) i Bank Import (wlasny klucz). Dotad dzielily jedno miejsce
+        // na zlecenie i odpowiedz — przy jednoczesnej pracy jedno zagluszalo drugie i konczylo sie „limitem czasu".
+        // NASLUCH na zmiane wartosci dziala takze w karcie w tle; sam zegar na glownym watku jest tam dlawiony do raz na
+        // minute, a Bank Import czeka 30 s. Zegar zostaje jako zapas. Operacje mostu sa tylko do odczytu.
+        const KANALY = [{ z: MOST_Z, o: MOST_O, ost: ostatnieZlec },
+                        { z: 'tm_eu_most_zlec_bank', o: 'tm_eu_most_odp_bank', ost: '' }];
+        function obsluzEu(kan, v){
             let z = null;
-            try { z = JSON.parse(GM_getValue(MOST_Z, '') || 'null'); } catch (e){ z = null; }
-            if (!z || !z.id || z.id === ostatnieZlec) return;
+            try { z = (typeof v === 'string') ? JSON.parse(v || 'null') : v; } catch (e){ z = null; }
+            if (!z || !z.id || z.id === kan.ost) return;
             if (Date.now() - (z.kiedy || 0) > 180000) return;   // przeterminowanego nie ruszamy
-            ostatnieZlec = z.id;
+            kan.ost = z.id;
             wykonaj(z).then(function (d){
-                GM_setValue(MOST_O, JSON.stringify({ id: z.id, ok: true, dane: d, kiedy: Date.now() }));
+                GM_setValue(kan.o, JSON.stringify({ id: z.id, ok: true, dane: d, kiedy: Date.now() }));
                 zrobione++;
                 if (zrobione === 1) chmurka('HUB pobiera dane przez tę kartę — zostaw ją otwartą.',
                                             '#0a58ca', 8000);
             }, function (e){
-                GM_setValue(MOST_O, JSON.stringify({ id: z.id, ok: false,
+                GM_setValue(kan.o, JSON.stringify({ id: z.id, ok: false,
                     blad: (e && e.message) || String(e), kiedy: Date.now() }));
+            });
+        }
+        KANALY.forEach(function (kan){
+            try {
+                if (typeof GM_addValueChangeListener === 'function')
+                    GM_addValueChangeListener(kan.z, function (k, st, nw){ obsluzEu(kan, nw); });
+            } catch (e){}
+        });
+        setInterval(function (){
+            KANALY.forEach(function (kan){
+                let v = '';
+                try { v = GM_getValue(kan.z, '') || ''; } catch (e){ v = ''; }
+                obsluzEu(kan, v);
             });
         }, 600);
     }
@@ -105790,6 +106176,14 @@
             // i szukanie po niej potrafi nie trafic.
             accountNum: UC_KONTO, komentarz: UC_KOM, osoba: r.autor, osobaId: r.autorId
         });
+        // Update poszedl, nowej noty nie widac (most nie klika drugi raz) — „dokończ ręcznie" robiloby druga note.
+        if (t && !t.ok && (t.niepotwierdzone || (t.ksieg && t.ksieg.niepotwierdzone))){
+            r.st = 'part';
+            dopisz(r, 'ticket ❓ niepotwierdzony: ' + ((t.ksieg && t.ksieg.error) || t.error || 'Update wysłany, noty nie widać')
+                    + ' — NIE księguj ręcznie, najpierw sprawdź ticket');
+            if (t.status) dopisz(r, 'status ticketu: ' + t.status);
+            return;
+        }
         if (!t || !t.ok){
             r.st = 'part';
             dopisz(r, 'ticket NIE zaksięgowany: ' + ((t && ((t.ksieg && t.ksieg.error) || t.error)) || 'nieznany błąd') + ' — dokończ ręcznie');
@@ -107090,7 +107484,8 @@
     // wiec nie przepisujemy tego tutaj — podajemy mu ten sam plik ta sama droga, ktora
     // chodzi jego guzik „wgraj wyciąg". Plik idzie bajtami (base64), zeby kodowanie
     // rozstrzygal ten, kto je zna.
-    var MKT_MOST_Z = 'bank_imp_do_mkt';
+    var MKT_MOST_Z = 'bank_imp_do_mkt';       // stary klucz (bez adresu) — tylko dla Marketplace na starym kodzie
+    var MKT_MOST_Z2 = 'bank_imp_do_mkt2';     // zlecenie z adresem karty (bkKartaDok) — patrz init_mkt
     var MKT_MOST_O = 'bank_imp_do_mkt_odp';
     function bkB64(buf){
         var b = new Uint8Array(buf), s2 = '';
@@ -107112,8 +107507,11 @@
         if (waga > 4 * 1024 * 1024)
             throw new Error('pliki mają razem ponad 4 MB — przekaż je wprost w module Marketplace’s');
         var id = 'm' + Date.now().toString(36);
+        // Zlecenie Z ADRESEM tej karty, w osobnym kluczu: bierze je tylko Marketplace w TEJ karcie (nie karta w tle, nie
+        // karta na starym kodzie — ta nowego klucza nie slucha). Po czasie zlecenie wycofujemy (przeglad 19.11.2026).
+        var karta = bkKartaDok();
         gmSet(MKT_MOST_O, '');
-        gmSet(MKT_MOST_Z, JSON.stringify({ id: id, tryb: opcje.tryb || '', nazwa: lista[0].nazwa, b64: bkB64(lista[0].buf),
+        gmSet(MKT_MOST_Z2, JSON.stringify({ id: id, karta: karta, tryb: opcje.tryb || '', nazwa: lista[0].nazwa, b64: bkB64(lista[0].buf),
             pliki: lista.map(function (x){ return { nazwa: x.nazwa, b64: bkB64(x.buf) }; }), kiedy: Date.now() }));
         var limit = opcje.czas || 60000;
         return await new Promise(function (ok, zle){
@@ -107129,8 +107527,18 @@
                 }
                 if (Date.now() - start > limit){
                     clearInterval(zegar);
-                    zle(new Error('moduł „Księgowanie Marketplace’s" nie odpowiedział w '
-                                + Math.round(limit / 1000) + ' s — sprawdź, czy jest włączony w ⚙ Moduły'));
+                    // Wycofujemy zlecenie (o ile dalej czeka) — dotad zostawalo i moglo zostac wziete po czasie.
+                    // Marketplace zdejmuje zlecenie z magazynu w chwili, gdy je bierze: nie ma go — zostalo wziete, tylko
+                    // odpowiedz nie przyszla; wtedy NIE piszemy „wycofane" (przeglad 20.11.2026: zachecalo do drugiego przekazania).
+                    var wycofane = false;
+                    try { var zw = String(gmGet(MKT_MOST_Z2, '') || ''); if (zw && zw.indexOf('"' + id + '"') >= 0){ gmSet(MKT_MOST_Z2, ''); wycofane = true; } } catch (e){}
+                    zle(new Error(wycofane
+                        ? ('moduł „Księgowanie Marketplace’s" w TEJ karcie nie odpowiedział w ' + Math.round(limit / 1000)
+                           + ' s — sprawdź, czy jest włączony w ⚙ Moduły (zlecenie wycofane — można przekazać jeszcze raz)')
+                        : ('moduł „Księgowanie Marketplace’s" w TEJ karcie wziął plik, ale nie odpowiedział w ' + Math.round(limit / 1000)
+                           + ' s — ' + (opcje.tryb === 'rozpoznaj'
+                               ? 'rozpoznanie wypłat nie dotarło; spróbuj jeszcze raz (to tylko odczyt)'
+                               : 'zanim przekażesz go jeszcze raz, sprawdź w Marketplace’s, czy zlecenie wypłaty już powstało'))));
                 }
             }, 400);
         });
@@ -107911,8 +108319,11 @@
     var EU_XAUTH_NAG = 'x-auth-token';
     // Cialo zapytania — komplet parametrow DataTables, dokladnie taki, jaki wysyla panel.
     var EU_BODY = 'draw=1&columns%5B0%5D%5Bdata%5D=&columns%5B0%5D%5Bname%5D=&columns%5B0%5D%5Bsearchable%5D=false&columns%5B0%5D%5Borderable%5D=false&columns%5B0%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B0%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B1%5D%5Bdata%5D=&columns%5B1%5D%5Bname%5D=&columns%5B1%5D%5Bsearchable%5D=false&columns%5B1%5D%5Borderable%5D=false&columns%5B1%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B1%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B2%5D%5Bdata%5D=estado&columns%5B2%5D%5Bname%5D=&columns%5B2%5D%5Bsearchable%5D=false&columns%5B2%5D%5Borderable%5D=false&columns%5B2%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B2%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B3%5D%5Bdata%5D=entidade&columns%5B3%5D%5Bname%5D=&columns%5B3%5D%5Bsearchable%5D=false&columns%5B3%5D%5Borderable%5D=false&columns%5B3%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B3%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B4%5D%5Bdata%5D=referencia&columns%5B4%5D%5Bname%5D=&columns%5B4%5D%5Bsearchable%5D=true&columns%5B4%5D%5Borderable%5D=false&columns%5B4%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B4%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B5%5D%5Bdata%5D=nome_servico&columns%5B5%5D%5Bname%5D=&columns%5B5%5D%5Bsearchable%5D=false&columns%5B5%5D%5Borderable%5D=false&columns%5B5%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B5%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B6%5D%5Bdata%5D=valor&columns%5B6%5D%5Bname%5D=amount&columns%5B6%5D%5Bsearchable%5D=false&columns%5B6%5D%5Borderable%5D=true&columns%5B6%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B6%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B7%5D%5Bdata%5D=retencao&columns%5B7%5D%5Bname%5D=&columns%5B7%5D%5Bsearchable%5D=false&columns%5B7%5D%5Borderable%5D=false&columns%5B7%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B7%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B8%5D%5Bdata%5D=iva&columns%5B8%5D%5Bname%5D=&columns%5B8%5D%5Bsearchable%5D=false&columns%5B8%5D%5Borderable%5D=false&columns%5B8%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B8%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B9%5D%5Bdata%5D=nome_canal&columns%5B9%5D%5Bname%5D=&columns%5B9%5D%5Bsearchable%5D=false&columns%5B9%5D%5Borderable%5D=false&columns%5B9%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B9%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B10%5D%5Bdata%5D=identificador&columns%5B10%5D%5Bname%5D=&columns%5B10%5D%5Bsearchable%5D=true&columns%5B10%5D%5Borderable%5D=false&columns%5B10%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B10%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B11%5D%5Bdata%5D=data&columns%5B11%5D%5Bname%5D=date&columns%5B11%5D%5Bsearchable%5D=false&columns%5B11%5D%5Borderable%5D=true&columns%5B11%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B11%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B12%5D%5Bdata%5D=hora&columns%5B12%5D%5Bname%5D=&columns%5B12%5D%5Bsearchable%5D=true&columns%5B12%5D%5Borderable%5D=true&columns%5B12%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B12%5D%5Bsearch%5D%5Bregex%5D=false&columns%5B13%5D%5Bdata%5D=&columns%5B13%5D%5Bname%5D=&columns%5B13%5D%5Bsearchable%5D=false&columns%5B13%5D%5Borderable%5D=false&columns%5B13%5D%5Bsearch%5D%5Bvalue%5D=&columns%5B13%5D%5Bsearch%5D%5Bregex%5D=false&order%5B0%5D%5Bcolumn%5D=11&order%5B0%5D%5Bdir%5D=desc&order%5B1%5D%5Bcolumn%5D=12&order%5B1%5D%5Bdir%5D=desc&start=0&length=25&search%5Bvalue%5D=&search%5Bregex%5D=false';
-    var EU_MOST_Z  = 'tm_eu_most_zlec';      // i ten sam most, ktorym chodzi Salda
-    var EU_MOST_O  = 'tm_eu_most_odp';
+    // Ten sam most co Salda (wykonawca: init_eutok), ale WLASNY kanal (19.11.2026) — wspolny klucz z Saldami sprawial,
+    // ze przy jednoczesnej pracy jedno zagluszalo drugie. Karta eupago na starszym kodzie tego kanalu nie slucha:
+    // wtedy „nie odpowiedziała" — odswiez karte eupago.
+    var EU_MOST_Z  = 'tm_eu_most_zlec_bank';
+    var EU_MOST_O  = 'tm_eu_most_odp_bank';
     // Kody statusu prosto z panelu (select „comboStatus") — nie z pamieci.
     var EU_STATUSY = {
         'pendente': 'Pending', 'paga': 'Paid', 'em processamento': 'Processing',
@@ -108069,9 +108480,11 @@
                 // panelu lepiej powiedziec to szybko, niz kazac patrzec w pasek.
                 if (Date.now() - start > 30000){
                     clearInterval(zegar);
+                    try { var zw = String(gmGet(EU_MOST_Z, '') || ''); if (zw && zw.indexOf('"' + id + '"') >= 0) gmSet(EU_MOST_Z, ''); } catch (e){}
                     zle(new Error('karta panelu eupago nie odpowiedziała w 30 s — otwórz '
                         + 'https://clientes.eupago.pt/backoffice/index.html, zaloguj się '
-                        + 'i zostaw tę kartę otwartą, wtedy HUB pyta przez nią.'));
+                        + 'i zostaw tę kartę otwartą, wtedy HUB pyta przez nią. Jeśli jest otwarta — odśwież ją '
+                        + '(po wklejeniu nowej wersji HUB-a stara karta nie zna kanału Bank Importu).'));
                 }
             }, 400);
         });
@@ -108452,6 +108865,15 @@
             var nr = String(x.payment_descr == null ? '' : x.payment_descr).trim();
             var st = BK_NF[nr];
             if (!st || !st.kw) return;
+            // Wplata ma juz zapis wprost na auftragu (albo zapis bez potwierdzenia) — propozycji z guzikami
+            // „Zaksięguj tutaj" nie rysujemy. Dotad wracaly po udanym zapisie, aktywne (przeglad 19.11.2026).
+            var juzP = bkZaks(j, nr);
+            if (juzP){
+                h += '<div style="margin:6px 0;padding:6px 8px;background:#faf7f6;border:1px solid #DBD9D7;border-radius:6px;font-size:11px">'
+                  +  '<b style="color:#750000">Propozycje dla ' + esc(nr) + '</b> — wpłata ma już zapis na auftragu '
+                  +  esc(juzP.num) + ', propozycji nie pokazuję.</div>';
+                return;
+            }
             var k = st.kw;
             h += '<div style="margin:6px 0;padding:6px 8px;background:#faf7f6;border:1px solid #DBD9D7;border-radius:6px">'
               +  '<b style="font-size:11px;color:#750000">Propozycje dla ' + esc(nr) + '</b>'
@@ -108537,6 +108959,24 @@
         var trw = bkZaks(j, nr);
         if (!st && !trw) return '<span style="color:#888">—</span>';
         if (!st) st = {};
+        // Zapis „Zaksięguj tutaj" w toku albo bez odpowiedzi (stan ze sladu sprzed zapisu) — nie „✔", tylko
+        // ostrzezenie i dwa guziki do rozstrzygniecia. Slady sprzed tej zmiany nie maja `stan` i zostaja „✔".
+        if (!st.zaks && trw && (trw.stan === 'wysylka' || trw.stan === 'niepewne')){
+            if (S.lot['eu:' + (j && j.impId) + ':' + nr]) return '<span style="color:#c47f00;font-weight:700">⏳ księguję na auftragu ' + esc(trw.num) + '…</span>';
+            // Swiezy slad z INNEJ karty (do 5 min, bez bledu): tamta moze wlasnie czekac na odpowiedz. Guzikow
+            // rozstrzygniecia wtedy nie ma — „zdejmij" w trakcie zapisu prowadzilo przy HU do drugiego zapisu.
+            if (bkObcyWToku(trw)) return '<span style="color:#c47f00;font-weight:700">⏳ inna karta księguje tę wpłatę na auftragu '
+                                       + esc(trw.num) + ' (od ' + esc(String(trw.czas || '').replace('T', ' ').slice(11, 16))
+                                       + ') — poczekaj albo odśwież za kilka minut</span>';
+            return '<span style="color:#c00;font-weight:700">⚠ zapis na auftragu '
+                 + '<a href="/auction.php?number=' + esc(trw.num) + '&txnid=3" target="_blank" style="color:#c00">' + esc(trw.num) + '</a>'
+                 + ' wysłany ' + esc(String(trw.czas || '').replace('T', ' ').slice(0, 16)) + ' BEZ POTWIERDZENIA'
+                 + (trw.blad ? ' (' + esc(trw.blad) + ')' : '') + ' — sprawdź tabelę Payments</span>'
+                 + ' <button class="bk-nf-zaks-ok" data-nr="' + esc(nr) + '" style="margin-left:4px;padding:1px 6px;border:1px solid #0a7a2f;'
+                 + 'border-radius:5px;background:#fff;color:#0a7a2f;cursor:pointer;font-size:10px">✔ jest na auftragu</button>'
+                 + ' <button class="bk-nf-zaks-zdejmij" data-nr="' + esc(nr) + '" style="padding:1px 6px;border:1px solid #c00;'
+                 + 'border-radius:5px;background:#fff;color:#c00;cursor:pointer;font-size:10px">✖ nie ma — zdejmij ślad</button>';
+        }
         var zaks = st.zaks || (trw && trw.num) || '';
         if (zaks) return '<span style="color:#0a7a2f;font-weight:700">✔ zaksięgowane na auftragu '
                           + '<a href="/auction.php?number=' + esc(zaks) + '&txnid=3" target="_blank"'
@@ -109171,7 +109611,10 @@
                 + 'Import utworzy paczkę. NIE zaksięguje jej — to osobny przycisk.')) return;
             wb.disabled = true; say('wysyłam…', '#666');
             try {
-                var imp = await bkWyslij(bkBlob(S.rows), S.nazwa, cfg);
+                // bezZapasu jak przy HU, pobraniach i CZ: gdy nazwa pliku nie trafi na liscie importow, NIE bierzemy
+                // „najnowszej paczki tego banku" — przy dwoch wyciagach jednego dnia (albo cudzym imporcie) bylaby to
+                // obca paczka, a „Zaksięguj OK" poszloby na nia. Bez numeru zostaje pole do recznego wpisu (przeglad 19.11.2026).
+                var imp = await bkWyslij(bkBlob(S.rows), S.nazwa, cfg, { bezZapasu: true });
                 jobZapisz({ impId: imp, nazwa: S.nazwa, format: S.format, wierszy: S.rows.length - 1,
                             czas: new Date().toISOString(), booked: false,
                             daty: bkMapaDat(S.rows, fmt(S.format)) });
@@ -111474,13 +111917,19 @@
                 if (!euNarz && S.lot['hu:' + j.impId + ':' + (b.getAttribute('data-k') || '')]){
                     zMow(Z, j, 'Na tym wierszu trwa zapis wprost na auftragu — poczekaj na wynik.', '#c47f00'); return;
                 }
+                // To samo przy eupago („Zaksięguj tutaj" w tej karcie trwa na tym numerze transakcji).
+                if (euNarz && S.lot['eu:' + j.impId + ':' + (b.getAttribute('data-nr') || '')]){
+                    zMow(Z, j, 'Na tym wierszu trwa zapis wprost na auftragu — poczekaj na wynik.', '#c47f00'); return;
+                }
                 var rid = b.getAttribute('data-row'), num1 = b.getAttribute('data-num');
                 var lab = b.getAttribute('data-lab') || num1, nr = b.getAttribute('data-nr') || '';
                 var kw = Number(b.getAttribute('data-amt'));
                 var znaneW = b.getAttribute('data-imp') === '1';
                 // Wplata poszla juz wprost na auftrag? Eupago pamieta to po numerze transakcji,
-                // HU — po wierszu paczki (tytul przelewu nie jest unikalny).
-                var juz = euNarz ? bkZaks(j, nr) : zMapa(Z, 'zaksAuf')[b.getAttribute('data-k') || ''];
+                // HU — po wierszu paczki (tytul przelewu nie jest unikalny). Slad czytany swiezo (zMapa → Z.get),
+                // nie z `j` z chwili rysowania — zapis mogla zostawic inna karta.
+                var juz = euNarz ? (function (){ var w = zMapa(Z, 'zaksAuf')[nr]; return (w && w.num) ? w : bkZaks(j, nr); })()
+                                 : zMapa(Z, 'zaksAuf')[b.getAttribute('data-k') || ''];
                 b.disabled = true; b.textContent = 'czytam auftrag…';
                 var a = null;
                 try { a = await bkCzytajAuftrag(num1); }
@@ -111740,40 +112189,147 @@
                 say('Skopiowane: ' + esc(t) + ' — wklej w eupago w „Consult Transactions → Identifier".', '#0a7a2f');
             };
         });
+        // Niepewny zapis „Zaksięguj tutaj" (bez odpowiedzi albo przerwany F5) rozstrzyga czlowiek po spojrzeniu
+        // w auftrag — tak jak przy HU (bk-hu-zaks-ok / -zdejmij).
+        qa('.bk-nf-zaks-ok').forEach(function (b){
+            b.onclick = function (){
+                if (!zAktualne(Z, j)) return;
+                var nr = b.getAttribute('data-nr'), w = zMapa(Z, 'zaksAuf')[nr];
+                if (!w) return;
+                if (!confirm('Uznać, że wpłata ' + f2(w.kwota) + ' jest zaksięgowana na auftragu ' + w.num + '?\n\n'
+                    + 'Sprawdź to najpierw na stronie auftragu (tabela Payments).')) return;
+                w.stan = 'ok'; w.potwReczne = true;
+                zMapaZapisz(Z, 'zaksAuf', nr, w);
+                var st3 = BK_NF[nr] || (BK_NF[nr] = {}); st3.zaks = w.num;
+                rysujPaczke(Z, d);
+            };
+        });
+        qa('.bk-nf-zaks-zdejmij').forEach(function (b){
+            b.onclick = function (){
+                if (!zAktualne(Z, j)) return;
+                var nr = b.getAttribute('data-nr'), w = zMapa(Z, 'zaksAuf')[nr];
+                if (!w) return;
+                if (!confirm('Zdjąć ślad zapisu na auftragu ' + w.num + '?\n\nZrób to TYLKO wtedy, gdy na auftragu NIE ma '
+                    + 'tej płatności — inaczej „Zaksięguj tutaj" zaksięguje ją drugi raz.')) return;
+                zMapaZapisz(Z, 'zaksAuf', nr, null);
+                if (BK_NF[nr]) delete BK_NF[nr].zaks;
+                rysujPaczke(Z, d);
+            };
+        });
+        // „💾 Zaksięguj tutaj" (eupago, NOT FOUND) — jak sciezka HU (bk-hu-ks, przeglad 29.09.2026). Dotad: bez sladu
+        // przed zapisem, bez swiezego odczytu auftragu i bez kontroli open (propozycje po kwocie i dacie nie sprawdzaly
+        // go wcale), a po udanym zapisie bkPropozycje rysowalo te same guziki od nowa, aktywne — jedno klikniecie
+        // i „OK" ksiegowalo wplate drugi raz. Po bledzie sieci guzik wracal, choc zapis mogl wejsc (przeglad 19.11.2026).
         qa('.bk-nf-ks').forEach(function (b){
             b.onclick = async function (){
                 if (!zAktualne(Z, j)) return;
                 var nr = b.getAttribute('data-nr'), num1 = b.getAttribute('data-num');
                 var kw = Number(b.getAttribute('data-amt')), iso = b.getAttribute('data-iso');
-                var skasowany = b.getAttribute('data-del') === '1';
                 var konto = Z.konto();
                 var kto = F.odbicie || BK_CS;
+                var lotK = 'eu:' + j.impId + ':' + nr;
+                if (S.lot[lotK]) return;
                 if (!konto){
                     say('Nie wiem, na które konto księgować — wpisz numer konta w ustawieniach (krok 2).', '#c47f00');
                     return;
                 }
-                if (!confirm('Zaksięgować wpłatę na auftragu ' + num1 + '?\n\n'
-                    + 'Numer transakcji: ' + nr + '\n'
-                    + 'Kwota: ' + f2(kw) + '\n'
-                    + 'Konto: ' + konto + '\n'
-                    + 'Data: ' + iso + ' (z pliku)\n'
-                    + 'Komentarz płatności: pusty\n'
-                    + (skasowany
-                        ? ('\nAuftrag jest SKASOWANY, więc zaraz po zaksięgowaniu dopiszę komentarz\n'
-                           + 'z saldem („Auftrag value - Total of Payments: …") i odbiję go na '
-                           + kto + '.\n')
-                        : '')
-                    + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
-                    + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
-                b.disabled = true; b.textContent = 'księguję…';
-                var r = await bkKsiegujAuftrag(num1, iso, konto, kw);
-                if (r.ok){
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')){ say('Nie znam daty tej wpłaty — nie księguję.', '#c47f00'); return; }
+                if (!isFinite(kw) || kw <= 0){ say('Nie odczytałem kwoty wpłaty — nie księguję.', '#c47f00'); return; }
+                // Slad czytany SWIEZO ze zlecenia (zMapa → Z.get), nie z `j` z chwili rysowania: zapis mogla zaczac
+                // inna karta z ta sama paczka — tak jak przy HU (zMapa(Z, 'zaksAuf')[klucz]).
+                var zaksTeraz = function (){
+                    var w = zMapa(Z, 'zaksAuf')[nr];
+                    if (w && w.num) return w;
+                    var st0 = BK_NF[nr];
+                    return (st0 && st0.zaks) ? { num: st0.zaks } : null;
+                };
+                var juz0 = zaksTeraz();
+                if (juz0){
+                    say('Ta wpłata ma już zapis na auftragu ' + esc(juz0.num)
+                        + (juz0.stan === 'wysylka' || juz0.stan === 'niepewne' ? ' — BEZ POTWIERDZENIA; sprawdź auftrag i rozstrzygnij przy wierszu.' : '.'),
+                        '#c00');
+                    rysujPaczke(Z, d);
+                    return;
+                }
+                // Blokada na czas calej operacji (odczyt, pytanie, zapis) — przerysowanie w tym czasie
+                // pokazuje „księguję…" zamiast swiezego, aktywnego guzika.
+                S.lot[lotK] = 1;
+                b.disabled = true; b.textContent = 'czytam auftrag…';
+                try {
+                    var a = null;
+                    try { a = await bkCzytajAuftrag(num1); } catch (e){ a = { ok: false, err: (e && e.message) || String(e) }; }
+                    var skasowany = !!a && a.deleted === true;
+                    if (!a || (!a.ok && !skasowany)){ say('Nie księguję: ' + esc((a && a.err) || 'nie odczytałem auftragu'), '#c00'); return; }
+                    if (!skasowany && a.open == null){ say('Nie odczytałem open amount auftragu ' + esc(num1) + ' — księguj ręcznie.', '#c47f00'); return; }
+                    // Zywy auftrag: ksiegowac wolno tylko wtedy, gdy JEST NA CZYM — inaczej jedno klikniecie zrobiloby
+                    // nadplate. Liczy sie stan Z TEJ CHWILI, nie z wyszukiwania sprzed kilku minut.
+                    if (!skasowany && a.open + 0.005 < kw){
+                        say('Open amount ' + f2(a.open) + ' na auftragu ' + esc(num1) + ' nie pokrywa wpłaty ' + f2(kw)
+                            + ' — księguj ręcznie.', '#c00'); return;
+                    }
+                    if (!confirm('Zaksięgować wpłatę na auftragu ' + num1 + '?\n\n'
+                        + 'Numer transakcji: ' + nr + '\n'
+                        + 'Kwota: ' + f2(kw) + '\n'
+                        + 'Konto: ' + konto + '\n'
+                        + 'Data: ' + iso + ' (z pliku)\n'
+                        + 'Komentarz płatności: pusty\n'
+                        + (skasowany
+                            ? ('\nAuftrag jest SKASOWANY, więc zaraz po zaksięgowaniu dopiszę komentarz\n'
+                               + 'z saldem („Auftrag value - Total of Payments: …") i odbiję go na '
+                               + kto + '.\n')
+                            : ('Open amount na auftragu: ' + f2(a.open) + '\n'))
+                        + '\nOdpowiada to formularzowi „Make payment" na stronie auftragu.'
+                        + '\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+                    // Jeszcze raz PO pytaniu: w tym czasie wplata mogla pojsc z innej karty albo innym guzikiem.
+                    if (!zAktualne(Z, j)) return;
+                    if (zaksTeraz()){ say('Ta wpłata została w międzyczasie zaksięgowana wprost na auftragu (albo zapis właśnie trwa w innej karcie).', '#c47f00'); return; }
+                    // Slad PRZED zapisem: po F5 albo zerwanym polaczeniu guzik nie wroci, dopoki czlowiek nie
+                    // sprawdzi auftragu (pamiec modulu ginie po odswiezeniu, slad przy zleceniu zostaje).
+                    var wpis = { num: num1, kwota: kw, iso: iso, konto: konto, stan: 'wysylka',
+                                 czas: new Date().toISOString(), skas: skasowany, karta: bkKarta() };
+                    zMapaZapisz(Z, 'zaksAuf', nr, wpis);
+                    b.textContent = 'księguję…';
+                    var r = await bkKsiegujAuftrag(num1, iso, konto, kw);
+                    if (!r.ok){
+                        // Rozstrzyga liczba platnosci na zywym auftragu: przybyla = zapis wszedl mimo bledu. Odmowa
+                        // jest pewna tylko przy 4xx — 5xx i brak odpowiedzi to „nie wiadomo" (jak przy HU).
+                        var kod = Number((String(r.err || '').match(/^HTTP (\d+)/) || [])[1] || 0), weszlo = false;
+                        if (!skasowany && a.nPay != null){
+                            try { var po0 = await bkCzytajAuftrag(num1); weszlo = !!po0.ok && po0.nPay != null && po0.nPay > a.nPay; }
+                            catch (e){ weszlo = false; }
+                        }
+                        if (!weszlo && kod >= 400 && kod < 500){
+                            zMapaZapisz(Z, 'zaksAuf', nr, null);
+                            say('Nie zaksięgowałem na auftragu ' + esc(num1) + ': ' + esc(r.err) + ' (serwer odmówił).', '#c00');
+                            return;
+                        }
+                        if (!weszlo){
+                            wpis.stan = 'niepewne'; wpis.blad = r.err || '?';
+                            zMapaZapisz(Z, 'zaksAuf', nr, wpis);
+                            say('Nie wiem, czy zapis na auftragu ' + esc(num1) + ' przeszedł (' + esc(r.err || '?')
+                                + ') — sprawdź auftrag i rozstrzygnij przy wierszu. Nie klikaj „Zaksięguj" jeszcze raz.', '#c00');
+                            return;
+                        }
+                        wpis.bladHttp = r.err;
+                    }
+                    // Kontrola zapisu PRZED „ok": HTTP 200 to jeszcze nie dowod — na zywym auftragu liczymy platnosci przed
+                    // i po. Bez nowej platnosci wynik jest niepewny (zapis mogl przepasc albo pokazac sie pozniej) — wiersz
+                    // nie moze wtedy stac jako „✔ zaksięgowane" (po F5 nic by o tym nie mowilo).
+                    if (!skasowany){
+                        try { var po1 = await bkCzytajAuftrag(num1); if (po1.ok && a.nPay != null && po1.nPay != null) wpis.kontrola = po1.nPay - a.nPay; }
+                        catch (e){}
+                    }
+                    if (wpis.kontrola === 0){
+                        wpis.stan = 'niepewne'; wpis.blad = 'serwer odpowiedział OK, ale na auftragu nie przybyła płatność';
+                        zMapaZapisz(Z, 'zaksAuf', nr, wpis);
+                        say('Wysłane na auftrag ' + esc(num1) + ', ale nowej płatności tam nie widać — sprawdź tabelę Payments '
+                            + 'i rozstrzygnij przy wierszu. Nie klikaj „Zaksięguj" jeszcze raz.', '#c00');
+                        return;
+                    }
+                    wpis.stan = 'ok';
+                    zMapaZapisz(Z, 'zaksAuf', nr, wpis);
                     var st2 = BK_NF[nr] || (BK_NF[nr] = {});
                     st2.zaks = num1;
-                    // Slad NA TRWALE, przy zleceniu. Pamiec modulu ginie po odswiezeniu
-                    // strony, a wtedy nic juz nie mowilo, ze ta wplata poszla na auftrag —
-                    // i latwo bylo przestawic wiersz na OK, czyli zaksiegowac ja drugi raz.
-                    zMapaZapisz(Z, 'zaksAuf', nr, { num: num1, kwota: kw, iso: iso, konto: konto });
                     var dop = '';
                     if (skasowany){
                         b.textContent = 'odbijam komentarz…';
@@ -111787,11 +112343,10 @@
                     }
                     say('Zaksięgowane na auftragu ' + esc(num1) + ' — ' + f2(kw) + ' na koncie '
                         + esc(konto) + '.' + esc(dop), po_kolor(st2));
-                } else {
-                    say('Nie zaksięgowałem na auftragu ' + esc(num1) + ': ' + esc(r.err || '?'), '#c00');
-                    b.disabled = false;
+                } finally {
+                    delete S.lot[lotK];
+                    rysujPaczke(Z, d);
                 }
-                rysujPaczke(Z, d);
             };
         });
     }
@@ -114235,47 +114790,121 @@
                      comprovativo: 'comprovativo składane przez panel' };
     // Zlecenie wykonuje KARTA PANELU eupago. Gdy jej nie ma, nic sie nie dzieje —
     // a puste „w toku…" wyglada wtedy jak zawieszenie. Dlatego odliczamy na glos.
+    // Kto wzial zlecenie (wpis karty eupago, init_zwrop): { id, karta, kiedy, start? }. `start` = karta je wykonuje.
+    var ZW_OP_ZAJ = 'zwr_op_zajete';
+    // JEDEN nasluch odpowiedzi na cala karte. Dotad kazde wywolanie mostem dokladalo nowy (i zaden nie znikal),
+    // wiec po kilku zwrotach kazda odpowiedz przechodzila przez kilkanascie martwych funkcji.
+    var mostCzeka = {};                 // id zlecenia -> przyjmij(v)
+    var mostNasluch = 0;                // kiedy wlaczony nasluch (0 = jeszcze nie)
+    // KARTA EUPAGO NA STARYM KODZIE. Wykonawca sprzed adresowania (puls bez `karta`) wykonuje KAZDE zlecenie, takze
+    // zaadresowane do innej karty — obok karty na nowym kodzie zwrot poszedlby dwa razy. Karta nieodswiezona po
+    // wklejeniu nowej wersji HUB-a dalej liczy starym kodem, a numer wersji tego nie zdradzi, gdy poprawka idzie pod
+    // tym samym numerem. Dlatego pilnujemy pulsow: swiezy puls bez `karta` widziany niedawno = zwrotu nie wysylamy.
+    var pulsStaryKod = 0;               // kiedy ostatnio widziany swiezy puls bez `karta`
+    function pulsObserwuj(v){
+        var p = null;
+        try { p = (typeof v === 'string') ? JSON.parse(v || 'null') : v; } catch (e){ return; }
+        if (p && p.czas && Date.now() - p.czas < 5000 && !p.karta) pulsStaryKod = Date.now();
+    }
+    function mostNasluchaj(){
+        if (mostNasluch) return;
+        mostNasluch = Date.now();
+        try {
+            if (typeof GM_addValueChangeListener === 'function'){
+                GM_addValueChangeListener(ZW_OP_O, function (k, st, nw){
+                    Object.keys(mostCzeka).forEach(function (id){ try { mostCzeka[id](nw); } catch (e){} });
+                });
+                GM_addValueChangeListener(ZW_OP_H, function (k, st, nw){ pulsObserwuj(nw); });
+            }
+        } catch (e){}
+        pulsObserwuj(gmGet(ZW_OP_H, ''));
+    }
+    // Przed zwrotem pulsy obserwujemy co najmniej tyle (kazda karta eupago daje puls co 0,7 s, a magazyn trzyma tylko
+    // ostatni), zeby karta na starym kodzie zdazyla sie pokazac. W zwyklym przebiegu i tak mija wiecej: zwrot idzie
+    // po odarchiwizowaniu i szczegolach platnosci.
+    var PULS_OBSERWUJ_MS = 2500;
     function mostem(op, dane, ile){
+        mostNasluchaj();
+        var opoz = (op === 'refund') ? Math.max(0, PULS_OBSERWUJ_MS - (Date.now() - mostNasluch)) : 0;
+        if (!opoz) return mostemTeraz(op, dane, ile);
+        return new Promise(function (r){ setTimeout(r, opoz); }).then(function (){ return mostemTeraz(op, dane, ile); });
+    }
+    function mostemTeraz(op, dane, ile){
         return new Promise(function (ok, zle){
-            var id = 'zwr' + (++opNr) + '_' + String(Math.random()).slice(2, 8);
-            var z = { id: id, op: op, kiedy: Date.now() };
+            var mojNr = ++opNr;
+            var id = 'zwr' + mojNr + '_' + String(Math.random()).slice(2, 8);
+            var limit = ile || 60000;
+            // `do` = do kiedy czekamy. Karta eupago nie wezmie zlecenia, ktorego termin minal albo zaraz minie —
+            // dotad brala zlecenia do 5 minut wstecz, takze takie, na ktore modul juz nie czekal.
+            var z = { id: id, op: op, kiedy: Date.now(), do: Date.now() + limit };
             Object.keys(dane || {}).forEach(function (k){ z[k] = dane[k]; });
+            // ADRES: karta eupago z ostatniego pulsu (puls co 0,7 s) — wykona tylko ona, choc otwartych kart jest kilka.
+            // Bez swiezego pulsu zlecenie idzie bez adresu; wezmie je karta otwarta w trakcie czekania (init_zwrop).
+            var p0 = puls();
+            pulsObserwuj(p0);
+            if (p0 && p0.karta && p0.czas && Date.now() - p0.czas < 5000) z.karta = p0.karta;
+            if (op === 'refund'){
+                // ZWROT tylko z adresem i tylko wtedy, gdy zadna karta eupago nie liczy starym kodem. Bez slowa „IBAN"
+                // w tresci: wolajacy rozpoznaje po nim odmowe „trzeba przelewu" i ponawia zwrot przelewem.
+                var odmowa = '';
+                if (pulsStaryKod && Date.now() - pulsStaryKod < 15000)
+                    odmowa = 'jedna z kart clientes.eupago.pt liczy STARYM kodem HUB-a (nie odświeżona po wklejeniu nowej wersji) '
+                           + 'i wykonałaby ten zwrot drugi raz. ODŚWIEŻ wszystkie karty eupago (albo zamknij nadmiarowe) i spróbuj ponownie.';
+                else if (!z.karta)
+                    odmowa = 'nie widzę świeżego pulsu karty clientes.eupago.pt z tej wersji HUB-a — otwórz ją albo odśwież, '
+                           + 'zaloguj się i spróbuj ponownie.';
+                if (odmowa){
+                    dz('MOST ✋ zwrot wstrzymany', odmowa, pulsOpis());
+                    zle(new Error('zwrotu NIE wysłałem: ' + odmowa));
+                    return;
+                }
+            }
             dz('MOST →', op, pulsOpis(), 'refid=' + (dane && dane.refid || '—'),
                'trid=' + (dane && dane.trid || '—'),
                'kwota=' + (dane && dane.amount != null ? dane.amount : '—'),
                'iban=' + maskIban(dane && dane.iban),
                'bic=' + ((dane && dane.bic) || '—'));
             gmSet(ZW_OP_Z, JSON.stringify(z));
-            var limit = ile || 60000;
             var start = Date.now(), koniec = start + limit;
             var opis = OP_NAZWY[op] || op;
             say('⏳ ' + opis + ' — czekam na kartę panelu eupago…', '#c47f00');
             // Odpowiedz odbieramy nasluchem, gdy jest dostepny — zegar zostaje do
             // odliczania czasu i jako zapas.
             var skonczone = false;
+            // Rozstrzygniecie odpowiedzi karty eupago — z nasluchu, z zegara albo tuz po czasie.
+            var wynik = function (o2){
+                gmSet(ZW_OP_O, '');
+                if (o2.ver && o2.ver !== ZW_VER){
+                    if (o2.ok && op === 'refund'){
+                        // Zwrot WYKONANY, tyle ze przez karte na innej wersji — nie wolno nazwac tego odmowa (wolajacy
+                        // archiwizowalby platnosc i pisal „zwrot odrzucony").
+                        var bw = new Error('karta panelu eupago na wersji ' + o2.ver + ' (moduł: ' + ZW_VER + ') zgłosiła ZWROT JAKO WYKONANY. '
+                                         + 'Odśwież kartę clientes.eupago.pt; sprawdź płatność w panelu eupago.');
+                        bw.niepewne = true;
+                        zle(bw);
+                        return;
+                    }
+                    zle(new Error('karta panelu eupago pracuje na wersji ' + o2.ver
+                                + ', a moduł na ' + ZW_VER
+                                + ' — ODŚWIEŻ kartę clientes.eupago.pt i spróbuj ponownie'));
+                    return;
+                }
+                dz('MOST ←', op, o2.ok ? 'OK' : ('BŁĄD: ' + (o2.err || '?')),
+                   o2.trid ? ('trid=' + o2.trid) : '');
+                if (o2.ok) ok(o2); else zle(new Error(o2.err || 'karta panelu odmówiła'));
+            };
             var przyjmij = function (v){
                 if (skonczone) return false;
                 var o2 = null;
                 try { o2 = v ? JSON.parse(v) : null; } catch (e){ return false; }
                 if (!o2 || o2.id !== id) return false;
                 skonczone = true;
+                delete mostCzeka[id];
                 clearInterval(zegar);
-                gmSet(ZW_OP_O, '');
-                if (o2.ver && o2.ver !== ZW_VER){
-                    zle(new Error('karta panelu eupago pracuje na wersji ' + o2.ver
-                                + ', a moduł na ' + ZW_VER
-                                + ' — ODŚWIEŻ kartę clientes.eupago.pt i spróbuj ponownie'));
-                    return true;
-                }
-                dz('MOST ←', op, o2.ok ? 'OK' : ('BŁĄD: ' + (o2.err || '?')),
-                   o2.trid ? ('trid=' + o2.trid) : '');
-                if (o2.ok) ok(o2); else zle(new Error(o2.err || 'karta panelu odmówiła'));
+                wynik(o2);
                 return true;
             };
-            try {
-                if (typeof GM_addValueChangeListener === 'function')
-                    GM_addValueChangeListener(ZW_OP_O, function (k, st, nw){ przyjmij(nw); });
-            } catch (e){}
+            mostCzeka[id] = przyjmij;
             var zegar = setInterval(function (){
                 if (przyjmij(gmGet(ZW_OP_O, ''))) return;
                 if (skonczone) return;
@@ -114287,10 +114916,52 @@
                       + 'jeśli właśnie zainstalowałeś nową wersję, odśwież ją.', '#c47f00');
                 if (Date.now() > koniec){
                     clearInterval(zegar); skonczone = true;
-                    zle(new Error('karta panelu eupago nie odpowiedziała przez '
-                                + Math.round(limit / 1000) + ' s. Otwórz clientes.eupago.pt, '
-                                + 'zaloguj się i ODŚWIEŻ kartę, potem spróbuj ponownie. '
-                                + 'Płatność została w archiwum — nic się nie zmieniło'));
+                    delete mostCzeka[id];
+                    // PO CZASIE. Dotad zlecenie zostawalo w magazynie, a komunikat mowil „nic się nie zmieniło"
+                    // i radzil odswiezyc karte eupago — odswiezona karta brala wtedy zlecenie (do 5 minut wstecz)
+                    // i robila zwrot, ktorego modul juz nie zapisal (bez ksiegowania, komentarza, Refund request).
+                    // Teraz: wycofujemy zlecenie (o ile dalej czeka) i po chwili czytamy wpis karty. `start` z naszym
+                    // id = karta zaczela je wykonywac, wiec skutek jest NIEZNANY; bez niego — nikt go nie wzial
+                    // i juz nie wezmie (karta przed wykonaniem sprawdza, czy zlecenie dalej stoi).
+                    try {
+                        var zw = String(gmGet(ZW_OP_Z, '') || '');
+                        if (zw && zw.indexOf('"' + id + '"') >= 0) gmSet(ZW_OP_Z, '');
+                    } catch (e){}
+                    setTimeout(function (){
+                        // Odpowiedz, ktora przyszla tuz po czasie, rozstrzyga normalnie (zamiast „mógł pójść").
+                        var o3 = null;
+                        try { o3 = JSON.parse(gmGet(ZW_OP_O, '') || 'null'); } catch (e){ o3 = null; }
+                        if (o3 && o3.id === id){ dz('MOST ← po czasie', op); wynik(o3); return; }
+                        var zaj = null;
+                        try { zaj = JSON.parse(gmGet(ZW_OP_ZAJ, '') || 'null'); } catch (e){ zaj = null; }
+                        var wziete = !!(zaj && zaj.id === id && zaj.start);
+                        // Wpis „kto wziął” jest jeden na wszystkie zlecenia. Gdy po naszym poszlo inne (np. comprovativo
+                        // z „Potwierdzenia” w trakcie zwrotu), moglo nadpisac nasz — brak wpisu niczego wtedy nie dowodzi.
+                        var niejasne = !wziete && opNr !== mojNr;
+                        dz('MOST ✖ czas', op, wziete ? 'karta WZIĘŁA zlecenie — skutek nieznany'
+                                                     : (niejasne ? 'nie wiem, czy karta wzięła (po nim poszło inne zlecenie) — skutek nieznany'
+                                                                 : 'nikt nie wziął — zlecenie wycofane'),
+                           pulsOpis());
+                        var blad;
+                        if (wziete || niejasne){
+                            // Bez slowa „IBAN" w tresci: wolajacy zwrot rozpoznaje po nim odmowe „trzeba przelewu"
+                            // i ponawia zwrot przelewem — tu byloby to drugie wyplacenie pieniedzy.
+                            blad = new Error((wziete
+                                    ? 'karta panelu eupago PRZYJĘŁA zlecenie („' + opis + '”) o ' + new Date(zaj.start).toTimeString().slice(0, 8)
+                                    : 'nie wiem, czy karta panelu eupago przyjęła zlecenie („' + opis + '”) — w międzyczasie poszło inne')
+                                + ', a odpowiedzi nie było przez ' + Math.round(limit / 1000) + ' s — '
+                                + (op === 'refund'
+                                   ? 'ZWROT MÓGŁ ZOSTAĆ WYKONANY. NIE ponawiaj: sprawdź tę płatność w panelu eupago, zanim zrobisz cokolwiek ręcznie.'
+                                   : 'operacja mogła się wykonać — sprawdź tę płatność w panelu eupago.'));
+                            blad.niepewne = true;
+                        } else {
+                            blad = new Error('karta panelu eupago nie odpowiedziała przez ' + Math.round(limit / 1000)
+                                + ' s i zlecenia nie wzięła — wycofałem je, więc nie wykona się później. '
+                                + 'Otwórz clientes.eupago.pt, zaloguj się i ODŚWIEŻ kartę, potem spróbuj ponownie.'
+                                + (op === 'unarchive' ? ' Płatność została w archiwum.' : ''));
+                        }
+                        zle(blad);
+                    }, 1200);
                 }
             }, 400);
         });
@@ -115155,8 +115826,34 @@
             // druga platnosc obok oryginalnej i wywala open amount na podwojny minus —
             // sprawdzone na auftragu 15532654. Ujemna zdejmuje ja z sumy wplat.
             var kwotaKsieg = -Math.abs(r.kwota);
+            // Ile platnosci tej kwoty stoi na auftragu PRZED zapisem. Dotad po bledzie odpowiedzi (siec, limit czasu, 5xx)
+            // wiersz mowil „NIE zaksięgowane — zrób ręcznie", choc zapis mogl wejsc — reczne ksiegowanie robilo wtedy dubel
+            // (przeglad 19.11.2026). Teraz po bledzie rozstrzyga liczba takich platnosci po zapisie.
+            var tejKwoty = function (a){
+                return (a && a.ok) ? (a.wyplaty || []).filter(function (p){ return Math.abs(Number(p.kwota) - kwotaKsieg) < 0.005; }).length : null;
+            };
+            var ilePrzed = null;
+            try { ilePrzed = tejKwoty(await czytajAuftrag(r.auf)); } catch (e){ ilePrzed = null; }
             var b = await ksiegujAuftrag(r.auf, dzisISO(), kwotaKsieg, tekst);
-            if (!b.ok){ dopisz(r, 'auftrag: NIE zaksięgowane (' + b.err + ') — zrób ręcznie'); return; }
+            if (!b.ok){
+                var kod = Number((String(b.err || '').match(/^HTTP (\d+)/) || [])[1] || 0), ilePo = null;
+                if (ilePrzed != null){
+                    try { await new Promise(function (ok){ setTimeout(ok, 1500); }); ilePo = tejKwoty(await czytajAuftrag(r.auf)); }
+                    catch (e){ ilePo = null; }
+                }
+                var weszlo = ilePrzed != null && ilePo != null && ilePo > ilePrzed;
+                if (!weszlo){
+                    dz('POST auction.php — błąd', b.err, 'płatności tej kwoty przed=' + ilePrzed + ' po=' + ilePo);
+                    if (kod >= 400 && kod < 500 && ilePo != null){
+                        dopisz(r, 'auftrag: NIE zaksięgowane (' + b.err + ', serwer odmówił, płatności nie przybyło) — zaksięguj ręcznie');
+                    } else {
+                        dopisz(r, 'auftrag: NIE WIEM, czy zaksięgowane (' + b.err + ') — sprawdź tabelę Payments auftragu ' + r.auf
+                                + ' (' + f2(kwotaKsieg) + '); NIE księguj ręcznie, zanim nie sprawdzisz');
+                    }
+                    return;
+                }
+                dopisz(r, 'auftrag: odpowiedź serwera ' + b.err + ', ale płatność ' + f2(kwotaKsieg) + ' przybyła');
+            }
             dopisz(r, 'auftrag: zaksięgowane ' + f2(kwotaKsieg) + ' na ' + ZW_KONTO);
             // Nowy open amount czytamy WPROST z auftragu, zamiast liczyc go w pamieci.
             // Liczony bylby tylko naszym domyslem; odczytany potwierdza ksiegowanie.
@@ -115215,6 +115912,13 @@
                 rozbijNaPozycje: true
             });
         } catch (e){ t = { ok: false, error: (e && e.message) || String(e) }; }
+        // Update w tickecie poszedl, a nowej noty nie widac — nota moze pojawic sie za kilka minut. „Dokończ ręcznie"
+        // konczyloby sie druga nota, wiec tu mowimy co innego.
+        if (t && !t.ok && (t.niepotwierdzone || (t.ksieg && t.ksieg.niepotwierdzone))){
+            dopisz(r, 'ticket ❓ niepotwierdzony: ' + ((t.ksieg && t.ksieg.error) || t.error || 'Update wysłany, noty nie widać')
+                    + ' — NIE księguj ręcznie, najpierw sprawdź ticket');
+            return;
+        }
         if (!t || !t.ok){
             dopisz(r, 'ticket NIE zaksięgowany: '
                     + ((t && ((t.ksieg && t.ksieg.error) || t.error)) || 'nieznany błąd')
@@ -115632,6 +116336,17 @@
     // Kolejnosc jak przy recznej robocie: odarchiwizuj -> szczegoly (trid) -> zwrot.
     // Gdy zwrot padnie, platnosc MUSI wrocic do archiwum — inaczej zostaje wyciagnieta
     // i nikt o niej nie pamieta.
+    // Zwrot o NIEZNANYM skutku: karta eupago wziela zlecenie, a odpowiedz nie przyszla na czas. Bez ponowienia,
+    // bez archiwizacji i bez zapisu skutkow — kazdy z tych krokow zaklada wiedze, ktorej nie mamy. Stan „fail"
+    // nie pozwala zwrocic jeszcze raz bez „Sprawdź", a ta kontrola (euZwroty) widzi zwroty z eupago.
+    function zwrotNiepewny(r, msg){
+        r.st = 'fail';
+        r.zwrotNiepewny = true;
+        dz('ZWROT NIEPEWNY', r.nr, 'refid=' + (r.refid || '—'), 'trid=' + (r.trid || '—'), 'kwota=' + r.kwota);
+        dopisz(r, '⚠ ZWROT MÓGŁ POJŚĆ — ' + msg + ' Nie zapisałem skutków (auftrag/ticket, komentarz, Refund request) '
+                + 'i nie archiwizowałem płatności. Po sprawdzeniu w eupago: zwrot jest → zapisz skutki ręcznie; '
+                + 'zwrotu nie ma → „Sprawdź” i zwróć jeszcze raz.');
+    }
     async function wykonaj(r){
         r.st = 'busy';
         var odarch = false;
@@ -115734,6 +116449,11 @@
             await mostem('refund', { trid: r.trid, amount: r.kwota, reason: powod, iban: '' }, 120000);
         } catch (e){
             var msg = String((e && e.message) || e);
+            // Karta eupago wziela zlecenie i nie odpowiedziala na czas — zwrot MOGL pojsc. Nie ponawiamy
+            // (ani na zrodlo, ani przelewem), nie archiwizujemy i nie zapisujemy skutkow: decyduje czlowiek po
+            // sprawdzeniu w eupago. Wiersz konczy jako „fail", wiec do ponownego zwrotu trzeba „Sprawdź",
+            // a ta kontrola (euZwroty) zobaczy zwrot, jesli poszedl.
+            if (e && e.niepewne){ zwrotNiepewny(r, msg); return; }
             // IBAN_MISSING znaczy, ze na zrodlo sie nie da — trzeba przelewu. IBAN mamy
             // w tabelce „Refund request". To odmowa WALIDACJI, wiec pieniadze jeszcze
             // sie nie ruszyly i ponowienie nie grozi podwojnym zwrotem.
@@ -115762,6 +116482,7 @@
                         dopisz(r, 'UWAGA: karta panelu wysłała PUSTY IBAN mimo że go podałem — odśwież ją');
                     r.ibanUzyty = ibanZTool;
                 } catch (e3){
+                    if (e3 && e3.niepewne){ zwrotNiepewny(r, String(e3.message || e3)); return; }
                     r.st = 'fail'; dopisz(r, 'zwrot przelewem też odrzucony: ' + ((e3 && e3.message) || e3));
                     if (odarch){
                     try { await mostem('archive', { refid: r.refid }); dopisz(r, 'zarchiwizowana z powrotem'); }
@@ -117042,6 +117763,31 @@
         throw new Error('nieznana operacja „' + z.op + '"');
     }
 
+    // JEDNA KARTA NA ZLECENIE. Nasluch odpala sie we WSZYSTKICH kartach eupago naraz (takze w zduplikowanej),
+    // a `ostatnie` jest tylko pamiecia tej karty — dwie otwarte karty wykonywaly ten sam zwrot dwa razy
+    // (eupago przyjmuje kilka czesciowych zwrotow jednej platnosci).
+    // Droga glowna: modul w prologistics ADRESUJE zlecenie (z.karta) do karty z ostatniego pulsu — tak jak most
+    // Bank Import → INS (z.karta). Wykonuje wylacznie ta karta; reszta zlecenia nie rusza.
+    // Zapas dla zlecenia bez adresu (puls stary albo modul na starszym kodzie): karta ZAJMUJE zlecenie wpisem
+    // w ZW_OP_ZAJ, po chwili sprawdza, czy wpis dalej jest jej, i wykonuje tylko wtedy. Gdy menedzer rozglosi
+    // zapisy dwoch kart w innej kolejnosci, moze nie wykonac zadna — modul wycofa wtedy zlecenie po czasie
+    // („nikt nie wziął"), ale dubla nie bedzie.
+    // Przed wykonaniem karta dopisuje `start` — modul po przekroczeniu czasu czyta go i wie, czy zwrot mogl pojsc.
+    var ZW_OP_ZAJ = 'zwr_op_zajete';
+    var KARTA = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    var ZAJ_CZEKAJ_MS = 600;
+    function czytajZaj(){ try { return JSON.parse(GM_getValue(ZW_OP_ZAJ, '') || 'null'); } catch (e){ return null; } }
+    // Zlecenie z terminem (z.do) bierzemy tylko, gdy do terminu zostal jeszcze zapas (15 s, przy krotkim czekaniu
+    // cwierc czasu) — po terminie modul juz nie czeka i nie zapisalby skutkow zwrotu. Zlecenie bez terminu
+    // (starsza karta prologistics): 5 minut jak dotad.
+    function przeterminowane(z){
+        var t = Date.now();
+        if (z.do){
+            var zapas = Math.min(15000, Math.max(0, (Number(z.do) - Number(z.kiedy || z.do)) / 4));
+            return t > Number(z.do) - zapas;
+        }
+        return !!(z.kiedy && (t - z.kiedy) > 300000);
+    }
     var ostatnie = '';
     function obsluz(s){
         s = String(s || '');
@@ -117050,9 +117796,31 @@
         var z = null;
         try { z = JSON.parse(s); } catch (e){ return; }
         if (!z || !z.id) return;
-        // Zlecenia starsze niz pieciu minut ignorujemy — to resztka po zamknietej karcie.
-        if (z.kiedy && (Date.now() - z.kiedy) > 300000) return;
-        try { GM_setValue(ZW_OP_Z, ''); } catch (e){}
+        // Zlecenia przeterminowane ignorujemy — to resztka po zamknietej karcie albo zlecenie, na ktore nikt juz nie czeka.
+        if (przeterminowane(z)) return;
+        if (z.karta){
+            if (z.karta !== KARTA) return;               // zlecenie dla innej karty eupago
+            try { GM_setValue(ZW_OP_ZAJ, JSON.stringify({ id: z.id, karta: KARTA, kiedy: Date.now(), start: Date.now() })); } catch (e){ return; }
+            try { GM_setValue(ZW_OP_Z, ''); } catch (e){}
+            wykonajZlecenie(z);
+            return;
+        }
+        var zaj = czytajZaj();
+        if (zaj && zaj.id === z.id) return;             // to zlecenie zajela juz inna karta
+        try { GM_setValue(ZW_OP_ZAJ, JSON.stringify({ id: z.id, karta: KARTA, kiedy: Date.now() })); } catch (e){ return; }
+        setTimeout(function (){
+            var moje = czytajZaj();
+            if (!moje || moje.id !== z.id || moje.karta !== KARTA) return;      // wygrala inna karta
+            var jest = '';
+            try { jest = String(GM_getValue(ZW_OP_Z, '') || ''); } catch (e){ return; }
+            if (jest !== s) return;                      // zlecenie wycofane (modul przestal czekac) albo podmienione
+            if (przeterminowane(z)) return;
+            try { GM_setValue(ZW_OP_ZAJ, JSON.stringify({ id: z.id, karta: KARTA, kiedy: moje.kiedy, start: Date.now() })); } catch (e){ return; }
+            try { GM_setValue(ZW_OP_Z, ''); } catch (e){}
+            wykonajZlecenie(z);
+        }, ZAJ_CZEKAJ_MS);
+    }
+    function wykonajZlecenie(z){
         chmurka('HUB: ' + z.op + '…', '#332524', 4000);
         wykonaj(z).then(function (d){
             odpowiedz(z.id, true, d || {});
@@ -117076,8 +117844,12 @@
     // Puls: znak zycia dla panelu. Dzieki niemu „czekam na kartę eupago" przestaje byc
     // zagadka — panel widzi, czy wykonawca tam jest, w jakiej wersji i od kiedy milczy.
     var ileTykniec = 0;
+    // Puls zapisujemy co PULS_CO_MS, nie przy kazdym tyku (0,7 s): kazdy zapis do magazynu menedzer rozglasza do
+    // wszystkich kart skryptu, a karta eupago wisi otwarta caly dzien (~85 zapisow na minute). Zwroty uznaja puls
+    // za swiezy do 5 s (adres zlecenia, wykrycie karty na starym kodzie), wiec 2 s zostawia zapas.
+    var PULS_CO_MS = 2000, pulsOst = 0;
     function puls(zrodlo){
-        ileTykniec++;
+        pulsOst = Date.now();
         try {
             // ZWOP_VER, nie ZW_VER. „ZW_VER" jest zmienna z init_zwr — z INNEGO domkniecia,
             // wiec tutaj nie istnieje: kazde wywolanie puls() konczylo sie cichym
@@ -117085,6 +117857,8 @@
             // Skutek widoczny po drugiej stronie: „Karta eupago milczy — nie ma na niej
             // wykonawcy", nawet gdy wykonawca stal tam i dzialal.
             GM_setValue(ZW_OP_H, JSON.stringify({
+                // karta: po niej modul w prologistics ADRESUJE zlecenie do tej jednej karty (obsluz).
+                karta: KARTA,
                 ver: ZWOP_VER, czas: Date.now(), zrodlo: zrodlo,
                 nasluch: mamNasluch, tyk: ileTykniec,
                 ukryta: (typeof document !== 'undefined' && document.visibilityState === 'hidden')
@@ -117092,7 +117866,8 @@
         } catch (e){}
     }
     function tyknij(){
-        puls(zegarZrodlo);
+        ileTykniec++;
+        if (Date.now() - pulsOst >= PULS_CO_MS) puls(zegarZrodlo);
         var v = '';
         try { v = GM_getValue(ZW_OP_Z, '') || ''; } catch (e){ return; }
         obsluz(v);
@@ -118271,20 +119046,24 @@
     // zostaje calkiem bez zegara.
     var zegarZrodlo = 'interval';
     var mamZapas = false;
+    // Co 10 s, nie co 0,7 s: pobieranie z Backoffice jest WYLACZONE (wykonaj() od razu odmawia), zlecenia i tak
+    // lapie nasluch, a Salda uznaja karte za zywa przy pulsie do 20 s (salSpDiagnoza). Dotad karta Saferpaya
+    // zapisywala puls do magazynu ~85 razy na minute, rozglaszany do wszystkich kart (przeglad 19.11.2026).
+    var SP_TYK_MS = 10000;
     function zapasowyZegar(powod){
         if (mamZapas) return;
         mamZapas = true;
         zegarZrodlo = powod;
-        setInterval(tyknij, 700);
+        setInterval(tyknij, SP_TYK_MS);
     }
     try {
-        var kod = 'setInterval(function(){ postMessage(1); }, 700);';
+        var kod = 'setInterval(function(){ postMessage(1); }, ' + SP_TYK_MS + ');';
         var url = URL.createObjectURL(new Blob([kod], { type: 'text/javascript' }));
         var wrk = new Worker(url);
         wrk.onmessage = tyknij;
         wrk.onerror = function (){ zapasowyZegar('interval (worker padł)'); };
         zegarZrodlo = 'worker';
-        setTimeout(function (){ if (ileTykniec < 2) zapasowyZegar('interval (worker milczał)'); }, 3000);
+        setTimeout(function (){ if (ileTykniec < 2) zapasowyZegar('interval (worker milczał)'); }, 2.5 * SP_TYK_MS);
     } catch (e){
         zapasowyZegar('interval');
     }
@@ -123073,7 +123852,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '6d23352 · 19.11.2026 11:56';
+    const HUB_BUDOWA = '2305534 · 20.11.2026 07:52';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -123150,7 +123929,11 @@
                 if (lc > ld) s = s.replace(/\./g, '').replace(',', '.');
                 else s = s.replace(/,/g, '');
             } else if (lc >= 0) {
-                s = (s.length - lc - 1 === 2) ? s.replace(',', '.') : s.replace(/,/g, '');
+                // Jedna albo dwie cyfry za przecinkiem = czesc dziesietna („49,9", „0,5", „12,50"); trzy = tysiace („1,895").
+                // Do 5.63.20 dziesietne byly tylko przy DWOCH cyfrach — „49,9 EUR" w komentarzu dawalo 499 i zly werdykt
+                // autoryzacji (przeglad 19.11.2026).
+                const po = s.length - lc - 1;
+                s = (po === 1 || po === 2) ? s.replace(/,(?=\d{1,2}$)/, '.').replace(/,/g, '') : s.replace(/,/g, '');
             } else if (ld >= 0 && s.length - ld - 1 === 3 && s.indexOf('.') === ld) {
                 s = s.replace(/\./g, '');   // „1.895" = tysiace
             }
@@ -124838,10 +125621,14 @@
     // ---------- ksiegowanie ----------
     async function zaksieguj(id){
         var z = zlecenie(id); if (!z || !z.impId || S.zajete[id]) return;
+        // Zajete OD RAZU, przed czekaniem na blokade. Dotad S.zajete stawalo dopiero po 400 ms, a blokada()
+        // przepuszcza wlasna karte — drugie klikniecie w tym czasie odpalalo drugi przebieg, ktory po drugim „OK"
+        // ksiegowal te same wiersze jeszcze raz (wzor dubla z paczki 2259365, przeglad 19.11.2026).
+        S.zajete[id] = 'zajmuję paczkę…'; rysuj();
         var inna = blokada(z.impId);
-        if (inna){ mow(id, '✖ Paczka ' + esc(z.impId) + ' jest teraz księgowana w innej karcie (od ' + esc(czasPl(new Date(inna.ts).toISOString())) + ') — poczekaj.', '#c00'); rysuj(); return; }
+        if (inna){ delete S.zajete[id]; mow(id, '✖ Paczka ' + esc(z.impId) + ' jest teraz księgowana w innej karcie (od ' + esc(czasPl(new Date(inna.ts).toISOString())) + ') — poczekaj.', '#c00'); rysuj(); return; }
         await czekaj(400);
-        if (!blokadaMoja(z.impId)){ mow(id, '✖ Inna karta zaczęła księgować tę paczkę w tej samej chwili — nic nie wysłałem.', '#c00'); rysuj(); return; }
+        if (!blokadaMoja(z.impId)){ delete S.zajete[id]; mow(id, '✖ Inna karta zaczęła księgować tę paczkę w tej samej chwili — nic nie wysłałem.', '#c00'); rysuj(); return; }
         var odn = setInterval(function (){ if (blokadaMoja(z.impId)) gmSet(COD_LOCK + z.impId, JSON.stringify({ karta: COD_KARTA, ts: Date.now() })); }, 5000);
         try {
             S.zajete[id] = 'czytam paczkę przed księgowaniem…'; rysuj();
@@ -124865,7 +125652,8 @@
             S.anal[id] = a; S.d[id] = d;
             if (!a.doKs.length){ mow(id, 'Nie ma czego księgować: brak wierszy OK bez płatności z auftragiem zgodnym z plikiem.', '#c47f00'); return; }
             var P = COD_PRZEW[z.przew] || {};
-            delete S.zajete[id]; rysuj();
+            // Paczka zostaje zajeta takze na czas pytania — przerysowanie nie wystawia w tym czasie aktywnego guzika.
+            S.zajete[id] = 'czekam na potwierdzenie…'; rysuj();
             if (!confirm('Zaksięgować ' + a.doKs.length + ' wierszy OK z paczki ' + z.impId + ' („' + COD_BLOCK_OPIS + '”)?\n\n'
                 + 'Przewoźnik: ' + P.nazwa + '\nSuma: ' + tys(a.sumaKs) + ' ' + (P.waluta || '') + '\nData paczki: ' + isoPl(z.data)
                 + (a.check.length ? ('\n\nCHECK (' + a.check.length + ') i NOT FOUND (' + a.nf.length + ') zostają w paczce — nie księguję ich.') : (a.nf.length ? ('\n\nNOT FOUND (' + a.nf.length + ') zostaje w paczce.') : ''))
@@ -125026,7 +125814,18 @@
         { id: 'recon',    name: 'Reconciliation',            test: onProlo,   init: init_recon },
     ];
 
+    // RAMKI PROLOGISTICS. Moduly otwieraja strony prologistics w UKRYTYCH ramkach (ticket przy ksiegowaniu, karta
+    // dostawcy, INS, wyszukiwarka) i obsluguja je ze strony-rodzica. Menedzer skryptow wstrzykuje jednak HUB takze do
+    // kazdej takiej ramki \u2014 i przy kazdym jej przeladowaniu startowalo tam kilkanascie modulow (16 guzikow), launcher
+    // z zegarem co 250 ms i \u201EZwrot w EUR" z wlasnymi zapytaniami (pomiar 19.11.2026). Zaden modul nie potrzebuje siebie
+    // w ramce prologistics, wiec tam nie startuje nic; modul, ktory kiedys bedzie potrzebowal, dostaje w MODULES
+    // `ramka: true`. Inne hosty bez zmian (np. GUS w ramce Kursu walut robi tam auto-wpis NIP).
+    var HUB_RAMKA_PROLO = (function (){
+        try { return onProlo() && window.top !== window.self; } catch (e){ return onProlo(); }
+    })();
+
     MODULES.forEach(function (m) {
+        if (HUB_RAMKA_PROLO && !m.ramka) return;
         try {
             GM_registerMenuCommand((isOn(m.id) ? '\u2705 ' : '\u2B1C ') + m.name, function () {
                 try { GM_setValue(HUB + m.id, !isOn(m.id)); } catch (e) {}
@@ -125046,6 +125845,7 @@
     // ===== Launcher: jeden guzik po prawej -> lista narzedzi + ustawienia =====
     function buildLauncher() {
         if (!onProlo()) return;
+        if (HUB_RAMKA_PROLO) return;          // ukryta ramka prologistics — launcher i jego zegar sa tam zbedne
         if (!document.body) return;
         if (document.getElementById('beliani-launcher')) return;
 
@@ -125248,6 +126048,8 @@
         // sposobach chowania robi sie kruche. Tu przerysowujemy tylko wtedy, gdy
         // zmieni sie ZBIOR otwartych paneli albo rozmiar okna.
         function blTick(){
+            // Karta w tle: niczego nie widac, wiec nie ma czego dokowac — pierwszy tik po powrocie zrobi swoje.
+            if (document.hidden) return;
             try { ensureClosers(); } catch (e){}
             const openNow = [];
             BL_DOCK.forEach(function (d){
@@ -125268,8 +126070,10 @@
                 });
                 blOrder = blOrder.slice(blOrder.length - lim);
             }
+            // blTop() czyta geometrie launchera (getBoundingClientRect = wymuszone przeliczenie ukladu strony), dotad
+            // 4 razy na sekunde na kazdej stronie. Potrzebna tylko przy otwartym panelu — bez paneli i tak nic nie zmienia.
             const key = blOrder.join('|') + '@' + window.innerWidth + 'x' + window.innerHeight
-                      + '@' + blTop() + '@' + ui.dok + ui.maks + '@' + ui.skala;
+                      + '@' + (blOrder.length ? blTop() : '-') + '@' + ui.dok + ui.maks + '@' + ui.skala;
             if (key === blKey) return;
             blKey = key;
             blApply();
@@ -126044,6 +126848,64 @@
                  + '> <span>Przy zwrocie w walucie ≠ EUR pokazuj równowartość w EUR i czy autor może go zlecić'
                  + '<i>działa na stronie ticketu (rma.php) i auftragu (auction.php); po zmianie strona się odświeży</i></span></label></div>';
         }
+        // MAGAZYN HUB-a (19.11.2026). Na zadanie, tylko odczyt: ile waza wpisy HUB-a w pamieci ScriptCata i ile
+        // w zleceniach Marketplace (mkt_jobs) to surowe raporty — pod decyzje o odchudzaniu starych zlecen (zlecenia
+        // nie wygasaja, a 214 miejsc czyta i zapisuje je w jednym kawalku). Liczone tylko po kliknieciu „Zmierz".
+        let magWynik = null;
+        function magZmierz(){
+            const t0 = Date.now();
+            let klucze = [];
+            try { if (typeof GM_listValues === 'function') klucze = GM_listValues() || []; } catch (e) { klucze = []; }
+            const brakListy = !klucze.length;
+            if (brakListy) klucze = ['mkt_jobs'];
+            const dl = function (x){
+                try { return x == null ? 0 : (typeof x === 'string' ? x.length : JSON.stringify(x).length); } catch (e) { return 0; }
+            };
+            const wpisy = klucze.map(function (k){
+                let v = null;
+                try { v = GM_getValue(k); } catch (e) { v = null; }
+                return { k: String(k), n: dl(v) };
+            }).sort(function (a, b){ return b.n - a.n; });
+            const razem = wpisy.reduce(function (s, x){ return s + x.n; }, 0);
+            // mkt_jobs: liczba zlecen, surowe raporty i ich czesc w zleceniach starszych niz 90 dni (po dacie wyplaty).
+            const mj = { zlecen: 0, surowe: 0, surowe90: 0, zlecen90: 0, najstarsze: '' };
+            try {
+                const jobs = JSON.parse(GM_getValue('mkt_jobs', '{}') || '{}') || {};
+                const granica = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+                Object.keys(jobs).forEach(function (k){
+                    const j = jobs[k] || {}, d = j.data || {};
+                    mj.zlecen++;
+                    const s = (d.amz ? dl(d.amz.raw) : 0) + (d.wayf ? dl(d.wayf.raw) : 0) + dl(d.raw);
+                    mj.surowe += s;
+                    const dt = String(j.date || '').slice(0, 10);
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(dt)){
+                        if (!mj.najstarsze || dt < mj.najstarsze) mj.najstarsze = dt;
+                        if (dt < granica){ mj.zlecen90++; mj.surowe90 += s; }
+                    }
+                });
+            } catch (e) { mj.blad = (e && e.message) || String(e); }
+            magWynik = { wpisy: wpisy, razem: razem, brakListy: brakListy, mj: mj, ms: Date.now() - t0 };
+        }
+        function magMB(n){ return (n / 1048576).toFixed(n >= 104858 ? 1 : 2) + ' MB'; }
+        function magHtml(){
+            let h = '<div class="bls-sek"><h4>Magazyn HUB-a</h4>'
+                  + '<p class="bls-p">Ile ważą wpisy HUB-a w pamięci ScriptCata — tylko odczyt, nic nie zmienia. Liczy się po kliknięciu.</p>'
+                  + '<div class="bls-btns"><button type="button" data-act="magazyn">📏 Zmierz</button></div>';
+            if (magWynik){
+                const w = magWynik, mj = w.mj;
+                h += '<p class="bls-p" id="bls-mag-razem">Razem: <b>' + magMB(w.razem) + '</b> w ' + w.wpisy.length + ' wpisach'
+                   + (w.brakListy ? ' (ScriptCat nie podał listy wpisów — liczę tylko mkt_jobs)' : '') + ' · policzone w ' + w.ms + ' ms.</p>'
+                   + '<table class="bls-t" id="bls-mag-tab">' + w.wpisy.slice(0, 12).map(function (x){
+                         return '<tr><td>' + blEsc(x.k) + '</td><td class="bls-ar">' + magMB(x.n) + '</td></tr>';
+                     }).join('') + '</table>'
+                   + '<p class="bls-p" id="bls-mag-mkt" style="margin-top:8px"><b>Zlecenia Marketplace (mkt_jobs):</b> ' + mj.zlecen + ' zleceń'
+                   + (mj.najstarsze ? ', najstarsze z ' + blEsc(mj.najstarsze) : '')
+                   + ' · surowe raporty (Amazon, Wayfair, OBI/VTEX): <b>' + magMB(mj.surowe) + '</b>'
+                   + ' · w tym w zleceniach starszych niż 90 dni (' + mj.zlecen90 + '): <b>' + magMB(mj.surowe90) + '</b>'
+                   + (mj.blad ? ' · <span style="color:#c00">błąd odczytu: ' + blEsc(mj.blad) + '</span>' : '') + '</p>';
+            }
+            return h + '</div>';
+        }
         function setModulyHtml(){
             const lista = menuWszystkie(menuGet());
             let h = '<div class="bls-sek"><h4>Widoczne w menu</h4>'
@@ -126087,7 +126949,7 @@
                    + '<div class="bls-btns"><button type="button" data-act="mod-zastosuj">Zastosuj i odśwież</button>'
                    + '<button type="button" data-act="mod-cofnij">↶ cofnij zmiany</button></div></div>';
             }
-            return h + '</div>';
+            return h + '</div>' + magHtml();
         }
         function setChgHtml(){
             let wer = '?';
@@ -126205,6 +127067,7 @@
                 return;
             }
             if (co === 'klucz-sprawdz') { polSprawdz(); return; }
+            if (co === 'magazyn') { magZmierz(); setMaluj(); return; }
             if (co === 'klucz-adres') {
                 // Wyjscie awaryjne: adres wdrozenia da sie przestawic bez nowej wersji HUB-a.
                 // Puste pole wraca do wbudowanego.
