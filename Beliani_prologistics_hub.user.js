@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.23
+// @version      5.63.24
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -299,7 +299,7 @@
                 c.komp = { id: 'k-' + losowe(3), nazwa: (c.komp && c.komp.nazwa) || '' };
                 zapisz(K_CFG, c);
             }
-            cache = { on: c.on !== false, url: String(c.url || HUB_DZ_URL || '').trim(), wlasnyUrl: !!c.url, komp: c.komp };
+            cache = { on: c.on !== false, url: String(c.url || HUB_DZ_URL || '').trim(), wlasnyUrl: !!c.url, komp: c.komp, diag: c.diag !== false };
             cacheT = t;
             return cache;
         }
@@ -377,10 +377,460 @@
             return 0;
         }
 
+        // ===== Diagnostyka komputera (23.11.2026) =====
+        // Po co: u jednej osoby ten sam HUB chodzi 2-3 razy wolniej niz u reszty (Ula: wczytanie ticketu w ramce 16 s przy
+        // 5-9 s u innych, a samo pobranie strony jak u wszystkich). Zeby nie zgadywac, czy winny jest komputer, przegladarka,
+        // grafika czy lacze, kazdy przebieg w „HUB Log" dostaje w naglowku linie „komputer: …":
+        //  * stale: rdzenie, pamiec, grafika (sprzetowo / PROGRAMOWO — bez akceleracji strony rysuje procesor), przegladarka;
+        //  * na starcie: test procesora (stala porcja obliczen; ms, mniej = szybciej), zasilanie, opoznienie do prologistics;
+        //  * w trakcie: ile czasu przegladarka byla zablokowana (zadania > 50 ms), opoznienie zegara strony, karta w tle,
+        //    obciazenie procesora wedlug Chrome (gdy je podaje) i pamiec strony.
+        // Przegladarka NIE daje: obciazenia calego komputera w %, listy programow, liczby kart, Wi-Fi/kabel/VPN.
+        // Linia idzie do NAGLOWKA, nie do wpisow — nie zmienia wyniku przebiegu (✔/⚠/✖).
+        // Pomiar jest obserwatorem: wszystko w try/catch, zegar pomiaru chodzi tylko, gdy jest otwarty przebieg.
+        // Wylacznik w stopce menu „Narzędzia" („Diagnostyka komputera: wyłącz") — domyslnie wlaczona. Tam tez „🔍 test komputera".
+        const DG_TIK = 500, DG_MAX = 20000, DG_CPU_WAZNY = 3 * 60000, DG_RTT_WAZNY = 10 * 60000;
+        const DG = { iv: null, ost: 0, ltN: 0, ltMs: 0, visN: 0, ukr: 0, probki: [], prStan: '', prCzas: {}, obsLT: null, obsPr: null,
+                     staly: '', cpu: null, cpuT: 0, rtt: null, rttT: 0, rttBiegnie: false, bat: '', test: false, x: 0 };
+        const DG_PR = { nominal: 'spokojnie', fair: 'umiarkowanie', serious: 'wysoko', critical: 'krytycznie' };
+        function dgTeraz() { try { return performance.now(); } catch (e) { return Date.now(); } }
+        function dgKw(a, q) {
+            if (!a.length) return null;
+            const s = a.slice().sort(function (x, y) { return x - y; });
+            return s[Math.min(s.length - 1, Math.floor(s.length * q))];
+        }
+        // Stala porcja obliczen (ok. 30 ms na szybkim komputerze). Blokuje karte na ten czas — dlatego najwyzej co 3 min.
+        function dgCpuTest() {
+            const t0 = dgTeraz();
+            let x = 0;
+            for (let i = 0; i < 2e7; i++) x += i % 7;
+            DG.x = x;                    // zeby optymalizator nie wyrzucil petli
+            return Math.round(dgTeraz() - t0);
+        }
+        // Karta graficzna z WebGL. „SwiftShader" / „Basic Render" = rysuje procesor (akceleracja wylaczona albo niedostepna).
+        function dgGrafika() {
+            try {
+                const cv = document.createElement('canvas');
+                const gl = cv.getContext('webgl') || cv.getContext('experimental-webgl');
+                if (!gl) return { txt: 'brak WebGL (akceleracja wyłączona?)', prog: true };
+                const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                const r = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
+                try { const lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext(); } catch (e) {}
+                let nazwa = r;
+                const m = /^ANGLE \((.*)\)$/.exec(r);
+                if (m) { const cz = m[1].split(', '); nazwa = cz[1] || cz[0]; }
+                nazwa = nazwa.replace(/\s*\(0x[0-9a-f]+\)/ig, '').replace(/\s+(Direct3D|vs_|ps_|OpenGL).*$/i, '').replace(/\s+/g, ' ').trim().slice(0, 60);
+                const prog = /SwiftShader|Basic Render|llvmpipe|software/i.test(r);
+                return { txt: (prog ? 'PROGRAMOWO, bez akceleracji (' : 'sprzętowo (') + (nazwa || '?') + ')', prog: prog };
+            } catch (e) { return { txt: '?', prog: null }; }
+        }
+        // Sprzet i przegladarka — raz na wczytanie strony.
+        function dgSprzet() {
+            if (DG.sprzet) return DG.sprzet;
+            const n = navigator || {};
+            let przegl = '';
+            try {
+                const b = (n.userAgentData && n.userAgentData.brands) || [];
+                const c = b.filter(function (x) { return /Chrome|Edge|Opera/i.test(x.brand); })[0];
+                przegl = c ? (c.brand.replace(/^Google\s+/, '') + ' ' + c.version) : '';
+            } catch (e) {}
+            if (!przegl) { const m = /(Edg|Chrome|Firefox)\/(\d+)/.exec(n.userAgent || ''); przegl = m ? m[1] + ' ' + m[2] : '?'; }
+            const g = dgGrafika();
+            DG.sprzet = { rdzenie: n.hardwareConcurrency || null, pamiec: n.deviceMemory || null, grafika: g.txt, grafikaProg: g.prog, przegl: przegl };
+            return DG.sprzet;
+        }
+        function dgStaly() {
+            if (DG.staly) return DG.staly;
+            const s = dgSprzet();
+            DG.staly = (s.rdzenie || '?') + ' rdzeni · ' + (s.pamiec ? s.pamiec + ' GB pamięci' : 'pamięć ?') + ' · grafika ' + s.grafika + ' · ' + s.przegl;
+            return DG.staly;
+        }
+        function dgBateria() {
+            try {
+                if (!navigator.getBattery) return;
+                navigator.getBattery().then(function (b) {
+                    DG.bat = b.charging ? 'zasilacz' : ('NA BATERII ' + Math.round(b.level * 100) + '%');
+                }).catch(function () {});
+            } catch (e) {}
+        }
+        // Opoznienie do prologistics: 3 × HEAD na favicon (bez tresci, bez pamieci podrecznej), mediana. Najwyzej co 10 min.
+        function dgRtt() {
+            try {
+                if (!onProlo() || window.top !== window || DG.rttBiegnie || (DG.rtt != null && Date.now() - DG.rttT < DG_RTT_WAZNY)) return;
+                DG.rttBiegnie = true;
+                const pomiary = [];
+                const jeden = function (i) {
+                    if (i >= 3) { DG.rtt = dgKw(pomiary, 0.5); DG.rttT = Date.now(); DG.rttBiegnie = false; return; }
+                    const t0 = dgTeraz();
+                    fetch('/favicon.ico', { method: 'HEAD', cache: 'no-store', credentials: 'same-origin' })
+                        .then(function () { pomiary.push(Math.round(dgTeraz() - t0)); }, function () {})
+                        .then(function () { jeden(i + 1); });
+                };
+                jeden(0);
+            } catch (e) { DG.rttBiegnie = false; }
+        }
+        function dgLtStart() {
+            try {
+                if (DG.obsLT || typeof PerformanceObserver !== 'function') return;
+                if ((PerformanceObserver.supportedEntryTypes || []).indexOf('longtask') < 0) return;
+                DG.obsLT = new PerformanceObserver(function (l) {
+                    try { l.getEntries().forEach(function (e) { DG.ltN++; DG.ltMs += e.duration; }); } catch (e) {}
+                });
+                DG.obsLT.observe({ type: 'longtask' });
+            } catch (e) { DG.obsLT = null; }
+        }
+        // Obciazenie procesora wedlug Chrome (Compute Pressure). Chrome podaje je zwykle tylko karcie na wierzchu.
+        function dgPresjaStart() {
+            try {
+                const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+                const PO = window.PressureObserver || W.PressureObserver;
+                if (typeof PO !== 'function' || DG.obsPr) return;
+                DG.obsPr = new PO(function (rec) {
+                    try { const r = rec[rec.length - 1]; if (r && r.state) DG.prStan = r.state; } catch (e) {}
+                });
+                const pr = DG.obsPr.observe('cpu', { sampleInterval: 2000 });
+                if (pr && pr.catch) pr.catch(function () { DG.obsPr = null; });
+            } catch (e) { DG.obsPr = null; }
+        }
+        function dgTik() {
+            try {
+                const t = dgTeraz();
+                const dt = t - DG.ost;
+                DG.ost = t;
+                const ukryta = document.visibilityState === 'hidden';
+                DG.visN++; if (ukryta) DG.ukr++;
+                if (DG.prStan) DG.prCzas[DG.prStan] = (DG.prCzas[DG.prStan] || 0) + dt;
+                let mb = 0;
+                try { if (performance.memory) mb = Math.round(performance.memory.usedJSHeapSize / 1048576); } catch (e) {}
+                DG.probki.push([t, Math.max(0, Math.round(dt - DG_TIK)), ukryta ? 1 : 0, mb]);
+                if (DG.probki.length > DG_MAX) DG.probki.splice(0, DG.probki.length - DG_MAX);
+            } catch (e) {}
+        }
+        function dgStart() {
+            try {
+                if (DG.iv) return;
+                DG.ost = dgTeraz();
+                dgLtStart(); dgPresjaStart(); dgBateria();
+                DG.iv = setInterval(dgTik, DG_TIK);
+            } catch (e) {}
+        }
+        function dgStop() {
+            try {
+                if (DG.iv) { clearInterval(DG.iv); DG.iv = null; }
+                if (DG.obsLT) { try { DG.obsLT.disconnect(); } catch (e) {} DG.obsLT = null; }
+                if (DG.obsPr) { try { DG.obsPr.disconnect(); } catch (e) {} DG.obsPr = null; }
+                DG.probki = []; DG.prStan = '';
+            } catch (e) {}
+        }
+        function dgStan() { return { t: dgTeraz(), ltN: DG.ltN, ltMs: DG.ltMs, visN: DG.visN, ukr: DG.ukr, pr: Object.assign({}, DG.prCzas), lt: !!DG.obsLT }; }
+        // Start przebiegu: pomiar, test procesora (najwyzej co 3 min), opoznienie do prologistics (najwyzej co 10 min).
+        function dgNaStart() {
+            try {
+                if (!cfg().diag) return null;
+                dgStart();
+                if (DG.cpu == null || Date.now() - DG.cpuT > DG_CPU_WAZNY) { DG.cpu = dgCpuTest(); DG.cpuT = Date.now(); }
+                dgRtt();
+                dgStaly();
+                return dgStan();
+            } catch (e) { return null; }
+        }
+        // Co dzialo sie od migawki a do teraz.
+        function dgWTrakcie(a) {
+            const b = dgStan();
+            const czas = Math.max(1, b.t - a.t);
+            const okno = DG.probki.filter(function (x) { return x[0] >= a.t; });
+            const lagi = okno.filter(function (x) { return !x[2]; }).map(function (x) { return x[1]; });
+            const pr = {}; let prSuma = 0;
+            Object.keys(b.pr).forEach(function (k) { const d = (b.pr[k] || 0) - (a.pr[k] || 0); if (d > 0) { pr[k] = d; prSuma += d; } });
+            // „Zegar spozniony > 50 ms" — dziala zawsze (pomiar z wlasnego zegara). Blokady (longtask) podaje tylko Chrome
+            // z karta na wierzchu; gdy zegar sie spoznial, a blokad zero, Chrome ich nie zglaszal — piszemy „brak danych", nie „0%".
+            const spoz = lagi.length ? Math.round(100 * lagi.filter(function (x) { return x > 50; }).length / lagi.length) : null;
+            const ltN = b.ltN - a.ltN;
+            return {
+                czas: czas, lt: a.lt && b.lt && (ltN > 0 || !(spoz > 5)), ltN: ltN, ltMs: b.ltMs - a.ltMs,
+                zablok: Math.round(100 * (b.ltMs - a.ltMs) / czas), spoz: spoz,
+                lagMed: dgKw(lagi, 0.5), lagP90: dgKw(lagi, 0.9),
+                tlo: (b.visN - a.visN) ? Math.round(100 * (b.ukr - a.ukr) / (b.visN - a.visN)) : null,
+                pr: pr, prSuma: prSuma,
+                mb: okno.reduce(function (m, x) { return Math.max(m, x[3] || 0); }, 0)
+            };
+        }
+        function dgOpis(a) {
+            try {
+                if (!a) return '';
+                const st = [dgStaly()];
+                if (DG.cpu != null) st.push('test procesora ' + DG.cpu + ' ms');
+                if (DG.bat) st.push(DG.bat);
+                if (DG.rtt != null) st.push('do prologistics ' + DG.rtt + ' ms');
+                try {
+                    const c = navigator.connection;
+                    if (c && c.effectiveType) st.push('łącze wg Chrome ' + c.effectiveType + (c.rtt != null ? ' ~' + c.rtt + ' ms' : '') + (c.downlink ? ' ~' + c.downlink + ' Mb/s' : ''));
+                } catch (e) {}
+                const txt = 'komputer: ' + st.join(' · ');
+                const w = dgWTrakcie(a);
+                if (w.czas < 3000) return txt;
+                const cz = [];
+                cz.push(w.lt ? ('przeglądarka zablokowana ' + w.zablok + '% czasu (' + w.ltN + ' blokad > 50 ms, razem ' + Math.round(w.ltMs / 1000) + ' s)')
+                             : 'blokady przeglądarki: brak danych');
+                if (w.spoz != null) cz.push('zegar spóźniony > 50 ms w ' + w.spoz + '% pomiarów');
+                if (w.lagMed != null) cz.push('opóźnienie zegara med ' + w.lagMed + ' ms, p90 ' + w.lagP90 + ' ms');
+                if (w.tlo != null) cz.push('karta w tle ' + w.tlo + '%');
+                if (w.prSuma > 0) cz.push('procesor wg Chrome: ' + Object.keys(DG_PR).filter(function (k) { return w.pr[k]; })
+                    .map(function (k) { return DG_PR[k] + ' ' + Math.round(100 * w.pr[k] / w.prSuma) + '%'; }).join(', '));
+                if (w.mb) cz.push('pamięć strony do ' + w.mb + ' MB');
+                return txt + ' | w trakcie (' + Math.round(w.czas / 1000) + ' s): ' + cz.join(' · ');
+            } catch (e) { return ''; }
+        }
+        function dgSen(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+        // Wczytanie strony w ukrytej ramce — tak samo ustawionej jak ramki workerow modulu ticketa.
+        function dgRamka(url, limit) {
+            return new Promise(function (resolve) {
+                let f = null, done = false;
+                const t0 = dgTeraz();
+                const koniec = function (ms) {
+                    if (done) return; done = true;
+                    try { if (f && f.parentNode) f.parentNode.removeChild(f); } catch (e) {}
+                    resolve(ms);
+                };
+                try {
+                    f = document.createElement('iframe');
+                    f.style.cssText = 'position:fixed; left:-2000px; top:-2000px; width:1200px; height:900px; opacity:0; pointer-events:none; z-index:-1;';
+                    f.onload = function () { koniec(Math.round(dgTeraz() - t0)); };
+                    f.src = url;                 // przed wstawieniem — inaczej pierwsze „load" to pusta strona
+                    setTimeout(function () { koniec(null); }, limit);
+                    document.body.appendChild(f);
+                } catch (e) { koniec(null); }
+            });
+        }
+        // Zapisy diagnostyki w GM: wynik ostatniego testu (zakladka „Diagnostyka" w ustawieniach) i obciazenie ostatnich przebiegow.
+        const K_DG_TEST = HUB + 'dz_diag_test_v1';
+        const K_DG_PRZ  = HUB + 'dz_diag_przebiegi_v1';
+        const DG_KARTA  = losowe(4);                  // id tej karty — do liczenia innych kart prologistics z HUB-em
+        const DG_KANAL  = 'beliani_hub_diag';
+        // Obciazenie skonczonego przebiegu — do listy „Obciążenie w ostatnich przebiegach" (30 ostatnich, ten komputer).
+        function dgZapiszPrzebieg(p) {
+            try {
+                const w = dgWTrakcie(p.dg0);
+                if (w.czas < 3000) return;
+                const prDom = w.prSuma > 0 ? Object.keys(w.pr).sort(function (x, y) { return w.pr[y] - w.pr[x]; })[0] : '';
+                const L = wczytaj(K_DG_PRZ, []);
+                L.push({ t: p.t0, m: p.modul, s: Math.round(w.czas / 1000), zb: w.lt ? w.zablok : null, n: w.ltN, sp: w.spoz,
+                         lp: w.lagP90, tl: w.tlo, pr: prDom, cpu: DG.cpu });
+                zapisz(K_DG_PRZ, L.slice(-30));
+            } catch (e) {}
+        }
+        // Ile INNYCH kart prologistics z HUB-em jest otwartych (odpowiadaja na „ping" na wspolnym kanale; patrz koniec HUBDZ).
+        function dgKarty() {
+            return new Promise(function (resolve) {
+                try {
+                    if (typeof BroadcastChannel !== 'function') { resolve(null); return; }
+                    const bc = new BroadcastChannel(DG_KANAL);
+                    const id = losowe(4), odp = {};
+                    bc.onmessage = function (e) {
+                        const d = (e && e.data) || {};
+                        if (d.co === 'pong' && d.id === id && d.karta !== DG_KARTA) odp[d.karta] = d;
+                    };
+                    bc.postMessage({ co: 'ping', id: id, karta: DG_KARTA });
+                    setTimeout(function () {
+                        try { bc.close(); } catch (e) {}
+                        const l = Object.keys(odp).map(function (k) { return odp[k]; });
+                        resolve({ n: l.length, wTle: l.filter(function (x) { return x.ukryta; }).length });
+                    }, 800);
+                } catch (e) { resolve(null); }
+            });
+        }
+
+        // OCENA WYNIKU TESTU — jedno zrodlo dla zakladki „Diagnostyka", okienka i wpisow w HUB Log.
+        // Normy sa WSTEPNE (23.11.2026): ustalone na logach zespolu z 21.10-20.11 (ramka ticketu 5-9 s u wiekszosci, 16 s u Uli)
+        // i na jednym komputerze (test procesora 25-33 ms). Po zebraniu testow z kilku komputerow — dostroic progi tutaj.
+        // o: 'ok' | 'uwaga' | 'zle' | 'info'.
+        function dgOcena(W) {
+            W = W || {};
+            const R = [];
+            const dodaj = function (k, g, n, w, o, norma, z) { R.push({ k: k, g: g, n: n, w: w, o: o, norma: norma, z: z }); };
+            const p3 = function (v, a, b) { return v == null ? 'info' : (v <= a ? 'ok' : (v <= b ? 'uwaga' : 'zle')); };
+            const nP = onProloDane(W);
+            dodaj('cpu', 'Komputer', 'Procesor (test obliczeniowy)',
+                W.cpuMin != null ? W.cpuMin + ' ms' + (W.cpuMed != null && W.cpuMed > W.cpuMin * 1.5 ? ' (mediana ' + W.cpuMed + ' ms — wyniki skaczą)' : '') : '—',
+                p3(W.cpuMin, 50, 100), 'do 50 ms dobrze · 50–100 ms przeciętnie · ponad 100 ms słabo',
+                'Ta sama porcja obliczeń na każdym komputerze — im mniej, tym szybszy procesor dla przeglądarki. Słaby wynik znaczy, że strony prologistics '
+                + 'wyświetlają się wolniej, zwłaszcza przy 5 workerach naraz. Gdy wyniki skaczą, komputer robił w tym czasie coś innego.');
+            dodaj('rdzenie', 'Komputer', 'Rdzenie procesora', W.rdzenie != null ? String(W.rdzenie) : '—',
+                W.rdzenie == null ? 'info' : (W.rdzenie >= 4 ? 'ok' : (W.rdzenie >= 2 ? 'uwaga' : 'zle')), 'co najmniej 4',
+                'Ile zadań komputer liczy naraz. Przy mniej niż 4 przeglądarka z 5 workerami i inne programy walczą o procesor.');
+            dodaj('ram', 'Komputer', 'Pamięć RAM (wg Chrome)', W.pamiec != null ? W.pamiec + ' GB' : '—',
+                W.pamiec == null ? 'info' : (W.pamiec >= 8 ? 'ok' : (W.pamiec >= 4 ? 'uwaga' : 'zle')), 'co najmniej 8 GB',
+                'Chrome podaje ją w zaokrągleniu. Przy 4 GB kilka arkuszy Google (300–500 MB każdy) i prologistics zapełniają pamięć, '
+                + 'a Windows zaczyna używać dysku zamiast pamięci — wtedy zwalnia wszystko.');
+            dodaj('grafika', 'Komputer', 'Grafika', W.grafika || '—', W.grafikaProg == null ? 'info' : (W.grafikaProg ? 'zle' : 'ok'), 'sprzętowo (z akceleracją)',
+                'Bez akceleracji strony rysuje procesor i każda wyświetla się wolniej. Włączenie: Chrome → Ustawienia → System → '
+                + '„Użyj akceleracji grafiki, gdy jest dostępna”, potem ponowne uruchomienie Chrome.');
+            dodaj('bat', 'Komputer', 'Zasilanie', W.bat || 'nieznane', !W.bat ? 'info' : (/BATERII/.test(W.bat) ? 'uwaga' : 'ok'), 'zasilacz',
+                'Laptop na baterii zwykle zwalnia procesor, żeby oszczędzać energię.');
+            dodaj('przegl', 'Komputer', 'Przeglądarka', W.przegl || '—', 'info', '—', 'Wersja przeglądarki — do porównań między komputerami.');
+            dodaj('rtt', 'Sieć i serwer', 'Opóźnienie do prologistics', W.rtt != null ? W.rtt + ' ms' : (nP ? '—' : 'nie mierzone (test poza prologistics)'),
+                p3(W.rtt, 80, 200), 'do 80 ms dobrze · 80–200 ms przeciętnie · ponad 200 ms słabo',
+                'Czas jednej krótkiej rozmowy z serwerem, bez treści. Wysokie przy dobrym procesorze znaczy kłopot z siecią (Wi-Fi, VPN, łącze). '
+                + 'Każda strona prologistics to kilkanaście takich rozmów.');
+            dodaj('pob', 'Sieć i serwer', 'Pobranie strony głównej (sieć + serwer)',
+                W.pob != null ? W.pob + ' ms' + (W.kb != null ? ' (' + W.kb + ' KB)' : '') : '—', p3(W.pob, 1500, 4000),
+                'do 1,5 s dobrze · 1,5–4 s przeciętnie · ponad 4 s wolno',
+                'Sama strona, bez wyświetlania. Wolno u wszystkich naraz — winny serwer prologistics; wolno tylko u jednej osoby — jej łącze.');
+            dodaj('sesja', 'Sieć i serwer', 'Sesja prologistics', W.sesja === 'ok' ? 'zalogowany' : (W.sesja === 'logowanie' ? 'strona logowania' : '—'),
+                W.sesja === 'ok' ? 'ok' : (W.sesja === 'logowanie' ? 'zle' : 'info'), 'zalogowany',
+                'Wylogowana sesja kończy każdy przebieg już na pierwszym zapytaniu.');
+            dodaj('dz', 'Sieć i serwer', 'Dziennik (arkusz „HUB Log”)', W.dz === 'ok' ? 'działa' : (W.dz || '—'),
+                W.dz === 'ok' ? 'ok' : (/^błąd/.test(W.dz || '') ? 'zle' : (W.dz ? 'uwaga' : 'info')), 'działa',
+                'Bez dziennika przebiegi i diagnostyka z tego komputera nie trafiają do arkusza — nie da się ich potem porównać ani przeanalizować.');
+            dodaj('lacze', 'Sieć i serwer', 'Łącze wg Chrome', W.lacze || '—', 'info', '—',
+                'Chrome mocno zaokrągla („4g, ~50 ms, ~10 Mb/s” to najlepsze, co podaje), więc to tylko orientacyjnie — pomiary wyżej są dokładniejsze.');
+            const dom = (W.ram != null && W.pob != null) ? Math.max(0, W.ram - W.pob) : null;
+            const krot = (W.ram != null && W.pob) ? Math.round(W.ram / Math.max(1, W.pob) * 10) / 10 : null;
+            dodaj('ram_ramka', 'Przeglądarka', 'Wyświetlenie strony (sieć + serwer + komputer)',
+                W.ram != null ? W.ram + ' ms' + (dom != null ? ' — z tego komputer ok. ' + dom + ' ms (' + String(krot).replace('.', ',') + '× pobranie)' : '') : '—',
+                dom == null ? 'info' : (dom <= 1000 ? 'ok' : (dom <= 3000 ? 'uwaga' : 'zle')),
+                'komputer dokłada do 1 s dobrze · 1–3 s przeciętnie · ponad 3 s wolno',
+                'Ta sama strona co wyżej, ale wyświetlona w ukrytej ramce — tak, jak robią to workery „Księgowania w tickecie”. Różnica to praca '
+                + 'komputera: rysowanie i skrypty strony. W logach z października i listopada ten czas u osoby z wolnym HUB-em był 2–3× dłuższy niż u innych.');
+            dodaj('blok', 'Przeglądarka', 'Blokady przeglądarki w czasie testu',
+                W.zablok != null ? W.zablok + '% czasu (' + (W.ltN || 0) + ' blokad)' : 'brak danych', p3(W.zablok, 10, 30),
+                'do 10% dobrze · 10–30% przeciętnie · ponad 30% źle',
+                'Ile czasu przeglądarka nie reagowała (zadania dłuższe niż 50 ms). Wysokie — komputer albo przeglądarka nie nadążają. '
+                + 'Chrome podaje to tylko karcie na wierzchu.');
+            dodaj('zegar', 'Przeglądarka', 'Zegar strony spóźniony > 50 ms',
+                W.spoz != null ? W.spoz + '% pomiarów' + (W.lagP90 != null ? ' (p90 ' + W.lagP90 + ' ms)' : '') : '—', p3(W.spoz, 5, 20),
+                'do 5% dobrze · 5–20% przeciętnie · ponad 20% źle',
+                'Jak często strona nie zdążyła na czas. Działa zawsze, także gdy Chrome nie podaje blokad — najprostszy wskaźnik zapchanego komputera.');
+            dodaj('presja', 'Przeglądarka', 'Obciążenie procesora wg Chrome', W.pr || 'Chrome nie podał',
+                !W.prStan ? 'info' : ({ nominal: 'ok', fair: 'ok', serious: 'uwaga', critical: 'zle' }[W.prStan] || 'info'), 'spokojnie albo umiarkowanie',
+                'Ocena Chrome dla całego komputera (także innych programów). Chrome podaje ją tylko karcie na wierzchu, więc bywa pusta.');
+            dodaj('mb', 'Przeglądarka', 'Pamięć tej karty', W.mb ? W.mb + ' MB' : '—', W.mb ? (W.mb <= 500 ? 'ok' : 'uwaga') : 'info', 'do 500 MB',
+                'Pamięć zajęta przez tę kartę prologistics. Dużo — karta długo otwarta; odświeżenie (F5) ją zwalnia.');
+            dodaj('karty', 'Przeglądarka', 'Inne karty prologistics z HUB-em',
+                W.karty ? W.karty.n + (W.karty.wTle ? ' (w tle: ' + W.karty.wTle + ')' : '') : '—',
+                !W.karty ? 'info' : (W.karty.n <= 3 ? 'ok' : (W.karty.n <= 6 ? 'uwaga' : 'zle')), 'do 3',
+                'Każda karta prologistics ma swój HUB i ok. 100–150 MB pamięci. Kilka to norma, dużo — warto zamknąć zbędne. '
+                + 'Liczą się tylko karty z tą albo nowszą wersją HUB-a (starsze trzeba odświeżyć).');
+            if (W.tlo) dodaj('tlo', 'Przeglądarka', 'Karta w tle podczas testu', W.tlo + '% czasu', 'uwaga', '0%',
+                'Chrome spowalnia karty w tle — wyniki są zawyżone. Powtórz test z tą kartą na wierzchu.');
+            if (W.inne && W.inne.length) dodaj('inne', 'Przeglądarka', 'Inny moduł pracował w czasie testu', W.inne.join(', '), 'uwaga', 'nic',
+                'Wyniki są zawyżone przez tamtą pracę — powtórz test, gdy nic nie pracuje.');
+            const o = function (k) { const x = R.filter(function (r) { return r.k === k; })[0]; return x ? x.o : 'info'; };
+            const zly = function (k) { return o(k) === 'zle'; }, slaby = function (k) { return o(k) === 'zle' || o(k) === 'uwaga'; };
+            const nazwy = function (f) { return R.filter(function (r) { return r.o === f; }).map(function (r) { return r.n; }).join(', '); };
+            let wn;
+            if ((W.inne && W.inne.length) || W.tlo) wn = 'Wynik zawyżony (karta w tle albo inna praca w czasie testu) — powtórz test z tą kartą na wierzchu, gdy nic nie pracuje.';
+            else if (zly('sesja')) wn = 'Prologistics pokazał stronę logowania — zaloguj się i powtórz test.';
+            else if (zly('grafika')) wn = 'Najpewniejsza przyczyna wolnej pracy: grafika bez akceleracji — strony rysuje procesor. Włącz akcelerację (wiersz „Grafika”).';
+            else if (slaby('ram_ramka') && !slaby('rtt'))
+                wn = 'Wąskim gardłem jest komputer albo przeglądarka, nie sieć: strona pobiera się normalnie, a wyświetla wolno. Pomaga: 2–3 workery '
+                   + '(albo mnożnik czasu ×5) w „Księgowaniu w tickecie”, zamknięcie zbędnych kart i programów'
+                   + (slaby('ram') ? ', a na dłużej — więcej pamięci' : '') + (slaby('cpu') ? '; procesor jest też słabszy od normy' : '') + '.';
+            else if (zly('rtt') || (slaby('rtt') && slaby('pob')))
+                wn = 'Wąskim gardłem jest sieć: długo trwa już samo połączenie z prologistics. Sprawdź Wi-Fi albo kabel, VPN i łącze; komputer nie jest tu winny.';
+            else if (zly('pob')) wn = 'Serwer prologistics odpowiada wolno, a połączenie jest w porządku — sprawdź, czy u innych też; jeśli tak, to nie wina tego komputera.';
+            else if (R.some(function (r) { return r.o === 'zle'; })) wn = 'Do poprawy: ' + nazwy('zle') + '.';
+            else if (R.some(function (r) { return r.o === 'uwaga'; })) wn = 'Komputer w normie, przeciętnie wypadło: ' + nazwy('uwaga') + '.';
+            else wn = 'Komputer w normie — nic nie odstaje.';
+            return { wiersze: R, wniosek: wn };
+        }
+        // Czy test mial pomiary prologistics (gdy nie — „nie mierzone", a nie „—").
+        function onProloDane(W) { return W && (W.rtt != null || W.pob != null || W.ram != null); }
+
+        // TEST KOMPUTERA (ok. 30 s) — z zakladki „Diagnostyka" w ustawieniach. Na prologistics porownuje POBRANIE strony glownej
+        // (siec + serwer) z jej WYSWIETLENIEM w ukrytej ramce (siec + serwer + praca komputera) — to rozroznienie wskazalo komputer Uli.
+        // Wynik idzie do GM (zakladka pokazuje go z normami — dgOcena) i jako przebieg „Test komputera" do HUB Log.
+        // Oddaje { tekst (krotko, do okienka), W (pomiary) }.
+        async function testKomputera() {
+            const M = 'Test komputera';
+            DG.test = true;
+            const W = { t: Date.now(), wersja: wersja() };
+            try {
+                const inne = Object.keys(przebiegi).filter(function (m) { return m !== M; });
+                W.inne = inne;
+                dgStart();
+                wpis(M, 'start', 'test komputera — start' + (inne.length ? ' (w tym czasie pracuje: ' + inne.join(', ') + ')' : ''));
+                const cpu = [];
+                for (let i = 0; i < 5; i++) { cpu.push(dgCpuTest()); await dgSen(150); }
+                DG.cpu = Math.min.apply(null, cpu); DG.cpuT = Date.now();
+                W.cpuMin = DG.cpu; W.cpuMed = dgKw(cpu, 0.5);
+                // Migawka PO tescie procesora — jego wlasne petle to tez „blokady" i zawyzylyby wynik. Chwila na dostarczenie wpisow.
+                await dgSen(300);
+                const a = dgStan();
+                const s = dgSprzet();
+                W.rdzenie = s.rdzenie; W.pamiec = s.pamiec; W.grafika = s.grafika; W.grafikaProg = s.grafikaProg; W.przegl = s.przegl;
+                await new Promise(function (r) {
+                    try {
+                        if (navigator.getBattery) navigator.getBattery().then(function (b) {
+                            DG.bat = b.charging ? 'zasilacz' : ('NA BATERII ' + Math.round(b.level * 100) + '%'); r();
+                        }, r);
+                        else r();
+                    } catch (e) { r(); }
+                });
+                W.bat = DG.bat || '';
+                try {
+                    const c = navigator.connection;
+                    if (c && c.effectiveType) W.lacze = c.effectiveType + (c.rtt != null ? ', ~' + c.rtt + ' ms' : '') + (c.downlink ? ', ~' + c.downlink + ' Mb/s' : '');
+                } catch (e) {}
+                if (onProlo() && window.top === window) {
+                    const rtt = [];
+                    for (let i = 0; i < 5; i++) {
+                        const t0 = dgTeraz();
+                        try { await fetch('/favicon.ico', { method: 'HEAD', cache: 'no-store', credentials: 'same-origin' }); rtt.push(Math.round(dgTeraz() - t0)); } catch (e) {}
+                    }
+                    DG.rtt = dgKw(rtt, 0.5); DG.rttT = Date.now();
+                    W.rtt = DG.rtt;
+                    const pob = [];
+                    for (let i = 0; i < 3; i++) {
+                        const t0 = dgTeraz();
+                        try {
+                            const r = await fetch('/', { cache: 'no-store', credentials: 'same-origin' });
+                            const tx = await r.text();
+                            pob.push(Math.round(dgTeraz() - t0));
+                            if (i === 0) { W.kb = Math.round(tx.length / 1024); W.sesja = /<input[^>]+type=["']?password/i.test(tx) ? 'logowanie' : 'ok'; }
+                        } catch (e) {}
+                    }
+                    const ram = [];
+                    for (let i = 0; i < 3; i++) { const ms = await dgRamka('/', 60000); if (ms != null) ram.push(ms); await dgSen(300); }
+                    W.pob = dgKw(pob, 0.5); W.ram = dgKw(ram, 0.5);
+                    W.karty = await dgKarty();
+                }
+                W.dz = await new Promise(function (r) {
+                    const c = cfg();
+                    if (!c.url) { r('brak adresu wdrożenia'); return; }
+                    if (!c.on) { r('wyłączony na tym komputerze'); return; }
+                    let done = false;
+                    const tm = setTimeout(function () { if (!done) { done = true; r('błąd: arkusz nie odpowiedział'); } }, 25000);
+                    sprawdz(function (err) { if (done) return; done = true; clearTimeout(tm); r(err ? 'błąd: ' + err : 'ok'); });
+                });
+                const w = dgWTrakcie(a);
+                W.zablok = w.lt ? w.zablok : null; W.ltN = w.ltN; W.spoz = w.spoz; W.lagMed = w.lagMed; W.lagP90 = w.lagP90;
+                W.tlo = w.tlo; W.mb = w.mb || null;
+                if (w.prSuma > 0) {
+                    W.prStan = Object.keys(w.pr).sort(function (x, y) { return w.pr[y] - w.pr[x]; })[0];
+                    W.pr = Object.keys(DG_PR).filter(function (k) { return w.pr[k]; })
+                        .map(function (k) { return DG_PR[k] + ' ' + Math.round(100 * w.pr[k] / w.prSuma) + '%'; }).join(', ');
+                }
+                zapisz(K_DG_TEST, W);
+                const O = dgOcena(W);
+                const IK = { ok: '✔', uwaga: '⚠', zle: '✖', info: '·' };
+                O.wiersze.forEach(function (x) { wpis(M, 'wynik', IK[x.o] + ' ' + x.n + ': ' + x.w); });
+                wpis(M, 'koniec', 'test komputera — wniosek: ' + O.wniosek);
+                const dop = O.wiersze.filter(function (x) { return x.o === 'zle' || x.o === 'uwaga'; });
+                const tekst = 'Test komputera\n\n' + O.wniosek + '\n\n'
+                    + (dop.length ? dop.map(function (x) { return IK[x.o] + ' ' + x.n + ': ' + x.w; }).join('\n') : '✔ Wszystkie pomiary w normie.')
+                    + '\n\nSzczegóły, normy i wyjaśnienia: ⚙ Ustawienia → Diagnostyka.';
+                return { tekst: tekst, W: W };
+            } finally {
+                DG.test = false;
+                if (!Object.keys(przebiegi).length) dgStop();
+            }
+        }
+
         function nowy(modul, t, czesc) {
             return { modul: modul, t0: t, tN: t, linie: [], n: 0, bl: 0, uw: 0, pierwszyBl: '', pierwszaUw: '',
                      startTxt: '', koniecTxt: '', koniec: false, czesc: czesc || 1, dalej: false,
-                     kto: osoba(), ostro: false };
+                     kto: osoba(), ostro: false, dg0: dgNaStart() };
         }
 
         function wpis(modul, faza, tekst, opcje) {
@@ -443,9 +893,13 @@
             const naglowek = [
                 'HUB ' + wersja() + ' · ' + (kto || '(nieznany)') + ' · ' + (etykietaKomp(c) ? etykietaKomp(c) + ' · ' : '') + c.komp.id + ' · ' + H,
                 p.modul + ' · ' + godz(p.t0) + ' → ' + godz(p.tN) + ' (' + trwa + ' s) · wpisów ' + p.n
-                    + (p.bl ? ' · błędów ' + p.bl : '') + (p.uw ? ' · uwag ' + p.uw : '') + ((p.czesc > 1 || p.dalej) ? ' · część ' + p.czesc : ''),
-                '————————————————————————————————————————'
+                    + (p.bl ? ' · błędów ' + p.bl : '') + (p.uw ? ' · uwag ' + p.uw : '') + ((p.czesc > 1 || p.dalej) ? ' · część ' + p.czesc : '')
             ];
+            // Diagnostyka komputera (dgOpis) — w naglowku, wiec nie wplywa na wynik przebiegu i nie wypada przy przycinaniu.
+            const dgL = p.dg0 ? dgOpis(p.dg0) : '';
+            if (dgL) naglowek.push(dgL);
+            if (p.dg0) dgZapiszPrzebieg(p);      // do listy w zakladce „Diagnostyka" (ten komputer)
+            naglowek.push('————————————————————————————————————————');
             const L = p.linie.map(function (l) { return '[' + godz(l.t, true) + '] ' + (l.f + '            ').slice(0, 9) + ' ' + l.s; });
             const lv = p.linie.map(function (l) { return l.lv > 0; });
             return {
@@ -472,6 +926,8 @@
                     const p = przebiegi[m];
                     if ((p.koniec && t - p.tN >= PO_KONCU_MS) || t - p.tN >= CISZA_MS) zamknij(m);
                 });
+                // Pomiar diagnostyki chodzi tylko w czasie przebiegow (i testu komputera).
+                if (!Object.keys(przebiegi).length && !DG.test && DG.iv) dgStop();
                 const zalega = doWyslania.length || wczytaj(K_KOL, []).length;
                 if (zalega) wyslij();
                 if (!Object.keys(przebiegi).length && !zalega || bledy >= 5) { clearInterval(timer); timer = null; }
@@ -637,6 +1093,18 @@
                 try { if (wczytaj(K_NAUKA, []).length) naukaWyslij(); } catch (e) {}
             }, 10000);
         } catch (e) {}
+        // Diagnostyka: karta prologistics (nie ramka) odpowiada na „ping" testu komputera z innej karty — tak test liczy otwarte karty z HUB-em.
+        try {
+            if (window.top === window && onProlo() && typeof BroadcastChannel === 'function') {
+                const bcO = new BroadcastChannel(DG_KANAL);
+                bcO.onmessage = function (e) {
+                    try {
+                        const d = (e && e.data) || {};
+                        if (d.co === 'ping' && d.karta !== DG_KARTA) bcO.postMessage({ co: 'pong', id: d.id, karta: DG_KARTA, ukryta: document.visibilityState === 'hidden' });
+                    } catch (er) {}
+                };
+            }
+        } catch (e) {}
 
         function esc(s) { return String(s == null ? '' : s).replace(/[<>&"]/g, function (ch) { return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[ch]; }); }
         // Stopka launchera: wynik ostatniej wysylki + kilka ustawien.
@@ -650,7 +1118,10 @@
             else if (!c.on) stan = 'wyłączony na tym komputerze';
             else if (!st) stan = 'czeka na pierwszy przebieg';
             else stan = (st.ok ? '✔ ' : '✖ ') + (st.ok ? 'wysłano ' : 'nie wysłano ') + godz(st.t) + (st.ok ? '' : ' — ' + esc(st.info));
-            return 'Dziennik: ' + stan + '<br>' + kim + '<br>' + linki;
+            // „diag-ust" obsluguje launcher (otwiera ustawienia na zakladce „Diagnostyka") — HUBDZ okna ustawien nie widzi.
+            const diag = 'Diagnostyka komputera: ' + (c.diag ? 'włączona' : 'wyłączona') + ' · <a href="#" data-dz="diag">' + (c.diag ? 'wyłącz' : 'włącz') + '</a> · '
+                       + (DG.test ? '⏳ test komputera trwa (ok. 30 s)…' : '<a href="#" data-dz="diag-ust" title="⚙ Ustawienia → Diagnostyka: test komputera, ostatni wynik z normami i wyjaśnieniami, obciążenie w ostatnich przebiegach">🔍 test i wyniki</a>');
+            return 'Dziennik: ' + stan + '<br>' + kim + '<br>' + linki + '<br>' + diag;
         }
         function klik(co, odswiez) {
             try {
@@ -667,6 +1138,15 @@
                     }
                 } else if (co === 'onoff') {
                     ustaw({ on: !c.on });
+                } else if (co === 'diag') {
+                    ustaw({ diag: !c.diag });
+                    if (c.diag) dgStop();
+                } else if (co === 'test') {
+                    if (DG.test) return;
+                    testKomputera().then(function (res) { odswiez(); alert(res.tekst); },
+                                         function (e) { odswiez(); alert('Test komputera: nie udał się — ' + ((e && e.message) || e)); });
+                    odswiez();
+                    return;
                 } else if (co === 'sprawdz') {
                     sprawdz(function (err, txt) { alert(err ? ('Dziennik: BŁĄD — ' + err) : ('Dziennik: połączenie działa.\n' + txt)); odswiez(); });
                     return;
@@ -699,7 +1179,16 @@
             });
         }
 
-        return { wpis: wpis, blad: blad, stopka: stopka, klik: klik, cfg: cfg, zmiany: zmiany, zmianyKopia: zmianyKopia, nauka: nauka, naukaStan: naukaStan };
+        // diag — dla zakladki „Diagnostyka" w ustawieniach (launcher): test, ostatni wynik, ocena z normami, obciazenie przebiegow, wylacznik.
+        const diag = {
+            test: testKomputera,
+            trwa: function () { return DG.test; },
+            ostatni: function () { return wczytaj(K_DG_TEST, null); },
+            przebiegi: function () { return wczytaj(K_DG_PRZ, []); },
+            ocena: dgOcena,
+            wlacz: function (v) { ustaw({ diag: !!v }); if (!v && !DG.test) dgStop(); }
+        };
+        return { wpis: wpis, blad: blad, stopka: stopka, klik: klik, cfg: cfg, zmiany: zmiany, zmianyKopia: zmianyKopia, nauka: nauka, naukaStan: naukaStan, diag: diag };
     })();
     // Jedyne wejscie dla modulow: hubDz('Nazwa modulu', 'faza', 'tekst', { ostro: true dla modulow z numerami kont }).
     function hubDz(modul, faza, tekst, opcje) { HUBDZ.wpis(modul, faza, tekst, opcje); }
@@ -3482,8 +3971,8 @@
             if (!poz[id]) poz[id] = { od: e.t, do: e.t, koniec: '' };
             poz[id].do = e.t;
             if (/zaksięgowano|zaksiegowano/i.test(e.tekst)) poz[id].koniec = '✔';
-            else if (/ESKALACJA|eskalacja/i.test(e.tekst)) poz[id].koniec = '⚠';
-            else if (/BŁĄD|BLAD|Deleted|Brak ticketu/i.test(e.tekst)) poz[id].koniec = '✖';
+            else if (/ESKALACJA|eskalacja|Brak ticketu|nie znaleziono ticketu/i.test(e.tekst)) poz[id].koniec = '⚠';
+            else if (/BŁĄD|BLAD|Deleted/i.test(e.tekst)) poz[id].koniec = '✖';
         });
         const ids = Object.keys(poz);
         if (ids.length > 1){
@@ -7184,7 +7673,11 @@
         // przy polskim zwrocie VAT — ksieguje kwote na wskazanym koncie i sprawdza, czy
         // wiersz naprawde sie pojawil — tyle ze BEZ opisu na platnosci.
         // Przy dopasowanej kwocie reszta wychodzi zero, wiec nic nie idzie na 8100.
+        // row._ksZapis — od tej chwili HUB moze juz cos zapisac w prologistics (Make payment, status ticketu, Update,
+        // eskalacja). Ponowienie po przekroczonym czasie (tryb rownolegly, 23.11.2026) bierze TYLKO pozycje bez tej flagi
+        // — PULAPKI pkt 9: ponawiac wolno tylko to, co padlo PRZED zapisem.
         if (row.bookTo === 'auftrag' && row.wyborAuctionUrl) {
+            row._ksZapis = true;
             const resA = await bookVatRefund(ctx, row.wyborAuctionUrl, row.amount, row.accountNum, row.bookingDate, '');
             return {
                 ok: !!resA.ok, vatRefund: true, naAuftragu: true, niepotwierdzone: !!resA.niepotwierdzone, ponowOd: resA.ponowOd || 0,
@@ -7196,6 +7689,7 @@
             };
         }
         if (row.vatRefund && row.vatAuctionUrl) {
+            row._ksZapis = true;
             const res = await bookVatRefund(ctx, row.vatAuctionUrl, row.amount, row.accountNum, row.bookingDate);
             const absAmt = Math.abs(parseFloat(normalizeAmount(row.amount))).toFixed(2);
             return {
@@ -7407,6 +7901,8 @@
                 wasClosedAtStart = isClosedNow;
             }
 
+            // Dalej sa juz zapisy (status → Open, Update, eskalacja) — patrz row._ksZapis na poczatku funkcji.
+            row._ksZapis = true;
             try {
                 if (isClosedNow) {
                     await setTicketStatus('Open', ctx);
@@ -8377,7 +8873,7 @@
         } catch (e){ try { console.error('[Beliani hub] log ticketa:', e); } catch (e2){} }
 
         const progressList = document.getElementById('tm-t-progress-list');
-        let ok = 0, fail = 0, already = 0, escalated = 0;
+        let ok = 0, fail = 0, already = 0, escalated = 0, bezTicketu = 0;
 
         // Wspólna kolejka — GRUPAMI po numerze zamówienia, nie pojedynczymi indeksami.
         // Jedno zamówienie to jeden ticket, a od rozdzielenia claimów ma ono często dwie
@@ -8396,6 +8892,18 @@
             });
             return [...g.values()];
         })();
+        // Kolejka sie zjada (shift) — do ponowienia na koncu potrzebny jest jej obraz z poczatku.
+        const grupyWszystkie = queue.map(function (g){ return g.slice(); });
+        // Wiersz logu kazdej pozycji (ponowienie pisze w TYM SAMYM wierszu — jedna linia na pozycje, jak dotad czyta
+        // ja modul Marketplace) i tresc bledu pozycji czekajacych na ponowienie (gdyby ponowienia jednak nie bylo).
+        const wierszeLogu = new Map();
+        const bladyCzasu = new Map();
+        function przywrocBlad(i, dopisek) {
+            const w = wierszeLogu.get(i);
+            if (w && bladyCzasu.has(i)) { w.innerHTML = bladyCzasu.get(i) + dopisek; w.style.color = '#dc2626'; }
+            bladyCzasu.delete(i);
+            if (previewRows[i]) previewRows[i].ponowCzas = false;
+        }
 
         // Pomocnik do logowania — każdy worker dorzuca swoje wiersze do progress listy
         function logLine(html, color) {
@@ -8407,8 +8915,10 @@
             return div;
         }
 
-        async function processOne(workerLabel, i, ctx) {
+        // staryWiersz — tylko przy ponowieniu po przekroczonym czasie: wiersz logu z pierwszego przejscia.
+        async function processOne(workerLabel, i, ctx, staryWiersz) {
             const row = previewRows[i];
+            const ponowienie = !!staryWiersz;
             const zn = ksRodzajZn(row);          // rodzaj przy numerze — modul marketplace'ow rozroznia po nim pozycje
             if (row.booked || row.alreadyBooked) {
                 // WZNAWIANIE. Ta pozycja przeszla w jednym z wczesniejszych przebiegow —
@@ -8430,7 +8940,34 @@
                 already++;
                 return 'pominiete';
             }
-            const logRow = logLine(`🔍 [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — szukam ticketu…`, '#6b7280');
+            const logRow = staryWiersz || logLine('', '#6b7280');
+            logRow.innerHTML = ponowienie
+                ? `↻ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — ponawiam po przekroczonym czasie — szukam ticketu…`
+                : `🔍 [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — szukam ticketu…`;
+            logRow.style.color = '#6b7280';
+            wierszeLogu.set(i, logRow);
+            row.ponowCzas = false;
+            row._ksZapis = false;            // ustawia bookOne, zanim cokolwiek zapisze
+
+            // PRZEKROCZONY CZAS PRZED ZAPISEM (23.11.2026). Timeouty prologistics to najczestszy blad przebiegow
+            // (u Teresy i Uli ok. 11 na 100 pozycji), a przy wiekszosci z nich nic jeszcze nie poszlo: padlo szukanie
+            // ticketu albo pierwsze wczytanie ticketu. Taka pozycja w pierwszym przejsciu dostaje „⏳ … ponowię na końcu
+            // przebiegu", a po wszystkich workerach idzie raz jeszcze (patrz ponowienie po Promise.all). ❌ zostaje dla
+            // reszty: blad po zapisie (row._ksZapis) i drugi raz to samo w ponowieniu — PULAPKI pkt 9, zadnego drugiego Update.
+            // Tekst „⏳" nie moze miec „błąd"/„BŁĄD" (nadajnik HUBDZ liczy to jako ✖) ani „zaksięgowan…" (Marketplace — KS_POTW).
+            const pokazBlad = function (html, msg, etap) {
+                const czas = !ponowienie && !row._ksZapis && /timeout/i.test(String(msg || ''));
+                row.ponowCzas = czas;
+                if (czas) {
+                    bladyCzasu.set(i, html);
+                    logRow.innerHTML = `⏳ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — przekroczony czas (${etap}): ${msg}`
+                                     + ` — nic nie poszło, ponowię na końcu przebiegu`;
+                    logRow.style.color = '#b45309';
+                } else {
+                    logRow.innerHTML = html;
+                    logRow.style.color = '#dc2626';
+                }
+            };
 
             let checkResult;
             try {
@@ -8440,8 +8977,7 @@
             } catch (e) {
                 previewRows[i].loading = false;
                 previewRows[i].error = e.message;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — błąd przy sprawdzaniu: ${e.message}`;
-                logRow.style.color = '#dc2626';
+                pokazBlad(`❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — błąd przy sprawdzaniu: ${e.message}`, e.message, 'szukanie ticketu');
                 updateRow(i);
                 fail++;
                 return;
@@ -8456,8 +8992,21 @@
                 previewRows[i].checkedTickets = checkResult.checkedTickets || 0;
                 previewRows[i].auctionUrls = checkResult.auctionUrls || [];
                 previewRows[i].stanUsun = checkResult.stanUsun || null;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — ${checkResult.error}`;
-                logRow.style.color = '#dc2626';
+                // BRAK TICKETU to nie awaria, tylko robota dla czlowieka (23.11.2026): ticketu nie ma, nic nie poszlo, trzeba go
+                // zalozyc. Do tej pory „❌" i licznik bledow — przebieg dostawal w dzienniku ✖ (72 przebiegi Marketplace w 4 tygodnie).
+                // Teraz „⚠️" i osobny licznik; lista z odnosnikami do auftragow jak dotad w „Do wykonania ręcznie".
+                // W tekscie zostaje „Brak ticketu" / „nie znaleziono ticketu" — po nich modul Marketplace (ksBledy) rozpoznaje powod;
+                // nie moze stac „zaksięgowan…" ani „deleted" (ksDone / ksUsuniete).
+                const bezT = checkResult.reportType === 'no_ticket' && !/deleted/i.test(String(checkResult.error || ''));
+                if (bezT) {
+                    const doZal = /załóż ticket/i.test(String(checkResult.error || '')) ? '' : ' — załóż ticket i puść pozycję jeszcze raz (nic nie poszło)';
+                    logRow.innerHTML = `⚠️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — ${checkResult.error}${doZal}`;
+                    logRow.style.color = '#b45309';
+                    updateRow(i);
+                    bezTicketu++;
+                    return;
+                }
+                pokazBlad(`❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — ${checkResult.error}`, checkResult.error, 'szukanie ticketu');
                 updateRow(i);
                 fail++;
                 return;
@@ -8570,30 +9119,30 @@
                 } else {
                     previewRows[i].bookError = bookResult.error; previewRows[i].booked = false;
                     previewRows[i].bookNiepotw = false; previewRows[i].bookNiepotwVat = false;
-                    logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${bookResult.error}`;
-                    logRow.style.color = '#dc2626';
+                    pokazBlad(`❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${bookResult.error}`, bookResult.error, 'wczytanie ticketu');
                     fail++;
                 }
             } catch (e) {
                 previewRows[i].bookError = e.message; previewRows[i].booked = false;
                 previewRows[i].bookNiepotw = false; previewRows[i].bookNiepotwVat = false;
-                logRow.innerHTML = `❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${e.message}`;
-                logRow.style.color = '#dc2626';
+                pokazBlad(`❌ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — BŁĄD: ${e.message}`, e.message, 'wczytanie ticketu');
                 fail++;
             }
             updateRow(i);
         }
 
-        async function workerLoop(workerLabel) {
+        // kolejka — domyslnie wspolna kolejka przebiegu; ponowienie po przekroczonym czasie podaje wlasna (ponow = true).
+        async function workerLoop(workerLabel, kolejka, ponow) {
+            const q = kolejka || queue;
             const ctx = createFrameCtx();
             try {
-                while (queue.length > 0) {
-                    const grupa = queue.shift();
+                while (q.length > 0) {
+                    const grupa = q.shift();
                     if (!grupa || !grupa.length) break;
                     // Cała grupa (= jedno zamówienie, jeden ticket) w jednym workerze,
                     // po kolei — patrz komentarz przy budowie kolejki.
                     for (const i of grupa) {
-                        const wynik = await processOne(workerLabel, i, ctx);
+                        const wynik = await processOne(workerLabel, i, ctx, ponow ? (wierszeLogu.get(i) || null) : null);
                         freeCtx(ctx); // zwolnij pamięć po każdej pozycji
                         // Przerwa jest po to, zeby nie zasypac prologistics. Pozycja pominieta
                         // nie wyslala do niego ani jednego zapytania, wiec nie ma czego
@@ -8620,23 +9169,73 @@
         try {
             await Promise.all(workers);
 
+            // PONOWIENIE PO PRZEKROCZONYM CZASIE (23.11.2026) — raz, na koncu, tylko pozycje „⏳" (patrz pokazBlad w processOne):
+            // przekroczony czas, a HUB nic jeszcze nie zapisal. Zamowienie, przy ktorym w tym przebiegu cokolwiek poszlo
+            // (row._ksZapis przy ktorejkolwiek jego pozycji), NIE idzie drugi raz: kolejnosc pozycji tej samej kwoty
+            // (dupIndex) liczy noty na tickecie, a czesc z nich bylaby juz z tego przebiegu.
+            // Ponowienie idzie wolniej i ostrozniej: najwyzej 2 naraz i z mnoznikiem czasu ×1,5 (do ×10) — w pierwszym
+            // przejsciu te strony nie zdazyly sie wczytac.
+            const doPonowienia = [];
+            grupyWszystkie.forEach(function (grupa) {
+                const zCzasem = grupa.filter(function (i) { return previewRows[i] && previewRows[i].ponowCzas; });
+                if (!zCzasem.length) return;
+                if (grupa.some(function (i) { return previewRows[i] && previewRows[i]._ksZapis; })) {
+                    zCzasem.forEach(function (i) {
+                        przywrocBlad(i, ' — nie ponawiam: przy tym zamówieniu w tym przebiegu był już zapis; puść pozycję jeszcze raz');
+                    });
+                    return;
+                }
+                doPonowienia.push(zCzasem);
+            });
+            if (doPonowienia.length) {
+                const nP = doPonowienia.reduce(function (s, g) { return s + g.length; }, 0);
+                const ileW = Math.min(2, workersCount);
+                const multP = Math.min(10, Math.round(timeoutMult * 1.5 * 10) / 10);
+                const okPrzed = ok;
+                doPonowienia.forEach(function (g) { g.forEach(function (i) {
+                    const r = previewRows[i];
+                    r.error = null; r.bookError = null; r.reportType = ''; r.ponowCzas = false;
+                    bladyCzasu.delete(i);
+                }); });
+                fail -= nP;                  // kazda z nich byla policzona jako blad w pierwszym przejsciu
+                logLine(`↻ Ponawiam ${nP} poz., które przekroczyły czas, zanim cokolwiek zapisałem — po kolei, najwyżej ${ileW} naraz, mnożnik czasu ×${multP}.`, '#7c3aed');
+                try {
+                    ksLog('ponowienie', '↻ ' + nP + ' poz. z przekroczonym czasem przed zapisem — ponawiam raz (' + ileW + ' naraz, mnożnik czasu ×' + multP + '): '
+                          + doPonowienia.map(function (g) { return previewRows[g[0]].orderNumber; }).join(', '));
+                } catch (e) {}
+                const kolejkaP = doPonowienia.slice();
+                tmTimeoutMultiplier = multP;
+                try {
+                    const wP = [];
+                    for (let w = 1; w <= ileW; w++) wP.push(workerLoop(w, kolejkaP, true));
+                    await Promise.all(wP);
+                } finally { tmTimeoutMultiplier = timeoutMult; }
+                try { ksLog('ponowienie', 'po ponowieniu: weszło ' + (ok - okPrzed) + ' z ' + nP); } catch (e) {}
+            }
+            // Na wszelki wypadek: zaden wiersz nie moze zostac z obietnica „ponowię", ktorej nikt nie spelni.
+            Array.from(bladyCzasu.keys()).forEach(function (i) { przywrocBlad(i, ' — nie ponowiłem'); });
+
             const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
             buildInitialTable(previewRows);
             if (fail === 0) clearProgress();
 
             const summary = document.getElementById('tm-t-summary');
             const _srvStatsP = formatServerStatsHtml(computeServerStats()); // v3.22
+            const _bezT = bezTicketu ? ` ⚠️ Bez ticketu: <strong>${bezTicketu}</strong> (do założenia — lista niżej).` : '';
             summary.innerHTML = (fail === 0
-                ? `🎉 Zaksięgowano teraz: <strong>${ok}</strong>. ℹ️ Już było: <strong>${already}</strong>.${escalated ? ` ⚠️ Eskalacje: <strong>${escalated}</strong>.` : ''} Czas: ${elapsed}s (${workersCount} workerów).`
-                : `✅ Zaksięgowano teraz: <strong>${ok}</strong> &nbsp; ℹ️ Już było: <strong>${already}</strong>${escalated ? ` &nbsp; ⚠️ Eskalacje: <strong>${escalated}</strong>` : ''} &nbsp; ❌ Błędy: <strong>${fail}</strong> &nbsp; Czas: ${elapsed}s (${workersCount} workerów)`) + _srvStatsP;
-            summary.style.color = fail === 0 ? (escalated ? '#d97706' : '#16a34a') : '#b45309';
+                ? `🎉 Zaksięgowano teraz: <strong>${ok}</strong>. ℹ️ Już było: <strong>${already}</strong>.${escalated ? ` ⚠️ Eskalacje: <strong>${escalated}</strong>.` : ''}${_bezT} Czas: ${elapsed}s (${workersCount} workerów).`
+                : `✅ Zaksięgowano teraz: <strong>${ok}</strong> &nbsp; ℹ️ Już było: <strong>${already}</strong>${escalated ? ` &nbsp; ⚠️ Eskalacje: <strong>${escalated}</strong>` : ''}${_bezT ? ' &nbsp;' + _bezT : ''} &nbsp; ❌ Błędy: <strong>${fail}</strong> &nbsp; Czas: ${elapsed}s (${workersCount} workerów)`) + _srvStatsP;
+            summary.style.color = fail === 0 ? ((escalated || bezTicketu) ? '#d97706' : '#16a34a') : '#b45309';
             updateIssueReport();
         } catch (e) {
+            // Pozycje „⏳ … ponowię" — ponowienia nie bedzie, wracaja do swojego bledu.
+            try { Array.from(bladyCzasu.keys()).forEach(function (i) { przywrocBlad(i, ' — przebieg przerwany, nie ponowiłem'); }); } catch (e5) {}
             try { buildInitialTable(previewRows); } catch (e2) {}
             const summary = document.getElementById('tm-t-summary');
             if (summary) {
                 summary.textContent = '❌ Przerwane: ' + ((e && e.message) ? e.message : String(e))
                     + ' — zaksięgowano ' + ok + ', już było ' + already + ', błędy ' + fail
+                    + (bezTicketu ? ', bez ticketu ' + bezTicketu : '')
                     + '. Sprawdź, co przeszło, zanim powtórzysz.';
                 summary.style.color = '#b45309';
             }
@@ -8650,7 +9249,7 @@
                 if (st) ksLog('koniec', 'roundtripów ' + st.n + ' · min ' + st.min + ' ms · mediana '
                               + (st.p50 != null ? st.p50 : '?') + ' ms · max ' + st.max + ' ms');
                 ksLog('koniec', '=== zaksięgowane ' + ok + ' · błędy ' + fail + ' · już były ' + already
-                      + ' · eskalacje ' + escalated + ' ===');
+                      + ' · eskalacje ' + escalated + (bezTicketu ? ' · ⚠ bez ticketu ' + bezTicketu : '') + ' ===');
             } catch (e){ try { console.error('[Beliani hub] log ticketa:', e); } catch (e2){} }
             tmIsBusy = false;
             parallelBtn.disabled = false;
@@ -67644,10 +68243,11 @@
     function kflSen(ms){ return new Promise(function (r){ setTimeout(r, ms); }); }
     // Raporty na zakres [od, doo]: swieza para z dzis albo jedno zamowienie obu typow i czekanie (do 6 min). Zamowione dzis
     // wczesniej i jeszcze w toku — czekamy na nie, nie zamawiamy drugi raz.
-    async function kflRaporty(od, doo, dzis, K){
+    // L0 — lista raportow pobrana przed chwila przez sprawdzenie na starcie (kflStart); bez niej pytamy portal sami.
+    async function kflRaporty(od, doo, dzis, K, L0){
         K = K || KFL_KRAJE.de;
         const sf = K.sf;
-        let L = (await kflZapytaj('lista', '', '', sf)).L || [];
+        let L = L0 || (await kflZapytaj('lista', '', '', sf)).L || [];
         const para0 = kflPara(L, od, doo, dzis, sf);
         if (para0) return Object.assign({ zamowione: false }, para0);
         const nazwy = [KFL_RAP.gmu.nazwa, KFL_RAP.pend.nazwa];
@@ -67703,7 +68303,7 @@
     function kflJobKraju(j, K){ return !!j && j.kind === 'kfl' && kflKrajJob(j).sf === K.sf; }
     // Faza 1 (bez zamka przelotu — tylko odczyty): stan paczek banku kraju, raporty z portalu, plan. Czekanie na portal trwa do kilku minut
     // i nie moze trzymac zamka, ktory blokuje import, ksiegowanie i „Wyczyść wszystko".
-    async function kflPobierzDane(K){
+    async function kflPobierzDane(K, L0){
         const dzis = kflDzis();
         // Zalegle sztuki: zapamietany dzien z poprzedniego pobrania i niezaimportowane zlecenia tego kraju (gdyby pamieci nie bylo).
         let dolny = kflDolnyLoad(K);
@@ -67722,7 +68322,7 @@
         const pacz = imp.paczki.filter(function (p){ return p.max === imp.start; })[0] || imp.paczki[0];
         say(K.nazwa + ': ostatni import kończy się ' + imp.start + ' (paczka ' + (pacz ? pacz.id : '?') + ')'
             + (odImp < startDz ? (', zaległe sztuki od ' + kflDn(odImp)) : '') + '. Szukam raportów ' + kflDn(od) + ' – ' + kflDn(dzis) + ' w Seller Portalu…');
-        const R = await kflRaporty(od, dzis, dzis, K);
+        const R = await kflRaporty(od, dzis, dzis, K, L0);
         say(K.nazwa + ': pobieram pliki raportów…');
         const gmu = kflParseGmu(await kflPlikRaportu(R.gmu.url, KFL_RAP.gmu.opis));
         const pend = kflParsePend(await kflPlikRaportu(R.pend.url, KFL_RAP.pend.opis));
@@ -67829,7 +68429,19 @@
         let ok = false;
         try {
             renderKfl();
-            const D = await kflPobierzDane(K);
+            // SELLER PORTAL NAJPIERW (23.11.2026). Do tej pory portal byl pytany dopiero po sprawdzeniu paczek w prologistics —
+            // przy wylogowanym portalu kazdy kraj konczyl sie bledem dopiero po tej robocie (Kasia: DE, AT, SK i PL po kolei).
+            // Teraz jedno zapytanie o liste raportow idzie na starcie; gdy portal nie odpowiada, mowimy to od razu i nic
+            // dalej nie robimy. Odpowiedz nie przepada — ta sama lista idzie do kflRaporty (bez drugiego zapytania).
+            say(K.nazwa + ': sprawdzam, czy Seller Portal odpowiada (zalogowany w tej przeglądarce)…');
+            let L0 = null;
+            try { L0 = (await kflZapytaj('lista', '', '', K.sf)).L || []; }
+            catch (e){
+                throw new Error('Seller Portal nie odpowiada albo nie jesteś w nim zalogowany — nic nie pobrałem i niczego nie sprawdzałem. '
+                    + 'Zaloguj się na ' + MK_KFL_PANEL + ' (zostaw tę kartę otwartą) i kliknij „' + K.nazwa + '” jeszcze raz. '
+                    + '[' + ((e && e.message) || e) + ']');
+            }
+            const D = await kflPobierzDane(K, L0);
             // Zapis zlecen nie moze trafic w przelot („⬇ Pobierz zestawienia" zapisuje migawke wszystkich zlecen z chwili startu i
             // zgubilby nasze) ani w dopis braków — czekamy na ich koniec (do 2 min), sam zapis jest natychmiastowy.
             kflBieg.co = 'zapis zleceń';
@@ -78873,9 +79485,37 @@
     //
     // To SUFIT BEZPIECZENSTWA, a nie harmonogram: czekanie konczy sie w chwili, gdy
     // tamten modul zwolni przycisk, wiec przy szybkich marketplace'ach nie kosztuje nic.
+    //
+    // 23.11.2026: sufit pol godziny ucinal paczki po 110-130 zwrotow (Agnieszka K., Teresa 22.10): modul ticketa
+    // pracowal dalej w tle, a nastepna grupa odbijala sie od jego zablokowanego guzika. Teraz czekamy, DOPOKI TAMTEN
+    // MODUL ROBI POSTEP — konczy nas dopiero cisza w jego logu (KS_CISZA_MS, zadna linia nie zmienila sie przez
+    // 20 min) albo sufit KS_MAX_MS. Kazda pozycja ticketa ma wlasne limity czasu na kazde wczytanie, wiec dluga
+    // cisza znaczy, ze naprawde stoi.
+    const KS_CISZA_MS = 20 * 60 * 1000;
+    const KS_MAX_MS = 4 * 60 * 60 * 1000;
     function ksLimit(ile){
         const fal = Math.max(1, Math.ceil((Number(ile) || 1) / 5));
-        return Math.min(30 * 60 * 1000, (4 + 10 * fal) * 60 * 1000);
+        return Math.min(KS_MAX_MS, (4 + 10 * fal) * 60 * 1000);
+    }
+    // Odcisk logu modulu ticketa: liczba wierszy i dlugosc tekstu. Tamten modul nadpisuje wiersze w miejscu
+    // („szukam ticketu…" → „księguję…" → wynik), wiec sama liczba wierszy nie wystarcza.
+    function ksLogOdcisk(){
+        const list = document.getElementById('tm-t-progress-list');
+        return list ? (list.children.length + ':' + String(list.textContent || '').length) : '';
+    }
+    // Modul ticketa jeszcze pracuje (poprzednia grupa skonczyla sie u nas „przerwane po czasie" albo ktos puscil
+    // go recznie) — czekamy, az zwolni guzik. false = stoi bez zmian KS_CISZA_MS albo minal KS_MAX_MS.
+    function ksCzekajWolny(btn){
+        return new Promise(function (resolve){
+            const t0 = Date.now();
+            let odcisk = ksLogOdcisk(), ruch = t0;
+            const iv = setInterval(function (){
+                if (!btn.disabled){ clearInterval(iv); resolve(true); return; }
+                const teraz = Date.now(), o = ksLogOdcisk();
+                if (o !== odcisk){ odcisk = o; ruch = teraz; }
+                if (teraz - ruch > KS_CISZA_MS || teraz - t0 > KS_MAX_MS){ clearInterval(iv); resolve(false); }
+            }, 1000);
+        });
     }
     // Czy log modulu ticketa pochodzi z TEGO przebiegu (20.11.2026). Tamten modul czysci swoja liste dopiero PO swoim pytaniu
     // i walidacji; gdy nie wystartowal („Anuluj" w jego oknie, blad walidacji, pusta wklejka), na liscie zostaja linie
@@ -78897,12 +79537,20 @@
         const limit = ksLimit(ile);
         return new Promise(function (resolve){
             const t0 = Date.now();
-            let started = false;
+            let started = false, odcisk = ksLogOdcisk(), ruch = t0;
             const iv = setInterval(function (){
                 if (btn.disabled){ started = true; }
-                else if (started){ clearInterval(iv); resolve('ok'); }
-                const dt = Date.now() - t0;
-                if (!started && dt > 30000){ clearInterval(iv); resolve('anulowane'); }
+                else if (started){ clearInterval(iv); resolve('ok'); return; }
+                const teraz = Date.now(), dt = teraz - t0;
+                const o = ksLogOdcisk();
+                if (o !== odcisk){ odcisk = o; ruch = teraz; }
+                if (!started && dt > 30000){ clearInterval(iv); resolve('anulowane'); return; }
+                // Cisza: log modulu ticketa nie drgnal od KS_CISZA_MS — stoi (patrz ksLimit).
+                if (started && teraz - ruch > KS_CISZA_MS){
+                    clearInterval(iv);
+                    resolve('przerwane po czasie (' + Math.round(KS_CISZA_MS / 60000) + ' min bez zmian w logu modułu ticketa)');
+                    return;
+                }
                 if (dt > limit){ clearInterval(iv); resolve('przerwane po czasie'); }
             }, 400);
         });
@@ -79171,6 +79819,11 @@
     // wygaszonymi guzikami — przerysowujemy ja teraz W TRAKCIE, wiec bez tej flagi
     // kazde przerysowanie stawialoby swieze, klikalne „▶ Zaksięguj".
     let refBusy = false;
+    // Numery, przy ktorych modul ticketa w TYM przelocie zbiorczym napisal „brak ticketu" (23.11.2026) — { numer: data grupy }.
+    // Ticket nie pojawi sie sam w kilka minut, wiec drugie podejscie nie wysyla grupy, w ktorej zostaly tylko one
+    // (do tej pory kazda taka pozycja dawala drugi czerwony krzyzyk), a na koniec przelotu idzie ich lista do zalozenia.
+    // null = poza przelotem zbiorczym (pojedyncza grupa niczego tu nie zbiera).
+    let refPrzelotBrakT = null;
     // Zwroty grupy, o ktorych juz PRZED wysylka wiadomo, ze sie znosza — POTWIERDZONE przy paczce importu
     // (slad „net": wplata NOT FOUND, auftrag Deleted, zwrot calej kwoty). Liczone PER WIERSZ: inna pozycja
     // tego samego zamowienia (claim, Goodwill) idzie do modulu ticketa normalnie.
@@ -79207,11 +79860,25 @@
             // Modul ticketa jeszcze pracuje (np. poprzednia grupa skonczyla sie u nas „przerwane po czasie"): klikniecie
             // w jego zablokowany guzik nic nie robi, a ksWait — widzac blokade — meldowal „ok", gdy konczyla sie TAMTA
             // praca. Ta grupa wychodzila wtedy jako przetworzona, choc nie poszla wcale (przeglad 19.11.2026).
+            // 23.11.2026: zamiast od razu oddawac grupe — czekamy, az tamten modul skonczy (ksCzekajWolny). Odbicie sie od
+            // zajetego guzika zostawialo kazda nastepna grupe przelotu „NIE poszła", chociaz wystarczylo poczekac.
+            // refBusy na czas czekania gasi guziki innych grup — dwie czekajace grupy nie wystartuja naraz.
             const kb = ksBtn();
             if (kb && kb.disabled){
-                const eB = 'moduł „Księgowanie w tickecie” jeszcze pracuje nad poprzednią paczką — ta grupa NIE poszła; '
-                         + 'poczekaj, aż skończy, i puść ją jeszcze raz';
-                mkLog('start', '✖ nie ruszylo: ' + eB); say(eB, '#c47f00'); return eB;
+                const tW = Date.now();
+                mkLog('start', 'modul ticketa jeszcze pracuje nad poprzednia paczka — czekam, az skonczy (stop po '
+                      + Math.round(KS_CISZA_MS / 60000) + ' min bez zmian w jego logu)');
+                say('Moduł „Księgowanie w tickecie” kończy poprzednią paczkę — ta grupa czeka na swoją kolej…', '#c47f00');
+                refBusy = true;
+                try { renderRef(); } catch (e){}
+                let wolny = false;
+                try { wolny = await ksCzekajWolny(kb); } finally { refBusy = false; }
+                if (!wolny){
+                    const eB = 'moduł „Księgowanie w tickecie” dalej pracuje nad poprzednią paczką (czekałem ' + mkLogSek(tW)
+                             + ') — ta grupa NIE poszła; poczekaj, aż skończy, i puść ją jeszcze raz';
+                    mkLog('start', '✖ nie ruszylo: ' + eB); say(eB, '#c47f00'); return eB;
+                }
+                mkLog('start', 'modul ticketa wolny po ' + mkLogSek(tW) + ' — ruszam z ta grupa');
             }
             const err = ksFill(xs);
             if (err){ mkLog('start', '✖ nie ruszylo: ' + err); say(err, '#c47f00'); return err; }
@@ -79243,8 +79910,8 @@
             const prob = ksProbki();
             ksBtn().click();                            // dalej pyta i pracuje juz tamten modul
             r = await ksWait(ksBtn(), xs.rows.length);
-            mkLog('ticket', '  (limit czekania na te paczke: '
-                  + Math.round(ksLimit(xs.rows.length) / 60000) + ' min)');
+            mkLog('ticket', '  (limit czekania na te paczke: ' + Math.round(ksLimit(xs.rows.length) / 60000)
+                  + ' min albo ' + Math.round(KS_CISZA_MS / 60000) + ' min bez zmian w logu modulu ticketa)');
             prob.stop();
             // Przy pracy rownoleglej „na pozycje" to zwykla srednia i NIE jest czasem jednej
             // pozycji — piec workerow na pieciu pozycjach robi 121 s lacznie, ale kazda z nich
@@ -79310,6 +79977,9 @@
         // Zamowienia, ktorych prologistics nie zna („Nie znaleziono zamówienia…" w logu ticketa) — nic do ksiegowania.
         // Zamykaja grupe osobnym sladem (rdMarkBz), a wiersz arkusza dostaje „Tak" z notatka (refDoArkusza).
         const blBz = bezTicketa ? {} : ksBledy(x);
+        if (refPrzelotBrakT) Object.keys(blBz).forEach(function (id){
+            if (blBz[id] === 'brak ticketu' && done.indexOf(id) < 0) refPrzelotBrakT[id] = x.date;
+        });
         const bezZam = x.rows.map(function (rr){ return rr.id; }).filter(function (id, n, a){
             return a.indexOf(id) === n && blBz[id] === 'brak zamówienia' && done.indexOf(id) < 0 && usuniete.indexOf(id) < 0;
         });
@@ -79521,6 +80191,9 @@
         // konta sa juz ustawione, wiec potwierdzanie kazdej grupy z osobna nic nie wnosi.
         window.__MKT_AUTO = true;
         let ok = 0; const bad = [];
+        refPrzelotBrakT = {};
+        const bezTicketuGrupy = [];       // grupy pominiete w drugim podejsciu — zostaly w nich same „brak ticketu"
+        let brakT = {};
         try {
             for (let i = 0; i < keys.length; i++){
                 say('Grupa ' + (i + 1) + '/' + keys.length + ' — konto ' + g[keys[i]].acct + '…');
@@ -79537,8 +80210,15 @@
             const zostalo = Object.keys(g2).sort().filter(function (k){
                 if (!g2[k].acct) return false;
                 const st = rdState(k, g2[k]);
-                return !st || st.left.length;
+                if (st && !st.left.length) return false;
+                // Zostaly same pozycje bez ticketu (refPrzelotBrakT) — drugie podejscie dalo by tylko drugi „brak ticketu".
+                const left = st ? st.left : (g2[k].rows || []);
+                if (left.length && left.every(function (r){ return refPrzelotBrakT[r.id]; })){ bezTicketuGrupy.push(k); return false; }
+                return true;
             });
+            if (bezTicketuGrupy.length)
+                mkLog('start', 'drugie podejscie pomija ' + bezTicketuGrupy.length + ' grup, w ktorych zostaly tylko pozycje bez ticketu: '
+                      + bezTicketuGrupy.map(function (k){ return g2[k].date + '/' + g2[k].acct; }).join(', '));
             if (zostalo.length){
                 mkLog('start', '=== drugie podejscie: ' + zostalo.length + ' grup, ktore nie weszly ===');
                 for (let i = 0; i < zostalo.length; i++){
@@ -79550,9 +80230,16 @@
             } else {
                 mkLog('start', 'drugie podejscie niepotrzebne — nic nie zostalo');
             }
-        } finally { window.__MKT_AUTO = false; }
+        } finally { window.__MKT_AUTO = false; brakT = refPrzelotBrakT || {}; refPrzelotBrakT = null; }
         b.disabled = false;
         render();                                         // lista tez — etap zlecenia zalezy od stanu zwrotow
+        // Lista ticketow do zalozenia — po numerze zamowienia; adresy auftragow pokazuje modul ticketa w „Do wykonania ręcznie".
+        const brakTIds = Object.keys(brakT);
+        const brakTTxt = brakTIds.length
+            ? (' ⚠ Bez ticketu (' + brakTIds.length + ') — załóż ticket i puść zwroty jeszcze raz: '
+               + brakTIds.map(function (id){ return id + ' (' + brakT[id] + ')'; }).join(', ') + '.')
+            : '';
+        if (brakTIds.length) mkLog('koniec', '⚠ do zalozenia ticketu (' + brakTIds.length + '): ' + brakTIds.join(', '));
         // v3.66: przelot zbiorczy przykrywa komunikaty poszczegolnych grup — kazda
         // kolejna grupa nadpisuje pasek. Bilans opisow potracen skladamy wiec tutaj,
         // z zapisanego sladu, zeby nie przepadl razem z tamtymi komunikatami.
@@ -79570,8 +80257,8 @@
             : '';
         say('Zwroty: zaksięgowanych grup ' + ok + ' z ' + keys.length
             + (skip.length ? (', pominiętych jako już zrobione ' + skip.length) : '')
-            + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.' + komTxt,
-            (bad.length || komZle) ? '#c47f00' : '#0a7a2f');
+            + (bad.length ? ('. Zatrzymane: ' + bad.join('; ')) : '') + '.' + komTxt + brakTTxt,
+            (bad.length || komZle || brakTIds.length) ? '#c47f00' : '#0a7a2f');
     }
 
     // v3.91: readBuf stalo w domknieciu „if (onProlo)", a od tej wersji potrzebuje go
@@ -125056,7 +125743,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '24c3a3f · 23.11.2026 07:52';
+    const HUB_BUDOWA = 'd2b9ca5 · 23.11.2026 09:19';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -127744,7 +128431,7 @@
             if (['obok', 'jeden', 'bez'].indexOf(u.dok) < 0) u.dok = UI_DOM.dok;
             u.maks = [0, 2, 3, 4].indexOf(Number(u.maks)) >= 0 ? Number(u.maks) : 0;
             u.skala = [100, 95, 90, 85, 80].indexOf(Number(u.skala)) >= 0 ? Number(u.skala) : 100;
-            if (['widok', 'moduly', 'polaczenia', 'changelog'].indexOf(u.tab) < 0) u.tab = UI_DOM.tab;
+            if (['widok', 'moduly', 'polaczenia', 'diagnostyka', 'changelog'].indexOf(u.tab) < 0) u.tab = UI_DOM.tab;
             u.napis = !!u.napis; u.kropka = !!u.kropka;
             uiCache = u;
             return u;
@@ -128004,7 +128691,7 @@
         }
         function setMaluj(){
             if (!setPanel) return;
-            const tabs = [['widok', 'Widok'], ['moduly', 'Moduły'], ['polaczenia', 'Połączenia'], ['changelog', 'Changelog']];
+            const tabs = [['widok', 'Widok'], ['moduly', 'Moduły'], ['polaczenia', 'Połączenia'], ['diagnostyka', 'Diagnostyka'], ['changelog', 'Changelog']];
             let h = '<div class="bls-head"><b>Ustawienia HUB-a</b><button type="button" class="bls-x" data-act="zamknij" title="Zamknij (Esc)">✕</button></div>';
             h += '<div class="bls-tabs">' + tabs.map(function(x){
                 return '<button type="button" class="bls-tab' + (setTab === x[0] ? ' on' : '') + '" data-tab="' + x[0] + '">' + x[1]
@@ -128012,7 +128699,8 @@
             }).join('') + '</div>';
             h += '<div class="bls-body">' + (setTab === 'widok' ? setWidokHtml()
                     : (setTab === 'moduly' ? setModulyHtml()
-                    : (setTab === 'polaczenia' ? setPolHtml() : setChgHtml()))) + '</div>';
+                    : (setTab === 'polaczenia' ? setPolHtml()
+                    : (setTab === 'diagnostyka' ? setDiagHtml() : setChgHtml())))) + '</div>';
             setPanel.innerHTML = h;
             if (setTab === 'changelog') { chgMaluj(); chgZaladuj(false); }
         }
@@ -128242,6 +128930,74 @@
                + 'bo klucz sprawdzany jest przed akcja.</div>';
             return h;
         }
+        // ZAKLADKA „DIAGNOSTYKA" (23.11.2026). Test komputera, wynik ostatniego testu z norma i objasnieniem przy kazdym pomiarze
+        // (ocene liczy HUBDZ.diag.ocena — ta sama, ktora idzie do HUB Log) i obciazenie w ostatnich przebiegach na tym komputerze.
+        function setDiagHtml(){
+            const D = HUBDZ.diag, c = HUBDZ.cfg(), trwa = D.trwa();
+            const KOL = { ok: ['✔', '#15803d'], uwaga: ['⚠', '#b45309'], zle: ['✖', '#b91c1c'], info: ['•', '#888'] };
+            const p2 = function (n){ return (n < 10 ? '0' : '') + n; };
+            const dt = function (t){ const d = new Date(t); return p2(d.getDate()) + '.' + p2(d.getMonth() + 1) + '.' + d.getFullYear() + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()); };
+            const TD = 'padding:5px 8px 5px 0;border-bottom:1px solid #f0eeed;vertical-align:top;';
+            let h = '<div class="bls-sek"><h4>Diagnostyka komputera</h4>'
+                  + '<p class="bls-p">Sprawdza, czy HUB ma na tym komputerze dobre warunki: procesor, pamięć, grafikę, zasilanie, połączenie '
+                  + 'z prologistics i to, jak szybko przeglądarka wyświetla strony. Przy każdym pomiarze jest norma i wyjaśnienie, o czym świadczy wynik.</p>'
+                  + '<div class="bls-btns"><button type="button" data-act="diag-test"' + (trwa ? ' disabled' : '') + '>'
+                  + (trwa ? '⏳ Test trwa (ok. 30 s)…' : '🔍 Uruchom test komputera') + '</button></div>'
+                  + '<p class="bls-p" style="margin-top:6px;font-size:11.5px;color:#777">Najlepiej z tą kartą na wierzchu i gdy nic innego w HUB-ie nie pracuje. '
+                  + 'Test kilka razy wczytuje stronę główną prologistics (tylko odczyt) i sprawdza połączenie z arkuszem „HUB Log”.</p>'
+                  + '<label class="bls-l"><input type="checkbox" data-diag="on"' + (c.diag ? ' checked' : '') + '> <span>Zapisuj obciążenie przy każdym przebiegu modułów'
+                  + '<i>linia „komputer: …” w arkuszu „HUB Log” i lista „Obciążenie w ostatnich przebiegach” niżej; pomiar działa tylko w czasie pracy modułu'
+                  + (c.on ? '' : ' — <b>dziennik jest wyłączony</b> (stopka menu „Narzędzia”), więc przebiegi się nie zapisują') + '</i></span></label></div>';
+            const W = D.ostatni();
+            if (!W) h += '<div class="bls-sek"><div class="bls-pusto">Na tym komputerze nie było jeszcze testu — kliknij „Uruchom test komputera”.</div></div>';
+            else {
+                const O = D.ocena(W);
+                h += '<div class="bls-sek"><h4>Ostatni test: ' + dt(W.t) + ' <span style="font-weight:normal;color:#888">· HUB ' + blEsc(W.wersja || '?') + '</span></h4>'
+                   + '<div class="bls-uwaga"><b>Wniosek:</b> ' + blEsc(O.wniosek) + '</div>';
+                let grupa = '';
+                O.wiersze.forEach(function (x){
+                    if (x.g !== grupa){
+                        if (grupa) h += '</table>';
+                        grupa = x.g;
+                        h += '<div style="margin:12px 0 2px;font-weight:bold;color:#332524">' + blEsc(grupa) + '</div>'
+                           + '<table style="width:100%;border-collapse:collapse;font-size:12.5px">';
+                    }
+                    const k = KOL[x.o] || KOL.info;
+                    h += '<tr><td style="' + TD + 'width:56%"><b>' + blEsc(x.n) + '</b>'
+                       + '<div style="color:#666;font-size:11.5px;line-height:1.4;margin-top:2px">' + blEsc(x.z) + '</div></td>'
+                       + '<td style="' + TD + 'padding-right:0"><span style="color:' + k[1] + ';font-weight:bold">' + k[0] + ' ' + blEsc(x.w) + '</span>'
+                       + '<div style="color:#888;font-size:11.5px;margin-top:2px">norma: ' + blEsc(x.norma) + '</div></td></tr>';
+                });
+                if (grupa) h += '</table>';
+                h += '</div>';
+            }
+            const P = D.przebiegi().slice(-15).reverse();
+            h += '<div class="bls-sek"><h4>Obciążenie w ostatnich przebiegach (ten komputer)</h4>'
+               + '<p class="bls-p">To samo co w teście, ale w czasie prawdziwej pracy. Gdy przy „Księgowaniu w tickecie” blokady przekraczają 30% '
+               + 'albo zegar spóźnia się w ponad 20% pomiarów, komputer nie nadąża z 5 workerami — ustaw 2–3 workery albo mnożnik czasu ×5. '
+               + 'Karta w tle w czasie przebiegu też go spowalnia (Chrome przycina karty w tle).</p>';
+            if (!P.length) h += '<div class="bls-pusto">Jeszcze nic — pojawi się po pierwszych przebiegach modułów (przy włączonym zapisie obciążenia i dzienniku).</div>';
+            else {
+                const oc = function (v, a, b){ return v == null ? KOL.info : (v <= a ? KOL.ok : (v <= b ? KOL.uwaga : KOL.zle)); };
+                const TP = 'padding:4px 6px;border-bottom:1px solid #f0eeed;';
+                const kom = function (v, a, b){ const k = oc(v, a, b); return '<td style="' + TP + 'text-align:right;color:' + k[1] + '">' + (v == null ? '—' : v + '%') + '</td>'; };
+                h += '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:#888;font-size:11px">'
+                   + '<td style="padding:2px 6px 2px 0">kiedy</td><td style="padding:2px 6px">moduł</td><td style="padding:2px 6px;text-align:right">trwał</td>'
+                   + '<td style="padding:2px 6px;text-align:right" title="norma do 10%">blokady</td><td style="padding:2px 6px;text-align:right" title="norma do 5%">zegar spóźniony</td>'
+                   + '<td style="padding:2px 6px;text-align:right" title="norma 0%">karta w tle</td></tr>';
+                P.forEach(function (x){
+                    h += '<tr><td style="' + TP + 'padding-left:0;white-space:nowrap">' + dt(x.t) + '</td><td style="' + TP + '">' + blEsc(x.m) + '</td>'
+                       + '<td style="' + TP + 'text-align:right;white-space:nowrap">' + (x.s >= 120 ? Math.round(x.s / 60) + ' min' : x.s + ' s') + '</td>'
+                       + kom(x.zb, 10, 30) + kom(x.sp, 5, 20) + kom(x.tl, 0, 50) + '</tr>';
+                });
+                h += '</table><p class="bls-p" style="margin-top:6px;font-size:11.5px;color:#777">Normy: blokady do 10% (powyżej 30% źle) · zegar spóźniony do 5% '
+                   + '(powyżej 20% źle) · karta w tle 0%. „—” = Chrome nie podał (np. karta była w tle).</p>';
+            }
+            h += '</div><div class="bls-stopka">Normy są wstępne (23.11.2026) — ustalone na logach zespołu z października i listopada oraz na jednym komputerze; '
+               + 'po zebraniu testów z kilku komputerów da się je dostroić. Przeglądarka nie podaje obciążenia całego komputera w %, listy programów, '
+               + 'liczby kart Chrome ani tego, czy jest Wi-Fi, kabel czy VPN — to widać pośrednio w pomiarach wyżej.</div>';
+            return h;
+        }
         function setKlik(e){
             const t = e.target && e.target.closest ? e.target.closest('[data-act],[data-tab],[data-menu]') : null;
             if (!t) return;
@@ -128272,6 +129028,13 @@
             }
             if (co === 'klucz-sprawdz') { polSprawdz(); return; }
             if (co === 'magazyn') { magZmierz(); setMaluj(); return; }
+            if (co === 'diag-test') {
+                if (HUBDZ.diag.trwa()) return;
+                const po = function(){ if (setPanel && setPanel.style.display !== 'none' && setTab === 'diagnostyka') setMaluj(); };
+                HUBDZ.diag.test().then(po, function(er){ po(); alert('Test komputera nie udał się: ' + ((er && er.message) || er)); });
+                setMaluj();
+                return;
+            }
             if (co === 'klucz-adres') {
                 // Wyjscie awaryjne: adres wdrozenia da sie przestawic bez nowej wersji HUB-a.
                 // Puste pole wraca do wbudowanego.
@@ -128321,6 +129084,7 @@
                 return;
             }
             if (t.getAttribute('data-menu') === 'poka') { menuPoka(t.getAttribute('data-sel'), !!t.checked); return; }
+            if (t.getAttribute('data-diag') === 'on') { HUBDZ.diag.wlacz(!!t.checked); setMaluj(); return; }
             const mod = t.getAttribute('data-mod');
             if (mod) { setMod[mod] = !!t.checked; setMaluj(); return; }
             // przelacznik modulu z zakladki „Widok" — ustawia flage GM i odswieza (jak „Moduly", ale od razu)
@@ -128390,6 +129154,8 @@
                 const a = e.target && e.target.closest ? e.target.closest('[data-dz]') : null;
                 if (!a) return;
                 e.preventDefault(); e.stopPropagation();
+                // „🔍 test i wyniki" w stopce → okno ustawien, zakladka „Diagnostyka" (HUBDZ nie widzi okna ustawien).
+                if (a.getAttribute('data-dz') === 'diag-ust') { panel.style.display = 'none'; setOtworz('diagnostyka'); return; }
                 HUBDZ.klik(a.getAttribute('data-dz'), function () { dzBox.innerHTML = HUBDZ.stopka(); });
             });
             panel.querySelectorAll('.bl-row[data-sel]').forEach(function(r){
