@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.24
+// @version      5.63.25
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -575,13 +575,27 @@
                 if (w.spoz != null) cz.push('zegar spóźniony > 50 ms w ' + w.spoz + '% pomiarów');
                 if (w.lagMed != null) cz.push('opóźnienie zegara med ' + w.lagMed + ' ms, p90 ' + w.lagP90 + ' ms');
                 if (w.tlo != null) cz.push('karta w tle ' + w.tlo + '%');
-                if (w.prSuma > 0) cz.push('procesor wg Chrome: ' + Object.keys(DG_PR).filter(function (k) { return w.pr[k]; })
+                if (w.prSuma > 0) cz.push('procesor wg Chrome: ' + Object.keys(DG_PR).filter(function (k) { return w.pr[k] && Math.round(100 * w.pr[k] / w.prSuma) > 0; })
                     .map(function (k) { return DG_PR[k] + ' ' + Math.round(100 * w.pr[k] / w.prSuma) + '%'; }).join(', '));
                 if (w.mb) cz.push('pamięć strony do ' + w.mb + ' MB');
                 return txt + ' | w trakcie (' + Math.round(w.czas / 1000) + ' s): ' + cz.join(' · ');
             } catch (e) { return ''; }
         }
         function dgSen(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+        // Zapytanie z limitem czasu (razem z odczytem tresci). Oddaje { ok, ms, tx, status } albo { ok: false, ms, blad }.
+        async function dgZapytaj(url, limit, metoda) {
+            const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            const t0 = dgTeraz();
+            const tm = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, limit);
+            try {
+                const r = await fetch(url, { method: metoda || 'GET', cache: 'no-store', credentials: 'same-origin', signal: ctrl ? ctrl.signal : undefined });
+                const tx = metoda === 'HEAD' ? '' : await r.text();
+                return { ok: true, ms: Math.round(dgTeraz() - t0), tx: tx, status: r.status };
+            } catch (e) {
+                return { ok: false, ms: Math.round(dgTeraz() - t0),
+                         blad: (e && e.name === 'AbortError') ? ('brak odpowiedzi w ' + Math.round(limit / 1000) + ' s') : ('błąd sieci: ' + ((e && e.message) || e)) };
+            } finally { clearTimeout(tm); }
+        }
         // Wczytanie strony w ukrytej ramce — tak samo ustawionej jak ramki workerow modulu ticketa.
         function dgRamka(url, limit) {
             return new Promise(function (resolve) {
@@ -668,14 +682,18 @@
             dodaj('bat', 'Komputer', 'Zasilanie', W.bat || 'nieznane', !W.bat ? 'info' : (/BATERII/.test(W.bat) ? 'uwaga' : 'ok'), 'zasilacz',
                 'Laptop na baterii zwykle zwalnia procesor, żeby oszczędzać energię.');
             dodaj('przegl', 'Komputer', 'Przeglądarka', W.przegl || '—', 'info', '—', 'Wersja przeglądarki — do porównań między komputerami.');
-            dodaj('rtt', 'Sieć i serwer', 'Opóźnienie do prologistics', W.rtt != null ? W.rtt + ' ms' : (nP ? '—' : 'nie mierzone (test poza prologistics)'),
-                p3(W.rtt, 80, 200), 'do 80 ms dobrze · 80–200 ms przeciętnie · ponad 200 ms słabo',
-                'Czas jednej krótkiej rozmowy z serwerem, bez treści. Wysokie przy dobrym procesorze znaczy kłopot z siecią (Wi-Fi, VPN, łącze). '
-                + 'Każda strona prologistics to kilkanaście takich rozmów.');
+            dodaj('rtt', 'Sieć i serwer', 'Opóźnienie sieci do prologistics',
+                W.rtt != null ? W.rtt + ' ms' : (W.rttBlad ? 'NIE — ' + W.rttBlad : (nP ? '—' : 'nie mierzone (test poza prologistics)')),
+                W.rttBlad && W.rtt == null ? 'zle' : p3(W.rtt, 80, 200), 'do 80 ms dobrze · 80–200 ms przeciętnie · ponad 200 ms słabo',
+                'Czas jednej krótkiej rozmowy z serwerem o mały plik (bez pracy samego prologistics). Wysokie przy dobrym procesorze znaczy kłopot '
+                + 'z siecią (Wi-Fi, VPN, łącze). Gdy to jest szybkie, a strony prologistics nie przychodzą — winny jest prologistics, nie sieć.');
             dodaj('pob', 'Sieć i serwer', 'Pobranie strony głównej (sieć + serwer)',
-                W.pob != null ? W.pob + ' ms' + (W.kb != null ? ' (' + W.kb + ' KB)' : '') : '—', p3(W.pob, 1500, 4000),
+                W.pob != null ? W.pob + ' ms' + (W.kb != null ? ' (' + W.kb + ' KB)' : '') : (W.pobBlad ? 'NIE — ' + W.pobBlad : '—'),
+                W.pobBlad && W.pob == null ? 'zle' : p3(W.pob, 1500, 4000),
                 'do 1,5 s dobrze · 1,5–4 s przeciętnie · ponad 4 s wolno',
-                'Sama strona, bez wyświetlania. Wolno u wszystkich naraz — winny serwer prologistics; wolno tylko u jednej osoby — jej łącze.');
+                'Sama strona, bez wyświetlania — tu pracuje już prologistics. Wolno u wszystkich naraz — przeciążony serwer; tylko u jednej osoby '
+                + 'przy szybkiej sieci — jej sesja jest zajęta inną długą operacją (np. wysyłką plików w innej karcie), bo prologistics obsługuje '
+                + 'zapytania jednej sesji po kolei.');
             dodaj('sesja', 'Sieć i serwer', 'Sesja prologistics', W.sesja === 'ok' ? 'zalogowany' : (W.sesja === 'logowanie' ? 'strona logowania' : '—'),
                 W.sesja === 'ok' ? 'ok' : (W.sesja === 'logowanie' ? 'zle' : 'info'), 'zalogowany',
                 'Wylogowana sesja kończy każdy przebieg już na pierwszym zapytaniu.');
@@ -687,8 +705,9 @@
             const dom = (W.ram != null && W.pob != null) ? Math.max(0, W.ram - W.pob) : null;
             const krot = (W.ram != null && W.pob) ? Math.round(W.ram / Math.max(1, W.pob) * 10) / 10 : null;
             dodaj('ram_ramka', 'Przeglądarka', 'Wyświetlenie strony (sieć + serwer + komputer)',
-                W.ram != null ? W.ram + ' ms' + (dom != null ? ' — z tego komputer ok. ' + dom + ' ms (' + String(krot).replace('.', ',') + '× pobranie)' : '') : '—',
-                dom == null ? 'info' : (dom <= 1000 ? 'ok' : (dom <= 3000 ? 'uwaga' : 'zle')),
+                W.ram != null ? W.ram + ' ms' + (dom != null ? ' — z tego komputer ok. ' + dom + ' ms (' + String(krot).replace('.', ',') + '× pobranie)' : '')
+                              : (W.ramBlad ? 'NIE — ' + W.ramBlad : '—'),
+                W.ramBlad && W.ram == null ? 'zle' : (dom == null ? 'info' : (dom <= 1000 ? 'ok' : (dom <= 3000 ? 'uwaga' : 'zle'))),
                 'komputer dokłada do 1 s dobrze · 1–3 s przeciętnie · ponad 3 s wolno',
                 'Ta sama strona co wyżej, ale wyświetlona w ukrytej ramce — tak, jak robią to workery „Księgowania w tickecie”. Różnica to praca '
                 + 'komputera: rysowanie i skrypty strony. W logach z października i listopada ten czas u osoby z wolnym HUB-em był 2–3× dłuższy niż u innych.');
@@ -719,7 +738,15 @@
             const zly = function (k) { return o(k) === 'zle'; }, slaby = function (k) { return o(k) === 'zle' || o(k) === 'uwaga'; };
             const nazwy = function (f) { return R.filter(function (r) { return r.o === f; }).map(function (r) { return r.n; }).join(', '); };
             let wn;
-            if ((W.inne && W.inne.length) || W.tlo) wn = 'Wynik zawyżony (karta w tle albo inna praca w czasie testu) — powtórz test z tą kartą na wierzchu, gdy nic nie pracuje.';
+            // Brak odpowiedzi prologistics rozstrzyga pierwszy: wtedy pozostale pomiary (komputer, przegladarka) sa w ogole bez znaczenia.
+            if (W.rttBlad && W.rtt == null)
+                wn = 'Brak połączenia z prologistics — nie przeszło nawet krótkie zapytanie o mały plik. Sprawdź sieć, Wi-Fi albo VPN.';
+            else if ((W.pobBlad && W.pob == null) || (W.ramBlad && W.ram == null))
+                wn = 'Prologistics nie oddał strony (' + (W.pobBlad || W.ramBlad) + '), choć sieć odpowiada' + (W.rtt != null ? ' (' + W.rtt + ' ms)' : '')
+                   + ' — to nie wina komputera ani łącza. Albo serwer jest przeciążony (wtedy prologistics muli u wszystkich), albo ta sesja jest zajęta '
+                   + 'inną długą operacją, np. wysyłką plików w innej karcie — prologistics obsługuje zapytania jednej sesji po kolei. '
+                   + 'Sprawdź, czy u innych działa; jeśli tak, poczekaj, aż tamta operacja się skończy, i powtórz test.';
+            else if ((W.inne && W.inne.length) || W.tlo) wn = 'Wynik zawyżony (karta w tle albo inna praca w czasie testu) — powtórz test z tą kartą na wierzchu, gdy nic nie pracuje.';
             else if (zly('sesja')) wn = 'Prologistics pokazał stronę logowania — zaloguj się i powtórz test.';
             else if (zly('grafika')) wn = 'Najpewniejsza przyczyna wolnej pracy: grafika bez akceleracji — strony rysuje procesor. Włącz akcelerację (wiersz „Grafika”).';
             else if (slaby('ram_ramka') && !slaby('rtt'))
@@ -772,27 +799,42 @@
                     const c = navigator.connection;
                     if (c && c.effectiveType) W.lacze = c.effectiveType + (c.rtt != null ? ', ~' + c.rtt + ' ms' : '') + (c.downlink ? ', ~' + c.downlink + ' Mb/s' : '');
                 } catch (e) {}
+                // KAZDY KROK SIECIOWY MA LIMIT i po pierwszym braku odpowiedzi nie powtarzamy go (23.11.2026). Test Ireny o 12:14
+                // trwal 7 min: prologistics nie oddawal stron, a fetch bez limitu wisial po ok. 2 min trzy razy, ramka po 60 s trzy
+                // razy — i wyszlo „w normie", bo pomiar, ktory sie nie udal, oceniano jak brak problemu. Teraz: limit 10 s na krotkie
+                // zapytanie, 30 s na strone; porazka to wynik (W.rttBlad / pobBlad / ramBlad, w ocenie ✖). Wpis do logu po kazdym
+                // kroku — inaczej 40 s ciszy (CISZA_MS) dzieli przebieg testu na dwa wiersze HUB Log.
                 if (onProlo() && window.top === window) {
                     const rtt = [];
-                    for (let i = 0; i < 5; i++) {
-                        const t0 = dgTeraz();
-                        try { await fetch('/favicon.ico', { method: 'HEAD', cache: 'no-store', credentials: 'same-origin' }); rtt.push(Math.round(dgTeraz() - t0)); } catch (e) {}
+                    let rttZle = 0, rttBlad = '';
+                    for (let i = 0; i < 5 && rttZle < 2; i++) {
+                        const x = await dgZapytaj('/favicon.ico', 10000, 'HEAD');
+                        if (x.ok) rtt.push(x.ms); else { rttZle++; rttBlad = x.blad; }
                     }
                     DG.rtt = dgKw(rtt, 0.5); DG.rttT = Date.now();
                     W.rtt = DG.rtt;
+                    if (!rtt.length) W.rttBlad = rttBlad || 'brak odpowiedzi';
+                    wpis(M, 'krok', 'opóźnienie do prologistics: ' + (W.rtt != null ? W.rtt + ' ms' : W.rttBlad));
                     const pob = [];
                     for (let i = 0; i < 3; i++) {
-                        const t0 = dgTeraz();
-                        try {
-                            const r = await fetch('/', { cache: 'no-store', credentials: 'same-origin' });
-                            const tx = await r.text();
-                            pob.push(Math.round(dgTeraz() - t0));
-                            if (i === 0) { W.kb = Math.round(tx.length / 1024); W.sesja = /<input[^>]+type=["']?password/i.test(tx) ? 'logowanie' : 'ok'; }
-                        } catch (e) {}
+                        const x = await dgZapytaj('/', 30000);
+                        if (x.ok && x.status >= 400) { W.pobBlad = 'serwer odpowiedział błędem HTTP ' + x.status; break; }
+                        if (!x.ok) { W.pobBlad = x.blad; break; }
+                        pob.push(x.ms);
+                        if (pob.length === 1) { W.kb = Math.round(x.tx.length / 1024); W.sesja = /<input[^>]+type=["']?password/i.test(x.tx) ? 'logowanie' : 'ok'; }
                     }
+                    W.pob = dgKw(pob, 0.5);
+                    if (pob.length) delete W.pobBlad;
+                    wpis(M, 'krok', 'pobranie strony głównej: ' + (W.pob != null ? W.pob + ' ms' : 'NIE — ' + W.pobBlad));
                     const ram = [];
-                    for (let i = 0; i < 3; i++) { const ms = await dgRamka('/', 60000); if (ms != null) ram.push(ms); await dgSen(300); }
-                    W.pob = dgKw(pob, 0.5); W.ram = dgKw(ram, 0.5);
+                    for (let i = 0; i < 3; i++) {
+                        const ms = await dgRamka('/', 30000);
+                        if (ms == null) { if (!ram.length) W.ramBlad = 'strona nie wczytała się w 30 s'; break; }
+                        ram.push(ms);
+                        await dgSen(300);
+                    }
+                    W.ram = dgKw(ram, 0.5);
+                    wpis(M, 'krok', 'wyświetlenie strony w ramce: ' + (W.ram != null ? W.ram + ' ms' : 'NIE — ' + W.ramBlad));
                     W.karty = await dgKarty();
                 }
                 W.dz = await new Promise(function (r) {
@@ -808,9 +850,10 @@
                 W.tlo = w.tlo; W.mb = w.mb || null;
                 if (w.prSuma > 0) {
                     W.prStan = Object.keys(w.pr).sort(function (x, y) { return w.pr[y] - w.pr[x]; })[0];
-                    W.pr = Object.keys(DG_PR).filter(function (k) { return w.pr[k]; })
+                    W.pr = Object.keys(DG_PR).filter(function (k) { return w.pr[k] && Math.round(100 * w.pr[k] / w.prSuma) > 0; })
                         .map(function (k) { return DG_PR[k] + ' ' + Math.round(100 * w.pr[k] / w.prSuma) + '%'; }).join(', ');
                 }
+                W.trwal = Math.round((Date.now() - W.t) / 1000);
                 zapisz(K_DG_TEST, W);
                 const O = dgOcena(W);
                 const IK = { ok: '✔', uwaga: '⚠', zle: '✖', info: '·' };
@@ -4176,6 +4219,22 @@
 
     // co — czego dotyczy przeladowanie („Update (księgowanie)”, „status → Open”…). Idzie na KONIEC wpisu, bo podsumowanie
     // logu czyta poczatek („przeładowanie po akcji N ms”). 17.11.2026 TIMEOUT-y dalo sie przypisac tylko po liczbie ms.
+    // KOLEJKA ZAPISOW UPDATE (23.11.2026). Kilka workerow klikajacych Update w tej samej sekundzie zawiesza prologistics.
+    // 23.11 o 10:11:18 piec Update'ow naraz: przeszedl jeden (17 s), cztery bez odpowiedzi przez 75 s i bez noty jeszcze po
+    // 11 min; o 10:16:47 cztery naraz — zaden. Te same Update'y pojedynczo (8 razy) — 2-8 s, wszystkie zapisane.
+    // Kazdy taki zapis konczyl sie „❓" i 20-minutowa blokada (KS_UPD_BLOKADA_MS), czyli recznym puszczeniem pozycji jeszcze raz.
+    // Dlatego klikniecie Update, czekanie na przeladowanie po nim i chwila oddechu ida przez JEDEN zamek: najwyzej jeden zapis
+    // noty naraz, reszta workerow czeka na swoja kolej. Szukanie ticketu, odczyty, zmiana statusu i wypelnianie formularza
+    // dalej ida rownolegle. Zamek nigdy nie zostaje zamkniety na stale: lancuch lapie kazdy blad, a czekanie na przeladowanie
+    // ma swoj limit (waitFrameLoad).
+    let ksZamekUpdate = Promise.resolve();
+    function ksPodZamkiemUpdate(fn) {
+        const t0 = Date.now();
+        const wynik = ksZamekUpdate.then(function () { return fn(Date.now() - t0); });
+        ksZamekUpdate = wynik.then(function () {}, function () {});
+        return wynik;
+    }
+
     function waitFrameLoad(ms = 20000, ctx = defaultFrameCtx, co = '') {
         const effectiveMs = Math.round(ms * tmTimeoutMultiplier);
         const t0 = performance.now();
@@ -6196,6 +6255,12 @@
     const KS_UPD_SLAD = 'tm_t_update_wyslany_v1';
     const KS_UPD_BLOKADA_MS = 20 * 60 * 1000;
     const KS_UPD_TRZYMAJ_MS = 24 * 3600 * 1000;
+    // Dosprawdzenie pozycji „❓" na koncu przebiegu (ksDosprawdzNiepotw, 24.11.2026): co ile czytamy ich tickety, do kiedy
+    // od Update (BRW 23.11: nota widoczna ok. 6 min po Update, 2 min po tym, jak pozycja przestala czekac) i najdluzej
+    // ile w sumie — modul Marketplace czeka na ten przebieg ograniczony czas (ksLimit: 14 min przy 1–5 pozycjach).
+    const KS_DOSPR_CO_MS = 30 * 1000;
+    const KS_DOSPR_MAX_MS = 10 * 60 * 1000;
+    const KS_DOSPR_LIMIT_MS = 8 * 60 * 1000;
     function ksUpdKlucz(row, ticketId, ticketHref) {
         const kw = Math.abs(Number(String(row.amount == null ? '' : row.amount).replace(',', '.')) || 0).toFixed(2);
         const kl = ksRodzajKlucz(row.kind);
@@ -7580,14 +7645,21 @@
         // v3.34: serwer pod obciążeniem (tryb równoległy) odpowiada p95~16s, max~19s.
         // 12s timeout obcinał Update w połowie. Podnosimy do 25s.
         // Slad dla nastepnych przebiegow (KS_UPD_SLAD) — TUZ przed kliknieciem, bo tylko wtedy wiadomo, ze Update poszedl.
-        if (opcje && typeof opcje.przedUpdate === 'function') {
-            try { opcje.przedUpdate({ articleId, checkedCount, fallbackUsed, fallbackReason: fallbackUsed ? fallbackReason : null,
-                                      solution: solutionSel ? String(solutionSel.value || '') : '' }); } catch (e) {}
-        }
-        const lp = waitFrameLoad(25000, ctx, 'Update (księgowanie)').catch(() => null);
-        updateBtn.click();
-        await lp;
-        await sleep(1200);
+        // Calosc pod zamkiem: jeden Update naraz na wszystkie workery (ksPodZamkiemUpdate, 23.11.2026). przedUpdate jest W SRODKU,
+        // zeby godzina klikniecia w sladzie byla prawdziwa, a nie godzina wejscia do kolejki.
+        await ksPodZamkiemUpdate(async function (czekal) {
+            if (czekal > 1500) {
+                try { ksLog('zapis', 'Update czekał na swoją kolej ' + (czekal / 1000).toFixed(1) + ' s — inny worker zapisywał w tym czasie notę'); } catch (e) {}
+            }
+            if (opcje && typeof opcje.przedUpdate === 'function') {
+                try { opcje.przedUpdate({ articleId, checkedCount, fallbackUsed, fallbackReason: fallbackUsed ? fallbackReason : null,
+                                          solution: solutionSel ? String(solutionSel.value || '') : '' }); } catch (e) {}
+            }
+            const lp = waitFrameLoad(25000, ctx, 'Update (księgowanie)').catch(() => null);
+            updateBtn.click();
+            await lp;
+            await sleep(1200);           // chwila oddechu dla serwera, zanim nastepny worker kliknie swoj Update
+        });
 
         return {
             articleId,
@@ -7790,11 +7862,24 @@
                     const nasza = ksUpdNotaZeSladu(docS, slad, row);
                     if (nasza) {
                         ksUpdUsun(sladK);
+                        // Ticket zamkniety przed tamtym Update wraca na Closed — ta sama droga co po zwyklym ksiegowaniu (24.11.2026:
+                        // 733631 po „❓" zostal otwarty). Ramka jest na tickecie (loadInFrame na poczatku proby). Slad bez „zamk"
+                        // (sprzed tej wersji) — nic nie zamykamy, jak dotad.
+                        let zamkPo = null;
+                        if (slad.zamk && getTicketStatus(docS) !== 'Closed') {
+                            try {
+                                await setTicketStatus('Closed', ctx);
+                                let stPo = '';
+                                try { await loadForRead(ticketHref, 20000, ctx); stPo = getTicketStatus(getFrameDoc(ctx)); } catch (e2) {}
+                                zamkPo = (stPo === 'Closed') ? true : (stPo ? false : 'nieznany');
+                            } catch (e) { zamkPo = false; }
+                        }
                         try { ksLog('zapis', '✔ ' + row.orderNumber + ' (ticket ' + (ticketId || '?') + ', ' + row.amount + '): nota z Update o '
                                     + ksGodz(slad.t) + ' (' + minTxt + ') jest — ' + nasza.text + ' · noty przy Update: '
-                                    + ksNumeryTekst(nWtedy) + ' · teraz: ' + ksNumeryTekst(nTeraz) + ' — Update NIE idzie drugi raz'); } catch (e) {}
+                                    + ksNumeryTekst(nWtedy) + ' · teraz: ' + ksNumeryTekst(nTeraz) + ' — Update NIE idzie drugi raz'
+                                    + (zamkPo === true ? ' · ticket zamknięty ponownie' : (zamkPo == null ? '' : ' · ticket NIE wrócił na Closed'))); } catch (e) {}
                         return {
-                            ok: true, wasClosed: false, ticketHref, ticketId, bookingAttempts: 0,
+                            ok: true, wasClosed: !!slad.zamk, zamknietyPonownie: zamkPo, ticketHref, ticketId, bookingAttempts: 0,
                             verified: true, verifyMethod: 'slad-update', articleId: null,
                             amount: row.amount, bookingDate: row.bookingDate, accountNum: row.accountNum,
                             checkedCreditNoteItems: 0, alreadyBooked: true, existingRefund: nasza
@@ -7955,7 +8040,10 @@
                     // Woła je fillTicket TUZ przed kliknieciem Update (nie woła, gdy Update nie idzie).
                     przedUpdate: function (info) {
                         tKlik = Date.now();
-                        ksUpdUstaw(sladK, { t: tKlik, ids: [...numeryPrzed.ids], bez: numeryPrzed.bezNumeru || 0, nr: row.orderNumber });
+                        // zamk — ticket byl zamkniety przed tym Update: kto potwierdzi note pozniej (dosprawdzenie, nastepny przebieg),
+                        // zamyka go z powrotem (24.11.2026, 733631 po „❓" zostal otwarty).
+                        ksUpdUstaw(sladK, { t: tKlik, ids: [...numeryPrzed.ids], bez: numeryPrzed.bezNumeru || 0, nr: row.orderNumber,
+                                            zamk: !!wasClosedAtStart });
                         try { ksLog('zapis', '▶ Update ' + row.orderNumber + ' (ticket ' + (ticketId || '?') + '): ' + row.amount + ' · data '
                                     + row.bookingDate + ' · konto ' + row.accountNum + ' · próba ' + attempt
                                     + ' · noty przed: ' + ksNumeryTekst(numeryPrzed)
@@ -8915,6 +9003,81 @@
             return div;
         }
 
+        // DOSPRAWDZENIE „❓" PO UPDATE (24.11.2026). Nota po Update potrafi pokazac sie kilka minut po tym, jak pozycja
+        // przestala na nia czekac (KS_PO_UPDATE_MAX_MS): BRW 23.11, ticket 733631 — Update ok. 09:24, nota widoczna 09:30,
+        // pozycja skonczyla sie „❓", a ticket zostal OTWARTY (zamyka sie go dopiero po potwierdzeniu). Rozstrzygal to dotad
+        // reczny ponowny przebieg. Teraz, po wszystkich pozycjach, przebieg sam czyta jeszcze tickety pozycji „❓" ze sladem
+        // Update — SAM ODCZYT, Update nie idzie drugi raz. Nota z tamtego Update (ksUpdNotaZeSladu: numer spoza zdjecia,
+        // kwota) = pozycja zaksiegowana: slad schodzi, ticket zamkniety przed Update wraca na Closed (jak w zwyklej drodze),
+        // linia pozycji dostaje „✅ … zaksięgowano" — te sama linie czyta modul Marketplace (ksDone, limit 400 znakow).
+        async function ksDosprawdzNiepotw() {
+            const cz = [];
+            previewRows.forEach(function (r, i) {
+                if (!r || !r.bookNiepotw || r.bookNiepotwVat || r.booked || !r.ticketHref) return;
+                const k = ksUpdKlucz(r, r.ticketId, r.ticketHref), s = ksUpdWez(k);
+                if (s && s.t) cz.push({ i: i, k: k, s: s });
+            });
+            if (!cz.length) return;
+            const t0 = Date.now();
+            const koniec = Math.min(t0 + KS_DOSPR_LIMIT_MS, Math.max.apply(null, cz.map(function (x) { return x.s.t + KS_DOSPR_MAX_MS; })));
+            if (koniec <= t0) return;
+            const opisCz = function () { return `⏳ Czekam jeszcze na noty po Update: ${cz.length} poz. (do ${ksGodz(koniec)}) — tylko czytam tickety, Update nie idzie drugi raz.`; };
+            const status = logLine(opisCz(), '#b45309');
+            try { ksLog('zapis', 'dosprawdzenie ❓: ' + cz.length + ' poz. (' + cz.map(function (x) { return previewRows[x.i].orderNumber; }).join(', ') + ') do ' + ksGodz(koniec)); } catch (e) {}
+            const ctx = createFrameCtx();
+            try {
+                while (cz.length && Date.now() < koniec) {
+                    await sleep(KS_DOSPR_CO_MS);
+                    for (let n = cz.length - 1; n >= 0; n--) {
+                        const x = cz[n], r = previewRows[x.i];
+                        let nasza = null;
+                        try { await loadForRead(r.ticketHref, 25000, ctx); nasza = ksUpdNotaZeSladu(getFrameDoc(ctx), x.s, r); } catch (e) { nasza = null; }
+                        if (!nasza) {
+                            if (Date.now() > x.s.t + KS_DOSPR_MAX_MS) cz.splice(n, 1);     // za dlugo od Update — dalej nie czekamy
+                            continue;
+                        }
+                        cz.splice(n, 1);
+                        ksUpdUsun(x.k);
+                        let zamk = null;
+                        if (x.s.zamk && getTicketStatus(getFrameDoc(ctx)) !== 'Closed') {
+                            try {
+                                await loadInFrame(r.ticketHref, 20000, ctx);
+                                await sleep(600);
+                                if (getTicketStatus(getFrameDoc(ctx)) !== 'Closed') await setTicketStatus('Closed', ctx);
+                                let stPo = '';
+                                try { await loadForRead(r.ticketHref, 20000, ctx); stPo = getTicketStatus(getFrameDoc(ctx)); } catch (e2) {}
+                                zamk = (stPo === 'Closed') ? true : (stPo ? false : 'nieznany');
+                            } catch (e) { zamk = false; }
+                        }
+                        const po = Math.max(1, Math.round((Date.now() - x.s.t) / 60000));
+                        r.booked = true; r.bookNiepotw = false; r.bookError = null; r.verifySplitInfo = nasza;
+                        r.zamknietyPonownie = zamk;
+                        ok++; fail = Math.max(0, fail - 1);
+                        const html = `✅ <strong>${r.orderNumber}</strong>${ksRodzajZn(r)} — zaksięgowano (Ticket #${r.ticketId}, ${r.amount}, ${r.bookingDate})`
+                            + ` — nota z Update o ${ksGodz(x.s.t)} widoczna po ok. ${po} min`
+                            + (zamk === true ? ' | ticket zamknięty ponownie' : zamk === false ? ' | ⚠ ticket NIE wrócił na Closed — zamknij ręcznie'
+                               : zamk === 'nieznany' ? ' | ⚠ nie odczytałem statusu ticketu — sprawdź, czy jest Closed' : '');
+                        const w = wierszeLogu.get(x.i);
+                        if (w) { w.innerHTML = html; w.style.color = '#16a34a'; } else logLine(html, '#16a34a');
+                        try {
+                            ksLog('zapis', '✔ ' + r.orderNumber + ' (ticket ' + (r.ticketId || '?') + ', ' + r.amount + '): nota z Update o '
+                                  + ksGodz(x.s.t) + ' widoczna po ok. ' + po + ' min — ' + nasza.text
+                                  + (zamk === true ? ' · ticket zamknięty ponownie' : (zamk == null ? '' : ' · ticket NIE wrócił na Closed')));
+                        } catch (e) {}
+                        updateRow(x.i);
+                    }
+                    if (status) status.textContent = opisCz();
+                }
+            } finally { destroyFrameCtx(ctx); }
+            if (status) status.textContent = cz.length
+                ? `❓ Po dosprawdzeniu dalej bez noty: ${cz.length} poz. — opis przy pozycji.`
+                : '✔ Dosprawdzenie skończone — noty po Update się pojawiły.';
+            cz.forEach(function (x) {
+                const w = wierszeLogu.get(x.i);
+                if (w) w.innerHTML += ` <em>(czytałem ticket do ${ksGodz(koniec)} — noty dalej nie ma)</em>`;
+            });
+        }
+
         // staryWiersz — tylko przy ponowieniu po przekroczonym czasie: wiersz logu z pierwszego przejscia.
         async function processOne(workerLabel, i, ctx, staryWiersz) {
             const row = previewRows[i];
@@ -9083,7 +9246,11 @@
                         const desc = describeExistingRefund(bookResult.existingRefund);
                         previewRows[i].alreadyBooked = true;
                         previewRows[i].existingRefund = bookResult.existingRefund;
-                        logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — w międzyczasie zaksięgowane: ${desc}.`;
+                        // Zamkniecie ticketu po nocie rozpoznanej ze sladu Update (zamknietyPonownie stoi tylko wtedy).
+                        const zamkO = bookResult.zamknietyPonownie === true ? ' | ticket zamknięty ponownie'
+                                    : bookResult.zamknietyPonownie === false ? ' | ⚠ ticket NIE wrócił na Closed — zamknij ręcznie'
+                                    : bookResult.zamknietyPonownie === 'nieznany' ? ' | ⚠ nie odczytałem statusu ticketu — sprawdź, czy jest Closed' : '';
+                        logRow.innerHTML = `ℹ️ [W${workerLabel}] <strong>${row.orderNumber}</strong>${zn} — w międzyczasie zaksięgowane: ${desc}.${zamkO}`;
                         logRow.style.color = '#2563eb';
                         already++;
                     } else {
@@ -9112,8 +9279,9 @@
                         + (bookResult.czeka
                            ? `Update na tym tickecie poszedł o ${ksGodz(bookResult.tKlik)}, nowej noty dalej nie widać. NIE klikam drugi raz przed ${odG} (byłby dubel). `
                              + `Puść pozycję po ${odG}; gdy nota się pojawi, HUB ją rozpozna.`
-                           : `Update wysłany, ale nowej noty nie widać. NIE klikam Update drugi raz (byłby dubel). `
-                             + `Sprawdź ticket; gdy noty nie ma, puść pozycję jeszcze raz${odG ? ' po ' + odG + ' (wcześniej HUB i tak nie kliknie Update drugi raz)' : ''}.`);
+                           : `Update wysłany, ale nowej noty jeszcze nie widać. NIE klikam Update drugi raz (byłby dubel). `
+                             + `Po wszystkich pozycjach sprawdzę ten ticket jeszcze kilka minut. Gdy nota się pojawi później, puść pozycję jeszcze raz — `
+                             + `HUB rozpozna ją od razu i zamknie ticket${odG ? '; nowy Update najwcześniej o ' + odG : ''}.`);
                     logRow.style.color = '#b45309';
                     fail++;
                 } else {
@@ -9212,6 +9380,10 @@
                 } finally { tmTimeoutMultiplier = timeoutMult; }
                 try { ksLog('ponowienie', 'po ponowieniu: weszło ' + (ok - okPrzed) + ' z ' + nP); } catch (e) {}
             }
+            // Pozycje „❓" po Update — jeszcze kilka minut samych odczytow ich ticketow (ksDosprawdzNiepotw). Blad tutaj nie
+            // zatrzymuje przebiegu: pozycja zostaje „❓", jak przed ta zmiana.
+            try { await ksDosprawdzNiepotw(); }
+            catch (e) { try { ksLog('zapis', 'dosprawdzenie ❓ przerwane: ' + ((e && e.message) || e)); } catch (e2) {} }
             // Na wszelki wypadek: zaden wiersz nie moze zostac z obietnica „ponowię", ktorej nikt nie spelni.
             Array.from(bladyCzasu.keys()).forEach(function (i) { przywrocBlad(i, ' — nie ponowiłem'); });
 
@@ -17004,6 +17176,13 @@
             ]
         }
     };
+    // Dostawcy, u których brak SAMEGO kraju albo numeru VAT nabywcy to norma — wtedy informacja, nie „?” (23.11.2026, decyzja
+    // użytkownika: „Nova Automobile AG — sprawdź, jak wcześniej było płacone, i najwyżej wyklucz te błędy”). Nova: Pickup Listen bez
+    // „Switzerland” i bez naszego VAT; 12 list zapłaconych 06.11 i 13.11.2026 dwoma przelewami zbiorczymi z UBS BI CHF, bez zastrzeżeń.
+    // Braki twarde (nazwa, ulica, kod z miastem) dalej dają ✖.
+    var TIS_NABYWCA_MIEKKIE_OK = [
+        { kto: /nova\s+automobile/i, opis: 'Nova Automobile AG — Pickup Listen bez kraju i VAT nabywcy; 12 list zapłaconych 06.11 i 13.11.2026 bez zastrzeżeń' }
+    ];
     // Lista braków (pusta = komplet) albo null, gdy dla tej spółki wzorca nie ma.
     function daneNabywcyBrak(tekst, spolkaOpcja){
         var wz = TIS_DANE_NABYWCY[String(spolkaOpcja || '')]; if (!wz) return null;
@@ -17713,7 +17892,9 @@
                 (twarde ? niepelne : miekkie).push(nazwa + ': brak ' + d.daneNab.join(', '));
             });
             if (niepelne.length) zle('dane nabywcy niepełne — na dokumencie muszą stać pełne dane ' + wzN.nazwa + ' (' + wzN.opis + ', ' + wzN.vatOpis + '): ' + niepelne.join('; '));
-            if (miekkie.length) spr('dane nabywcy bez kraju albo numeru VAT — sprawdź, czy tak może zostać (' + wzN.nazwa + ', ' + wzN.opis + ', ' + wzN.vatOpis + '): ' + miekkie.join('; '));
+            var normaN = TIS_NABYWCA_MIEKKIE_OK.filter(function (t){ return t.kto.test(String(r.company || '')); })[0];
+            if (miekkie.length && normaN) p.push({ w: 'info', t: 'dane nabywcy bez kraju albo numeru VAT — u tego dostawcy to norma (' + normaN.opis + ')' });
+            else if (miekkie.length) spr('dane nabywcy bez kraju albo numeru VAT — sprawdź, czy tak może zostać (' + wzN.nazwa + ', ' + wzN.opis + ', ' + wzN.vatOpis + '): ' + miekkie.join('; '));
             if (niespr.length) spr('pełnych danych nabywcy nie sprawdziłem (' + niespr.join(', ') + ') — sprawdź na fakturze adres i numer VAT');
         }
         var nabOk = p.length === przedNab;
@@ -20801,8 +20982,38 @@
             if (zRef.length) g.qr = { ref: zRef[0].qr.ref, plik: zRef[0].plik, ile: zRef.length };
         }
         g.qrIban = !!g.iban && /^(CH|LI)\d{2}3[01]\d{3}/.test(g.iban);
+        // QR-IBAN bez odczytanej części płatniczej (23.11.2026, mandat 563954: skan z warstwą OCR — „Zahiteil”, „Zahibar durch”,
+        // nagłówków części QR HUB nie widzi, a referencja „60 53550 00000 00900 00551 23968” stoi w tekście). Decyzja użytkownika:
+        // brać ją z tekstu — tylko 27 cyfr z sumą kontrolną referencji QR i tylko gdy w fakturach grupy jest DOKŁADNIE jedna taka;
+        // zawsze z „? porównaj”, nigdy jako pewna.
+        if (g.qrIban && !g.qr){
+            var refT = qrRefZTekstu(g);
+            if (refT) g.qr = { ref: refT.ref, plik: refT.plik, ile: 1, zTekstu: true };
+        }
         g.reczny = !!g.iban && !g.zTabeli && !g.zPoprzedniego && !g.zKomentarza && !g.konta.some(function (x){ return x.n === g.iban; }) && qrs.indexOf(g.iban) < 0;
         g.brakNaDok = g.iban ? zIban.filter(function (d){ return d.ibany.indexOf(g.iban) < 0; }) : [];
+    }
+    // Referencja QR z tekstu faktur grupy (gdy części płatniczej QR nie odczytano). W linii szukamy ciągów grup cyfr rozdzielonych
+    // spacjami i sprawdzamy każde okno kolejnych grup dające dokładnie 27 cyfr („… 23968 40.00” nie psuje referencji obok kwoty).
+    function qrRefZTekstu(g){
+        var zn = {}, lista = [];
+        (g.issue || []).forEach(function (r){
+            ((r.faktura && r.faktura.docs) || []).forEach(function (d){
+                if (!d || d.korekta || d.nieFaktura) return;
+                (d.linieT || []).forEach(function (t){
+                    var re = /\d[\d ]*\d/g, m;
+                    while ((m = re.exec(String(t || '')))){
+                        var gr = m[0].split(/ +/);
+                        for (var i = 0; i < gr.length; i++){
+                            var s = '';
+                            for (var j = i; j < gr.length && s.length < 27; j++) s += gr[j];
+                            if (s.length === 27 && qrRefOk(s) && !zn[s]){ zn[s] = 1; lista.push({ ref: s, plik: d.plik }); }
+                        }
+                    }
+                });
+            });
+        });
+        return lista.length === 1 ? lista[0] : null;
     }
     // Jeden odbiorca + kilka issue = jeden przelew, razem z korektami (decyzja 09.10.2026).
     function pbPlan(){
@@ -21581,6 +21792,7 @@
         var u = [];
         if (g.powod && !(g.gr <= 0)) u.push(g.powod);
         if (g.zQr && g.qrIban && !g.qr) u.push('QR-IBAN bez odczytanej referencji — przepisz „Referenz” z części płatniczej faktury');
+        if (g.qr && g.qr.zTekstu) u.push('referencja QR ' + qrRefFormat(g.qr.ref) + ' wzięta z tekstu faktury („' + g.qr.plik + '”) — części płatniczej QR nie odczytałem (skan?); porównaj z fakturą');
         // Kanton Zug 308470: część płatnicza QR jest, ale nieczytelna — lista wzięła zwykły IBAN ze stopki, a bank zapłacił na QR-IBAN.
         if (!g.zQr && g.issue.some(function (r){ return ((r.faktura && r.faktura.docs) || []).some(function (d){ return d.qrKotwica && !d.qr && !d.korekta; }); }))
             u.push('faktura ma część płatniczą QR, ale konta z niej nie odczytałem — sprawdź konto i referencję na fakturze');
@@ -21625,6 +21837,7 @@
         if (g.qrIban && !g.qr) return { k: 'zle', t: '⚠ przepisz referencję QR z części płatniczej faktury' };
         if (!isFinite(g.gr)) return { k: 'zle', t: '⚠ wpisz kwotę z faktury' };
         if (zle.length) return { k: 'zle', t: '➕ dodane mimo uwag: ' + skr(zle[0]) };
+        if (g.qr && g.qr.zTekstu) return { k: 'spr', t: '? referencja QR ' + qrRefFormat(g.qr.ref) + ' z tekstu faktury (części QR nie odczytałem) — porównaj z fakturą' };
         if (g.poprzedniBledny && g.iban && g.iban === g.poprzedniBledny.n) return { k: 'zle', t: '⛔ to rachunek z przelewu, który według komentarza był pomyłką — wskaż właściwy' };
         if (g.zKomentarza) return { k: 'spr', t: '? rachunek z komentarza (' + g.zKomentarza.kto + '), nie z faktury — sprawdź' };
         if (g.poprzedniBledny) return { k: 'spr', t: '? poprzedni przelew był pomyłką (' + (g.poprzedniBledny.n ? ibanFormat(g.poprzedniBledny.n) : g.poprzedniBledny.tekst) + ') — sprawdź rachunek' };
@@ -27213,6 +27426,19 @@
           + '</div>'
           + '<div id="wp-out-merged" style="overflow-x:auto;margin-top:14px"></div>'
           + '<div id="wp-epo-box" style="display:none;margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
+          // „🔎 Sprawdź zamówienia" (23.11.2026): lista numerow wklejona w dowolnej postaci -> potwierdzenie, komentarz, duplikaty.
+          + '<details id="wp-zchk" style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7">'
+          + '<summary style="cursor:pointer;font-weight:700;font-size:12px;color:#750000">🔎 Sprawdź zamówienia — potwierdzenie, komentarz, duplikaty</summary>'
+          + '<div style="font-size:11px;color:#666;margin:4px 0 6px;line-height:1.45">Wklej numery zamówień w dowolnej postaci (kolumna, linki, tekst maila) — HUB weźmie same numery. '
+          + 'Przy każdym pokaże: czy jest potwierdzenie płatności z wybranego dnia, czy jest komentarz z pola „💬” u góry z tego dnia, '
+          + 'i czy coś nie jest dodane dwa razy tego samego dnia. Samo sprawdzenie niczego nie zapisuje.</div>'
+          + '<textarea id="wp-zchk-txt" rows="4" placeholder="22462&#10;22434&#10;22447 …" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:11px;border:1px solid #FFCCB7;border-radius:6px;padding:4px"></textarea>'
+          + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">'
+          + '<button id="wp-zchk-go" class="chn-btn maroon">🔎 Sprawdź</button>'
+          + '<label style="font-size:11px;color:#666">dzień <input type="date" id="wp-zchk-dzien" style="font-size:11px"></label>'
+          + '<span id="wp-zchk-msg" style="font-size:11px;color:#666"></span></div>'
+          + '<div id="wp-zchk-out" style="margin-top:8px;overflow-x:auto"></div>'
+          + '</details>'
           + '<div id="wp-pain-box" style="display:none;margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7"></div>'
           + '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #FFCCB7;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
           + '<button id="wp-log" class="chn-btn ghost" title="Zapisuje plik .txt z pelnym przebiegiem: wklejone dane, komentarze z zamowien, odczyty z P/I, werdykty i tytuly przelewow. Mozna go wkleic do rozmowy z Claude.">📄 Zapisz log (txt)</button>'
@@ -41496,6 +41722,464 @@
             if (epoZegar) clearTimeout(epoZegar);
             epoZegar = setTimeout(function (){ epoZegar = null; epoSprawdzPo(); }, EPO_PO_MS);
         }
+        /* ===== Czy potwierdzenie JUZ jest w zamowieniu / duplikaty (23.11.2026) =====
+           Prosba uzytkownika: „dodaj opcje sprawdz czy sa juz potwierdzenia, dodaj tez opcje usun duplikat". Do 5.63.24 wgrywanie
+           z EPO nie zagladalo do sekcji „Payment conformation" — ponowne wczytanie tego samego wydruku (inna sesja, inny komputer)
+           dokladalo drugi plik do kazdego zamowienia. Potwierdzenie „to samo" = plik o tej samej nazwie (pcNazwaPasuje: litery
+           i cyfry, bez wielkosci liter; dluzsza nazwa moze byc przedluzeniem krotszej). Nazwe sklada epoNazwaPliku z tresci
+           przelewu, wiec to ten sam przelew, a nie tylko ten sam dostawca.
+           TEGO SAMEGO DNIA (uzytkownik, 23.11.2026: „i dodany tego samego dnia to wazne"): ta sama nazwa z INNEGO dnia to moze byc
+           inny przelew o tym samym tytule — np. ponowny po zwrocie (por. PC_ZWROT_RE). Dlatego:
+             • wysylka POMIJA zamowienie tylko wtedy, gdy plik o tej nazwie dodano DZIS; z innego dnia — tylko „ℹ" w wierszu;
+             • duplikat = ta sama nazwa i ta sama data dodania w jednym zamowieniu.
+           „🔎 Sprawdź, czy są już potwierdzenia" czyta strony zamowien i opisuje wiersz; „Wyślij zaznaczone" robi to samo sam,
+           zanim cokolwiek wgra. „🗑 Usuń duplikaty": zostaje NAJSTARSZY z dnia, reszta idzie tak samo jak przyciskiem „Delete"
+           na stronie zamowienia. */
+        // Dzisiejsza data w zapisie strony zamowienia (RRRR-MM-DD, „by X on 2026-11-23 10:15").
+        function epoDzis(){
+            var d = new Date();
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        }
+        function epoDocOpis(d){
+            if (!d) return '';
+            return (d.date || '?') + (d.time ? ' ' + String(d.time).slice(0, 5) : '') + (d.by ? ', ' + d.by : '');
+        }
+        // Najstarszy pierwszy: data + godzina, potem nizszy doc_id (wgrany wczesniej).
+        function epoDocStarszy(a, b){
+            var x = (a.date || '') + ' ' + (a.time || ''), y = (b.date || '') + ' ' + (b.time || '');
+            if (x !== y) return x < y ? -1 : 1;
+            return Number(a.id) - Number(b.id);
+        }
+        // Wynik jednego zamowienia: { docs: [pasujace pliki, najstarszy pierwszy] } albo { nieWiem: true }.
+        function epoIstniejaceZHtml(html, nazwa){
+            var docs = pcDokiPC(html);
+            if (docs == null) return { nieWiem: true };
+            return { docs: docs.filter(function (d){ return pcNazwaPasuje(d.name, nazwa); }).sort(epoDocStarszy) };
+        }
+        // Duplikat do usuniecia = ta sama nazwa CO DO ZNAKU (po pcPlikKlucz) i TA SAMA DATA dodania w jednym zamowieniu. Luzne
+        // „jedna jest poczatkiem drugiej" wystarcza, zeby nie wgrywac drugi raz, ale nie do kasowania: oba pliki zapisal ten sam
+        // serwer, wiec kopia tego samego wydruku ma identyczna nazwe. Plik bez daty nie jest niczyim duplikatem. Zostaje
+        // najstarszy z dnia. -> [{ zostaw, usun: [..] }]
+        function epoDuplikatyPlan(docs){
+            var grupy = {}, kol = [];
+            (docs || []).forEach(function (d){
+                var n = pcPlikKlucz(d.name);
+                if (!n || !d.date) return;
+                var k = n + '|' + d.date;
+                if (!grupy[k]){ grupy[k] = []; kol.push(k); }
+                grupy[k].push(d);
+            });
+            return kol.filter(function (k){ return grupy[k].length >= 2; }).map(function (k){
+                var g = grupy[k].slice().sort(epoDocStarszy);
+                return { zostaw: g[0], usun: g.slice(1) };
+            });
+        }
+        // Opis wiersza po sprawdzeniu. juz = zamowienia z plikiem dodanym DZIS (wysylka je pomija), inny = tylko z innego dnia
+        // (wysylka wgra, czlowiek widzi date i sam ocenia), dub = duplikaty z jednego dnia.
+        function epoIstOpisWiersza(w, dzis){
+            dzis = dzis || epoDzis();
+            var ord = w.ordery || [w.order], juz = [], inny = [], dub = [], nw = [];
+            ord.forEach(function (o){
+                var j = (w._juz || {})[o];
+                if (!j) return;
+                if (j.nieWiem){ nw.push(o); return; }
+                var dz = j.docs.filter(function (d){ return d.date === dzis; });
+                if (dz.length) juz.push(o); else if (j.docs.length) inny.push(o);
+                if (epoDuplikatyPlan(j.docs).length) dub.push(o);
+            });
+            w._juzOrd = juz; w._dubOrd = dub;
+            var t = [], dzisDok = function (o){ return w._juz[o].docs.filter(function (d){ return d.date === dzis; })[0]; };
+            var ostatni = function (o){ var ds = w._juz[o].docs; return ds[ds.length - 1]; };
+            if (juz.length) t.push('⚠ dziś już dodane ' + (juz.length === ord.length
+                    ? (ord.length > 1 ? 'we wszystkich ' + ord.length + ' zamówieniach' : 'w zamówieniu')
+                    : ('w ' + juz.length + ' z ' + ord.length + ' zamówień')) + ': '
+                + juz.slice(0, 6).map(function (o){ return o + ' (' + epoDocOpis(dzisDok(o)) + ')'; }).join(', ')
+                + (juz.length > 6 ? ' …' : '') + ' — tam nie wgram drugi raz');
+            if (inny.length) t.push('ℹ plik o tej nazwie jest z innego dnia: '
+                + inny.slice(0, 6).map(function (o){ return o + ' (' + epoDocOpis(ostatni(o)) + ')'; }).join(', ')
+                + (inny.length > 6 ? ' …' : '') + ' — wgram; odznacz, jeśli to ten sam przelew');
+            if (dub.length) t.push('♊ duplikat z jednego dnia: ' + dub.map(function (o){
+                    return o + ' ×' + epoDuplikatyPlan(w._juz[o].docs).reduce(function (s, g){ return s + 1 + g.usun.length; }, 0);
+                }).join(', ')
+                + ' — „🗑 Usuń duplikaty” zostawi najstarszy');
+            if (nw.length) t.push('? nie odczytałem strony: ' + nw.join(', '));
+            w.istUwaga = t.join(' · ');
+            w.istKolor = (juz.length || dub.length || inny.length) ? '#c47f00' : (nw.length ? '#0a58ca' : '#0a7a2f');
+            if (!t.length) w.istUwaga = '✓ w zamówieniach nie ma jeszcze tego potwierdzenia';
+            return { juz: juz, inny: inny, dub: dub, nw: nw, ord: ord };
+        }
+        function epoSprawdzIstniejace(){ return epoWKolejce(function (){ return epoSprawdzIstniejaceTeraz(null); }, 'sprawdzenie potwierdzeń'); }
+        // lista — wiersze do sprawdzenia (null = wszystkie poza nieodczytanymi). Woła ja tez epoWyslijTeraz (juz w kolejce).
+        async function epoSprawdzIstniejaceTeraz(lista){
+            var L = (lista || epoLista).filter(function (w){ return w && !w.blok; });
+            var zad = [];
+            L.forEach(function (w){ w._juz = {}; (w.ordery || [w.order]).forEach(function (o){ if (o) zad.push({ w: w, o: String(o) }); }); });
+            if (!zad.length){ epoPodsumowanie('Nie ma czego sprawdzić.'); return { juz: 0, dub: 0 }; }
+            var strony = {}, zrob = 0;
+            epoPodsumowanie('Sprawdzam, czy potwierdzenia już są w zamówieniach: 0/' + zad.length + '…');
+            await runPool(zad, async function (z){
+                if (!strony[z.o]) strony[z.o] = pcOrderHtmlR(z.o).catch(function (){ return ''; });
+                var html = await strony[z.o];
+                z.w._juz[z.o] = html ? epoIstniejaceZHtml(html, z.w.nazwa) : { nieWiem: true };
+                zrob++;
+                epoPodsumowanie('Sprawdzam, czy potwierdzenia już są w zamówieniach: ' + zrob + '/' + zad.length + '…');
+            }, EPO_NARAZ);
+            var nJuz = 0, nInny = 0, nDub = 0, nNw = 0, dzis = epoDzis();
+            L.forEach(function (w){
+                var r = epoIstOpisWiersza(w, dzis);
+                nJuz += r.juz.length; nInny += r.inny.length; nDub += r.dub.length; nNw += r.nw.length;
+                w._sprIst = true; w._sprIstT = Date.now();
+                // Plik jest juz (dodany dzis) we WSZYSTKICH zamowieniach wiersza — nie ma czego wysylac.
+                if (!w.wyslane && r.juz.length && r.juz.length === r.ord.length) w.sel = false;
+            });
+            epoRysuj();
+            epoPodsumowanie('Sprawdzone ' + zad.length + ' ' + epoOdm(zad.length, ['zamówienie', 'zamówienia', 'zamówień'])
+                + ': dziś już dodane w ' + nJuz + (nInny ? (', ten sam plik z innego dnia w ' + nInny) : '')
+                + (nDub ? (', duplikaty z jednego dnia w ' + nDub) : '') + (nNw ? (', nie odczytałem ' + nNw) : '') + '.');
+            return { juz: nJuz, inny: nInny, dub: nDub, nw: nNw };
+        }
+        /* Usuniecie dokumentu zamowienia. Prologistics nie ma do tego osobnego adresu: przycisk „Delete" przy dokumencie woła
+           deleteDoc(id), a ta wpisuje numer w ukryte pole „deleted_doc" i wysyla CALY formularz strony (document.forms[0]) —
+           odczytane 23.11.2026 z op_order.php. Dlatego nie skladamy formularza sami (strona dorabia pola skryptami — pulapka
+           z insurance.php): ladujemy prawdziwa strone zamowienia w ukrytej ramce i robimy dokladnie to, co deleteDoc, bez
+           okienka „Delete this file?" (pytamy wczesniej, raz, o cala liste). -> { ok, why }                                   */
+        function epoRamkaLoad(ifr, ms){
+            return new Promise(function (res, rej){
+                var t = setTimeout(function (){ ifr.removeEventListener('load', ok); rej(new Error('strona zamówienia nie wczytała się w ' + Math.round(ms / 1000) + ' s')); }, ms);
+                function ok(){ clearTimeout(t); ifr.removeEventListener('load', ok); res(); }
+                ifr.addEventListener('load', ok);
+            });
+        }
+        // Czy przycisk „Delete" przy TYM dokumencie stoi na stronie i czy deleteDoc robi to, co odczytalismy. Gdyby prologistics
+        // zmienil te funkcje (inne pole, AJAX zamiast formularza), HUB nie zgaduje — odmawia. -> '' albo powod odmowy.
+        function epoUsunKontrola(doc, win, docId){
+            // Strona logowania tez ma formularz (forms[0]) — rozpoznajemy ja PRZED szukaniem pola, inaczej meldunek mylil.
+            if (doc && doc.querySelector && doc.querySelector('input[type=password]')) return 'strona logowania — sesja wygasła';
+            var f = doc && doc.forms && doc.forms[0];
+            if (!f) return 'na stronie zamówienia nie ma formularza';
+            if (!f.elements || !f.elements['deleted_doc']) return 'formularz zamówienia nie ma pola „deleted_doc”';
+            var re = new RegExp('deleteDoc\\(\\s*[\'"]?' + String(docId).replace(/\D/g, '') + '[\'"]?\\s*\\)');
+            var jest = Array.prototype.some.call(doc.querySelectorAll('input[type=button],button,a'), function (b){
+                return re.test((b.getAttribute('onclick') || '') + ' ' + (b.getAttribute('href') || ''));
+            });
+            if (!jest) return 'na stronie nie ma przycisku „Delete” przy dokumencie #' + docId + ' (już usunięty?)';
+            if (!epoDeleteDocZgodny(epoDeleteDocZrodlo(doc, win)))
+                return 'prologistics usuwa dokumenty inaczej niż przy odczycie 23.11.2026 (funkcja deleteDoc) — nic nie usuwam';
+            return '';
+        }
+        // Tresc funkcji deleteDoc: ze strony (gdy skrypt widzi jej zmienne) albo z wbudowanych <script> (ScriptCat bywa
+        // w osobnym swiecie i window.deleteDoc jest wtedy undefined). '' = nie znalazlem.
+        function epoDeleteDocZrodlo(doc, win){
+            var src = '';
+            try { if (win && typeof win.deleteDoc === 'function') src = String(win.deleteDoc); } catch (e){}
+            if (src) return src;
+            try {
+                var all = Array.prototype.map.call(doc.querySelectorAll('script:not([src])'), function (s){ return s.textContent || ''; }).join('\n');
+                var m = /function\s+deleteDoc\s*\([^)]*\)\s*\{[\s\S]{0,600}?\}\s*\}/.exec(all);
+                if (m) return m[0];
+            } catch (e){}
+            return '';
+        }
+        // Zgodna = wpisuje numer w deleted_doc pierwszego formularza i go wysyla (stan z 23.11.2026).
+        function epoDeleteDocZgodny(src){
+            return !!src && /deleted_doc/.test(src) && /forms\s*\[\s*0\s*\]/.test(src) && /submit\s*\(/.test(src);
+        }
+        async function pcUsunDokument(order, docId){
+            var ifr = document.createElement('iframe');
+            ifr.style.cssText = 'position:fixed;left:-20000px;top:0;width:1280px;height:900px;border:0;opacity:0;pointer-events:none';
+            ifr.setAttribute('aria-hidden', 'true');
+            (document.body || document.documentElement).appendChild(ifr);
+            try {
+                var l1 = epoRamkaLoad(ifr, 120000);
+                ifr.src = '/op_order.php?id=' + encodeURIComponent(order);
+                await l1;
+                // Strona dorabia czesc pol skryptami po wczytaniu — chwila zapasu, tak jak czlowiek, ktory klika po obejrzeniu strony.
+                await new Promise(function (r){ setTimeout(r, 1500); });
+                var doc = ifr.contentDocument, win = ifr.contentWindow;
+                if (!doc || !win) return { ok: false, why: 'nie mam dostępu do strony zamówienia w ramce' };
+                if (!new RegExp('[?&]id=' + String(order).replace(/\D/g, '') + '(?!\\d)').test(String(win.location.search))) return { ok: false, why: 'ramka otworzyła inną stronę' };
+                var nie = epoUsunKontrola(doc, win, docId);
+                if (nie) return { ok: false, why: nie };
+                var f = doc.forms[0];
+                var l2 = epoRamkaLoad(ifr, 120000);
+                // Dokladnie to, co deleteDoc(id) po „OK" w okienku „Delete this file ?".
+                f.elements['deleted_doc'].value = String(docId);
+                // Pole o nazwie „submit" przykryloby metode formularza — wtedy bierzemy ja z prototypu.
+                var wyslij = (typeof f.submit === 'function') ? f.submit : win.HTMLFormElement.prototype.submit;
+                wyslij.call(f);
+                await l2;
+                return { ok: true };
+            } catch (e){
+                return { ok: false, why: String((e && e.message) || e) };
+            } finally {
+                setTimeout(function (){ try { ifr.remove(); } catch (e){} }, 300);
+            }
+        }
+        // Plan usuwania z wynikow sprawdzenia: jedna pozycja na grupe duplikatow (nazwa + dzien) w zamowieniu. To samo
+        // zamowienie bywa w dwoch wierszach listy — dokument trafia do planu raz. -> [{ w, o, zostaw, usun: [..] }]
+        function epoUsunPlan(lista){
+            var plan = [], widz = {};
+            (lista || []).forEach(function (w){
+                (w._dubOrd || []).forEach(function (o){
+                    epoDuplikatyPlan(((w._juz || {})[o] || {}).docs || []).forEach(function (g){
+                        var usun = g.usun.filter(function (d){ return !widz[o + '|' + d.id] && String(d.id) !== String(g.zostaw.id); });
+                        usun.forEach(function (d){ widz[o + '|' + d.id] = 1; });
+                        if (usun.length) plan.push({ w: w, o: String(o), zostaw: g.zostaw, usun: usun });
+                    });
+                });
+            });
+            return plan;
+        }
+        function epoUsunDuplikaty(){ return epoWKolejce(epoUsunDuplikatyTeraz, 'usuwanie duplikatów'); }
+        async function epoUsunDuplikatyTeraz(){
+            var plan = epoUsunPlan(epoLista);
+            if (!plan.length){ epoPodsumowanie('Nie znalazłem duplikatów — najpierw „🔎 Sprawdź, czy są już potwierdzenia”.'); return; }
+            var R = await pcUsunDuplikatyWykonaj(plan, {
+                przed: function (p, i){
+                    epoStan(p.w, '⏳ usuwam duplikaty w ' + p.o + ' (' + (i + 1) + '/' + plan.length + ')…', '#888');
+                    epoPodsumowanie('Usuwam duplikaty: ' + (i + 1) + '/' + plan.length + ' zamówień…');
+                },
+                po: function (p, html){
+                    if (html) p.w._juz[p.o] = epoIstniejaceZHtml(html, p.w.nazwa);
+                    epoIstOpisWiersza(p.w);
+                }
+            });
+            if (!R) return;
+            epoRysuj();
+            epoPodsumowanie(R.wynik);
+            var st = wp.querySelector('#wp-status'); if (st) st.textContent = R.wynik;
+        }
+        // Wspolne usuwanie duplikatow potwierdzen — lista EPO i „🔎 Sprawdź zamówienia". plan: [{ o, zostaw, usun: [..] }],
+        // opcje.przed(p, i) / opcje.po(p, html|'') — postep i odswiezenie opisu u wolajacego. Jedno pytanie o cala liste,
+        // potem zamowienie po zamowieniu, z odczytem kontrolnym. -> null (Anuluj) albo { okZ, zle, stop, wynik }
+        async function pcUsunDuplikatyWykonaj(plan, opcje){
+            opcje = opcje || {};
+            var ile = plan.reduce(function (s, p){ return s + p.usun.length; }, 0);
+            if (!confirm('Usunąć ' + ile + ' ' + epoOdm(ile, ['zdublowane potwierdzenie', 'zdublowane potwierdzenia', 'zdublowanych potwierdzeń'])
+                + ' z ' + plan.length + ' ' + epoOdm(plan.length, ['zamówienia', 'zamówień', 'zamówień']) + '?\n\n'
+                + plan.map(function (p){
+                    return '  • ' + p.o + ': zostaje #' + p.zostaw.id + ' (' + epoDocOpis(p.zostaw) + '), usuwam '
+                         + p.usun.map(function (d){ return '#' + d.id + ' (' + epoDocOpis(d) + ')'; }).join(', ');
+                  }).join('\n')
+                + '\n\nPlik: „' + plan[0].zostaw.name + '”' + (plan.length > 1 ? ' i inne z listy' : '')
+                + '\n\nUsuwam tak samo jak przycisk „Delete” na stronie zamówienia. Z HUB-a nie da się tego cofnąć.')) return null;
+            var okZ = 0, zle = [], stop = '';
+            for (var i = 0; i < plan.length && !stop; i++){
+                var p = plan[i], bledy = [];
+                try { if (opcje.przed) opcje.przed(p, i); } catch (e){}
+                for (var k = 0; k < p.usun.length; k++){
+                    var r = await pcUsunDokument(p.o, p.usun[k].id);
+                    if (!r.ok){
+                        bledy.push('#' + p.usun[k].id + ': ' + r.why);
+                        // Wygasla sesja albo zmieniony mechanizm prologistics — dalsze proby skoncza sie tak samo.
+                        if (/sesja wygasła|usuwa dokumenty inaczej|nie ma pola „deleted_doc”/.test(r.why)){ stop = r.why; break; }
+                    }
+                }
+                // Kontrola PO: usuniete zniknely, a najstarszy ZOSTAL. Samo „formularz wyslany" niczego nie dowodzi.
+                var html = await pcOrderHtmlR(p.o), po = pcDokiPC(html);
+                if (po == null) bledy.push('nie odczytałem strony po usunięciu — sprawdź ręcznie');
+                else {
+                    var ids = po.map(function (d){ return d.id; });
+                    p.usun.forEach(function (d){ if (ids.indexOf(d.id) >= 0) bledy.push('#' + d.id + ' dalej jest'); });
+                    if (ids.indexOf(p.zostaw.id) < 0) bledy.push('⛔ zniknął też zostawiony #' + p.zostaw.id + ' — wgraj potwierdzenie z powrotem');
+                }
+                if (bledy.length) zle.push(p.o + ' (' + bledy.join('; ') + ')'); else okZ++;
+                try { if (opcje.po) opcje.po(p, po == null ? '' : html); } catch (e){}
+            }
+            var wynik = 'Duplikaty: wyczyszczone w ' + okZ + ' z ' + plan.length + ' ' + epoOdm(plan.length, ['zamówienia', 'zamówień', 'zamówień'])
+                      + (zle.length ? (' · problem: ' + zle.join(' · ')) : '')
+                      + (stop ? (' · PRZERWANE: ' + stop + ' — pozostałych nie ruszałem') : '') + '.';
+            return { okZ: okZ, zle: zle, stop: stop, wynik: wynik };
+        }
+        /* ===== „🔎 Sprawdź zamówienia" — potwierdzenie, komentarz, duplikaty (23.11.2026) =====
+           Prosba uzytkownika: po wpisaniu numerow zamowien (lista 25 numerow z linkami) „sprawdziło, czy jest potwierdzenie,
+           czy jest komentarz i czy nie ma duplikatu czasem komentarza albo potwierdzenia". Dzien wybiera czlowiek (domyslnie
+           dzis): potwierdzenie i komentarz liczymy z TEGO dnia — zamowienie ma zwykle tez potwierdzenie depozytu sprzed tygodni.
+           Komentarz = tekst z pola „💬” u gory („Payment confirmation attached."); puste pole = dowolny komentarz z dnia.
+           Duplikat (jak przy liscie EPO): ten sam plik albo ta sama tresc komentarza dodane DWA RAZY TEGO SAMEGO DNIA —
+           z kazdego dnia, nie tylko wybranego. Duplikaty potwierdzen usuwa „🗑” (pcUsunDuplikatyWykonaj); komentarzy HUB nie
+           usuwa — pokazuje, ktore. Same odczyty stron, po EPO_NARAZ naraz, w kolejce EPO.                                   */
+        var zchkWyniki = [];
+        // Numery zamowien z dowolnego tekstu: 5–6 cyfr, nie czesc dluzszej liczby, kwoty, daty ani numeru konta. Bez powtorzen.
+        function zchkNumery(txt){
+            var out = [], re = /(?<![\d.,:\/-])\d{5,6}(?![\d.,:\/-]*\d)/g, m;
+            var s = String(txt == null ? '' : txt);
+            while ((m = re.exec(s))){ if (out.indexOf(m[0]) < 0) out.push(m[0]); }
+            return out;
+        }
+        // Tresc komentarza do porownan: same litery i cyfry, bez wielkosci liter. 23.11.2026: Irena wpisala recznie „Payment
+        // confirmation attached" BEZ kropki, pole HUB-a ma „Payment confirmation attached." — dokladne porownanie dalo ✗ we
+        // wszystkich 25 zamowieniach, choc komentarz stal. Ten sam klucz grupuje duplikaty (z kropka i bez to ten sam wpis).
+        function zchkKomKlucz(t){ return pcTxt(t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ''); }
+        // Komentarz pasuje, gdy klucz jest ten sam albo komentarz ZACZYNA sie od szukanego tekstu („Payment confirmation
+        // attached - deposit 15%"). Zawieranie w srodku nie wystarcza: „No payment confirmation attached yet" to nie to.
+        function zchkKomPasuje(tekst, szukKlucz){
+            if (!szukKlucz) return true;
+            var k = zchkKomKlucz(tekst);
+            return k === szukKlucz || (szukKlucz.length >= 10 && k.indexOf(szukKlucz) === 0);
+        }
+        // Wynik jednego zamowienia ze strony. nazwaKom — szukany tekst komentarza ('' = dowolny). -> { nieWiem } albo opis.
+        function zchkZamowienie(html, nazwaKom, dzien){
+            var docs = pcDokiPC(html);
+            if (docs == null) return { nieWiem: true };
+            docs = docs.slice().sort(epoDocStarszy);
+            var cs = [];
+            try { cs = (pcComments(html) || []).filter(function (c){ return pcTxt(c.text || ''); }); } catch (e){ return { nieWiem: true }; }
+            var szuk = zchkKomKlucz(nazwaKom);
+            var dzienC = function (c){ return String(c.date || '').slice(0, 10); };
+            var pasuje = function (c){ return zchkKomPasuje(c.text, szuk); };
+            var grupy = {}, kol = [];
+            cs.forEach(function (c){
+                var k = zchkKomKlucz(c.text) + '|' + dzienC(c);
+                if (!dzienC(c)) return;
+                if (!grupy[k]){ grupy[k] = []; kol.push(k); }
+                grupy[k].push(c);
+            });
+            return {
+                docs: docs,
+                docsDzien: docs.filter(function (d){ return d.date === dzien; }),
+                dubDocs: epoDuplikatyPlan(docs),
+                komDzien: cs.filter(function (c){ return pasuje(c) && dzienC(c) === dzien; }),
+                komOst: cs.filter(pasuje).slice(-1)[0] || null,
+                dubKom: kol.filter(function (k){ return grupy[k].length >= 2; }).map(function (k){ return grupy[k]; })
+            };
+        }
+        function zchkKomOpis(c){ return c ? (String(c.date || '?').slice(0, 16) + (c.author ? ', ' + c.author : '')) : ''; }
+        // Ocena wiersza: 'ok' (jest i jedno, i drugie, bez duplikatow) / 'brak' / 'dub' / 'nw' (strona nieodczytana).
+        function zchkOcena(r){
+            if (!r || r.nieWiem) return 'nw';
+            if (r.dubDocs.length || r.dubKom.length) return 'dub';
+            return (r.docsDzien.length && r.komDzien.length) ? 'ok' : 'brak';
+        }
+        function zchkPlanUsun(){
+            var plan = [];
+            zchkWyniki.forEach(function (x){
+                if (!x.r || x.r.nieWiem) return;
+                x.r.dubDocs.forEach(function (g){ plan.push({ o: x.o, zostaw: g.zostaw, usun: g.usun }); });
+            });
+            return plan;
+        }
+        function zchkMsg(t){ var m = wp.querySelector('#wp-zchk-msg'); if (m) m.textContent = t; }
+        function zchkSprawdz(){ return epoWKolejce(zchkSprawdzTeraz, 'sprawdzenie zamówień'); }
+        async function zchkSprawdzTeraz(){
+            var ta = wp.querySelector('#wp-zchk-txt'), dz = wp.querySelector('#wp-zchk-dzien');
+            var nr = zchkNumery(ta ? ta.value : '');
+            if (!nr.length){ zchkMsg('Nie widzę numerów zamówień (5–6 cyfr).'); return; }
+            var dzien = (dz && dz.value) || epoDzis();
+            var komEl = wp.querySelector('#wp-pc-comment-text');
+            var kom = komEl ? String(komEl.value || '').trim() : '';
+            zchkWyniki = nr.map(function (o){ return { o: o, r: null }; });
+            zchkWyniki.dzien = dzien; zchkWyniki.kom = kom;
+            var zrob = 0;
+            zchkRysuj();
+            zchkMsg('Czytam ' + nr.length + ' ' + epoOdm(nr.length, ['zamówienie', 'zamówienia', 'zamówień']) + '… 0/' + nr.length);
+            await runPool(zchkWyniki, async function (x){
+                var html = '';
+                try { html = await pcOrderHtmlR(x.o); } catch (e){ html = ''; }
+                x.r = html ? zchkZamowienie(html, kom, dzien) : { nieWiem: true };
+                zrob++;
+                zchkMsg('Czytam ' + nr.length + ' ' + epoOdm(nr.length, ['zamówienie', 'zamówienia', 'zamówień']) + '… ' + zrob + '/' + nr.length);
+            }, EPO_NARAZ);
+            zchkRysuj();
+        }
+        function zchkPodsumowanie(){
+            var L = zchkWyniki, bezP = [], bezK = [], dubP = [], dubK = [], nw = [];
+            L.forEach(function (x){
+                var r = x.r;
+                if (!r) return;
+                if (r.nieWiem){ nw.push(x.o); return; }
+                if (!r.docsDzien.length) bezP.push(x.o);
+                if (!r.komDzien.length) bezK.push(x.o);
+                if (r.dubDocs.length) dubP.push(x.o);
+                if (r.dubKom.length) dubK.push(x.o);
+            });
+            var n = L.length, dz = L.dzien || '';
+            return { n: n, bezP: bezP, bezK: bezK, dubP: dubP, dubK: dubK, nw: nw,
+                tekst: n + ' ' + epoOdm(n, ['zamówienie', 'zamówienia', 'zamówień']) + ' (' + dz + '): '
+                    + 'potwierdzenie ✓ ' + (n - bezP.length - nw.length) + (bezP.length ? (', brak ' + bezP.length + ' (' + bezP.join(', ') + ')') : '')
+                    + ' · komentarz ✓ ' + (n - bezK.length - nw.length) + (bezK.length ? (', brak ' + bezK.length + ' (' + bezK.join(', ') + ')') : '')
+                    + (dubP.length ? (' · ♊ potwierdzenie 2× w ' + dubP.join(', ')) : '')
+                    + (dubK.length ? (' · ♊ komentarz 2× w ' + dubK.join(', ')) : '')
+                    + (nw.length ? (' · nie odczytałem: ' + nw.join(', ')) : '')
+                    + ((bezP.length || bezK.length || dubP.length || dubK.length || nw.length) ? '' : ' — wszystko na miejscu, bez duplikatów') };
+        }
+        function zchkRysuj(){
+            var out = wp.querySelector('#wp-zchk-out');
+            if (!out) return;
+            var L = zchkWyniki;
+            if (!L.length){ out.innerHTML = ''; return; }
+            var dz = L.dzien || '', kom = L.kom || '';
+            var td = 'padding:3px 5px;vertical-align:top;border-top:1px solid #eee';
+            var h = '<table style="border-collapse:collapse;font-size:11px;width:100%">'
+                  + '<tr style="color:#999;font-size:10px"><td style="padding:2px 5px">zamówienie</td><td style="padding:2px 5px">potwierdzenie z ' + esc(dz) + '</td>'
+                  + '<td style="padding:2px 5px">komentarz' + (kom ? ' „' + esc(kom) + '”' : ' (dowolny)') + ' z ' + esc(dz) + '</td><td style="padding:2px 5px">duplikaty (ten sam dzień)</td></tr>';
+            L.forEach(function (x){
+                var r = x.r, oc = zchkOcena(r);
+                var bg = oc === 'ok' ? '#F1FAF3' : (oc === 'nw' ? '#EEF4FF' : (r ? '#FFF6E0' : '#fff'));
+                var cP, cK, cD;
+                if (!r){ cP = cK = cD = '<span style="color:#888">⏳</span>'; }
+                else if (r.nieWiem){ cP = cK = '<span style="color:#0a58ca">? nie odczytałem strony — sprawdź ręcznie</span>'; cD = ''; }
+                else {
+                    var ost = r.docs[r.docs.length - 1];
+                    cP = r.docsDzien.length
+                        ? '<span style="color:#0a7a2f">✓ ' + r.docsDzien.map(function (d){ return esc(d.name) + ' <span style="color:#888">(' + esc(epoDocOpis(d)) + ')</span>'; }).join('<br>✓ ') + '</span>'
+                        : '<span style="color:#c00">✗ brak</span>' + (ost ? '<div style="color:#888;font-size:10px">ostatnie: ' + esc(ost.name) + ' (' + esc(epoDocOpis(ost)) + ')</div>' : '<div style="color:#888;font-size:10px">sekcja pusta</div>');
+                    cK = r.komDzien.length
+                        ? '<span style="color:#0a7a2f">✓ ' + ((kom && pcTxt(r.komDzien[r.komDzien.length - 1].text) === pcTxt(kom)) ? '' : '„' + esc(r.komDzien[r.komDzien.length - 1].text) + '” ') + '<span style="color:#888">(' + esc(zchkKomOpis(r.komDzien[r.komDzien.length - 1])) + ')</span></span>'
+                        : '<span style="color:#c00">✗ brak</span>' + (r.komOst ? '<div style="color:#888;font-size:10px">ostatni: ' + esc(zchkKomOpis(r.komOst)) + '</div>' : '');
+                    var dd = [];
+                    r.dubDocs.forEach(function (g){
+                        dd.push('♊ plik ×' + (1 + g.usun.length) + ': ' + esc(g.zostaw.name) + ' <span style="color:#888">(' + esc(g.zostaw.date) + ': '
+                            + [g.zostaw].concat(g.usun).map(function (d){ return esc(String(d.time || '').slice(0, 5) || '#' + d.id); }).join(', ') + ')</span>');
+                    });
+                    r.dubKom.forEach(function (g){
+                        dd.push('♊ komentarz ×' + g.length + ': „' + esc(g[0].text) + '” <span style="color:#888">(' + esc(String(g[0].date).slice(0, 10)) + ': '
+                            + g.map(function (c){ return esc(String(c.date || '').slice(11, 16) + (c.author ? ' ' + c.author : '')); }).join(', ') + ') — usuń ręcznie</span>');
+                    });
+                    cD = dd.length ? '<span style="color:#c47f00">' + dd.join('<br>') + '</span>' : '<span style="color:#0a7a2f">—</span>';
+                }
+                h += '<tr style="background:' + bg + '"><td style="' + td + ';white-space:nowrap">' + aLink('/op_order.php?id=' + esc(x.o), x.o) + '</td>'
+                   + '<td style="' + td + '">' + cP + '</td><td style="' + td + '">' + cK + '</td><td style="' + td + '">' + cD + '</td></tr>';
+            });
+            h += '</table>';
+            var gotowe = L.every(function (x){ return x.r; });
+            var plan = gotowe ? zchkPlanUsun() : [];
+            var nUsun = plan.reduce(function (s, p){ return s + p.usun.length; }, 0);
+            var S = gotowe ? zchkPodsumowanie() : null;
+            if (gotowe){
+                h += '<div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                   + (nUsun ? '<button id="wp-zchk-usun" class="chn-btn maroon" title="Ten sam plik dodany kilka razy tego samego dnia do jednego zamówienia: zostaje najstarszy, resztę usuwam jak przyciskiem „Delete” na stronie zamówienia. Przed usunięciem pokażę listę.">🗑 Usuń duplikaty potwierdzeń (' + nUsun + ')</button>' : '')
+                   + ((S.bezP.length || S.bezK.length) ? '<button id="wp-zchk-kopiuj" class="chn-btn ghost" title="Do schowka: numery zamówień bez potwierdzenia albo bez komentarza z tego dnia, każdy w osobnej linii.">📋 Kopiuj numery z brakami</button>' : '')
+                   + '</div>';
+            }
+            out.innerHTML = h;
+            if (S) zchkMsg(S.tekst);
+            var bU = out.querySelector('#wp-zchk-usun');
+            if (bU) bU.onclick = function (){ zchkUsunDuplikaty(); };
+            var bK = out.querySelector('#wp-zchk-kopiuj');
+            if (bK) bK.onclick = function (){
+                var nr = [];
+                S.bezP.concat(S.bezK).forEach(function (o){ if (nr.indexOf(o) < 0) nr.push(o); });
+                var okk = pcCopyText(nr.join('\n'));
+                zchkMsg(okk ? ('Skopiowano ' + nr.length + ' ' + epoOdm(nr.length, ['numer', 'numery', 'numerów']) + ' z brakami.') : 'Nie udało się skopiować.');
+            };
+        }
+        function zchkUsunDuplikaty(){ return epoWKolejce(zchkUsunDuplikatyTeraz, 'usuwanie duplikatów'); }
+        async function zchkUsunDuplikatyTeraz(){
+            var plan = zchkPlanUsun();
+            if (!plan.length){ zchkMsg('Nie ma duplikatów potwierdzeń.'); return; }
+            var R = await pcUsunDuplikatyWykonaj(plan, {
+                przed: function (p, i){ zchkMsg('Usuwam duplikaty: ' + (i + 1) + '/' + plan.length + ' (' + p.o + ')…'); },
+                po: function (p, html){
+                    var x = zchkWyniki.filter(function (y){ return y.o === p.o; })[0];
+                    if (x) x.r = html ? zchkZamowienie(html, zchkWyniki.kom, zchkWyniki.dzien) : { nieWiem: true };
+                }
+            });
+            if (!R) return;
+            zchkRysuj();
+            zchkMsg(R.wynik + ' Teraz: ' + zchkPodsumowanie().tekst);
+            var st = wp.querySelector('#wp-status'); if (st) st.textContent = R.wynik;
+        }
         function epoRysuj(){
             var box = wp.querySelector('#wp-epo-box');
             if (!box) return;
@@ -41508,7 +42192,7 @@
                   + '<td style="padding:2px 4px">nazwa po dołączeniu</td><td style="padding:2px 4px">uwagi</td></tr>';
             epoLista.forEach(function (w, i){
                 var bg = w.blok ? '#FDECEC'
-                       : ((w.uwaga && !w.lekka && !w.wyslane) ? '#FFF6E0' : '#fff');
+                       : (((w.uwaga && !w.lekka) || (w._juzOrd || []).length || (w._dubOrd || []).length) && !w.wyslane ? '#FFF6E0' : '#fff');
                 h += '<tr style="background:' + bg + ';border-top:1px solid #eee">'
                   + '<td style="padding:3px 4px;vertical-align:top">'
                   + (w.blok ? '' : '<input type="checkbox" class="epo-chk" data-i="' + i + '"' + (w.sel ? ' checked' : '') + '>')
@@ -41530,6 +42214,9 @@
                   // inaczej nie byloby gdzie pisac w trakcie dopisywania.
                   + '<div class="epo-km" data-i="' + i + '" style="font-size:10px;color:#0a7a2f">'
                   + esc(w.komUwaga || '') + '</div>'
+                  // Trzecia linijka — wynik „🔎 Sprawdź, czy są już potwierdzenia" (dzis / inny dzien / duplikaty).
+                  + (w.istUwaga ? ('<div class="epo-ist" data-i="' + i + '" style="font-size:10px;color:' + (w.istKolor || '#666') + '">'
+                                   + esc(w.istUwaga) + '</div>') : '')
                   // Probka odczytanego tekstu TYLKO przy pliku, ktorego nie rozpoznalismy —
                   // tam bez niej nie da sie zgadnac, co poszlo nie tak. Przy rozpoznanym
                   // byla samym halasem: i tak widac numer zamowienia, kwote i nazwe.
@@ -41537,9 +42224,12 @@
                                  + esc(w.probka) + '…"</div>') : '')
                   + '</td></tr>';
             });
+            var nUsun = epoUsunPlan(epoLista).reduce(function (s, p){ return s + p.usun.length; }, 0);
             h += '</table></div>'
               + '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-              + '<button id="epo-send" class="chn-btn maroon">⬆ Wyślij zaznaczone</button>'
+              + '<button id="epo-send" class="chn-btn maroon" title="Przed wgraniem HUB sam sprawdza zamówienia: tam, gdzie ten plik dodano już dziś, nie wgrywa drugi raz.">⬆ Wyślij zaznaczone</button>'
+              + '<button id="epo-ist" class="chn-btn ghost" title="Czyta strony zamówień z listy i pokazuje przy każdym pliku, czy takie potwierdzenie już tam jest — dodane dziś, z innego dnia, albo kilka razy tego samego dnia. Niczego nie zapisuje.">🔎 Sprawdź, czy są już potwierdzenia</button>'
+              + (nUsun ? ('<button id="epo-usun" class="chn-btn maroon" title="Ten sam plik dodany kilka razy tego samego dnia do jednego zamówienia: zostaje najstarszy, resztę usuwam jak przyciskiem „Delete” na stronie zamówienia. Przed usunięciem pokażę listę.">🗑 Usuń duplikaty (' + nUsun + ')</button>') : '')
               + '<button id="epo-comment" class="chn-btn maroon" title="Dodaj komentarz z pola u góry do wszystkich zamówień z zaznaczonych wierszy — bez tabeli DEPO.">💬 Dodaj komentarz</button>'
               + '<button id="epo-check" class="chn-btn ghost" title="Wróć na zamówienia i sprawdź, czy plik i komentarz naprawdę tam są. Robi się to samo po chwili od wysyłki — ten guzik powtarza sprawdzenie.">🔍 Sprawdź zapis</button>'
               + '<button id="epo-all" class="chn-btn ghost">☑ Zaznacz wszystkie</button>'
@@ -41557,6 +42247,9 @@
             box.querySelector('#epo-send').onclick = epoWyslij;
             box.querySelector('#epo-comment').onclick = function(){ epoKomentarz(this); };
             box.querySelector('#epo-check').onclick = function(){ epoSprawdzPo(true); };
+            box.querySelector('#epo-ist').onclick = function(){ epoSprawdzIstniejace(); };
+            var bUsun = box.querySelector('#epo-usun');
+            if (bUsun) bUsun.onclick = function(){ epoUsunDuplikaty(); };
             box.querySelector('#epo-all').onclick = function(){ epoZaznaczWszystkie(true); };
             box.querySelector('#epo-none').onclick = function(){ epoZaznaczWszystkie(false); };
             epoPodsumowanie();
@@ -41644,10 +42337,31 @@
         async function epoWyslijTeraz(){
             var doWys = epoLista.filter(function (w){ return w.sel && !w.blok && !w.wyslane; });
             if (!doWys.length){ epoPodsumowanie('Nie ma czego wysłać.'); return; }
+            // Najpierw: czy te pliki nie sa juz w zamowieniach (dodane dzis). Sprawdzenie sprzed chwili (guzik „🔎”) wystarcza —
+            // nie czytamy stron drugi raz; starsze niz 3 min albo brak — czytamy teraz.
+            var doSpr = doWys.filter(function (w){ return !w._sprIst || !w._sprIstT || (Date.now() - w._sprIstT) > 180000; });
+            if (doSpr.length) await epoSprawdzIstniejaceTeraz(doSpr);
+            var pomin = [], innyDzien = [];
+            doWys = doWys.filter(function (w){
+                var juz = w._juzOrd || [];
+                juz.forEach(function (o){ pomin.push(o + ' (' + epoDocOpis(((w._juz[o] || {}).docs || []).filter(function (d){ return d.date === epoDzis(); })[0]) + ')'); });
+                (w.ordery || [w.order]).forEach(function (o){
+                    var j = (w._juz || {})[o];
+                    if (j && j.docs && j.docs.length && juz.indexOf(o) < 0) innyDzien.push(o + ' (' + epoDocOpis(j.docs[j.docs.length - 1]) + ')');
+                });
+                return (w.ordery || [w.order]).some(function (o){ return juz.indexOf(o) < 0; });
+            });
+            if (!doWys.length){
+                epoRysuj();
+                epoPodsumowanie('Nic do wysłania — zaznaczone potwierdzenia dziś już są w swoich zamówieniach (' + pomin.length + ').');
+                return;
+            }
             var zadania = [];
             doWys.forEach(function (w){
                 w._plik = new File([w.blob], w.nazwa, { type: 'application/pdf' });
-                w._lista = w.ordery || [w.order];
+                var juz = w._juzOrd || [];
+                w._pominiete = (w.ordery || [w.order]).filter(function (o){ return juz.indexOf(o) >= 0; });
+                w._lista = (w.ordery || [w.order]).filter(function (o){ return juz.indexOf(o) < 0; });
                 w._ok = 0; w._niepewne = 0; w._zle = [];
                 w._lista.forEach(function (o){ zadania.push({ w: w, order: o }); });
             });
@@ -41656,6 +42370,9 @@
                     var os = w._lista;
                     return '  • ' + (os.length > 1 ? (os.length + ' zam.: ' + os.join(', ')) : os[0]) + '  ' + w.nazwa;
                   }).join('\n')
+                + (pomin.length ? ('\n\nPomijam — ten plik dodano tam już dziś (' + pomin.length + '): ' + pomin.slice(0, 15).join(', ') + (pomin.length > 15 ? ' …' : '')) : '')
+                + (innyDzien.length ? ('\n\nUWAGA — plik o tej nazwie jest już z innego dnia, a mimo to wgram (' + innyDzien.length + '): '
+                    + innyDzien.slice(0, 15).join(', ') + (innyDzien.length > 15 ? ' …' : '') + '. Jeśli to ten sam przelew — Anuluj i odznacz.') : '')
                 + '\n\nTej operacji nie da się cofnąć ze skryptu.')) return;
             // Postep widac na dwoch poziomach: przy kazdym wierszu osobno i lacznie pod tabela.
             doWys.forEach(function (w){ epoStan(w, '⏳ czekam…', '#888'); });
@@ -41668,7 +42385,8 @@
                 }
                 // Czesc stala i dopisek osobno — pozniejsze sprawdzenie ma dopisek ZASTAPIC.
                 w._bazaUwaga = (w._ok ? ('✓ dołączone do ' + w._ok + ' z ' + ile) : '✗ nie poszło')
-                             + (w._zle.length ? (' · błąd przy: ' + w._zle.join(', ')) : '');
+                             + (w._zle.length ? (' · błąd przy: ' + w._zle.join(', ')) : '')
+                             + ((w._pominiete || []).length ? (' · pominięte, bo dziś już było: ' + w._pominiete.join(', ')) : '');
                 w.uwaga = w._bazaUwaga
                         + (w._niepewne ? (' · ' + w._niepewne + ' bez potwierdzenia — sprawdzę za chwilę') : '');
                 w.lekka = false;
@@ -41742,6 +42460,8 @@
         wp.querySelector('#wp-epo').onclick = function(){
             var fi = wp.querySelector('#wp-epo-file'); fi.value = ''; fi.click();
         };
+        wp.querySelector('#wp-zchk-go').onclick = function(){ zchkSprawdz(); };
+        (function (){ var d = wp.querySelector('#wp-zchk-dzien'); if (d && !d.value) d.value = epoDzis(); })();
         wp.querySelector('#wp-epo-file').onchange = async function(){
             var status = wp.querySelector('#wp-status');
             var pliki = Array.prototype.slice.call(this.files || []);
@@ -49187,11 +49907,14 @@
         // szesciu, krotszy numer nie trafilby w regule, wplata spadlaby do zapasowej
         // („PayPro (nieznany sklep)") i NIE UTWORZYLABY zlecenia — a pieniadze bylyby
         // na koncie. Ksztalt „/OPF/X/////<numer>:p24w-<sklep>" wystarcza za rozpoznanie.
+        // Waluta celu — oba placa w PLN. Bez niej zlecenie z arkusza dostawalo domyslne EUR („cur: w.cur || 'EUR'")
+        // i paczka BRW nazywala sie „… 30388.50 EUR do prolo.csv" (24.11.2026; tak stalo we wszystkich paczkach BRW).
+        // Cel z ustawien („Mirakl (BRW) · Beliani PL") bierze walute z reguly, bo sklep nie ma jej w mkShopPary.
         { mp: 'Mirakl (Empik)', ok: true, payer: /PAYPRO/i, ref: /(\d+)\s*:\s*p24w-302277\b/i,
-          brand: 'Empik', short: 'Empik', host: 'marketplace.empik.com', shop: 'Empik PL' },
+          brand: 'Empik', short: 'Empik', host: 'marketplace.empik.com', shop: 'Empik PL', cur: 'PLN' },
         { mp: 'Mirakl (BRW)',   ok: true, payer: /PAYPRO/i, ref: /(\d+)\s*:\s*p24w-230912\b/i,
           brand: 'Black Red White', short: 'BRW', host: 'blackredwhitepl-prod.mirakl.net',
-          shop: 'Black Red White PL' },
+          shop: 'Black Red White PL', cur: 'PLN' },
         // PayPro z p24w, ktorego nie znamy. Bez tej reguly wplata nie utworzylaby zlecenia
         // ANI nie pokazalaby sie w podsumowaniu — mkWczytajWyciagi pomija wiersze bez „mp"
         // bez slowa, a cicho polkniety przelew to najgorszy blad, jaki ten modul moze
@@ -86761,7 +87484,15 @@
                 if (!v.hasAttribute('data-ks-orig')){ v.setAttribute('data-ks-orig', v.textContent); v.setAttribute('data-ks-dis', v.disabled ? '1' : '0'); }
                 v.textContent = e; v.disabled = true;
             } else if (v && v.hasAttribute('data-ks-orig')){
-                v.textContent = v.getAttribute('data-ks-orig'); v.disabled = v.getAttribute('data-ks-dis') === '1';
+                // Koniec zapisu tej paczki. Do 24.11.2026 wracal tu napis sprzed zapisu („▶ Zaksięguj OK (66)") z CZYNNYM
+                // guzikiem — na kilka sekund, az widok sie przerysowal; przy „▶ Zaksięguj paczki" nadpisywal nawet ustawione juz
+                // „✔ Zaksięgowane" (BRW, paczka 2361255) i wygladalo, jakby nic nie poszlo. Teraz guzik zostaje WYLACZONY:
+                // paczka zaksiegowana dostaje „✔ Zaksięgowane", inna — informacje, ze stan jest czytany. Widok przerysowuje sie
+                // sam (po zapisie render + impCheck), a blad zapisu wlacza guzik z jego napisem w swoim catch.
+                let zaks = false;
+                try { zaks = jobList().some(function (j){ return String(j.impId || '') === String(mkImpWidok) && !!j.booked; }); } catch (e2){}
+                v.textContent = zaks ? '✔ Zaksięgowane' : '⏳ Zapis wysłany — czytam stan paczki…';
+                v.disabled = true;
                 v.removeAttribute('data-ks-orig'); v.removeAttribute('data-ks-dis');
             }
         } catch (err){}
@@ -88543,6 +89274,7 @@
                     + '\n\n') : '')
                 + 'Paczka ' + job.impId + ' · ' + (job.data ? job.data.shop : '') + '\n'
                 + 'Odpowiada to przyciskowi „Book on main account".\n\nTej operacji nie da się cofnąć z poziomu skryptu.')) return;
+            const bbNapis = bb.textContent;             // napis sprzed zapisu — po bledzie wraca (mkKsOdswiezEtykiety go zmienia)
             bb.disabled = true; m.style.color = '#666'; m.textContent = 'księguję…';
             mkImpBieg++; mkKsiegBieg++;
             try {
@@ -88601,7 +89333,7 @@
                 if (pomW) say('⚠ ' + pomW + ' — świeży odczyt tuż przed zapisem; nie księgowałem tych wierszy drugi raz.', '#c47f00');
             } catch (e){
                 m.style.color = '#c00'; m.textContent = 'nie poszło: ' + ((e && e.message) || e);
-                bb.disabled = false;
+                bb.textContent = bbNapis; bb.disabled = false;
                 try { mkUstawProblem(kluczJob, 'ksiegowanie', 'księgowanie paczki ' + job.impId, (e && e.message) || String(e)); } catch (e2){}
             } finally { mkImpBieg = Math.max(0, mkImpBieg - 1); mkKsiegBieg = Math.max(0, mkKsiegBieg - 1); }
         };
@@ -95261,6 +95993,10 @@
     const SAL_LISTA = [
         { id: 'p24', grupa: 'fp', nazwa: 'Przelewy24 ↔ Export payments', opis: 'raport XLSX · konto 1031 · dopasowanie po ID i mailu', gotowe: true },
         { id: 'paypal', grupa: 'fp', nazwa: 'PayPal ↔ Export payments', opis: 'raport PayPala kontra zestawienie z prologistics', gotowe: true },
+        // PayU: raporty operacji CSV z panelu (sklep i raty osobno), jedno konto 1023.
+        // Laczy po Trans ID, liczac saldo numeru, bo zwrot niesie numer pierwotnej wplaty.
+        { id: 'payu', grupa: 'fp', nazwa: 'PayU ↔ Export payments',
+          opis: 'raporty CSV z panelu PayU (sklep i raty) kontra zestawienie z prologistics · konto 1023 · saldo per numer transakcji, saldo PayU z prowizjami i wypłatami', gotowe: true },
         // Saferpay parujemy po Transaction ID — obie strony go niosa. Przy okazji
         // sprawdzamy terminal: cztery sa reczne i tam zdarza sie zly wybor.
         // Jedna pozycja, DWA warianty: kontra ksiega prologistics albo kontra rozliczenia
@@ -95521,6 +96257,7 @@
             const x = SAL_LISTA.filter(function (y){ return y.id === d.getAttribute('data-id'); })[0];
             if (x && x.gotowe) d.onclick = function (){
                 if (x.id === 'p24'){ salRysujP24(); return; }
+                if (x.id === 'payu'){ salRysujPU(); return; }
                 (x.id === 'bank' ? salRysujBank
                     : (x.id === 'amazon' ? salRysujAmz
                     : (x.id === 'mano' ? salRysujMM
@@ -95777,6 +96514,616 @@
             }catch(e){status.textContent='Nie ukończono porównania po '+elapsed()+' s: '+e.message;}
             finally{clearInterval(clock);P24_RUN=false;p.querySelectorAll('input,button').forEach(e=>{e.disabled=false;});}
         };
+    }
+
+
+    // ================= PAYU ↔ Export payments =================
+    // Raporty operacji CSV z panelu PayU kontra konto 1023 w prologistics. Ustalone
+    // 24.11.2026 na pazdzierniku 2026: raport sklepu „Beliani PL" (2149 operacji)
+    // i rat „Beliani PL (Installments)" (22) wobec 2200 wierszy konta 1023.
+    //
+    //   * Trans ID z PayU stoi w prologistics w kolumnie Transaction ID (wplaty) albo
+    //     jako pierwsza liczba w Comment (zwroty z noty — tam Transaction ID jest pusty).
+    //   * ZWROT w raporcie PayU niesie Trans ID PIERWOTNEJ wplaty, prologistics tak samo.
+    //     Dlatego nie parujemy wiersza z wierszem, tylko SALDO NUMERU: wplaty minus zwroty
+    //     po obu stronach. Nota w prologistics bywa rozbita na kilka linii (pozycje noty),
+    //     a PayU ma jedna kwote — wiersz z wierszem dawal 39 falszywych roznic.
+    //   * Raty (POS „PayU Installments") ksieguja sie na tym samym 1023 — 18 z 18 po numerze.
+    //   * Wynik pazdziernika: saldo zgodne na 2069 z 2072 numerow. Reszta to dwa zwroty
+    //     z noty BEZ numeru w Comment — PayU ma w Opisie „Ticket #686554", ksiega
+    //     w Auftrag number „CREDIT … TICKET 686554 AUFTRAG …". Po tym je laczymy.
+    //   * Prowizji i wyplat na 1023 nie ma. Saldo PayU (poczatek, prowizje, wyplaty,
+    //     koniec) liczymy z samego raportu i sprawdzamy jego ciaglosc wiersz po wierszu.
+    //   * Daty: ksiega ma wplate zwykle do godziny PRZED czasem z PayU, zwrot do doby
+    //     przed (pojedyncze ponad tydzien). Ksiege pobieramy wiec z zapasem dni po obu
+    //     stronach okresu — tylko po to, zeby roznice na granicy miesiaca nazwac po imieniu.
+    const PU_KONTO = '1023';        // PayU Beliani PL, PLN — sklep i raty razem
+    const PU_ZAPAS = 10;            // dni zapasu ksiegi po obu stronach okresu
+    const PU_SWIEZA_MIN = 15;       // tyle minut pobrana ksiega wystarcza do kolejnego sprawdzenia
+    let PU_PLIKI = [];              // wczytane raporty PayU (wynik puCzytaj)
+    let PU_EXP = null;              // { od, doo, t, wiersze, zle } — ksiega 1023 z zapasem
+    let PU_WYNIK = null;
+    let PU_RUN = false;
+
+    // „829.00", „-243138.08", „" -> grosze (liczba calkowita), null dla pustego, NaN dla smieci.
+    // Na groszach, zeby sumy setek pozycji porownywac rownoscia, a nie tolerancja.
+    function puGr(v){
+        const s = String(v == null ? '' : v).replace(/\s/g, '');
+        if (!s) return null;
+        if (!/^-?\d+(?:[.,]\d{1,2})?$/.test(s)) return NaN;
+        return Math.round(Number(s.replace(',', '.')) * 100);
+    }
+    function puZl(gr){ return salPln((Number(gr) || 0) / 100); }
+    function puSuma(l, pole){ return l.reduce(function (a, x){ return a + x[pole]; }, 0); }
+    function puDzien(iso, dni){
+        const d = new Date(iso + 'T00:00:00Z');
+        d.setUTCDate(d.getUTCDate() + dni);
+        return d.toISOString().slice(0, 10);
+    }
+    // Kolumny raportu PayU. Szukamy po nazwie, nie po pozycji — naglowek ma 31 kolumn.
+    const PU_KOL = { typ: 'Typ operacji', data: 'Data', czas: 'Czas', trans: 'Trans ID', kwota: 'Kwota',
+                     saldo: 'Saldo', opis: 'Opis', konto: 'Opis2/nr konta', order: 'Order ID',
+                     mail: 'E-mail', osoba: 'Imię i nazwisko', prow: 'Prowizja', wal: 'Waluta',
+                     sklep: 'Nazwa sklepu', pos: 'Nazwa Pos', rodzaj: 'Typ płatności' };
+    const PU_MUSI = ['typ', 'data', 'czas', 'trans', 'kwota', 'saldo', 'opis', 'prow', 'wal'];
+    // Typy operacji: t — wplata, c — zwrot, w — wyplata na rachunek, bc — korekta
+    // rozliczenia („Billing correction after ifpp calculation", bez Trans ID).
+    const PU_TYP = { t: 'wpłata', c: 'zwrot', w: 'wypłata', bc: 'korekta rozliczenia' };
+    function puCzytaj(tekst, nazwa){
+        const w = slCsvPodziel(String(tekst == null ? '' : tekst).replace(/^﻿/, ''));
+        const nag = (w[0] || []).map(function (x){ return String(x).trim().toLowerCase(); });
+        const k = {};
+        Object.keys(PU_KOL).forEach(function (x){ k[x] = nag.indexOf(PU_KOL[x].toLowerCase()); });
+        const brak = PU_MUSI.filter(function (x){ return k[x] < 0; }).map(function (x){ return PU_KOL[x]; });
+        if (brak.length) throw new Error(nazwa + ': to nie wygląda na raport operacji PayU — brak kolumn: '
+                                       + brak.join(', '));
+        const op = [], zle = [];
+        for (let i = 1; i < w.length; i++){
+            const r = w[i];
+            const v = function (x){ return k[x] >= 0 ? String(r[k[x]] == null ? '' : r[k[x]]).trim() : ''; };
+            const data = v('data'), czas = v('czas') || '00:00:00';
+            const kw = puGr(v('kwota')), saldo = puGr(v('saldo')), prow = puGr(v('prow'));
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(data) || !/^\d{2}:\d{2}(:\d{2})?$/.test(czas)
+                || kw == null || isNaN(kw) || isNaN(saldo) || isNaN(prow)){ zle.push(i + 1); continue; }
+            op.push({ plik: nazwa, wiersz: i + 1, typ: v('typ').toLowerCase(), data: data,
+                      chwila: data + ' ' + (czas.length === 5 ? czas + ':00' : czas),
+                      trans: v('trans'), kw: kw, saldo: saldo, prow: prow || 0, wal: v('wal').toUpperCase(),
+                      opis: v('opis'), konto: v('konto'), order: v('order'), mail: v('mail'),
+                      osoba: v('osoba'), sklep: v('sklep'), pos: v('pos'), rodzaj: v('rodzaj') });
+        }
+        if (!op.length) throw new Error(nazwa + ': raport nie ma ani jednej operacji'
+                                      + (zle.length ? (' (nieczytelnych wierszy: ' + zle.length + ')') : ''));
+        // Ciaglosc salda: kazda operacja zmienia saldo o kwote i prowizje. Przerwa znaczy,
+        // ze w pliku brakuje wierszy albo ktos go edytowal — wtedy bilans ponizej klamie.
+        let przerwy = 0, prev = null, pierwsza = null, ostatnia = null;
+        op.forEach(function (o){
+            if (o.saldo == null){ prev = null; return; }
+            if (prev != null && prev + o.kw + o.prow !== o.saldo) przerwy++;
+            if (!pierwsza) pierwsza = o;
+            ostatnia = o; prev = o.saldo;
+        });
+        const m = String(nazwa).match(/(\d{4}-\d{2}-\d{2})_-_(\d{4}-\d{2}-\d{2})/);
+        const daty = op.map(function (o){ return o.data; }).sort();
+        const sklep = (op.filter(function (o){ return o.sklep; })[0] || {}).sklep || nazwa;
+        return { nazwa: nazwa, sklep: sklep, op: op, zle: zle, przerwy: przerwy,
+                 od: m ? m[1] : daty[0], doo: m ? m[2] : daty[daty.length - 1],
+                 start: pierwsza ? pierwsza.saldo - pierwsza.kw - pierwsza.prow : null,
+                 koniec: ostatnia ? ostatnia.saldo : null };
+    }
+
+    // Numer transakcji PayU po stronie ksiegi: kolumna Transaction ID, a gdy pusta —
+    // pierwsza liczba w Comment. Z XLS-a numer potrafi przyjsc jako liczba; 10 cyfr
+    // miesci sie w niej bez strat (17-cyfrowe numery PayPala juz nie — patrz slTxId).
+    function puNumer(v){
+        if (typeof v === 'number') return (Number.isSafeInteger(v) && v > 0) ? String(v) : '';
+        const s = String(v == null ? '' : v).trim();
+        return /^\d{6,}$/.test(s) ? s : '';
+    }
+    function puChwila(v){
+        const ms = slChwila(v);
+        return ms ? new Date(ms).toISOString().slice(0, 19).replace('T', ' ') : '';
+    }
+    function puKsiega(wiersze){
+        const h = (wiersze[0] || []).map(function (x){ return String(x == null ? '' : x).trim().toLowerCase(); });
+        const k = { data: h.indexOf('payment date'), kw: h.indexOf('amount'), dt: h.indexOf('debit'),
+                    ct: h.indexOf('credit'), tx: h.indexOf('transaction id'), kom: h.indexOf('comment'),
+                    auf: h.indexOf('auftrag number'), fv: h.indexOf('invoice number'), nazwa: h.indexOf('name') };
+        const brak = ['data', 'kw', 'dt', 'ct', 'tx', 'kom', 'auf'].filter(function (x){ return k[x] < 0; });
+        if (brak.length) throw new Error('w pliku Export payments brakuje kolumn: ' + brak.join(', '));
+        const t = function (r, x){ return (k[x] >= 0 && r[k[x]] != null) ? String(r[k[x]]).trim() : ''; };
+        const out = [], zle = [];
+        for (let i = 1; i < wiersze.length; i++){
+            const r = wiersze[i];
+            if (!r || !r.some(function (x){ return x != null && String(x).trim(); })) continue;
+            const dt = t(r, 'dt'), ct = t(r, 'ct');
+            const znak = dt === PU_KONTO ? 1 : (ct === PU_KONTO ? -1 : 0);
+            // Przeniesienie w obrebie tego samego konta nie zmienia jego salda.
+            if (!znak || dt === ct) continue;
+            const kw = slKwota(r[k.kw]), chwila = puChwila(r[k.data]);
+            if (kw == null || !chwila){ zle.push(i + 1); continue; }
+            const kom = t(r, 'kom'), auf = t(r, 'auf');
+            const am = auf.match(/(?:^|AUFTRAG\s+)(\d{5,})\s*\/\s*(\d+)/i);
+            out.push({ wiersz: i + 1, chwila: chwila, data: chwila.slice(0, 10),
+                       gr: znak * Math.round(kw * 100),
+                       nr: puNumer(r[k.tx]) || ((kom.match(/^\s*(\d{6,})(?!\d)/) || [])[1] || ''),
+                       kom: kom, aufTekst: auf, auf: am ? { nr: am[1], txn: am[2] } : null,
+                       ticket: (auf.match(/TICKET\s*(\d{4,})/i) || [])[1] || '',
+                       fv: t(r, 'fv'), nazwa: t(r, 'nazwa') });
+        }
+        return { wiersze: out, zle: zle };
+    }
+
+    // Klucz zwrotu z Opisu PayU: numer ticketu („Ticket #686554") albo auftraga („15794849").
+    function puKluczZwrotu(o){
+        const t = String(o.opis || '').match(/ticket\s*#?\s*(\d{4,})/i);
+        if (t) return { ticket: t[1] };
+        const a = String(o.opis || '').match(/^\s*(\d{5,})\s*(?:\/\s*\d+)?\s*$/);
+        return a ? { auf: a[1] } : null;
+    }
+    function puPasuje(w, kl){
+        return !!kl && ((kl.ticket && w.ticket === kl.ticket) || (kl.auf && w.auf && w.auf.nr === kl.auf));
+    }
+    function puMs(c){ return Date.parse(String(c).replace(' ', 'T') + 'Z') || 0; }
+
+    function puUzgodnij(pliki, ksiega, od, doo){
+        const OD = od + ' 00:00:00', DO = doo + ' 23:59:59';
+        const zOD = puDzien(od, -PU_ZAPAS) + ' 00:00:00', zDO = puDzien(doo, PU_ZAPAS) + ' 23:59:59';
+        const wOkr = function (c){ return c >= OD && c <= DO; };
+        // Poza okresem patrzymy tylko w tym samym oknie, z jakim pobieramy ksiege —
+        // inaczej wczytany raport PayU z innego miesiaca widzialby wiecej niz ksiega.
+        const wZap = function (c){ return c >= zOD && c <= zDO; };
+        const G = new Map();
+        const grupa = function (nr){
+            if (!G.has(nr)) G.set(nr, { nr: nr, pu: [], pl: [], puPoza: [], plPoza: [], dobrane: [] });
+            return G.get(nr);
+        };
+        const op = [];
+        pliki.forEach(function (f){ f.op.forEach(function (o){ op.push(o); }); });
+        const puBezNr = [];
+        let pokrycieDo = '';
+        op.forEach(function (o){
+            if (o.chwila > pokrycieDo) pokrycieDo = o.chwila;
+            // Wyplata ma w Trans ID numer przelewu na rachunek — na 1023 jej nie ma.
+            if (o.typ === 'w') return;
+            if (!o.trans){ if (o.typ !== 'bc' && wOkr(o.chwila)) puBezNr.push(o); return; }
+            if (wOkr(o.chwila)) grupa(o.trans).pu.push(o);
+            else if (wZap(o.chwila)) grupa(o.trans).puPoza.push(o);
+        });
+        const bezNr = [], bezNrPoza = [];
+        ksiega.forEach(function (w){
+            if (!w.nr){ (wOkr(w.chwila) ? bezNr : bezNrPoza).push(w); return; }
+            if (wOkr(w.chwila)) grupa(w.nr).pl.push(w);
+            else grupa(w.nr).plPoza.push(w);
+        });
+
+        const zgodne = [], daty = [], dobrane = [];
+        let rozne = [];
+        G.forEach(function (g){
+            if (!g.pu.length && !g.pl.length) return;
+            g.sPu = puSuma(g.pu, 'kw'); g.sPl = puSuma(g.pl, 'gr');
+            if (g.sPu === g.sPl){ zgodne.push(g); return; }
+            // Rozjazd dat: obie strony zgadzaja sie, gdy doliczyc dni tuz poza okresem.
+            if (g.sPu + puSuma(g.puPoza, 'kw') === g.sPl + puSuma(g.plPoza, 'gr')){ daty.push(g); return; }
+            rozne.push(g);
+        });
+
+        // Wiersze ksiegi bez numeru. Najpierw zwroty po tickecie albo auftragu z Opisu PayU,
+        // potem — tylko jednoznacznie w obie strony — kwota i data.
+        const uzyte = new Set();
+        const wolne = function (){ return bezNr.concat(bezNrPoza).filter(function (w){ return !uzyte.has(w); }); };
+        rozne.forEach(function (g){
+            const brakuje = g.sPu - g.sPl;
+            const kl = g.pu.concat(g.puPoza).filter(function (o){ return o.typ === 'c'; })
+                .map(puKluczZwrotu).filter(Boolean);
+            if (!brakuje || !kl.length) return;
+            const kand = wolne().filter(function (w){ return kl.some(function (x){ return puPasuje(w, x); }); });
+            const jeden = kand.filter(function (w){ return w.gr === brakuje; });
+            const wybor = jeden.length === 1 ? jeden : (kand.length && puSuma(kand, 'gr') === brakuje ? kand : null);
+            if (!wybor) return;
+            wybor.forEach(function (w){ uzyte.add(w); });
+            g.dobrane = wybor;
+            g.jak = kl[0].ticket ? 'ticket' : 'auftrag';
+        });
+        const propozycje = new Map();
+        rozne.forEach(function (g){
+            if (g.dobrane.length || g.pl.length || g.plPoza.length || !g.pu.length) return;
+            const zwrot = g.pu.every(function (o){ return o.typ === 'c'; });
+            const okno = (zwrot ? 10 : 2) * 86400000, t0 = puMs(g.pu[0].chwila);
+            propozycje.set(g, wolne().filter(function (w){
+                return w.gr === g.sPu && Math.abs(puMs(w.chwila) - t0) <= okno; }));
+        });
+        propozycje.forEach(function (lista, g){
+            if (lista.length !== 1 || uzyte.has(lista[0])) return;
+            let ile = 0;
+            propozycje.forEach(function (l2){ if (l2.indexOf(lista[0]) >= 0) ile++; });
+            if (ile !== 1) return;
+            uzyte.add(lista[0]);
+            g.dobrane = lista; g.jak = 'kwota';
+        });
+        rozne = rozne.filter(function (g){
+            if (g.dobrane.length){ dobrane.push(g); return false; }
+            // Ksiega ma, PayU nie, a raporty PayU koncza sie, zanim minal zapas po ksiegowaniu:
+            // zwrot mogl zostac wykonany juz po ostatniej operacji z wczytanych raportow.
+            if (!g.pu.length && !g.puPoza.length && g.pl.every(function (w){
+                    return puDzien(w.data, PU_ZAPAS) + ' 23:59:59' > pokrycieDo; }))
+                g.granica = true;
+            return true;
+        });
+        rozne.sort(function (a, b){ return Math.abs(b.sPu - b.sPl) - Math.abs(a.sPu - a.sPl); });
+        const bezPary = bezNr.filter(function (w){ return !uzyte.has(w); });
+
+        // Podsumowanie okresu po obu stronach.
+        const wOkresie = op.filter(function (o){ return wOkr(o.chwila); });
+        const typy = {};
+        wOkresie.forEach(function (o){
+            const t = typy[o.typ] || (typy[o.typ] = { n: 0, gr: 0 });
+            t.n++; t.gr += o.kw;
+        });
+        const plOkr = ksiega.filter(function (w){ return wOkr(w.chwila); });
+        return { od: od, doo: doo, pokrycieDo: pokrycieDo, pliki: pliki.slice(),
+                 nNum: zgodne.length + daty.length + dobrane.length + rozne.length,
+                 zgodne: zgodne, daty: daty, dobrane: dobrane, rozne: rozne, bezPary: bezPary, puBezNr: puBezNr,
+                 typy: typy, prow: puSuma(wOkresie, 'prow'),
+                 puNetto: wOkresie.filter(function (o){ return o.typ !== 'w' && o.trans; })
+                     .reduce(function (a, o){ return a + o.kw; }, 0),
+                 plN: plOkr.length,
+                 plWn: plOkr.filter(function (w){ return w.gr > 0; }).reduce(function (a, w){ return a + w.gr; }, 0),
+                 plMa: plOkr.filter(function (w){ return w.gr < 0; }).reduce(function (a, w){ return a + w.gr; }, 0) };
+    }
+
+    // ---------- wynik ----------
+    function puAufHtml(w){
+        const cz = [];
+        if (w.auf) cz.push(slAufKom(w.auf));
+        if (w.ticket) cz.push('<a href="https://www.prologistics.info/rma.php?rma_id=' + encodeURIComponent(w.ticket)
+                            + '" target="_blank" style="color:#750000">ticket ' + salEsc(w.ticket) + '</a>');
+        return cz.length ? cz.join(' · ') : (w.aufTekst ? salEsc(w.aufTekst) : '—');
+    }
+    // `szukaj` — dopisz odnosnik do wyszukiwarki po mailu. Tylko tam, gdzie ksiega nie ma
+    // pod tym numerem nic: tam trzeba dopiero znalezc zamowienie.
+    function puOpHtml(o, szukaj){
+        let h = salEsc(o.chwila.slice(0, 16)) + ' · ' + salEsc(PU_TYP[o.typ] || o.typ)
+              + ' <b>' + puZl(o.kw) + '</b>';
+        if (/install/i.test(o.pos || o.sklep)) h += ' · raty';
+        if (o.typ === 'c' && o.opis){
+            const kl = puKluczZwrotu(o);
+            h += ' · ' + (kl && kl.auf ? slAufKom({ nr: kl.auf, txn: '3' })
+                 : (kl && kl.ticket ? ('<a href="https://www.prologistics.info/rma.php?rma_id=' + encodeURIComponent(kl.ticket)
+                     + '" target="_blank" style="color:#750000">ticket ' + salEsc(kl.ticket) + '</a>') : salEsc(o.opis)));
+        }
+        if (o.osoba) h += ' · ' + salEsc(o.osoba);
+        if (szukaj && o.typ === 't' && o.mail)
+            h += ' · <a href="/search.php?express&amp;what=email&amp;email=' + encodeURIComponent(o.mail)
+               + '" target="_blank" style="color:#750000" title="Szukaj zamówienia po mailu z PayU">szukaj po mailu</a>';
+        return h;
+    }
+    function puWHtml(w){
+        return salEsc(w.chwila.slice(0, 16)) + ' <b>' + puZl(w.gr) + '</b> · ' + puAufHtml(w)
+             + (w.nazwa ? (' · ' + salEsc(w.nazwa)) : '');
+    }
+    function puGrupaHtml(g, r){
+        const L = [];
+        const szukaj = !g.pl.length && !g.plPoza.length && !g.dobrane.length;
+        g.pu.forEach(function (o){ L.push('<span style="color:#555">PayU:</span> ' + puOpHtml(o, szukaj)); });
+        g.pl.forEach(function (w){ L.push('<span style="color:#555">księga:</span> ' + puWHtml(w)); });
+        g.puPoza.forEach(function (o){ L.push('<span style="color:#94a3b8">PayU poza okresem: ' + puOpHtml(o, szukaj) + '</span>'); });
+        g.plPoza.forEach(function (w){ L.push('<span style="color:#94a3b8">księga poza okresem: ' + puWHtml(w) + '</span>'); });
+        g.dobrane.forEach(function (w){
+            L.push('<span style="color:#b45309">księga bez numeru'
+                 + ((w.data < r.od || w.data > r.doo) ? ' (poza okresem)' : '') + ':</span> ' + puWHtml(w)); });
+        if (g.dobrane.length)
+            L.push('<span style="color:#888">połączone ' + (g.jak === 'ticket' ? 'po numerze ticketu z opisu zwrotu w PayU'
+                 : (g.jak === 'auftrag' ? 'po numerze auftraga z opisu zwrotu w PayU' : 'po kwocie i dacie (jedyna para w obie strony)'))
+                 + '</span>');
+        if (!g.pl.length && !g.plPoza.length && !g.dobrane.length)
+            L.push('<span style="color:#c00">w księdze nie ma tego numeru ani w okresie, ani ' + PU_ZAPAS + ' dni obok</span>');
+        if (!g.pu.length && !g.puPoza.length)
+            L.push('<span style="color:#c00">PayU nie ma tego numeru we wczytanych raportach</span>');
+        if (g.granica)
+            L.push('<span style="color:#b45309">raporty PayU kończą się ' + salEsc(String(r.pokrycieDo || '').slice(0, 16))
+                 + ' — PayU mógł to wykonać później; wgraj raport PayU za kolejne dni</span>');
+        return L.join('<br>');
+    }
+    function puRender(r){
+        const H = [];
+        const bl = r.rozne.length + r.bezPary.length + r.puBezNr.length;
+        const t = r.typy.t || { n: 0, gr: 0 }, c = r.typy.c || { n: 0, gr: 0 };
+        H.push('<div style="border:1px solid ' + (bl ? '#f5c2c7' : '#badbcc') + ';background:'
+             + (bl ? '#fff5f5' : '#f3fbf6') + ';border-radius:8px;padding:8px;margin-bottom:8px">'
+             + '<div style="font-weight:700">' + (bl ? ('Do sprawdzenia: ' + bl + ' pozycji') : 'Wszystko się zgadza') + '</div>'
+             + '<div style="font-size:11px;color:#555;margin-top:2px">PayU ' + PU_KONTO + ' · ' + salEsc(r.od) + ' – ' + salEsc(r.doo)
+             + ' · numerów transakcji ' + r.nNum + ', saldo zgodne ' + r.zgodne.length
+             + (r.daty.length ? (', zgodne po dniach obok okresu ' + r.daty.length) : '')
+             + (r.dobrane.length ? (', dobrane bez numeru ' + r.dobrane.length) : '')
+             + '<br>PayU: wpłat ' + t.n + ' (' + puZl(t.gr) + '), zwrotów ' + c.n + ' (' + puZl(c.gr) + '), netto <b>' + puZl(r.puNetto) + '</b>'
+             + ' · księga ' + PU_KONTO + ': ' + r.plN + ' wierszy, Wn ' + puZl(r.plWn) + ', Ma ' + puZl(r.plMa)
+             + ', netto <b>' + puZl(r.plWn + r.plMa) + '</b>'
+             + (r.puNetto !== r.plWn + r.plMa ? (' · różnica <b>' + puZl(r.puNetto - r.plWn - r.plMa) + '</b>') : '')
+             + '</div></div>');
+        if ((r.zleKsiega || []).length)
+            H.push('<div style="color:#c00;font-size:11px;margin-bottom:6px">Nieczytelne wiersze Export payments (bez kwoty albo daty): '
+                 + r.zleKsiega.length + ' — nr ' + salEsc(r.zleKsiega.slice(0, 10).join(', ')) + (r.zleKsiega.length > 10 ? ' …' : '') + '</div>');
+
+        const tab = function (tyt, kolor, opis, nag, wier){
+            if (!wier.length) return;
+            H.push('<div style="margin-top:10px"><div style="font-weight:700;color:' + kolor + ';font-size:12px">' + tyt + '</div>'
+                 + (opis ? ('<div style="font-size:11px;color:#666;margin:2px 0 3px">' + opis + '</div>') : '')
+                 + '<div style="max-height:320px;overflow:auto"><table style="border-collapse:collapse;font-size:11px;width:100%">'
+                 + '<tr style="color:#999;font-size:10px">'
+                 + nag.map(function (h){ return '<td style="padding:1px 6px">' + salEsc(h) + '</td>'; }).join('')
+                 + '</tr>' + wier.join('') + '</table></div></div>');
+        };
+        const kom = function (x){ return '<td style="padding:3px 6px;vertical-align:top">' + x + '</td>'; };
+        const kwo = function (x){ return '<td style="padding:3px 6px;text-align:right;vertical-align:top;white-space:nowrap">' + x + '</td>'; };
+        // Przy dobranych liczymy po stronie ksiegi tez wiersze bez numeru — inaczej tabela
+        // pokazywalaby roznice, ktorej juz nie ma.
+        const wierszGrupy = function (g){
+            const pl = g.sPl + puSuma(g.dobrane, 'gr');
+            return '<tr style="border-top:1px solid #f1f5f9">' + kom('<code>' + salEsc(g.nr) + '</code>')
+                 + kwo(puZl(g.sPu)) + kwo(puZl(pl)) + kwo('<b>' + puZl(g.sPu - pl) + '</b>')
+                 + kom(puGrupaHtml(g, r)) + '</tr>';
+        };
+        tab('Saldo numeru się nie zgadza (' + r.rozne.length + ')', '#c00',
+            'Suma wpłat i zwrotów pod tym numerem transakcji w PayU jest inna niż na koncie ' + PU_KONTO + ' w tym samym okresie.',
+            ['Trans ID', 'PayU', 'Księga', 'Różnica', 'Wiersze'], r.rozne.map(wierszGrupy));
+        tab('Operacje PayU bez Trans ID (' + r.puBezNr.length + ')', '#c00', '', ['Plik / wiersz', 'Operacja'],
+            r.puBezNr.map(function (o){ return '<tr style="border-top:1px solid #f1f5f9">'
+                + kom(salEsc(o.plik + ' / ' + o.wiersz)) + kom(puOpHtml(o, true)) + '</tr>'; }));
+        tab('W księdze bez numeru transakcji, bez pary (' + r.bezPary.length + ')', '#c00',
+            'Wiersze konta ' + PU_KONTO + ' bez Transaction ID i bez numeru w Comment, których nie dało się przypisać do operacji PayU.',
+            ['Data', 'Kwota', 'Auftrag / ticket', 'Comment'],
+            r.bezPary.map(function (w){ return '<tr style="border-top:1px solid #f1f5f9">'
+                + kom(salEsc(w.chwila.slice(0, 16))) + kwo(puZl(w.gr)) + kom(puAufHtml(w)) + kom(salEsc(w.kom || '—')) + '</tr>'; }));
+        tab('Dobrane bez numeru transakcji (' + r.dobrane.length + ')', '#b45309',
+            'Saldo się zgadza, ale w księdze brakuje numeru transakcji PayU w Comment — połączone po tickecie albo auftragu z opisu zwrotu w PayU'
+            + ' (albo, jednoznacznie, po kwocie i dacie). Warto dopisać numer, żeby następnym razem łączyło się samo.',
+            ['Trans ID', 'PayU', 'Księga', 'Różnica', 'Wiersze'], r.dobrane.map(wierszGrupy));
+        tab('Rozjazd dat — zgodne po doliczeniu dni obok okresu (' + r.daty.length + ')', '#64748b',
+            'W PayU i w księdze ta sama kwota, ale jedna ze stron ma ją tuż przed albo tuż po okresie. Do wiadomości — w kolejnym miesiącu wyrówna się sama.',
+            ['Trans ID', 'PayU w okresie', 'Księga w okresie', 'Różnica', 'Wiersze'], r.daty.map(wierszGrupy));
+
+        // Saldo PayU z samego raportu.
+        const wypl = [];
+        const wierSaldo = r.pliki.map(function (f){
+            const s = function (typ){ return f.op.filter(function (o){ return o.typ === typ; })
+                .reduce(function (a, o){ return a + o.kw; }, 0); };
+            const inne = f.op.filter(function (o){ return !(o.typ in { t: 1, c: 1, w: 1 }); })
+                .reduce(function (a, o){ return a + o.kw; }, 0);
+            const prow = puSuma(f.op, 'prow');
+            f.op.filter(function (o){ return o.typ === 'w'; }).forEach(function (o){ wypl.push(o); });
+            const zgoda = f.start != null && f.koniec != null && f.start + puSuma(f.op, 'kw') + prow === f.koniec;
+            const ok = zgoda && !f.przerwy && !f.zle.length;
+            return '<tr style="border-top:1px solid #f1f5f9">' + kom(salEsc(f.sklep) + '<br><span style="color:#888">'
+                     + salEsc(f.od + ' – ' + f.doo) + '</span>')
+                 + kwo(f.start == null ? '?' : puZl(f.start)) + kwo(puZl(s('t'))) + kwo(puZl(prow)) + kwo(puZl(s('c')))
+                 + kwo(puZl(s('w'))) + kwo(puZl(inne)) + kwo('<b>' + (f.koniec == null ? '?' : puZl(f.koniec)) + '</b>')
+                 + kom(ok ? '<span style="color:#0a7a2f">ciągłe</span>'
+                       : ('<span style="color:#c00">' + [f.przerwy ? ('przerwy salda: ' + f.przerwy) : '',
+                            f.zle.length ? ('nieczytelne wiersze: ' + f.zle.length) : '',
+                            !zgoda ? 'początek + ruch ≠ koniec' : ''].filter(Boolean).join(', ') + '</span>')) + '</tr>';
+        });
+        tab('Saldo PayU z raportów (' + r.pliki.length + ')', '#333',
+            'Z całego pliku, bez względu na wybrany okres. Prowizje PayU potrąca z salda przy każdej wpłacie — na koncie '
+            + PU_KONTO + ' ich nie ma, tak samo jak wypłat na rachunek. „Inne" to korekty rozliczenia.',
+            ['Raport', 'Początek', 'Wpłaty', 'Prowizje', 'Zwroty', 'Wypłaty', 'Inne', 'Koniec', 'Kontrola'], wierSaldo);
+        if (wypl.length)
+            H.push('<details style="margin-top:6px;font-size:11px"><summary style="cursor:pointer;color:#555">Wypłaty PayU na rachunek ('
+                 + wypl.length + ', razem ' + puZl(puSuma(wypl, 'kw')) + ')</summary><table style="border-collapse:collapse;font-size:11px;margin-top:3px">'
+                 + wypl.sort(function (a, b){ return a.chwila < b.chwila ? -1 : 1; }).map(function (o){
+                     return '<tr style="border-top:1px solid #f1f5f9">' + kom(salEsc(o.chwila.slice(0, 16))) + kom(salEsc(o.sklep))
+                          + kom('<code>' + salEsc(o.trans) + '</code>') + kwo(puZl(o.kw)) + kom('<span style="color:#888">' + salEsc(o.konto) + '</span>') + '</tr>';
+                 }).join('') + '</table></details>');
+        if (r.ksiegaT)
+            H.push('<div style="font-size:10px;color:#aaa;margin-top:8px">Księga pobrana ' + salEsc(new Date(r.ksiegaT).toLocaleTimeString('pl-PL'))
+                 + ' — przez ' + PU_SWIEZA_MIN + ' min kolejne sprawdzenie używa jej bez pobierania; „↻ Księga od nowa" pobiera ją świeżo.</div>');
+        return H.join('');
+    }
+
+    // Arkusz z tym, co wymaga uwagi: kazda grupa rozpisana na wiersze obu stron.
+    function puXlsx(){
+        const r = PU_WYNIK;
+        if (!r){ salSay('Najpierw uruchom sprawdzanie.', '#c47f00'); return; }
+        const w = [['Wynik', 'Trans ID', 'Strona', 'Data', 'Kwota PLN', 'Typ', 'Auftrag', 'Ticket', 'Opis / Comment',
+                    'Osoba / Name', 'E-mail', 'Plik / wiersz']];
+        const aufKom = function (a){ return a ? { v: a.nr + ' / ' + a.txn, href: slAufUrl(a) } : ''; };
+        const zOp = function (wyn, g, o, poza){
+            const kl = o.typ === 'c' ? puKluczZwrotu(o) : null;
+            w.push([wyn + (poza ? ' (poza okresem)' : ''), g ? g.nr : o.trans, 'PayU', o.chwila, o.kw / 100, PU_TYP[o.typ] || o.typ,
+                    kl && kl.auf ? aufKom({ nr: kl.auf, txn: '3' }) : '', kl && kl.ticket ? kl.ticket : '',
+                    o.opis, o.osoba, o.mail, o.plik + ' / ' + o.wiersz]);
+        };
+        const zW = function (wyn, g, x, dopisek){
+            w.push([wyn + (dopisek || ''), g ? g.nr : '', 'księga ' + PU_KONTO, x.chwila, x.gr / 100, x.gr > 0 ? 'Wn' : 'Ma',
+                    aufKom(x.auf), x.ticket, x.kom, x.nazwa, '', 'wiersz ' + x.wiersz]);
+        };
+        const grupy = function (wyn, lista){
+            lista.forEach(function (g){
+                g.pu.forEach(function (o){ zOp(wyn, g, o, false); });
+                g.pl.forEach(function (x){ zW(wyn, g, x, ''); });
+                g.puPoza.forEach(function (o){ zOp(wyn, g, o, true); });
+                g.plPoza.forEach(function (x){ zW(wyn, g, x, ' (poza okresem)'); });
+                g.dobrane.forEach(function (x){ zW(wyn, g, x, ' — wiersz bez numeru'); });
+            });
+        };
+        grupy('saldo numeru się nie zgadza', r.rozne);
+        r.puBezNr.forEach(function (o){ zOp('PayU bez Trans ID', null, o, false); });
+        r.bezPary.forEach(function (x){ zW('księga bez numeru, bez pary', null, x, ''); });
+        grupy('dobrane bez numeru', r.dobrane);
+        grupy('rozjazd dat', r.daty);
+        w.push([]);
+        w.push(['Okres', r.od + ' – ' + r.doo]);
+        w.push(['Numerów transakcji', r.nNum]);
+        w.push(['Saldo zgodne', r.zgodne.length]);
+        w.push(['PayU netto (wpłaty − zwroty)', r.puNetto / 100]);
+        w.push(['Księga ' + PU_KONTO + ' netto (Wn − Ma)', (r.plWn + r.plMa) / 100]);
+        const blob = slXlsxBlob('PayU', w);
+        const nazwa = 'payu-' + PU_KONTO + '-' + r.od + '_' + r.doo + '.xlsx';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = nazwa;
+        document.body.appendChild(a); a.click();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+        salSay('Zapisane: ' + nazwa + ' — ' + (w.length - 7) + ' wierszy.', '#0a7a2f');
+    }
+
+    // ---------- ekran ----------
+    function puInfo(){
+        const p = salPanel(), el = p.querySelector('#pu-pliki');
+        if (!el) return;
+        el.innerHTML = PU_PLIKI.length ? PU_PLIKI.map(function (f){
+            const n = {};
+            f.op.forEach(function (o){ n[o.typ] = (n[o.typ] || 0) + 1; });
+            return '<div>📄 <b>' + salEsc(f.sklep) + '</b> · ' + salEsc(f.od + ' – ' + f.doo) + ' · '
+                 + Object.keys(n).map(function (k){ return (PU_TYP[k] || k) + ' ' + n[k]; }).join(', ')
+                 + ' <span style="color:#aaa">(' + salEsc(f.nazwa) + ')</span>'
+                 + (f.zle.length ? (' <span style="color:#c00">· nieczytelnych wierszy ' + f.zle.length + '</span>') : '')
+                 + '</div>';
+        }).join('') : '<span style="color:#888">Nie wczytano raportu PayU.</span>';
+        const x = p.querySelector('#pu-xlsx');
+        if (x) x.style.display = PU_WYNIK ? '' : 'none';
+        const n = p.querySelector('#pu-nowa');
+        if (n) n.style.display = PU_EXP ? '' : 'none';
+    }
+    async function puWczytaj(files){
+        // Kopia PRZED pierwszym await: FileList z pola wyboru jest zywy, a pole czyscimy
+        // zaraz po wywolaniu (zeby ten sam plik dalo sie wybrac drugi raz). Bez kopii
+        // z dwoch zaznaczonych plikow wczytywal sie tylko pierwszy — raty przepadaly.
+        const lista = Array.prototype.slice.call(files || []);
+        if (PU_RUN || !lista.length) return;
+        const p = salPanel(), bledy = [], dodane = [];
+        for (let i = 0; i < lista.length; i++){
+            const f = lista[i];
+            try {
+                const x = puCzytaj(await f.text(), f.name);
+                const obca = x.op.filter(function (o){ return o.typ !== 'w' && o.trans && o.wal && o.wal !== 'PLN'; })[0];
+                if (obca) throw new Error(f.name + ': konto ' + PU_KONTO + ' jest w PLN, a raport ma operacje w ' + obca.wal);
+                // Ten sam sklep z nakladajacym sie okresem policzylby te same operacje dwa razy.
+                PU_PLIKI = PU_PLIKI.filter(function (y){
+                    const ten = y.nazwa === x.nazwa || (y.sklep === x.sklep && y.od <= x.doo && x.od <= y.doo);
+                    if (ten && y.nazwa !== x.nazwa) dodane.push('zastąpił ' + y.nazwa);
+                    return !ten;
+                });
+                PU_PLIKI.push(x);
+                dodane.push(x.sklep + ' (' + x.op.length + ' operacji)');
+            } catch (e){ bledy.push((e && e.message) || String(e)); }
+        }
+        PU_PLIKI.sort(function (a, b){ return a.sklep.localeCompare(b.sklep) || (a.od < b.od ? -1 : 1); });
+        PU_WYNIK = null;
+        const out = p.querySelector('#pu-wynik');
+        if (out) out.innerHTML = '';
+        if (PU_PLIKI.length){
+            const od = PU_PLIKI.map(function (f){ return f.od; }).sort()[0];
+            const doo = PU_PLIKI.map(function (f){ return f.doo; }).sort().pop();
+            const a = p.querySelector('#pu-od'), b = p.querySelector('#pu-do');
+            if (a && b){ a.value = od; b.value = doo; }
+        }
+        puInfo();
+        salSay((dodane.length ? ('Wczytane: ' + dodane.join(', ') + '. ') : '') + bledy.join(' '),
+               bledy.length ? '#c00' : '#0a7a2f');
+    }
+    async function puSprawdz(b, odNowa){
+        if (PU_RUN) return;
+        const p = salPanel();
+        const od = p.querySelector('#pu-od').value, doo = p.querySelector('#pu-do').value;
+        if (!PU_PLIKI.length){ salSay('Najpierw wczytaj raport PayU (CSV).', '#c47f00'); return; }
+        if (!od || !doo || od > doo){ salSay('Uzupełnij poprawny zakres dat.', '#c47f00'); return; }
+        if (typeof window.__TM_EXPORT_FETCH !== 'function'){
+            salSay('Moduł Export payments jest wyłączony w launcherze — bez niego nie pobiorę księgi.', '#c00'); return; }
+        try { GM_setValue('sal_pu_daty', JSON.stringify({ od: od, doo: doo })); } catch (e){}
+        const zOd = puDzien(od, -PU_ZAPAS), zDo = puDzien(doo, PU_ZAPAS);
+        PU_RUN = true;
+        p.querySelectorAll('#pu-ekran button:not(#sal-close), #pu-ekran input').forEach(function (e){ e.disabled = true; });
+        try {
+            if (odNowa || !PU_EXP || PU_EXP.od !== zOd || PU_EXP.doo !== zDo || Date.now() - PU_EXP.t > PU_SWIEZA_MIN * 60000){
+                PU_EXP = null;
+                salPraca('pl', 'konto ' + PU_KONTO + ', ' + zOd + ' – ' + zDo + ' (okres i ' + PU_ZAPAS + ' dni obok)…');
+                const wynik = await window.__TM_EXPORT_FETCH([PU_KONTO], zOd, zDo, 'excel', function (i, n, nazwa, etap){
+                    salPraca('pl', nazwa + (etap ? (' · ' + etap) : ''));
+                });
+                const x = wynik[0];
+                if (!x || x.blad) throw new Error((x && x.blad) || 'brak odpowiedzi');
+                const k = x.buf ? puKsiega(slXls(x.buf)) : { wiersze: [], zle: [] };
+                PU_EXP = { od: zOd, doo: zDo, t: Date.now(), wiersze: k.wiersze, zle: k.zle };
+                salKoniec('pl', k.wiersze.length + ' wierszy konta ' + PU_KONTO
+                        + (k.zle.length ? (' · nieczytelnych ' + k.zle.length) : ''), k.zle.length ? '#c47f00' : '#0a7a2f');
+            }
+            PU_WYNIK = puUzgodnij(PU_PLIKI, PU_EXP.wiersze, od, doo);
+            PU_WYNIK.zleKsiega = PU_EXP.zle;
+            PU_WYNIK.ksiegaT = PU_EXP.t;
+            // W trakcie pobierania mozna bylo przejsc na inny ekran Sald — wtedy wynik
+            // czeka w PU_WYNIK i pokaze sie po powrocie.
+            const out = p.querySelector('#pu-wynik');
+            if (out) out.innerHTML = puRender(PU_WYNIK);
+            const r = PU_WYNIK, bl = r.rozne.length + r.bezPary.length + r.puBezNr.length;
+            salSay((bl ? ('Do sprawdzenia: ' + bl + ' pozycji.') : 'Wszystko się zgadza.')
+                 + ' Saldo zgodne na ' + r.zgodne.length + ' z ' + r.nNum + ' numerów'
+                 + (r.dobrane.length ? (', ' + r.dobrane.length + ' dobrane bez numeru') : '')
+                 + (r.daty.length ? (', ' + r.daty.length + ' z rozjazdem dat') : '') + '.', bl ? '#c47f00' : '#0a7a2f');
+        } catch (e){
+            salKoniec('pl', 'nie pobrałem: ' + ((e && e.message) || e), '#c00');
+        } finally {
+            PU_RUN = false;
+            p.querySelectorAll('#pu-ekran button:not(#sal-close), #pu-ekran input').forEach(function (e){ e.disabled = false; });
+            puInfo();
+        }
+    }
+    function salRysujPU(){
+        const p = salPanel(), u = salUst();
+        let zap = {};
+        try { zap = JSON.parse(GM_getValue('sal_pu_daty', '{}')) || {}; } catch (e){}
+        const od = PU_PLIKI.length ? PU_PLIKI.map(function (f){ return f.od; }).sort()[0] : (zap.od || u.od);
+        const doo = PU_PLIKI.length ? PU_PLIKI.map(function (f){ return f.doo; }).sort().pop() : (zap.doo || u.do);
+        p.innerHTML = '<div id="pu-ekran"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<div style="font-weight:700;color:#750000">Salda · PayU ↔ Export payments</div>'
+            + '<div><button id="sal-back" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px">← lista</button> '
+            + '<button id="sal-close" style="border:none;background:none;font-size:18px;cursor:pointer;color:#888">×</button></div></div>'
+            + '<div style="color:#555;margin-bottom:8px;font-size:11px">Sprawdzam konto <b>' + PU_KONTO + '</b> (PayU Beliani PL). '
+            + 'Wpłaty sklepu i raty (PayU Installments) księgują się na nim razem, więc wczytaj <b>oba raporty operacji CSV</b> '
+            + 'z panelu PayU za ten sam okres. Łączę po <b>Trans ID</b>: suma wpłat i zwrotów pod numerem po obu stronach '
+            + '(zwrot w PayU i w prologistics niesie numer pierwotnej wpłaty, a nota bywa rozbita na kilka linii).</div>'
+            + '<div id="pu-drop" style="border:1px dashed #DBD9D7;border-radius:8px;padding:8px 10px;margin-bottom:8px">'
+            + '<input id="pu-plik" type="file" accept=".csv,text/csv" multiple style="font-size:11px"> '
+            + '<button id="pu-czysc" style="padding:3px 10px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px">Wyczyść</button>'
+            + '<span style="font-size:11px;color:#888"> albo upuść pliki tutaj</span>'
+            + '<div id="pu-pliki" style="font-size:11px;margin-top:6px"></div></div>'
+            + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            + '<label>od <input type="date" id="pu-od" value="' + salEsc(od) + '" style="font-size:12px;width:130px"></label>'
+            + '<label>do <input type="date" id="pu-do" value="' + salEsc(doo) + '" style="font-size:12px;width:130px"></label>'
+            + '<button id="pu-sprawdz" style="padding:6px 16px;border:none;border-radius:6px;background:#750000;color:#fff;font-weight:700;cursor:pointer">🔍 Pobierz Export payments i sprawdź</button>'
+            + '<button id="pu-nowa" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Pobierz konto ' + PU_KONTO + ' z prologistics jeszcze raz, np. po poprawkach w księdze">↻ Księga od nowa</button>'
+            + '<button id="pu-xlsx" style="padding:5px 12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;font-size:11px;display:none" '
+            + 'title="Pozycje do sprawdzenia rozpisane na wiersze PayU i księgi">📗 Wynik (XLSX)</button>'
+            + '</div>'
+            + '<div style="font-size:11px;color:#888;margin-bottom:6px">Okres to data operacji w PayU i data płatności w księdze. '
+            + 'Księgę pobieram z zapasem ' + PU_ZAPAS + ' dni po obu stronach — tylko po to, żeby rozpoznać rozjazd dat na granicy okresu.</div>'
+            + '<div id="sal-status" style="font-size:11px;color:#666;margin-bottom:6px"></div>'
+            + '<div id="pu-wynik"></div></div>';
+        p.querySelector('#sal-close').onclick = function (){ p.style.display = 'none'; };
+        p.querySelector('#sal-back').onclick = function (){ if (!PU_RUN) salWstecz(); };
+        p.querySelector('#pu-plik').onchange = function (e){ puWczytaj(e.target.files); e.target.value = ''; };
+        p.querySelector('#pu-czysc').onclick = function (){
+            if (PU_RUN) return;
+            PU_PLIKI = []; PU_WYNIK = null;
+            p.querySelector('#pu-wynik').innerHTML = '';
+            puInfo(); salSay('Raporty PayU usunięte z pamięci.', '#666');
+        };
+        // Upuszczanie na wlasne pole, nie na caly panel: panel jest wspolny dla wszystkich
+        // ekranow i zostawiony na nim ondrop wczytywalby pliki do PayU z cudzego ekranu.
+        const drop = p.querySelector('#pu-drop');
+        drop.ondragover = function (e){ e.preventDefault(); };
+        drop.ondrop = function (e){ e.preventDefault(); puWczytaj(e.dataTransfer.files); };
+        p.querySelector('#pu-sprawdz').onclick = function (){ puSprawdz(this, false); };
+        p.querySelector('#pu-nowa').onclick = function (){ puSprawdz(this, true); };
+        p.querySelector('#pu-xlsx').onclick = function (){ puXlsx(); };
+        ['#pu-od', '#pu-do'].forEach(function (s){
+            p.querySelector(s).onchange = function (){
+                PU_WYNIK = null; p.querySelector('#pu-wynik').innerHTML = ''; puInfo();
+                salSay('Zakres zmieniony — uruchom sprawdzanie ponownie.', '#666');
+            };
+        });
+        if (PU_WYNIK) p.querySelector('#pu-wynik').innerHTML = puRender(PU_WYNIK);
+        puInfo();
     }
 
 
@@ -125743,7 +127090,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'd2b9ca5 · 23.11.2026 09:19';
+    const HUB_BUDOWA = 'a4833bc · 24.11.2026 09:41';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -128952,7 +130299,8 @@
             if (!W) h += '<div class="bls-sek"><div class="bls-pusto">Na tym komputerze nie było jeszcze testu — kliknij „Uruchom test komputera”.</div></div>';
             else {
                 const O = D.ocena(W);
-                h += '<div class="bls-sek"><h4>Ostatni test: ' + dt(W.t) + ' <span style="font-weight:normal;color:#888">· HUB ' + blEsc(W.wersja || '?') + '</span></h4>'
+                h += '<div class="bls-sek"><h4>Ostatni test: ' + dt(W.t) + ' <span style="font-weight:normal;color:#888">· HUB ' + blEsc(W.wersja || '?')
+                   + (W.trwal != null ? ' · trwał ' + W.trwal + ' s' : '') + '</span></h4>'
                    + '<div class="bls-uwaga"><b>Wniosek:</b> ' + blEsc(O.wniosek) + '</div>';
                 let grupa = '';
                 O.wiersze.forEach(function (x){
