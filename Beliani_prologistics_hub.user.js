@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.26
+// @version      5.63.27
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -3145,7 +3145,9 @@
         // 28.10.2026 — Vivre HU (bez wpisu pole konta przy nocie zwrotu pokazuje nieznane konto)
         "1458":"Vivre HU Beliani (DE) Gmbh",
         // 16.11.2026 — MediaMarkt Saturn CH (import 269; bez wpisu pole konta przy nocie zwrotu pokazuje nieznane konto)
-        "1468":"MediaMarkt Saturn Beliani Switzerland GmbH"
+        "1468":"MediaMarkt Saturn Beliani Switzerland GmbH",
+        // 25.11.2026 — Payback DE (konto rozliczeniowe Mirakla; bez wpisu pole konta przy nocie zwrotu pokazuje nieznane konto)
+        "1470":"Payback DE Beliani DE"
     };
 
     function getAccountLabel(num) {
@@ -31471,7 +31473,8 @@
                     verified: st.ok && !hintBad && !juzZapl.length, why: st.why,
                     nDep: (G.dep || []).length, nBal: (G.bal || []).length,
                     sumDep: ds || 0, sumBal: bs || 0, zrodlo: W.zr,
-                    e2e: painFirstOrder(G)
+                    e2e: painFirstOrder(G),
+                    platReczna: pcPlatnoscReczna(G)
                 });
             });
             return out;
@@ -31484,9 +31487,37 @@
            „⛔ wstrzymany" (komentarz z innym kontem, balans juz zaplacony, zwrot z zamowieniami spoza paczki — wiersz
            czerwony) albo „⏸ do sprawdzenia" (reszta — bez zielonego), z krotkimi powodami i odsylaczem do grupy (↑ pokaz).
            Pelna tresc zostaje na gorze, w liscie do platnosci (Excel) i w logu przebiegu.                                  */
+        /* ===== Dostawcy placeni RECZNIE — poza plikiem pain.001 (25.11.2026) =====
+           Prosba uzytkownika: „tego suppliera musielismy puscic przez inny bank, aby uwzglednic bank posredniczacy. Chce, aby
+           ten supplier zostal jakos oznaczony w skrypcie i w momencie, jak sie pojawi, byla informacja, aby wprowadzic go recznie,
+           aby juz na liscie byl widoczny, np. na jasnoczerwonym tle, i pomijalo go w pliku PAIN". Zamowienie 19479, COMFORT
+           INDUSTRY GROUP (karta 648): przelew z 10.11.2026 wrocil 19.11 — PostFinance nie pozwala wskazac banku posredniczacego,
+           a dostawca wymaga Citibank NA (CITIUS33). Na karcie: nazwa „… (pay via UBS)", komentarz 20.11 „DO NOT TRANSFER VIA
+           POSTFINANCE, USE OTHER ACCOUNT WHERE YOU CAN DECLARE TO USE CITYBANK NA WITH SWIFT CITIUS33".
+           Zrodla: PC_PLATNOSC_RECZNA (po company_id karty) oraz dopisek „(pay via …)" w nazwie dostawcy — zespol juz tak oznacza
+           karty, wiec nastepny taki dostawca nie wymaga zmiany kodu (wyjatek: „(pay via PostFinance)").
+           Skutki: widok DEPO/BALANCE — jasnoczerwone tlo grupy i czerwony pasek „PLATNOSC RECZNA"; okno przelewow — wiersz bez
+           checkboxa, nie da sie go zaznaczyc ani wyslac w pliku (painSelected go odrzuca); Excel do banku — wiersz z powodem.   */
+        var PC_PLATNOSC_RECZNA = {
+            '648': 'przelew przez UBS, NIE przez PostFinance — dostawca wymaga banku pośredniczącego Citibank NA (SWIFT CITIUS33), '
+                 + 'a PostFinance nie pozwala go wskazać (przelew z 10.11.2026 wrócił 19.11, zamówienie 19479)'
+        };
+        var PC_RECZNA_TLO = '#FDECEC';
+        // -> { powod, zrodlo: 'HUB' | 'karta' } albo null
+        function pcPlatnoscReczna(G){
+            if (!G) return null;
+            var cid = G.cid != null ? String(G.cid) : '';
+            if (cid && PC_PLATNOSC_RECZNA[cid]) return { powod: PC_PLATNOSC_RECZNA[cid], zrodlo: 'HUB' };
+            var nz = String((cid && _sup[cid] && _sup[cid].nazwa) || '') + ' ' + String(G.sup || '');
+            var m = nz.match(/\(\s*pay\s+via\s+([^)]{2,40})\)/i);
+            if (m && !/post\s*finance/i.test(m[1]))
+                return { powod: 'na karcie dostawcy stoi „pay via ' + m[1].trim() + '” — przelew innym bankiem niż PostFinance', zrodlo: 'karta' };
+            return null;
+        }
         function painWstrzym(r){
             var stop = [], spr = [], widz = {};
             function dodaj(L, t){ t = String(t || '').trim(); if (t && !widz[t]){ widz[t] = 1; L.push(t); } }
+            if (r.platReczna) dodaj(stop, '🏦 płatność ręczna — ' + r.platReczna.powod);
             if (r.acctHintBad) dodaj(stop, 'komentarz wskazuje inne konto'
                 + ((r.acctHint && r.acctHint.accs && r.acctHint.accs.length) ? ' (' + r.acctHint.accs.join(' / ') + (r.acctHint.old ? ', STARE' : '') + ')' : ''));
             if (r.juzZapl && r.juzZapl.length) dodaj(stop, 'balans już zapłacony? (' + r.juzZapl.map(function (z){ return z.order; }).join(', ') + ')');
@@ -32188,6 +32219,9 @@
                     // o przewalutowaniu musi tam byc, i to nad reszta danych.
                     var nfx = pcNoFxCtry(G);
                     if (nfx) labelRow('UWAGA (' + PC_NOFX[nfx] + '):', PC_NOFX_TXT + '  —  wpisz to w tytule/uwagach przelewu, żeby bank pośredniczący nie przewalutował USD', XLS.BADW, 30);
+                    // Platnosc reczna (25.11.2026) — osoba wprowadzajaca przelew ma wiedziec, ktorym bankiem i czemu.
+                    var prc = pcPlatnoscReczna(G);
+                    if (prc) labelRow('PŁATNOŚĆ RĘCZNA:', prc.powod + '  —  tego przelewu NIE MA w pliku pain.001, wprowadź go ręcznie', XLS.BADW, 30);
                     if (st.why) labelRow('Uwaga:', st.why, st.s === 'bad' ? XLS.BADW : XLS.WARNW, 30);
                     // Zrodlo po PIECIU spacjach, bez nawiasu: czytnik Excela w „Sprawdzeniu z bankiem"
                     // (bcParseXlsxRows) tnie komorke na /\s{4,}/, wiec numer zostaje sam.
@@ -35310,7 +35344,8 @@
             return R;
         }
 
-        function painSelected(rows){ return rows.filter(function(r){ return !!(state.painSel || {})[r.key]; }); }
+        // Platnosc reczna (pcPlatnoscReczna) nigdy nie wchodzi do pliku — nawet gdyby zaznaczenie zostalo w stanie.
+        function painSelected(rows){ return rows.filter(function(r){ return !r.platReczna && !!(state.painSel || {})[r.key]; }); }
         // Dopisek pod polem nazwy beneficjenta: skad nazwa, gdy nie z P/I, albo jaki beneficjent stoi na karcie,
         // gdy jest inny niz nazwa do pliku (painNazwaZKarty, 09.11.2026).
         /* ===== Nazwa beneficjenta: kilka nazw do wyboru, domyslnie ta z OSTATNIEGO przelewu (18.11.2026) =====
@@ -35426,7 +35461,7 @@
             // przerysowanie tabeli, ktore leci po kazdym kliknieciu.
             // Dotychczasowy zestaw (sprawdzone, z bankiem, z kompletem danych) jest
             // o jedno klikniecie: guzik „tylko OK".
-            rows.forEach(function(r){ if (state.painSel[r.key] === undefined) state.painSel[r.key] = false; });
+            rows.forEach(function(r){ if (state.painSel[r.key] === undefined || r.platReczna) state.painSel[r.key] = false; });
             var typ = painAdrTyp(), sel = painSelected(rows), v = painValidate(cfg, sel, strict, typ);
             var cents = 0; sel.forEach(function(r){ cents += painCents(r.amount); });
 
@@ -35514,6 +35549,15 @@
                     + pcAttr(wsR.powody.join('\n') + '\n\nSzczegóły w nagłówku grupy w widoku ' + wsR.widok + '.') + '">' + esc(painWstrzymEt(wsR)) + '</span>'
                     + ' <button class="chn-btn ghost pain-do-grupy" data-key="' + pcAttr(r.key) + '" data-sup="' + pcAttr(r.sup || '') + '"'
                     + ' title="Przewiń do tej grupy w widoku ' + pcAttr(wsR.widok) + '" style="padding:0 6px;font-size:10px">↑ pokaż</button><br>' + st;
+                // Platnosc reczna (25.11.2026): jedna, wlasna etykieta zamiast „⛔ wstrzymany" — tu nie ma czego rozstrzygac na gorze,
+                // przelew po prostu idzie innym bankiem. Inne powody wstrzymania (np. juz zaplacone) dopisujemy pod spodem.
+                if (r.platReczna){
+                    bg = PC_RECZNA_TLO;
+                    var inneWs = wsR.powody.filter(function (p){ return p.indexOf('🏦') !== 0; });
+                    st = '<span style="color:#a10000;font-weight:700" title="' + pcAttr(r.platReczna.powod) + '">🏦 PŁATNOŚĆ RĘCZNA — nie idzie do pliku</span>'
+                       + '<div style="color:#a10000;font-size:10px">' + esc(r.platReczna.powod) + '. Wprowadź ten przelew ręcznie w banku.</div>'
+                       + (inneWs.length ? '<div style="color:#a10000;font-size:10px">⛔ także: ' + esc(inneWs.join('; ')) + '</div>' : '');
+                }
                 if (r.geoWeak) st += ' <span style="color:#c47f00" title="Kraj wyprowadzony ' + (r.geoSrc === 'bic' ? 'z BIC banku' : 'z nazwy firmy') + ', nie z adresu">(kraj: ' + esc(r.geoSrc) + ')</span>';
                 // Skad wziety adres — zeby nie trzeba bylo zgadywac, czemu miasto jest
                 // takie, a nie inne. „karta" znaczy: rozpisane pola z karty dostawcy.
@@ -35522,7 +35566,11 @@
                 else if (r.adrSrc === 'pi') st += ' <span style="color:#c47f00" title="' + pcAttr('Adres beneficjenta z P/I (tekst rozpisany na pola)' + (r.adrInny ? ' — blok „' + r.adrInny.grupa + '” karty to inny adres: ' + r.adrInny.linia : '')) + '">(adres: P/I)</span>';
                 var tl = painChars(r.title, strict).txt.length;
                 h += '<tr style="background:' + bg + '">'
-                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top"><input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '></td>'
+                   + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top">'
+                   + (r.platReczna
+                       ? '<span title="Płatność ręczna — tego przelewu nie da się zaznaczyć do pliku pain.001" style="cursor:help">🏦</span>'
+                       : '<input type="checkbox" class="pain-chk" data-key="' + pcAttr(r.key) + '"' + (on ? ' checked' : '') + '>')
+                   + '</td>'
                    + '<td style="padding:2px 4px;border-top:1px solid #eee;vertical-align:top;max-width:170px">' + esc(r.sup)
                        // NUMERY ZAMOWIEN POD NAZWA. Po rozcieciu obok siebie staja dwa
                        // wiersze o IDENTYCZNEJ nazwie dostawcy i bez numerow nie da sie
@@ -36801,7 +36849,8 @@
             var hasDep = G.dep.length > 0, hasBal = G.bal.length > 0;
             var depSum = hasDep ? pcSumRows(G.dep) : null, balSum = hasBal ? pcBalSum(G.bal) : null;
             var accBase = G.cid ? (_acc[G.cid] || '') : ''; var accShown = (state.pcAccEdit && state.pcAccEdit[G.key] != null) ? state.pcAccEdit[G.key] : accBase;
-            var h = '<tr class="pc-suphdr" data-sup="' + gi + '"><td colspan="8" style="background:#F6E7E6;border-top:2px solid #750000;padding:3px 7px;color:#750000">'
+            var platR = pcPlatnoscReczna(G);
+            var h = '<tr class="pc-suphdr" data-sup="' + gi + '"><td colspan="8" style="background:' + (platR ? PC_RECZNA_TLO : '#F6E7E6') + ';border-top:2px solid ' + (platR ? '#c00' : '#750000') + ';padding:3px 7px;color:#750000">'
                 + ''
                 + '<label style="cursor:pointer;font-weight:700"><input type="checkbox" class="pc-sup-chk" data-sup="' + gi + '"> ' + esc(G.sup) + '</label>'
                 // Scalenie reczne ma byc WIDOCZNE — inaczej za pol roku nie wiadomo,
@@ -36856,6 +36905,12 @@
                   +  '⚠ Scalone rekordy mają RÓŻNE konta: ' + esc((G.konta || []).join('   |   '))
                   +  ' — przelew pójdzie na konto z „' + esc(G.sup) + '".</div>';
             }
+            // Platnosc reczna (25.11.2026) — pasek nad tytulem, zeby nie dalo sie go przeoczyc.
+            if (platR){
+                h += '<div style="margin-top:3px;background:#c00;color:#fff;border-radius:5px;padding:3px 8px;font-size:11px;font-weight:700">'
+                  +  '🏦 PŁATNOŚĆ RĘCZNA — wprowadź ten przelew ręcznie w banku. Do pliku pain.001 nie idzie.'
+                  +  '<div style="font-weight:400">' + esc(platR.powod) + (platR.zrodlo === 'karta' ? ' (rozpoznane po nazwie na karcie dostawcy)' : '') + '</div></div>';
+            }
             var t = pcTitleFor(G); if (t){ var _ov = t.length > PC_TITLE_MAX; h += '<div style="margin-top:3px;font-family:ui-monospace,monospace;font-size:11px"><span style="color:#750000;font-weight:700">Tytuł:</span> <span class="pc-title-txt">' + esc(t) + '</span> <button class="chn-btn ghost pc-title-copy" style="padding:1px 8px" title="Kopiuj tytuł przelewu">📋</button> <span style="font-size:10px;color:' + (_ov ? '#c00;font-weight:700' : '#888') + '">(' + t.length + '/' + PC_TITLE_MAX + ')</span></div>';
                 // v3.70: druga linia — nazwa do zapisania pliku pobranego z banku.
                 // Limit 140 znakow dotyczy TYTULU PRZELEWU, nie nazwy pliku, wiec tu go nie ma;
@@ -36895,7 +36950,8 @@
                                          rozdziel: G.rozdziel || '', wyciety: G.wyciety || '',
                                          korzen: G.korzen || '', wycieteOrdery: (G.wycieteOrdery || []).slice(),
                                          cid: G.cid || null, konto: G.cid ? (_acc[G.cid] || '') : '' });
-                    var gcol = CM[G.key] || '';
+                    // Platnosc reczna — wiersze grupy na jasnoczerwonym tle (25.11.2026).
+                    var gcol = pcPlatnoscReczna(G) ? PC_RECZNA_TLO : (CM[G.key] || '');
                     html += pcGroupHeader(G, gi, gcol);
                     // Ciac jest co tylko w grupie o WIECEJ NIZ JEDNYM zamowieniu.
                     var _ordy = [];
@@ -40436,7 +40492,7 @@
                     setTimeout(function (){ hdr.style.outline = bylo || ''; }, 2500);
                     return;
                 }
-                if (t.id === 'pain-all'){ rows.forEach(function(r){ state.painSel[r.key] = true; }); renderPain(); return; }
+                if (t.id === 'pain-all'){ rows.forEach(function(r){ state.painSel[r.key] = !r.platReczna; }); renderPain(); return; }
                 if (t.id === 'pain-none'){ rows.forEach(function(r){ state.painSel[r.key] = false; }); (state._painSchowek || []).forEach(function (w){ w.sel = false; }); renderPain(); return; }
                 // „Tylko sprawdzone" ma znaczyc TO SAMO co zielony status — inaczej guzik
                 // zostawialby zaznaczone wiersze, ktore w tabeli maja uwagi.
@@ -46601,6 +46657,11 @@
         // „MediaMarkt Saturn CH": CHF, konto 1468, booking 9 (Fulfillment No), data w kol. 3, numer w 5, kwota w 15 —
         // domyslny uklad MK_HDR, wiec bez wpisu w MK_KOL_KWOTA. Odczyt ustawienia 16.11.2026 (pierwszy import, paczek brak).
         'Mirakl (MediaMarkt) · MediaMarkt Saturn CH': { bank: '269', booking: '9', acct: '1468' },
+        // Payback DE: panel paybackde-prod.mirakl.net, sklep 2075. Import 272 „Payback DE" (zalozony przez zespol 25.11.2026,
+        // odczyt /api/bankSettings/index/272/): EUR, konto 1470 „Payback DE Beliani DE", booking 9 (Fulfillment No), data
+        // w kol. 3, numer w 5, kwota w 15 — domyslny uklad MK_HDR, wiec bez wpisu w MK_KOL_KWOTA. Booking 9, bo ff_number
+        // auftragu to wprost orderUuid z Mirakla („PPR1624748847-A" -> 16244322, sprawdzone w search.php).
+        'Mirakl (Payback) · Payback DE': { bank: '272', booking: '9', acct: '1470' },
         // Hobbybox SE i DK: ten sam panel co Hobbybox FI (ipagencyfi-prod.mirakl.net), sklepy 4314 „Beliani SE" (SEK)
         // i 4313 „Beliani DK" (DKK) — w MK_SHOPID z jawnymi nazwami. Ustawienia 259 „Hobbybox SE" (SEK, konto 1540)
         // i 260 „Hobbybox DK" (DKK, konto 1541) to kopie 226 „Hobbybox FI": booking 9, data w kolumnie 3, numer w 5,
@@ -46939,6 +47000,8 @@
         ["1463", "XXXLutz HR Beliani (Europe) GmbH", 1], ["1536", "XXXLutz SE Beliani (DE) GmbH", 1],
         // Dopisane recznie 16.11.2026 — konto ustawienia importu 269 „MediaMarkt Saturn CH" (account_name z /api/bankSettings/index/269/).
         ["1468", "MediaMarkt Saturn Beliani Switzerland GmbH", 1],
+        // Dopisane recznie 25.11.2026 — konto Payback DE (aktywne), odczytane z /accounts.php.
+        ["1470", "Payback DE Beliani DE", 1],
         ["1611", "Forderungen Tulip", 1], ["1745", "BCE Verbindlichkeiten", 1],
         ["1756", "Beliani International", 1], ["1770", "Umsatzsteuer 0% DE Out of country, within EU", 1], ["1774", "Umsatzsteuer 23% SK", 1],
         ["1775", "Umsatzsteuer 16% DE", 1], ["1776", "Umsatzsteuer 19% DE", 1], ["1801", "Umsatzsteuer 21% BE", 1],
@@ -49531,6 +49594,8 @@
         "261": "xxx Lutz HR",
         // 269 „MediaMarkt Saturn CH" — odczytane 16.11.2026 z /api/bankSettings/index/ (CHF, konto 1468).
         "269": "MediaMarkt Saturn CH",
+        // 272 „Payback DE" — odczytane 25.11.2026 z /api/bankSettings/index/272/ (EUR, konto 1470, booking 9).
+        "272": "Payback DE",
         // 254 „Limango DE NEW" — panel Mirakla. Osobne ustawienie od 200 „Limango DE" (stary dashboard),
         // bo pliki maja inny uklad: 200 czyta numer z kol. 1 i kwote z 8, a 254 numer z 5, kwote z 14, date z 3.
         // Odczytane 26.10.2026 z /api/bankSettings/index/254/ (EUR, konto 1515, booking 9).
@@ -50095,6 +50160,16 @@
         // sierpniu trzy, na 11 199,13.
         { mp: 'Mirakl (Hobbybox)', ok: true, payer: /MANGOPAY/i, ref: /\b(IPA\d{4,})\b/i,
           brand: 'Hobbybox', short: 'Hobbybox', host: 'ipagencyfi-prod.mirakl.net' },
+        // Payback DE — panel paybackde-prod.mirakl.net (domena Mirakla, wystarcza @connect mirakl.net), jeden sklep 2075
+        // „Beliani DE" (MK_SHOPID z jawna nazwa „Payback DE"), EUR. Placi przez Mangopaya na HVB DE (22889389), tytul jak
+        // Vente i Hobbybox: „SEPA-GUTSCHRIFT Mangopay PAY230210 Mirakl KUNDENREFERENZ f6613aff02d2 4a998fe9668607f0855e"
+        // (24.11.2026, 512,28). PAY230210 to referencja wyplaty: payOut.reference cyklu „Mirakl Payout: Funds transferred
+        // to your bank account - Reference: PAY230210" (documentNumber wiersza Payment 000000230210), wiec mkMatchCycle
+        // trafia cykl WPROST. Odczyt panelu 25.11.2026: cykl 0858cbf3 (voucher 000010, 04.11.2025–23.11.2026, PAID 23.11).
+        // Hex po KUNDENREFERENZ to identyfikator przelewu Mangopaya — o rozliczeniu nie mowi nic. Bez \b z przodu po
+        // sklejeniu („MangopayPAY…") wzorzec nie trafia — tak jak VEN; „MARKETPAY" (Carrefour) nie ma cyfr zaraz po PAY.
+        { mp: 'Mirakl (Payback)', ok: true, payer: /MANGOPAY/i, ref: /\b(PAY\d{4,})\b/i,
+          brand: 'Payback', short: 'Payback', host: 'paybackde-prod.mirakl.net', shop: 'Payback DE', cur: 'EUR' },
         // But (BUT INTERNATIONAL) — panel but-prod.mirakl.net, sklep 2496. Placi przez
         // Mangopay, tytul ma ten sam uklad co Maxeda: „Mangopay 281371 BUT INTERNATI
         // CUSTOMER REF <32 hex>". Numer po „Mangopay" to referencja wyplaty, hex to
@@ -50812,6 +50887,12 @@
         if (/OPEN_AMOUNT/.test(s)) return { k: 'skip', ref: ref };
         if (/MANUAL_INVOICE/.test(s)) return { k: 'skip', ref: ref };   // faktury operatora
         if (/PENALTY/.test(s)) return { k: 'skip', ref: ref };          // kary naliczone sprzedawcy
+        // Rezerwa sprzedawcy (Payback DE, 25.11.2026): RESERVE_FUNDING to kwota, ktora operator ODKLADA z wyplaty
+        // („Amount set aside for the seller reserve", −300.00 w cyklu 0858cbf3, bez numeru zamowienia). Zwolnienie rezerwy
+        // wraca do wyplaty (cykl podaje je w sellerPayableAmount.details jako „reserveSettlement"; typu pozycji jeszcze nie
+        // widziano, stad wzorzec na kazde RESERVE_…). To pieniadze sprzedawcy, nie zamowienia: do brutta nie wchodzi, do
+        // kontroli netto owszem (comp). Do 5.63.26 szla jako „unknown" i wstrzymywala import calego cyklu. „rez" = do pokazania.
+        if (/^RESERVE_/.test(s)) return { k: 'skip', ref: false, rez: true };
         // Reczne pozycje operatora (Home24, od 10.2026). JSON: INVOICEABLE_ONE_OFF_DEBIT / MANUAL_CREDIT (+ _TAX / _VAT),
         // CSV: „One-off debit" / „Manual credit" (+ „ tax"). One-off debit to reczny zwrot dla klienta, ktory operator
         // odlicza od wyplaty (faktura „Calculation of a manual refund"); Manual credit to uznanie dla sprzedawcy
@@ -50857,11 +50938,14 @@
         // skladniki +694.52, Payment -694.52), a sciezka zapasowa dla cykli jeszcze bez
         // wiersza wyplaty pokazywalaby 0.00 zamiast prawdziwej kwoty.
         let comp = 0;
+        // Rezerwa sprzedawcy (mkCls: rez) — ze znakiem: minus = odlozona z tej wyplaty, plus = zwolniona do niej.
+        let rezerwa = 0;
         (data || []).forEach(function (x){
             const a = Number(x.amount) || 0;
             const c = mkCls(x.type);
             if (c.k === 'payment') { pays.push({ a: a, r: mkPayRef(x) }); return; }
             comp = r2(comp + a);
+            if (c.rez) rezerwa = r2(rezerwa + a);
             if (c.k === 'unknown') { unknown[x.type] = (unknown[x.type] || 0) + 1; return; }
             if (c.k === 'oneoff' || c.k === 'manualcr'){
                 const rodzaj = (c.k === 'oneoff') ? 'One-off debit' : 'Manual credit';
@@ -50921,7 +51005,8 @@
         if (wantRef){ const m = pays.filter(function (p){ return p.r.indexOf(wantRef) >= 0; }); if (m.length === 1) pay = m[0].a; }
         if (pay == null && pays.length === 1) pay = pays[0].a;
         return { ord: ord, ref: ref, unknown: unknown, skipped: skipped, comp: comp, pay: pay, pays: pays, payAll: payAll,
-                 reczne: Object.keys(reczne).map(function (k){ return reczne[k]; }), manual: manual, bezNr: bezNr, niepewne: niepewne };
+                 reczne: Object.keys(reczne).map(function (k){ return reczne[k]; }), manual: manual, bezNr: bezNr, niepewne: niepewne,
+                 rezerwa: rezerwa };
     }
 
     // ================= LIMANGO — Mirakl: model zakupowy =================
@@ -51506,7 +51591,11 @@
         // MediaMarkt Saturn CH: sklep 13216 odczytany 16.11.2026 z panelu (shops/current „Beliani CH", uuid 13216, CHF; /_menu bez
         // przelacznika — jedyny sklep loginu). Nazwe wpisujemy jawnie — etykieta z _Markety to „MediaMarkt Saturn CH".
         '13216': { mp: 'Mirakl (MediaMarkt)', brand: 'MediaMarkt Saturn', short: 'MediaMarkt',
-                   host: 'mediamarktsaturn.mirakl.net', shop: 'MediaMarkt Saturn CH', cur: 'CHF' }
+                   host: 'mediamarktsaturn.mirakl.net', shop: 'MediaMarkt Saturn CH', cur: 'CHF' },
+        // Payback DE: sklep 2075 odczytany 25.11.2026 z panelu (currentShopUUID na stronie glownej, shops/current „Beliani DE",
+        // uuid 2075, EUR; /_menu bez przelacznika — jedyny sklep loginu). Nazwe wpisujemy jawnie — panel mowi „Beliani DE".
+        '2075': { mp: 'Mirakl (Payback)', brand: 'Payback', short: 'Payback',
+                  host: 'paybackde-prod.mirakl.net', shop: 'Payback DE', cur: 'EUR' }
     };
     // Numery sklepow Leroya rozpoznane z WGRANYCH eksportow — kraj bierze sie z kolumny
     // „Sales channel" (LMES -> ES). Zapamietujemy je, bo panel takiej kolumny nie oddaje:
@@ -51838,6 +51927,7 @@
                    netOk: full && (bezKwoty || eq(net, j.amount)), netSkip: bezKwoty,
                    ord: a.ord, ref: a.ref, refExtra: refExtra, reczne: a.reczne,
                    unknown: a.unknown, skipped: a.skipped, full: full,
+                   rezerwa: a.rezerwa || 0,
                    limFv: o.limFv || null,
                    limRoz: limRozW,
                    limZdjete: limZdjete.length ? { noty: limRozW.bezNot.slice(), poz: limZdjete } : null,
@@ -71617,7 +71707,9 @@
                        // e-Price IT — Mirakl na wlasnej domenie, ten sam wykaz rozliczen.
                        'marketplace.eprice.it': '/sellerpayment/shop/shop-billing-cycles',
                        // MediaMarkt Saturn CH — ten sam wykaz rozliczen (16.11.2026).
-                       'mediamarktsaturn.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
+                       'mediamarktsaturn.mirakl.net': '/sellerpayment/shop/shop-billing-cycles',
+                       // Payback DE — ten sam wykaz rozliczen (25.11.2026).
+                       'paybackde-prod.mirakl.net': '/sellerpayment/shop/shop-billing-cycles' };
     function mkPanelUrl(host){ return 'https://' + host + (MK_PANEL[host] || '/'); }
     // Ciasteczko sesji VTEX ma SameSite, wiec przy zapytaniu z prologistics przegladarka
     // go NIE dolacza — i VTEX oddaje 404 zamiast 401. Czytamy je wiec wprost dla domeny
@@ -74227,6 +74319,13 @@
                 }
                 const sk = Object.keys(j.data.skipped || {});
                 if (sk.length) det += '<div style="color:#888;font-size:10px">poza zakresem (nie księgujemy): ' + esc(sk.join(', ')) + '</div>';
+                // Rezerwa sprzedawcy (Payback DE): kwota jest w roznicy miedzy brutto a wyplata, a na auftragi nie idzie —
+                // bez tej linii 300 z 474.62 roznicy (cykl 0858cbf3: brutto 986.90 po zwrocie, wyplata 512.28) nie mialoby
+                // na ekranie wyjasnienia; reszta to prowizja z VAT-em (174.62).
+                if (j.data.rezerwa) det += '<div style="color:#0369a1;font-size:11px">rezerwa sprzedawcy ' + f2(j.data.rezerwa)
+                    + (j.data.rezerwa < 0 ? ' — operator odłożył ją z tej wypłaty (wróci przy zwolnieniu rezerwy)'
+                                          : ' — zwolniona rezerwa doszła do tej wypłaty')
+                    + '; na auftragi nie idzie</div>';
                 // Reczne pozycje operatora (One-off debit = reczny zwrot dla klienta, Manual credit = uznanie): kwoty sa w wyplacie,
                 // a ich ksiegowanie idzie lista zwrotow — nota na zamowieniu (zwrot) albo nota ze znakiem minus (uznanie).
                 const rcz = j.data.reczne || [];
@@ -77916,8 +78015,20 @@
         const del = ((d && d.del) || []).filter(function (id){ return ids.indexOf(id) < 0; });
         // Zamowienia nieznane prologistics (rdMarkBz) — tak samo: zalatwione, ale nie zaksiegowane.
         const bz = ((d && d.bz) || []).filter(function (id){ return ids.indexOf(id) < 0 && del.indexOf(id) < 0; });
-        if (!ids.length && !del.length && !bz.length) return null;
-        const zalatwione = ids.concat(del, bz);
+        // „Znosi się" POTWIERDZONE PRZY PACZCE (slad „net": wplata NOT FOUND, auftrag Deleted, zwrot calej kwoty), jeszcze
+        // bez przebiegu zwrotow. Ten sam warunek, ktorym refZnosiPrzed nie wysyla pozycji do modulu ticketa: kazdy wiersz
+        // numeru sie znosi (claim czy Goodwill tego samego zamowienia trzyma numer otwartym), numer nie jest zaksiegowany.
+        // Do 25.11.2026 grupe zamykal dopiero slad „del" z przebiegu — Payback DE 24.11 (PPR743280578-A 5.00): lista mowila
+        // „znoszą się, ▶ Zaksięguj nie wyśle tej pozycji", a licznik dalej stal na (1) i arkusz na Refunded „Nie".
+        const net = (d && d.net) || [];
+        const znosiPrzed = [];
+        net.forEach(function (id){
+            if (znosiPrzed.indexOf(id) >= 0 || ids.indexOf(id) >= 0 || del.indexOf(id) >= 0 || bz.indexOf(id) >= 0) return;
+            const rr = (x.rows || []).filter(function (r){ return r.id === id; });
+            if (rr.length > 0 && rr.every(mkZnosiSie)) znosiPrzed.push(id);
+        });
+        if (!ids.length && !del.length && !bz.length && !znosiPrzed.length) return null;
+        const zalatwione = ids.concat(del, bz, znosiPrzed);
         // Zaksiegowane, ale bez opisu w tickecie (rdMarkKom, 20.11.2026) — zostaja w „zostało", dopoki opis nie wejdzie.
         const brakOpisu = ((d && d.kom) || []).filter(function (id){
             const s = rcState(id);
@@ -77927,16 +78038,17 @@
         // Z pominietych (Deleted) osobno te, ktore ZNOSZA SIE z wplata: rowna wplata w tym samym rozliczeniu
         // (przy KAZDYM wierszu tego numeru — claim czy Goodwill tego samego zamowienia nie chowa sie pod zielonym)
         // i potwierdzenie z paczki importu, ze wplata nie weszla (slad „net").
-        const net = (d && d.net) || [];
         const znosi = del.filter(function (id){
             const rr = x.rows.filter(function (r){ return r.id === id; });
             return net.indexOf(id) >= 0 && rr.length > 0 && rr.every(mkZnosiSie);
-        });
-        return { at: (d && d.at) || 'wg zapisu modułu ticketa',
+        }).concat(znosiPrzed);
+        // Grupa zamknieta samym potwierdzeniem z paczki nie ma daty przebiegu (rdMarkNet jej nie zapisuje).
+        const bezPrzebiegu = !(d && d.at) && !zLogu.length && znosiPrzed.length > 0;
+        return { at: (d && d.at) || (bezPrzebiegu ? 'wg paczki importu' : 'wg zapisu modułu ticketa'),
                  sure: d ? (d.sure !== false) : true,
                  reczne: !!(d && d.reczne),
                  zLogu: zLogu.length,
-                 zaks: ids.length, pominiete: del.length - znosi.length, znosi: znosi.length,
+                 zaks: ids.length, pominiete: del.length - (znosi.length - znosiPrzed.length), znosi: znosi.length,
                  delIds: del, znosiIds: znosi, bezZam: bz.length, bzIds: bz,
                  // oznaczone bez potwierdzenia, bo log ticketa o nich milczal (rdMarkBp), i dalej niepotwierdzone zapisem modulu ticketa
                  bpIds: ((d && d.bp) || []).filter(function (id){ return zLogu.indexOf(id) < 0 && x.rows.some(function (r){ return r.id === id; }); }),
@@ -77974,9 +78086,12 @@
         // „Deleted" wiemy z dwoch zrodel: modul ticketa pominal zwrot (slad „del" grupy) albo auftrag
         // sprawdzono przy wierszu NOT FOUND paczki (mkNfDeleted). Sama rownosc kwot NIE wystarcza:
         // przy zywym auftragu zwrot idzie w tickecie, a wplate trzeba zaksiegowac.
-        // Allegro: takze brak auftragu (mkNfBrakAuf) oraz trwale potwierdzenie z paczki („net") — wynik sprawdzenia
-        // auftragu zyje w pamieci strony, a anulacja bez auftragu nie zostawia sladu „del" w module ticketa.
-        const net = (j.kind === 'alle' && d && d.net) || [];
+        // Allegro: takze brak auftragu (mkNfBrakAuf). Trwale potwierdzenie z paczki („net") — wynik sprawdzenia auftragu zyje
+        // w pamieci strony, a anulacja bez auftragu nie zostawia sladu „del" w module ticketa. Od 25.11.2026 „net" liczy sie
+        // na KAZDYM rynku: grupa zwrotow zamyka sie na nim sama (rdState), wiec sladu „del" z przebiegu moze nie byc nigdy,
+        // a bez tego po odswiezeniu strony wplata zniesiona zwrotem wracalaby do „Do wyjaśnienia" (Payback DE, 24.11.2026).
+        // „net" powstaje tylko przy komplecie warunkow (mkZnosiPotwierdz), a pelny zwrot i brak zaksiegowania sprawdzamy nizej na swiezo.
+        const net = (d && d.net) || [];
         return Object.keys(j.data.ref || {}).filter(function (id){
             return mkPelnyZwrot(j, id) && (del.indexOf(id) >= 0 || net.indexOf(id) >= 0 || mkNfZnosiAuf(id, j)) && !mkZwrotWszedl(j, id);
         });
@@ -78866,7 +78981,7 @@
             refArkZapisz(kand.map(function (k){ return k.key; }), doWys.length ? 'Tak po domknięciu' : 'bez zmian');
             if (doWys.length){
                 const t = 'Arkusz: Refunded „Tak” dla ' + doWys.map(function (w){ return w.opis; }).join(', ')
-                        + ' — zwroty tej wpłaty domknęły się poza przebiegiem z listy (np. moduł ticketa puszczony wprost), więc wpisałem „Tak” teraz'
+                        + ' — zwroty tej wpłaty domknęły się poza przebiegiem z listy (moduł ticketa puszczony wprost albo wpłata i zwrot, które się znoszą), więc wpisałem „Tak” teraz'
                         + ((res && res.missing && res.missing.length) ? (' · nie znalazłem ' + res.missing.length + ' wierszy') : '') + '.';
                 mkLog('arkusz', '✔ ' + t);
                 if (!refBusy) say(t, '#0a7a2f');
@@ -79019,7 +79134,7 @@
                               + ' są w tym samym rozliczeniu i znoszą się: wpłata nie weszła (NOT FOUND w paczce), auftrag jest Deleted'
                               + (r.kind === 'alle' ? ' albo go nie ma' : '')
                               + ' — nie księguje się ani jedno, ani drugie.'
-                              + (przedBiegiem ? ' „▶ Zaksięguj” nie wyśle tej pozycji do modułu ticketa.' : '')
+                              + (przedBiegiem ? ' Liczy się jako załatwione — nic tu nie trzeba klikać, „▶ Zaksięguj” i tak nie wyśle tej pozycji do modułu ticketa.' : '')
                               // Allegro: stan wpisu w arkuszu „allegro anulacje" (IRENKA) — po nim saldujacy wyklucza pare.
                               + (r.kind === 'alle' ? alleAnulStanHtml(r.id) : '');
                         } else if (mkZnosiSie(r)){
@@ -79137,7 +79252,7 @@
                 const po = rdState(k, x);
                 if (po && !po.left.length)
                     say('Ślad HUB-a zdjęty, ale grupa dalej jest zamknięta — zamyka ją zapis modułu „Księgowanie w tickecie”'
-                        + ' albo ślady Deleted / brak zamówienia.', '#c47f00');
+                        + ' albo ślady Deleted / brak zamówienia / „znosi się” z wpłatą (potwierdzone przy paczce).', '#c47f00');
                 else say('Cofnięte — grupa wróciła na listę do zrobienia.', '#c47f00');
             } else {
                 const zostalo = s ? s.left.length : x.rows.length;
@@ -128245,7 +128360,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = '9b704db · 24.11.2026 14:39';
+    const HUB_BUDOWA = '0b42f4d · 25.11.2026 10:29';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -130176,6 +130291,1366 @@
 })();
     }
 
+    function init_korekty() {
+(function () {
+    'use strict';
+    if (!/(^|\.)prologistics\.info$/i.test(location.hostname)) return;
+    // Inne moduly otwieraja prologistics w ukrytych ramkach — panel tylko w oknie glownym.
+    if (window.top !== window.self) return;
+    if (document.getElementById('kor-btn')) return;
+
+    // ===== Korekty faktur (25.11.2026) =====
+    // Faktura korygujaca do faktury WYSLANEJ klientowi. Zrodla danych odczytane 25.11.2026 na auftragach
+    // 16067436 (FV 12112933, zmiana stawki 19% -> 0%) i 16050784 (FV 12095007, trzy wysylki, storno):
+    //  - FAKTURA WYSLANA = zalacznik maila z protokolu e-maili. Lekko, bez strony auftragu:
+    //    GET /api/comments/emaillog?log_type=3&page_id=<auftrag>&order_dir=ASC&output=1
+    //    -> email_log[] { date, template, docs: [{ name: "Faktura VAT <nr>.pdf", url: ...doc.php?attachment_id=N }] }.
+    //    Ten sam plik oddaje prologistics pod /doc.php?attachment_id=N (ta sama domena, bez @connect).
+    //    Faktura bywa wysylana kilka razy i wersje ROZNIA SIE (16050784: 28.10 0%, 19.11 23%, 20.11 19%; korekta
+    //    12095007/1 poprawiala wersje z 19.11) — dlatego lista wersji z kwotami i wybor uzytkownika.
+    //  - „Show static invoice" (…&static=static&show=1, PDF) NIE jest wyslanym dokumentem: po zmianie auftragu
+    //    prologistics go przelicza (16067436: pokazuje juz 0%). Bierzemy go tylko, gdy w protokole nie ma faktury.
+    //  - STAN BIEZACY = static_invoice_HTML.php?number&txnid=3&kk=<securityKey ze strony auftragu>&shipping_list=0&static=
+    //    (HTML, wiersze tr: ilosc | nazwa | td.item_price | kwota VAT | stawka | td.total_price) — podpowiedz „po korekcie".
+    //  - is_correction_invoice=1 oddaje zwykla fakture — prologistics sam korekty nie sklada.
+    //  - Zapis jak w Zwrotach: formularz pliku na stronie auftragu (newpicfn[], POST pod adres auftragu, typ „Other")
+    //    + komentarz js_backend.php fn=addComment obj=auction obj_id=<auction_Id>.
+    // Decyzje uzytkownika 25.11.2026: PDF + komentarz (bez odbicia), PDF RYSOWANY (blad poprawia sie w formularzu
+    // i generuje kolejna), wczytanie PDF faktury z pliku, na start tylko PL („Faktura korygujaca").
+    // Liczenie: kwoty w groszach. Pozycja „po korekcie" liczona od brutto (jak faktury prologistics: netto =
+    // brutto/(1+stawka), VAT = brutto - netto); przy zmianie stawki do wyboru „zachowaj netto" (VAT do zwrotu,
+    // jak 12112933/1) albo „zachowaj brutto". Pozycja bez zmian = dokladnie kwoty z faktury. Sumy wg stawek = sumy
+    // pozycji. Kontrola netto/brutto wskazuje pozycje faktury, w ktorych prologistics policzyl niespojnie.
+
+    var KOR_MOD = 'Korekty faktur';
+    var KOR_SZKIC = 'kor_szkic_v1';     // szkic formularza — przezywa odswiezenie strony
+    var KOR_DODANE = 'kor_dodane_v1';   // { "<auftrag>|<nr korekty>": { ts, plik, potw } } — ochrona przed dublem
+    var KOR_STAWKI = [23, 8, 5, 0];
+    var KOR_POWODY = ['Zmiana stawki VAT', 'Błędna stawka VAT', 'Zwrot towaru', 'Anulowanie zamówienia',
+                      'Rabat / obniżka ceny', 'Błędna cena', 'Błędna ilość'];
+    var KOR_KOMENTARZ = 'Korekta {nr} załączona, proszę o kontakt z klientem.';
+    var KOR_LOGO = '/logo/288x77px%20logo.png';
+    var APO = String.fromCharCode(0x2019);          // separator tysiecy jak na korektach: 1’436.13
+    var KOR_WAL = 'PLN|EUR|CHF|GBP|CZK|HUF|SEK|DKK|NOK|RON|zł';
+    var KOR_TYS = "'" + APO + String.fromCharCode(0xA0, 0x202F);
+    var KOR_KW_SRC = '(-?\\d[\\d' + KOR_TYS + ']*[.,]\\d{2})\\s*(' + KOR_WAL + ')';
+    var KOR_ST_RE = /(-?\d{1,2}(?:[.,]\d+)?)\s*%/;
+    var KOR_SEP_RE = new RegExp("[\\s'" + APO + ']', 'g');
+
+    // ---------- drobne ----------
+    function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function pad2(n){ return (n < 10 ? '0' : '') + n; }
+    function gmGet(k, d){ try { return GM_getValue(k, d); } catch (e){ return d; } }
+    function gmSet(k, v){ try { GM_setValue(k, v); } catch (e){} }
+    function jGet(k){ try { return JSON.parse(gmGet(k, '') || '{}') || {}; } catch (e){ return {}; } }
+    function jSet(k, o){ gmSet(k, JSON.stringify(o || {})); }
+    // Zaokraglenie „od zera" (0,5 grosza w gore co do wartosci bezwzglednej), odporne na 0,49999 z dzielenia.
+    function zaokr(x){ var a = Math.floor(Math.abs(x) + 0.5 + 1e-7); return x < 0 ? -a : a; }
+    // Tekst -> liczba: „1’436.13", „1 436,13", „-70.09", „1,436.13".
+    function liczba(s){
+        var t = String(s == null ? '' : s).replace(KOR_SEP_RE, '').replace(/[^\d,.\-]/g, '');
+        if (!t || t === '-') return NaN;
+        var p = t.lastIndexOf('.'), c = t.lastIndexOf(',');
+        if (p >= 0 && c >= 0){ t = (c > p) ? t.replace(/\./g, '').replace(',', '.') : t.replace(/,/g, ''); }
+        else if (c >= 0) t = t.replace(',', '.');
+        var v = parseFloat(t);
+        return isFinite(v) ? v : NaN;
+    }
+    function gr(s){ var v = liczba(s); return isFinite(v) ? zaokr(v * 100) : null; }
+    function kw(c){
+        if (c == null || !isFinite(c)) return '';
+        var a = Math.abs(Math.round(c)), zl = Math.floor(a / 100);
+        return (c < 0 && a ? '-' : '') + String(zl).replace(/\B(?=(\d{3})+(?!\d))/g, APO) + '.' + pad2(a % 100);
+    }
+    function kwP(c){ return (c == null || !isFinite(c)) ? '' : (Math.round(c) / 100).toFixed(2); }
+    function il(q){ return (Math.round((+q || 0) * 100) / 100).toFixed(2); }
+    function stTxt(s){ return (s == null || !isFinite(s)) ? '' : (String(Math.round(s * 100) / 100).replace('.', ',') + '%'); }
+    function isoDzis(){ var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+    function isoPlus(iso, dni){
+        var p = String(iso).split('-'), d = new Date(+p[0], +p[1] - 1, +p[2] + dni);
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    }
+    function dataDok(iso){ var m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? (m[3] + '-' + m[2] + '-' + m[1]) : String(iso || ''); }
+    function czas(){ var d = new Date(); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
+    function kwoty(t){
+        var re = new RegExp(KOR_KW_SRC, 'g'), m, out = [];
+        while ((m = re.exec(String(t || '')))) out.push({ c: gr(m[1]), w: (m[2] === 'zł' ? 'PLN' : m[2]) });
+        return out;
+    }
+
+    var KOR_LOG = [];
+    // Log na ekranie + dziennik HUB-a (przebieg = 'start' ... 'koniec'). Bez nazw i adresow klientow — same numery.
+    function log(t, faza){
+        KOR_LOG.push(czas() + '  ' + t);
+        if (KOR_LOG.length > 400) KOR_LOG.shift();
+        try { if (typeof hubDz === 'function') hubDz(KOR_MOD, faza || '', t); } catch (e){}
+    }
+
+    // ---------- kwota slownie ----------
+    var SL_J = ['', 'jeden', 'dwa', 'trzy', 'cztery', 'pięć', 'sześć', 'siedem', 'osiem', 'dziewięć'];
+    var SL_N = ['dziesięć', 'jedenaście', 'dwanaście', 'trzynaście', 'czternaście', 'piętnaście', 'szesnaście',
+                'siedemnaście', 'osiemnaście', 'dziewiętnaście'];
+    var SL_D = ['', '', 'dwadzieścia', 'trzydzieści', 'czterdzieści', 'pięćdziesiąt', 'sześćdziesiąt',
+                'siedemdziesiąt', 'osiemdziesiąt', 'dziewięćdziesiąt'];
+    var SL_S = ['', 'sto', 'dwieście', 'trzysta', 'czterysta', 'pięćset', 'sześćset', 'siedemset', 'osiemset', 'dziewięćset'];
+    var SL_G = [['', '', ''], ['tysiąc', 'tysiące', 'tysięcy'], ['milion', 'miliony', 'milionów'], ['miliard', 'miliardy', 'miliardów']];
+    function slTrojka(n){
+        var s = Math.floor(n / 100), r = n % 100, d = Math.floor(r / 10), j = r % 10, w = [];
+        if (s) w.push(SL_S[s]);
+        if (d === 1) w.push(SL_N[j]);
+        else { if (d) w.push(SL_D[d]); if (j) w.push(SL_J[j]); }
+        return w.join(' ');
+    }
+    function slForma(n){ if (n === 1) return 0; var r = n % 100, j = n % 10; return (j >= 2 && j <= 4 && !(r >= 12 && r <= 14)) ? 1 : 2; }
+    // grosze -> „pięćset osiemdziesiąt i 38/100" (wartosc bezwzgledna)
+    function slownie(c){
+        var a = Math.abs(Math.round(c || 0)), zl = Math.floor(a / 100), g = a % 100, czesci = [], i = 0, n = zl;
+        while (n > 0 && i < SL_G.length){
+            var t = n % 1000;
+            if (t) czesci.unshift((i > 0 && t === 1) ? SL_G[i][0] : (slTrojka(t) + (i > 0 ? ' ' + SL_G[i][slForma(t)] : '')));
+            n = Math.floor(n / 1000); i++;
+        }
+        return (czesci.join(' ') || 'zero') + ' i ' + pad2(g) + '/100';
+    }
+
+    // ---------- zapytania ----------
+    async function pobierz(url, opcje, ms, opis){
+        var lim = ms || 60000, ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var o = Object.assign({ credentials: 'same-origin' }, opcje || {});
+        if (ctrl) o.signal = ctrl.signal;
+        var t = setTimeout(function (){ try { if (ctrl) ctrl.abort(); } catch (e){} }, lim);
+        try {
+            var r = await fetch(url, o);
+            if (!r.ok) throw new Error((opis || String(url).split('?')[0]) + ': HTTP ' + r.status);
+            return r;
+        } catch (e){
+            if (e && e.name === 'AbortError') throw new Error((opis || 'zapytanie') + ' — brak odpowiedzi po ' + Math.round(lim / 1000) + ' s');
+            throw e;
+        } finally { clearTimeout(t); }
+    }
+
+    // ---------- PDF: odczyt (pdf.js z @require) ----------
+    function pdfJs(){
+        var lib = null;
+        try { if (typeof pdfjsLib !== 'undefined') lib = pdfjsLib; } catch (e){}
+        if (!lib){ try { lib = window.pdfjsLib; } catch (e){} }
+        if (!lib){ try { lib = window['pdfjs-dist/build/pdf']; } catch (e){} }
+        if (!lib){ try { if (typeof unsafeWindow !== 'undefined') lib = unsafeWindow.pdfjsLib; } catch (e){} }
+        if (lib && lib.GlobalWorkerOptions){
+            try { if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e){}
+        }
+        return lib;
+    }
+    function zLimitem(p, ms, opis, naCzas){
+        var t = null;
+        return Promise.race([
+            Promise.resolve(p).then(function (v){ clearTimeout(t); return v; }, function (e){ clearTimeout(t); throw e; }),
+            new Promise(function (_, zle){ t = setTimeout(function (){ if (naCzas) naCzas(); zle(new Error(opis + ' — przerwałem po ' + Math.round(ms / 1000) + ' s')); }, ms); })
+        ]);
+    }
+    // Kawalki tekstu z polozeniem i krojem: krój odroznia nazwe pozycji (pogrubiona) od opisu pod nia.
+    // Dokument ZAWSZE niszczymy (task.destroy) — inaczej zostaje zywy worker do F5.
+    function czytajPdf(bajty){
+        var lib = pdfJs();
+        if (!lib) return Promise.reject(new Error('brak pdf.js — odśwież stronę'));
+        var task = lib.getDocument({ data: new Uint8Array(bajty).slice() });
+        function zniszcz(){ try { task.destroy(); } catch (e){} }
+        return zLimitem((async function (){
+            try {
+                var doc = await task.promise, strony = [];
+                for (var n = 1; n <= Math.min(doc.numPages, 15); n++){
+                    var pg = await doc.getPage(n), vp = pg.getViewport({ scale: 1 }), tc = await pg.getTextContent();
+                    strony.push({ w: vp.width, h: vp.height, items: tc.items.filter(function (it){ return it && it.str != null && String(it.str).trim() !== ''; }).map(function (it){
+                        var tr = it.transform || [];
+                        return { s: String(it.str), x: +tr[4] || 0, y: +tr[5] || 0, w: +it.width || 0, f: it.fontName || '',
+                                 h: Math.abs(+tr[3] || 0) || Math.hypot(+tr[2] || 0, +tr[3] || 0) || 8 };
+                    }) });
+                }
+                return strony;
+            } finally { zniszcz(); }
+        })(), 45000, 'odczyt PDF', zniszcz);
+    }
+    function tekstZ(items){
+        var t = '', prev = null;
+        items.slice().sort(function (a, b){ return a.x - b.x; }).forEach(function (i){
+            if (prev){ var luka = i.x - (prev.x + prev.w); if (luka > Math.max(0.8, (prev.h || 8) * 0.15)) t += ' '; }
+            t += i.s; prev = i;
+        });
+        return t.replace(/\s+/g, ' ').trim();
+    }
+    function linieZeStron(strony){
+        var out = [];
+        strony.forEach(function (st, si){
+            var rows = [];
+            st.items.forEach(function (it){
+                var r = null;
+                for (var i = 0; i < rows.length; i++) if (Math.abs(rows[i].y - it.y) <= 2) { r = rows[i]; break; }
+                if (!r){ r = { y: it.y, it: [] }; rows.push(r); }
+                r.it.push(it);
+            });
+            rows.sort(function (a, b){ return b.y - a.y; });
+            rows.forEach(function (r){
+                r.it.sort(function (a, b){ return a.x - b.x; });
+                out.push({ s: si, y: r.y, w: st.w, it: r.it, t: tekstZ(r.it) });
+            });
+        });
+        return out;
+    }
+    function czyscBlok(linie){
+        return linie.map(function (s){ return String(s || '').replace(/\s+/g, ' ').trim(); })
+            .filter(function (s){
+                return s && !/^(numer kom[óo]rkowy|tel(efon)?\b|phone|mobile|e-?mail)/i.test(s) && s.indexOf('@') < 0
+                       && !/^\+?\d[\d\s\-\/]{7,}$/.test(s);
+            })
+            .map(function (s){
+                var nip = (/^[A-Z]{2}\s?[0-9A-Z]{8,12}$/.test(s) && /\d{6}/.test(s)) || /^\d{10}$/.test(s);
+                return nip ? ('NIP ' + s.replace(/\s/g, '')) : s;
+            }).join('\n');
+    }
+    var KOR_STOP_RE = /^(Odbiorca|Nabywca|Sprzedawca|Faktura\b|Twoje zam|Numer (Faktury|zam|klienta)|Spos[óo]b p[łl]at|Waga|Przewidywany|Data wystaw|Ilo[śs][ćc])/i;
+    var KOR_OPIS_RE = /^(\d+(?:[.,]\d+)?\s*x\s*\d|EAN\b|Dost[ęe]pne|Availability|Estimated)/i;
+    function naglowekTabeli(L){
+        for (var i = 0; i < L.length; i++){
+            var it = L[i].it, il0 = null, pr = null;
+            for (var k = 0; k < it.length; k++){
+                var s0 = it[k].s.trim();
+                if (/^Ilo[śs][ćc]$/i.test(s0)) il0 = it[k];
+                else if (/^Produkt$/i.test(s0)) pr = it[k];
+                else if (/^Ilo[śs][ćc]\s+Produkt\b/i.test(s0)){
+                    // pdf.js sklejil oba naglowki w jeden kawalek — polozenie „Produkt" z proporcji szerokosci
+                    il0 = it[k];
+                    pr = { x: it[k].x + it[k].w * (s0.search(/Produkt/i) / s0.length), s: 'Produkt' };
+                }
+            }
+            if (!il0 || !pr) continue;
+            var xc = null;
+            L.forEach(function (l){
+                if (l.s !== L[i].s || Math.abs(l.y - L[i].y) > 14) return;
+                l.it.forEach(function (x){ if (/^(Cena|Kwota)$/i.test(x.s.trim()) && x.x > pr.x + 20 && (xc == null || x.x < xc)) xc = x.x; });
+            });
+            if (xc == null) continue;
+            return { i: i, s: L[i].s, y: L[i].y, xIl: il0.x, xProd: pr.x, xCena: xc };
+        }
+        return null;
+    }
+    function blokiNaglowka(L, hdr){
+        var str = hdr ? hdr.s : 0, yMin = hdr ? hdr.y + 6 : -1e9, lewe = [], prawe = [], out = {};
+        L.forEach(function (l){
+            if (l.s !== str || l.y <= yMin) return;
+            var lw = l.it.filter(function (i){ return i.x < l.w * 0.5; }), pr = l.it.filter(function (i){ return i.x >= l.w * 0.5; });
+            if (lw.length) lewe.push({ y: l.y, t: tekstZ(lw), h: lw[0].h });
+            if (pr.length) prawe.push({ y: l.y, t: tekstZ(pr), h: pr[0].h });
+        });
+        [lewe, prawe].forEach(function (kol){
+            for (var i = 0; i < kol.length; i++){
+                var m = kol[i].t.match(/^(Odbiorca|Nabywca|Sprzedawca)\s*:?\s*(.*)$/i);
+                if (!m) continue;
+                var klucz = m[1].toLowerCase(), linie = [], prevY = kol[i].y, h = kol[i].h || 8;
+                if (m[2]) linie.push(m[2]);
+                for (var j = i + 1; j < kol.length; j++){
+                    if (prevY - kol[j].y > h * 2.6 || KOR_STOP_RE.test(kol[j].t)) break;
+                    linie.push(kol[j].t); prevY = kol[j].y;
+                }
+                if (!out[klucz]) out[klucz] = czyscBlok(linie);
+            }
+        });
+        return out;
+    }
+    // Wartosci pozycji: kwota VAT na fakturze prologistics jest kwota CALEJ pozycji; gdy arytmetyka mowi, ze
+    // podano ja na sztuke — przeliczamy. Netto pozycji = brutto - VAT (tak jak stoi na fakturze).
+    function wartosciPozycji(p){
+        var n = p.ilosc, vatL = p.vat, tol = Math.max(1, Math.abs(n));
+        if (p.cenaN != null && Math.abs(zaokr(n * p.cenaN) + p.vat - p.brutto) > tol
+            && Math.abs(zaokr(n * (p.cenaN + p.vat)) - p.brutto) <= tol) vatL = zaokr(n * p.vat);
+        return { nazwa: p.nazwa, ilosc: n, cenaN: p.cenaN, stawka: p.stawka, netto: p.brutto - vatL, vat: vatL, brutto: p.brutto };
+    }
+    function pozycjeZPdf(L, hdr){
+        var xP = hdr.xProd - 2, xC = hdr.xCena - 4, poz = [], cur = null, nCont = 0, prevY = 0, prevS = -1;
+        for (var i = hdr.i + 1; i < L.length; i++){
+            var l = L[i];
+            if (/^(Kwota VAT|Kwota ca[łl]kowita|Suma na fakturze|Twoje p[łl]atno)/i.test(l.t) && kwoty(l.t).length) break;
+            var am = l.it.filter(function (x){ return x.x >= xC; }), nm = l.it.filter(function (x){ return x.x >= xP && x.x < xC; }),
+                qt = l.it.filter(function (x){ return x.x < xP; });
+            var amT = tekstZ(am), k = kwoty(amT), st = amT.match(KOR_ST_RE);
+            if (k.length >= 3 && st){
+                var qtT = tekstZ(qt), nazwa = tekstZ(nm), q = 1, fnt = nm.length ? nm[0] : (qt[0] || {});
+                if (/^-?\d+(?:[.,]\d+)?$/.test(qtT)) q = liczba(qtT);
+                else if (qtT) nazwa = (qtT + ' ' + nazwa).trim();
+                cur = { nazwa: nazwa, ilosc: q, cenaN: k[0].c, vat: k[1].c, brutto: k[k.length - 1].c, stawka: liczba(st[1]),
+                        w: k[0].w, f: fnt.f || '', h: fnt.h || 8 };
+                poz.push(cur); nCont = 0; prevY = l.y; prevS = l.s;
+                continue;
+            }
+            // Ciag dalszy nazwy: ten sam krój (pogrubiony), tuz pod spodem, tylko w kolumnie nazwy, a nazwa
+            // nie skonczyla sie jeszcze litera klasy („… 1/1 A"). Opis uslugi (zwykly krój) i wymiary — stop.
+            if (cur && nCont < 3 && l.s === prevS && !am.length && !qt.length && nm.length && nm[0].f === cur.f
+                && prevY - l.y <= cur.h * 1.8 && !/\s[A-Z]$/.test(cur.nazwa) && !KOR_OPIS_RE.test(l.t)){
+                cur.nazwa += ' ' + tekstZ(nm); nCont++; prevY = l.y;
+                continue;
+            }
+            if (cur) nCont = 99;
+        }
+        return poz;
+    }
+    // Faktura prologistics (PL) z PDF-a -> { nr, data, zamowienie, waluta, sprzedawca, nabywca, odbiorca, poz[], sumy{}, uwagi[] }
+    function fakturaZPdf(strony){
+        var L = linieZeStron(strony), caly = L.map(function (l){ return l.t; }).join('\n'), m;
+        var F = { nr: '', data: '', zamowienie: '', waluta: '', sprzedawca: '', nabywca: '', odbiorca: '', poz: [], sumy: {}, uwagi: [] };
+        if ((m = caly.match(/Numer Faktury:?\s*(\d+)/i))) F.nr = m[1];
+        if ((m = caly.match(/Data wystawienia(?: dokumentu)?:?\s*(\d{2}[.\-]\d{2}[.\-]\d{4})/i))) F.data = m[1].replace(/-/g, '.');
+        if ((m = caly.match(/Numer zam[óo]wienia:?\s*(\d+)/i))) F.zamowienie = m[1];
+        if (/faktura\s+koryguj/i.test(caly)) F.uwagi.push('plik wygląda na FAKTURĘ KORYGUJĄCĄ, a nie na fakturę');
+        if (/proforma/i.test(caly)) F.uwagi.push('plik wygląda na fakturę PROFORMA');
+        var hdr = naglowekTabeli(L);
+        var b = blokiNaglowka(L, hdr);
+        F.nabywca = b.nabywca || ''; F.odbiorca = b.odbiorca || ''; F.sprzedawca = b.sprzedawca || '';
+        if (!hdr){ F.uwagi.push('nie znalazłem nagłówka tabeli pozycji („Ilość / Produkt / Cena”) — uzupełnij pozycje ręcznie'); return F; }
+        var surowe = pozycjeZPdf(L, hdr), wal = {};
+        surowe.forEach(function (p){ wal[p.w] = (wal[p.w] || 0) + 1; });
+        F.waluta = Object.keys(wal).sort(function (a, c){ return wal[c] - wal[a]; })[0] || '';
+        F.poz = surowe.map(wartosciPozycji);
+        L.forEach(function (l){
+            var k = kwoty(l.t); if (!k.length) return;
+            if (/^Kwota VAT\b/i.test(l.t)) F.sumy.vat = k[k.length - 1].c;
+            else if (/^Kwota ca[łl]kowita\s*\(bez VAT\)/i.test(l.t)) F.sumy.netto = k[k.length - 1].c;
+            else if (/^Kwota ca[łl]kowita\b/i.test(l.t)) F.sumy.brutto = k[k.length - 1].c;
+        });
+        if (!F.poz.length) F.uwagi.push('nie rozpoznałem żadnej pozycji — uzupełnij ręcznie');
+        return F;
+    }
+
+    // ---------- faktura HTML (stan biezacy auftragu) ----------
+    function blokHtml(d, etykieta){
+        var re = new RegExp('^\\s*' + etykieta + '\\s*:?\\s*$', 'i');
+        var b = Array.prototype.filter.call(d.querySelectorAll('b'), function (x){ return re.test(x.textContent); })[0];
+        if (!b) return '';
+        var kont = b.closest('td') || b.parentElement;
+        if (!kont) return '';
+        var h = kont.innerHTML, bh = b.outerHTML, i = h.indexOf(bh);
+        if (i < 0) return '';
+        var reszta = h.slice(i + bh.length), j = reszta.search(/<b[\s>]/i);
+        if (j >= 0) reszta = reszta.slice(0, j);
+        var tmp = d.createElement('div');
+        tmp.innerHTML = reszta.replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|tr|li)>/gi, '\n');
+        return czyscBlok(String(tmp.textContent || '').split('\n'));
+    }
+    function fakturaZHtml(html){
+        var d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+        var F = { nr: '', data: '', zamowienie: '', waluta: '', sprzedawca: '', nabywca: '', odbiorca: '', poz: [], sumy: {}, uwagi: [] };
+        var tx = String((d.body && d.body.textContent) || '').replace(/\s+/g, ' '), m, wal = {};
+        if ((m = tx.match(/Numer Faktury:?\s*(\d+)/i))) F.nr = m[1];
+        if ((m = tx.match(/Data wystawienia(?: dokumentu)?:?\s*(\d{2}[.\-]\d{2}[.\-]\d{4})/i))) F.data = m[1].replace(/-/g, '.');
+        if ((m = tx.match(/Numer zam[óo]wienia:?\s*(\d+)/i))) F.zamowienie = m[1];
+        F.nabywca = blokHtml(d, 'Nabywca'); F.odbiorca = blokHtml(d, 'Odbiorca'); F.sprzedawca = blokHtml(d, 'Sprzedawca');
+        Array.prototype.forEach.call(d.querySelectorAll('tr'), function (tr){
+            var td = tr.children, n = td.length;
+            if (n < 5 || n > 7) return;
+            var a = kwoty(td[n - 4].textContent), v = kwoty(td[n - 3].textContent), s = String(td[n - 2].textContent).match(KOR_ST_RE),
+                b = kwoty(td[n - 1].textContent);
+            if (a.length !== 1 || v.length !== 1 || b.length !== 1 || !s) return;
+            var qtEl = n >= 6 ? td[0] : null, nmEl = n >= 6 ? td[1] : td[0];
+            var bs = nmEl.querySelectorAll('b');
+            var nazwa = (bs.length ? Array.prototype.map.call(bs, function (x){ return x.textContent; }).join(' ') : nmEl.textContent).replace(/\s+/g, ' ').trim();
+            var qtT = qtEl ? String(qtEl.textContent).replace(/\s+/g, ' ').trim() : '', q = 1;
+            if (/^-?\d+(?:[.,]\d+)?$/.test(qtT)) q = liczba(qtT);
+            else if (qtT) nazwa = (qtT + ' ' + nazwa).trim();
+            wal[a[0].w] = (wal[a[0].w] || 0) + 1;
+            F.poz.push(wartosciPozycji({ nazwa: nazwa, ilosc: q, cenaN: a[0].c, vat: v[0].c, brutto: b[0].c, stawka: liczba(s[1]) }));
+        });
+        F.waluta = Object.keys(wal).sort(function (x, y){ return wal[y] - wal[x]; })[0] || '';
+        Array.prototype.forEach.call(d.querySelectorAll('tr'), function (tr){
+            var t = String(tr.textContent || '').replace(/\s+/g, ' ').trim(), k = kwoty(t);
+            if (!k.length || tr.querySelector('tr')) return;
+            if (/^Kwota VAT\b/i.test(t)) F.sumy.vat = k[k.length - 1].c;
+            else if (/^Kwota ca[łl]kowita\s*\(bez VAT\)/i.test(t)) F.sumy.netto = k[k.length - 1].c;
+            else if (/^Kwota ca[łl]kowita\b/i.test(t)) F.sumy.brutto = k[k.length - 1].c;
+        });
+        return F;
+    }
+    function sumyPoz(poz){
+        return poz.reduce(function (a, p){ a.netto += p.netto; a.vat += p.vat; a.brutto += p.brutto; return a; }, { netto: 0, vat: 0, brutto: 0 });
+    }
+    function stawkiPoz(poz){
+        var o = {}; poz.forEach(function (p){ o[stTxt(p.stawka)] = 1; });
+        return Object.keys(o).join(', ');
+    }
+
+    // ---------- auftrag ----------
+    async function auftragPoFakturze(fv){
+        var r = await pobierz('/search.php?what=invoice_number&invoice_number=' + encodeURIComponent(fv), null, 60000, 'wyszukiwarka faktur');
+        var m0 = String(r.url || '').match(/auction\.php\?number=(\d+)/);
+        if (m0) return m0[1];
+        var html = await r.text(), d = new DOMParser().parseFromString(html, 'text/html'), tab = d.querySelector('#egusli');
+        var zr = tab ? tab.innerHTML : '', re = /auction\.php\?number=(\d+)/g, m, nums = {};
+        while ((m = re.exec(zr))) nums[m[1]] = 1;
+        var lista = Object.keys(nums);
+        if (!lista.length) throw new Error('nie znalazłem auftragu z fakturą ' + fv);
+        if (lista.length > 1) throw new Error('numer ' + fv + ' pasuje do kilku auftragów (' + lista.join(', ') + ') — wpisz numer auftragu');
+        return lista[0];
+    }
+    function plikiAuftragu(html){
+        var re = />\s*([^<>]{1,180}?\.pdf)\s*<\/a>/gi, m, out = [];
+        while ((m = re.exec(String(html || '')))) out.push(m[1].replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim());
+        return out;
+    }
+    // Kolejny numer korekty: pliki „12112933 1.pdf", „Korekta_12112933-1.pdf", „Korekta 12112933/2.pdf"…
+    function nastepnyNumer(pliki, fv){
+        if (!fv) return 1;
+        var re = new RegExp('(?:^|\\D)' + fv + '[ _\\-/]+(\\d{1,2})(?!\\d)[^/]*\\.pdf$', 'i'), max = 0;
+        (pliki || []).forEach(function (n){ var m = String(n).match(re); if (m) max = Math.max(max, +m[1]); });
+        return max + 1;
+    }
+    // Auftrag otwarty w tej karcie: strona auftragu (number= w adresie) albo ticket z odnosnikiem do auftragu.
+    function otwartyAuftrag(){
+        var m = String(location.search).match(/[?&]number=(\d+)/);
+        if (/auction\.php/i.test(location.pathname) && m) return { nr: m[1], strona: true };
+        if (/rma\.php/i.test(location.pathname)){
+            var a = document.querySelector('a[href*="auction.php?number="]'), n = a && String(a.getAttribute('href') || '').match(/number=(\d+)/);
+            if (n) return { nr: n[1], strona: false };
+        }
+        return null;
+    }
+    // zStrony = otwarta karta auftragu: securityKey, auction_Id i lista plikow sa w jej HTML-u — bez drugiego pobrania ~4 MB.
+    async function czytajAuftrag(nr, zStrony){
+        var html;
+        if (zStrony) html = document.documentElement.outerHTML;
+        else html = await (await pobierz('/auction.php?number=' + encodeURIComponent(nr) + '&txnid=3', null, 90000, 'strona auftragu ' + nr)).text();
+        var kk =(html.match(/\bconst\s+securityKey\s*=\s*["']([^"']+)["']/) || [])[1] || '';
+        var objId = (html.match(/\bconst\s+auction_Id\s*=\s*["'](\d+)["']/) || [])[1] || '';
+        if (!kk || !objId) throw new Error('strona auftragu ' + nr + ' bez danych faktury — sesja wygasła albo auftrag nie istnieje');
+        var txt = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+        return { nr: String(nr), kk: kk, objId: objId,
+                 fv: (txt.match(/Numer Faktury:\s*(\d+)/) || [])[1] || '',
+                 konto: ((txt.match(/Username seller\s+(.{3,70}?GmbH)/) || [])[1] || '').trim(),
+                 pliki: plikiAuftragu(html) };
+    }
+    async function wersjeZMaili(nr){
+        var r = await pobierz('/api/comments/emaillog?log_type=3&page_id=' + encodeURIComponent(nr) + '&order_dir=ASC&output=1',
+                              { headers: { accept: 'application/json' } }, 60000, 'protokół e-maili');
+        var j = await r.json(), out = [];
+        (j && j.email_log || []).forEach(function (e){
+            (e.docs || []).forEach(function (doc){
+                var m = String(doc.url || '').match(/attachment_id=(\d+)/), nazwa = String(doc.name || '');
+                if (!m || !/^faktura\b/i.test(nazwa) || /proforma|zaliczk|koryg/i.test(nazwa)) return;
+                out.push({ data: String(e.date || ''), szablon: String(e.template || ''), nazwa: nazwa, id: m[1] });
+            });
+        });
+        return out;
+    }
+    async function pdfZAdresu(url, opis){
+        var ab = await (await pobierz(url, null, 60000, opis)).arrayBuffer(), u = new Uint8Array(ab, 0, Math.min(5, ab.byteLength));
+        if (String.fromCharCode.apply(null, u) !== '%PDF-') throw new Error(opis + ': to nie jest PDF');
+        return ab;
+    }
+
+    // ---------- stan ----------
+    var KS = { f: null, fakt: null, A: null, edytuj: false, zaakc: false, pdf: null, podglad: null, zapis: null,
+               robie: '', blad: '', info: '', wejAuf: '', wejFv: '',
+               q: { poz: '-1', kw: '', poz2: '0', il: '1' } };   // pola „Szybkiej korekty” — przezywaja przerysowanie
+    (function (){ var m = String(location.search).match(/[?&]number=(\d+)/); if (/auction\.php/i.test(location.pathname) && m) KS.wejAuf = m[1]; })();
+
+    var szkicT = null;
+    function zapiszSzkic(){
+        clearTimeout(szkicT);
+        szkicT = setTimeout(function (){
+            try { gmSet(KOR_SZKIC, KS.f ? JSON.stringify({ ts: Date.now(), f: KS.f, fakt: KS.fakt, A: KS.A, edytuj: KS.edytuj }) : ''); } catch (e){}
+        }, 400);
+    }
+    function wczytajSzkic(){
+        try {
+            var o = JSON.parse(gmGet(KOR_SZKIC, '') || 'null');
+            if (o && o.f && Date.now() - o.ts < 7 * 864e5){
+                KS.f = o.f; KS.fakt = o.fakt || null; KS.A = o.A || null; KS.edytuj = !!o.edytuj;
+                KS.info = 'Przywróciłem szkic z ' + new Date(o.ts).toLocaleString('pl-PL') + ' (faktura ' + (o.f.fvNr || '—') + '). „Wyczyść” zaczyna od nowa.';
+            }
+        } catch (e){}
+    }
+    function zmiana(){ KS.zaakc = false; KS.pdf = null; KS.podglad = null; KS.zapis = null; zapiszSzkic(); }
+
+    // zachowaj = przelaczenie wersji faktury w tym samym auftragu: powod i tryb zostaja. Nowa faktura zaczyna od
+    // „netto" i pustego powodu — wybor z poprzedniej korekty nie przechodzi po cichu na nastepna.
+    function budujFormularz(F, A, zachowaj){
+        var st = (zachowaj && KS.f) || {}, dzis = isoDzis(), n = A ? nastepnyNumer(A.pliki, F.nr || A.fv) : 1, bz = (A && A.biezaca) || {};
+        KS.fakt = F;
+        KS.f = {
+            auftrag: A ? A.nr : (F.zamowienie || ''),
+            nr: (F.nr ? (F.nr + '/' + n) : ''),
+            dataWyst: dzis, miejsce: 'Baar', termin: isoPlus(dzis, 7), dataDost: dzis, forma: 'Przelew',
+            powod: st.powod || '', fvNr: F.nr || (A && A.fv) || '', fvData: F.data || '', waluta: F.waluta || bz.waluta || 'PLN',
+            sprzedawca: F.sprzedawca || bz.sprzedawca || '', nabywca: F.nabywca || bz.nabywca || '', odbiorca: F.odbiorca || bz.odbiorca || '',
+            tryb: st.tryb || 'netto', komentarz: null,
+            poz: (F.poz || []).map(function (p){
+                return { nazwa: p.nazwa,
+                         przed: { ilosc: p.ilosc, cenaN: p.cenaN, stawka: p.stawka, netto: p.netto, vat: p.vat, brutto: p.brutto },
+                         po: { ilosc: p.ilosc, cenaB: null, stawka: p.stawka, trzymaj: false } };
+            })
+        };
+        if (!KS.f.poz.length){ KS.f.poz.push(pustaPozycja()); KS.edytuj = true; }
+        zmiana();
+    }
+    function pustaPozycja(){
+        return { nazwa: '', przed: { ilosc: 1, cenaN: 0, stawka: 23, netto: 0, vat: 0, brutto: 0 },
+                 po: { ilosc: 1, cenaB: null, stawka: 23, trzymaj: false } };
+    }
+    function tekstKomentarza(f){ return (f.komentarz != null && String(f.komentarz).trim()) ? String(f.komentarz) : KOR_KOMENTARZ.replace('{nr}', f.nr || ''); }
+    function nazwaPliku(f){
+        var c = String(f.nr || 'korekta').split('/'), nr = c.length > 1 ? (c.slice(0, -1).join('-') + '-' + c[c.length - 1]) : c[0];
+        return ('Korekta_' + nr + '.pdf').replace(/[\\\/:*?"<>|\s]+/g, '_');
+    }
+
+    // ---------- liczenie ----------
+    // Pozycja „po korekcie" w groszach. Bez zmian (ta sama ilosc, cena i stawka) = dokladnie kwoty z faktury.
+    function liczPo(p){
+        var a = p.przed, b = p.po, q = +b.ilosc || 0, s = isFinite(+b.stawka) ? +b.stawka : 0, r = { ilosc: q, stawka: s };
+        if (!q){ r.netto = 0; r.vat = 0; r.brutto = 0; r.cenaN = 0; r.cenaB = 0; return r; }
+        if (b.trzymaj){
+            r.netto = a.ilosc ? zaokr(a.netto * q / a.ilosc) : 0;
+            r.vat = zaokr(r.netto * s / 100);
+            r.brutto = r.netto + r.vat;
+        } else {
+            if (b.cenaB == null || String(b.cenaB).trim() === '') r.brutto = (q === a.ilosc) ? a.brutto : (a.ilosc ? zaokr(a.brutto * q / a.ilosc) : 0);
+            else { var cb = liczba(b.cenaB); r.brutto = zaokr(q * (isFinite(cb) ? cb : 0) * 100); }
+            if (r.brutto === a.brutto && s === a.stawka && q === a.ilosc){ r.netto = a.netto; r.vat = a.vat; }
+            else { r.netto = zaokr(r.brutto / (1 + s / 100)); r.vat = r.brutto - r.netto; }
+        }
+        r.cenaN = zaokr(r.netto / q); r.cenaB = zaokr(r.brutto / q);
+        return r;
+    }
+    function wylicz(f){
+        var W = { poz: [], stawki: [], przed: { netto: 0, vat: 0, brutto: 0 }, po: { netto: 0, vat: 0, brutto: 0 }, razem: null }, ms = {};
+        function st(s){ var k = String(isFinite(+s) ? +s : 0); if (!ms[k]) ms[k] = { s: +k, przed: { netto: 0, vat: 0, brutto: 0 }, po: { netto: 0, vat: 0, brutto: 0 } }; return ms[k]; }
+        function dodaj(o, x){ o.netto += x.netto; o.vat += x.vat; o.brutto += x.brutto; }
+        f.poz.forEach(function (p){
+            var a = p.przed, cbA = a.ilosc ? zaokr(a.brutto / a.ilosc) : 0, cnA = (a.cenaN != null) ? a.cenaN : (a.ilosc ? zaokr(a.netto / a.ilosc) : 0);
+            var A = { ilosc: +a.ilosc || 0, cenaN: cnA, cenaB: cbA, stawka: +a.stawka || 0, netto: a.netto, vat: a.vat, brutto: a.brutto };
+            var P = liczPo(p);
+            var K = { ilosc: Math.round((P.ilosc - A.ilosc) * 1000) / 1000, cenaN: P.cenaN - A.cenaN, cenaB: P.cenaB - A.cenaB,
+                      netto: P.netto - A.netto, vat: P.vat - A.vat, brutto: P.brutto - A.brutto };
+            W.poz.push({ a: A, p: P, k: K });
+            dodaj(st(A.stawka).przed, A); dodaj(st(P.stawka).po, P); dodaj(W.przed, A); dodaj(W.po, P);
+        });
+        W.stawki = Object.keys(ms).map(function (k){ var o = ms[k]; o.kor = { netto: o.po.netto - o.przed.netto, vat: o.po.vat - o.przed.vat, brutto: o.po.brutto - o.przed.brutto }; return o; })
+            .filter(function (o){ return o.przed.brutto || o.po.brutto || o.przed.netto || o.po.netto; })
+            .sort(function (x, y){ return x.s - y.s; });
+        W.razem = { netto: W.po.netto - W.przed.netto, vat: W.po.vat - W.przed.vat, brutto: W.po.brutto - W.przed.brutto };
+        return W;
+    }
+    // Kontrola netto/brutto: [{ z: 'ok'|'uw'|'bl', t }]
+    function kontrola(f, W){
+        var k = [], zle = 0;
+        W.poz.forEach(function (x, i){
+            var a = x.a, nr = 'poz. ' + (i + 1);
+            if (a.netto + a.vat !== a.brutto){ k.push({ z: 'uw', t: nr + ' (faktura): netto ' + kw(a.netto) + ' + VAT ' + kw(a.vat) + ' ≠ brutto ' + kw(a.brutto) }); zle++; }
+            var vg = a.brutto - zaokr(a.brutto / (1 + a.stawka / 100)), vn = zaokr(a.netto * a.stawka / 100);
+            if (Math.abs(a.vat - vg) > 1 && Math.abs(a.vat - vn) > 1){ k.push({ z: 'uw', t: nr + ' (faktura): VAT ' + kw(a.vat) + ' nie wynika ze stawki ' + stTxt(a.stawka) + ' (od brutto wychodzi ' + kw(vg) + ', od netto ' + kw(vn) + ')' }); zle++; }
+            if (a.ilosc && Math.abs(zaokr(a.cenaN * a.ilosc) - a.netto) > Math.max(1, Math.abs(a.ilosc))){ k.push({ z: 'uw', t: nr + ' (faktura): cena netto ' + kw(a.cenaN) + ' × ' + il(a.ilosc) + ' ≠ wartość netto ' + kw(a.netto) }); zle++; }
+            if (x.p.netto + x.p.vat !== x.p.brutto) k.push({ z: 'bl', t: nr + ' (po korekcie): netto + VAT ≠ brutto — błąd liczenia, zgłoś' });
+        });
+        if (!zle && W.poz.length) k.push({ z: 'ok', t: 'pozycje faktury: netto + VAT = brutto i VAT zgodny ze stawką w każdej pozycji' });
+        var F = KS.fakt;
+        if (F && F.sumy && F.sumy.brutto != null && !KS.edytuj){
+            var s = W.przed, dob = (F.sumy.netto == null || F.sumy.netto === s.netto) && (F.sumy.vat == null || F.sumy.vat === s.vat) && F.sumy.brutto === s.brutto;
+            k.push(dob ? { z: 'ok', t: 'sumy faktury (netto ' + kw(F.sumy.netto) + ', VAT ' + kw(F.sumy.vat) + ', brutto ' + kw(F.sumy.brutto) + ') = sumy pozycji' }
+                       : { z: 'uw', t: 'sumy na fakturze (netto ' + kw(F.sumy.netto) + ', VAT ' + kw(F.sumy.vat) + ', brutto ' + kw(F.sumy.brutto) + ') ≠ sumy pozycji (' + kw(s.netto) + ' / ' + kw(s.vat) + ' / ' + kw(s.brutto) + ') — sprawdź, czy wszystkie pozycje się wczytały' });
+        }
+        W.stawki.forEach(function (o){
+            ['przed', 'po'].forEach(function (kt){
+                var x = o[kt]; if (!x.netto || !o.s) return;
+                var zSumy = zaokr(x.netto * o.s / 100);
+                if (Math.abs(zSumy - x.vat) > 1) k.push({ z: 'uw', t: 'stawka ' + stTxt(o.s) + ' (' + (kt === 'przed' ? 'przed korektą' : 'po korekcie') + '): VAT z pozycji ' + kw(x.vat) + ', od sumy netto byłoby ' + kw(zSumy) + ' — różnica zaokrągleń większa niż 1 grosz' });
+            });
+        });
+        var bz = KS.A && KS.A.biezaca;
+        if (bz && bz.poz && bz.poz.length){
+            var sb = sumyPoz(bz.poz);
+            bz.poz.forEach(function (p, i){
+                if (p.netto + p.vat !== p.brutto || (Math.abs(p.vat - (p.brutto - zaokr(p.brutto / (1 + p.stawka / 100)))) > 1 && Math.abs(p.vat - zaokr(p.netto * p.stawka / 100)) > 1))
+                    k.push({ z: 'uw', t: 'stan bieżący auftragu, poz. ' + (i + 1) + ': prologistics liczy niespójnie (netto ' + kw(p.netto) + ', VAT ' + kw(p.vat) + ' przy ' + stTxt(p.stawka) + ', brutto ' + kw(p.brutto) + ')' });
+            });
+            k.push(sb.brutto === W.po.brutto && sb.vat === W.po.vat
+                ? { z: 'ok', t: 'po korekcie = stan bieżący auftragu (brutto ' + kw(sb.brutto) + ', VAT ' + kw(sb.vat) + ')' }
+                : { z: 'uw', t: 'po korekcie (brutto ' + kw(W.po.brutto) + ', VAT ' + kw(W.po.vat) + ') ≠ stan bieżący auftragu (brutto ' + kw(sb.brutto) + ', VAT ' + kw(sb.vat) + ') — zgadza się tylko wtedy, gdy auftrag już poprawiono' });
+        }
+        if (!W.razem.brutto && !W.razem.vat && !W.razem.netto) k.push({ z: 'uw', t: 'korekta nie zmienia żadnej kwoty' });
+        return k;
+    }
+    function walidacja(f){
+        var b = [];
+        if (!String(f.nr).trim()) b.push('numer korekty');
+        if (!String(f.fvNr).trim() || !String(f.fvData).trim()) b.push('numer i data faktury korygowanej');
+        if (!String(f.powod).trim()) b.push('powód korekty');
+        if (!String(f.sprzedawca).trim() || !String(f.nabywca).trim()) b.push('sprzedawca i nabywca');
+        if (!f.dataWyst) b.push('data wystawienia');
+        if (!f.poz.length) b.push('co najmniej jedna pozycja');
+        f.poz.forEach(function (p, i){ if (!String(p.nazwa).trim()) b.push('nazwa pozycji ' + (i + 1)); });
+        return b.length ? ('Uzupełnij: ' + b.join(', ')) : '';
+    }
+
+    // ---------- przebiegi ----------
+    // otw = { nr, strona } z otwartyAuftrag(): bez pol „Auftrag / nr faktury”, a na stronie auftragu czytamy ja sama.
+    async function zAuftragu(otw){
+        var auf = otw ? otw.nr : String(KS.wejAuf || '').trim(), fv = otw ? '' : String(KS.wejFv || '').trim();
+        if (KS.f && KS.f.poz && KS.f.poz.length && !confirm('Wczytać dane z auftragu' + (otw ? ' ' + auf : '') + '? Bieżący formularz zostanie zastąpiony.')) return;
+        KS.blad = ''; KS.info = '';
+        if (otw){ KS.wejAuf = auf; KS.wejFv = ''; }
+        log('Dane z ' + (otw ? 'otwartego ' : '') + 'auftragu: auftrag ' + (auf || '—') + ', faktura ' + (fv || '—'), 'start');
+        try {
+            if (!auf && fv){ stan('szukam auftragu z fakturą ' + fv); auf = await auftragPoFakturze(fv); KS.wejAuf = auf; }
+            if (!/^\d{4,}$/.test(auf)) throw new Error('wpisz numer auftragu albo numer faktury');
+            var zStrony = !!(otw && otw.strona);
+            stan(zStrony ? 'czytam otwarty auftrag ' + auf : 'czytam auftrag ' + auf + ' (duża strona — kilka sekund)');
+            var A = await czytajAuftrag(auf, zStrony);
+            if (A.konto && !/\(PL\)/.test(A.konto)) KS.info = 'Auftrag sprzedaje „' + A.konto + '” — wzór korekty jest polski (Beliani PL). Sprawdź dane.';
+            stan('protokół e-maili');
+            var wersje = await wersjeZMaili(auf), fvNr = fv || A.fv;
+            if (fvNr){ var tylko = wersje.filter(function (w){ return w.nazwa.indexOf(fvNr) >= 0; }); if (tylko.length) wersje = tylko; }
+            for (var i = 0; i < wersje.length; i++){
+                stan('czytam fakturę wysłaną ' + wersje[i].data + ' (' + (i + 1) + '/' + wersje.length + ')');
+                try { wersje[i].fakt = fakturaZPdf(await czytajPdf(await pdfZAdresu('/doc.php?attachment_id=' + wersje[i].id, 'faktura z maila'))); }
+                catch (e){ wersje[i].blad = e.message; log('⚠ faktura wysłana ' + wersje[i].data + ': ' + e.message); }
+            }
+            var baza = '/static_invoice_HTML.php?number=' + encodeURIComponent(auf) + '&txnid=3&kk=' + encodeURIComponent(A.kk);
+            var nieczyt = wersje.filter(function (w){ return !w.fakt; }).length;
+            if (nieczyt) KS.info = (KS.info ? KS.info + ' ' : '') + 'Nie odczytałem ' + nieczyt + ' z ' + wersje.length + ' wysłanych faktur (szczegóły w logu).';
+            wersje = wersje.filter(function (w){ return w.fakt; });
+            if (!wersje.length){
+                stan('w protokole e-maili nie ma faktury — czytam fakturę statyczną');
+                var Fs = fakturaZPdf(await czytajPdf(await pdfZAdresu(baza + '&shipping_list=0&static=static&show=1', 'faktura statyczna')));
+                wersje = [{ data: '—', szablon: 'faktura statyczna z auftragu (bieżąca — prologistics mógł ją nadpisać)', nazwa: '', id: '', fakt: Fs }];
+                KS.info = (KS.info ? KS.info + ' ' : '') + 'Klient nie dostał faktury mailem (brak w protokole) — wczytałem fakturę statyczną, która po zmianach auftragu bywa przeliczona. Porównaj z tym, co klient ma, albo wgraj jego PDF.';
+            }
+            stan('stan bieżący auftragu');
+            try { A.biezaca = fakturaZHtml(await (await pobierz(baza + '&shipping_list=0&static=', null, 60000, 'faktura bieżąca')).text()); }
+            catch (e){ A.biezaca = null; log('⚠ stan bieżący: ' + e.message); }
+            A.wersje = wersje; A.wyb = wersje.length - 1;
+            KS.A = A; KS.edytuj = false;
+            budujFormularz(wersje[A.wyb].fakt, A);
+            log('wczytane: auftrag ' + auf + ', FV ' + (KS.f.fvNr || '?') + ', wersji wysłanych ' + wersje.length + ', pozycji ' + KS.f.poz.length + ', korekta nr ' + KS.f.nr, 'koniec');
+        } catch (e){
+            KS.blad = (e && e.message) || String(e);
+            log('✖ ' + KS.blad, 'koniec');
+        }
+        KS.robie = ''; rysuj();
+    }
+    async function zPliku(file){
+        if (!file) return;
+        if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf'){ KS.blad = 'to nie jest PDF: ' + file.name; rysuj(); return; }
+        KS.blad = ''; KS.info = ''; stan('czytam ' + file.name);
+        log('PDF faktury z pliku (' + file.size + ' B)', 'start');
+        try {
+            var F = fakturaZPdf(await czytajPdf(await file.arrayBuffer()));
+            KS.A = null; KS.edytuj = false;
+            budujFormularz(F, null);
+            if (F.zamowienie) KS.wejAuf = F.zamowienie;
+            if (F.uwagi.length) KS.info = F.uwagi.join(' · ');
+            log('odczyt z pliku: FV ' + (F.nr || '?') + ', pozycji ' + F.poz.length, 'koniec');
+        } catch (e){ KS.blad = (e && e.message) || String(e); log('✖ ' + KS.blad, 'koniec'); }
+        KS.robie = ''; rysuj();
+    }
+    function stan(t){ KS.robie = t; rysuj(); }
+
+    // ---------- PDF korekty: rysunek strony ----------
+    var KOR_DPI = 200, KOR_PXMM = KOR_DPI / 25.4, KOR_WPX = Math.round(210 * KOR_PXMM), KOR_HPX = Math.round(297 * KOR_PXMM);
+    var KOR_FONT = 'Arial, Helvetica, sans-serif';
+    var logoCache = null;
+    async function wczytajLogo(){
+        if (logoCache) return logoCache;
+        try {
+            var blob = await (await pobierz(KOR_LOGO, null, 20000, 'logo')).blob();
+            logoCache = (typeof createImageBitmap === 'function') ? await createImageBitmap(blob) : await new Promise(function (ok, zle){
+                var im = new Image(); im.onload = function (){ ok(im); }; im.onerror = zle; im.src = URL.createObjectURL(blob);
+            });
+        } catch (e){ logoCache = null; log('logo: ' + e.message + ' — piszę nazwę tekstem'); }
+        return logoCache;
+    }
+    function rysujStrony(f, W, logo){
+        var strony = [], ctx = null, y = 0, L0 = 15, R0 = 195, DOL = 279;
+        function M(v){ return v * KOR_PXMM; }
+        function font(p, b, i){ ctx.font = (i ? 'italic ' : '') + (b ? 'bold ' : '') + (p * KOR_DPI / 72).toFixed(1) + 'px ' + KOR_FONT; }
+        function tekst(t, x, yy, wyr){ ctx.textAlign = wyr || 'left'; ctx.fillText(String(t == null ? '' : t), M(x), M(yy)); }
+        function szer(t){ return ctx.measureText(String(t)).width / KOR_PXMM; }
+        function kreska(x1, y1, x2, y2, kropki, grub, kolor){
+            ctx.save(); ctx.strokeStyle = kolor || '#777'; ctx.lineWidth = M(grub || 0.18);
+            if (kropki) ctx.setLineDash([M(0.35), M(0.55)]);
+            ctx.beginPath(); ctx.moveTo(M(x1), M(y1)); ctx.lineTo(M(x2), M(y2)); ctx.stroke(); ctx.restore();
+        }
+        function tlo(x, yy, w, h, kolor){ ctx.save(); ctx.fillStyle = kolor || '#d9d9d9'; ctx.fillRect(M(x), M(yy), M(w), M(h)); ctx.restore(); }
+        function ramka(x, yy, w, h){ kreska(x, yy, x + w, yy, 1); kreska(x, yy + h, x + w, yy + h, 1); kreska(x, yy, x, yy + h, 1); kreska(x + w, yy, x + w, yy + h, 1); }
+        function zawin(t, w){
+            var out = [];
+            String(t == null ? '' : t).split('\n').forEach(function (akap){
+                var slowa = akap.split(/\s+/).filter(Boolean), cur = '';
+                slowa.forEach(function (s){
+                    var pr = cur ? cur + ' ' + s : s;
+                    if (szer(pr) <= w || !cur) cur = pr; else { out.push(cur); cur = s; }
+                    while (szer(cur) > w && cur.length > 1){
+                        var k = cur.length - 1; while (k > 1 && szer(cur.slice(0, k)) > w) k--;
+                        out.push(cur.slice(0, k)); cur = cur.slice(k);
+                    }
+                });
+                if (cur) out.push(cur);
+            });
+            return out;
+        }
+        function nowaStrona(){
+            var c = document.createElement('canvas'); c.width = KOR_WPX; c.height = KOR_HPX;
+            ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, KOR_WPX, KOR_HPX);
+            ctx.fillStyle = '#000'; ctx.textBaseline = 'alphabetic'; strony.push(c); y = 15;
+        }
+        // --- glowka (strona 1) ---
+        nowaStrona();
+        if (logo){ try { ctx.drawImage(logo, M(L0), M(10), M(46), M(46 * 77 / 288)); } catch (e){ logo = null; } }
+        if (!logo){ ctx.fillStyle = '#FF2F00'; font(26, true); tekst('Beliani', L0, 21); ctx.fillStyle = '#000'; }
+        kreska(L0, 29, R0, 29, 1);
+        font(13, true); tekst('FAKTURA KORYGUJĄCA', L0, 36.5); tekst('Nr: ' + f.nr, R0, 36.5, 'right');
+        kreska(L0, 40, R0, 40, 1);
+        font(9); tekst('Faktura korygowana:', L0, 47); font(9, true); tekst(f.fvNr + ' z dnia ' + f.fvData, L0 + 34, 47);
+        font(9); tekst('Powód korekty:', L0, 52.5); font(9, true);
+        var pl = zawin(f.powod, R0 - L0 - 34); pl.forEach(function (t, i){ tekst(t, L0 + 34, 52.5 + i * 4); });
+        y = 52.5 + (pl.length - 1) * 4 + 5;
+        // strony dokumentu
+        var bw = (R0 - L0 - 8) / 3, bloki = [['SPRZEDAWCA', f.sprzedawca], ['NABYWCA', f.nabywca], ['ODBIORCA', f.odbiorca]], maxL = 0;
+        font(8.5, true);
+        bloki.forEach(function (b){ b.push(zawin(b[1], bw - 5)); maxL = Math.max(maxL, b[2].length); });
+        var bh = Math.max(30, 7 + 4 + maxL * 3.8 + 2);
+        bloki.forEach(function (b, i){
+            var x = L0 + i * (bw + 4);
+            tlo(x, y, bw, 6.5); ramka(x, y, bw, bh); kreska(x, y + 6.5, x + bw, y + 6.5, 1);
+            font(8.5, true); tekst(b[0], x + bw / 2, y + 4.6, 'center');
+            b[2].forEach(function (t, k){ tekst(t, x + 2.5, y + 6.5 + 5 + k * 3.8); });
+        });
+        y += bh + 6;
+        function para(lab, wart, x, yy, prawo){
+            font(9);
+            if (prawo){ font(9, true); var sw = szer(wart); tekst(wart, R0, yy, 'right'); font(9); tekst(lab, R0 - sw - 2, yy, 'right'); }
+            else { tekst(lab, x, yy); var lw = szer(lab); font(9, true); tekst(wart, x + lw + 2, yy); }
+        }
+        para('Miejsce wystawienia:', f.miejsce, L0, y); para('Data wystawienia:', dataDok(f.dataWyst), 0, y, true); y += 5.5;
+        para('Termin płatności:', dataDok(f.termin), L0, y); para('Data zakończenia dostawy/usługi:', dataDok(f.dataDost), 0, y, true); y += 5.5;
+        para('Forma płatności:', f.forma, L0, y); y += 4;
+        // --- tabela pozycji ---
+        var KOL = [['lp', 8, 'Lp.'], ['na', 64, 'Towar / Usługa'], ['il', 13, 'Ilość'], ['cn', 18, 'Cena|netto'], ['st', 11, 'VAT'],
+                   ['cb', 18, 'Cena|brutto'], ['wn', 23, 'Wartość|netto'], ['wb', 25, 'Wartość|brutto']], X = {}, xx = L0;
+        KOL.forEach(function (k){ X[k[0]] = { x: xx, w: k[1] }; xx += k[1]; });
+        function pionowe(y1, y2){ KOL.forEach(function (k, i){ if (i) kreska(X[k[0]].x, y1, X[k[0]].x, y2, 1); }); kreska(L0, y1, L0, y2, 1); kreska(R0, y1, R0, y2, 1); }
+        function glowkaTabeli(){
+            tlo(L0, y, R0 - L0, 8.5); kreska(L0, y, R0, y, 1); kreska(L0, y + 8.5, R0, y + 8.5, 1); pionowe(y, y + 8.5);
+            font(7.5);
+            KOL.forEach(function (k){
+                var t = k[2].split('|'), c = X[k[0]];
+                t.forEach(function (s, i){ tekst(s, c.x + c.w / 2, y + (t.length === 1 ? 5.4 : 3.7 + i * 3.2), 'center'); });
+            });
+            y += 8.5;
+        }
+        function liczbyWiersza(yy, v, rozm, gruby){
+            font(rozm || 8, gruby);
+            ['il', 'cn', 'cb', 'wn', 'wb'].forEach(function (k){ if (v[k] != null) tekst(v[k], X[k].x + X[k].w - 1.5, yy, 'right'); });
+            if (v.st) tekst(v.st, X.st.x + X.st.w / 2, yy, 'center');
+        }
+        y += 2; glowkaTabeli();
+        W.poz.forEach(function (x, i){
+            var p = f.poz[i];
+            font(8); var nl = zawin(p.nazwa, X.na.w - 3); if (nl.length > 8) nl = nl.slice(0, 8);
+            var h1 = Math.max(5.4, nl.length * 3.5 + 2), h2 = 4.6, hh = h1 + 2 * h2;
+            if (y + hh > DOL){ nowaStrona(); glowkaTabeli(); }
+            var y0 = y;
+            font(8); tekst(String(i + 1), X.lp.x + X.lp.w / 2, y0 + 3.9, 'center');
+            nl.forEach(function (t, k){ tekst(t, X.na.x + 1.5, y0 + 3.9 + k * 3.5); });
+            liczbyWiersza(y0 + 3.9, { il: il(x.a.ilosc), cn: kw(x.a.cenaN), st: stTxt(x.a.stawka), cb: kw(x.a.cenaB), wn: kw(x.a.netto), wb: kw(x.a.brutto) });
+            kreska(X.na.x + 2, y0 + h1, R0, y0 + h1, 1, 0.12, '#aaa');
+            font(7, false, true); ctx.fillStyle = '#333'; tekst('korekta', X.il.x - 2, y0 + h1 + 3.3, 'right');
+            liczbyWiersza(y0 + h1 + 3.3, { il: il(x.k.ilosc), cn: kw(x.k.cenaN), cb: kw(x.k.cenaB), wn: kw(x.k.netto), wb: kw(x.k.brutto) }, 7.5);
+            kreska(X.na.x + 2, y0 + h1 + h2, R0, y0 + h1 + h2, 1, 0.12, '#aaa');
+            font(7, false, true); tekst('po korekcie', X.il.x - 2, y0 + h1 + h2 + 3.3, 'right'); ctx.fillStyle = '#000';
+            liczbyWiersza(y0 + h1 + h2 + 3.3, { il: il(x.p.ilosc), cn: kw(x.p.cenaN), st: stTxt(x.p.stawka), cb: kw(x.p.cenaB), wn: kw(x.p.netto), wb: kw(x.p.brutto) });
+            pionowe(y0, y0 + hh); kreska(L0, y0 + hh, R0, y0 + hh, 1, 0.22, '#555');
+            y += hh;
+        });
+        // --- podsumowanie ---
+        var wl = f.waluta || 'PLN', roz = W.razem.brutto;
+        var potrz = 9 + 5 + (2 + W.stawki.length * 3 + 1) * 5 + 22;
+        if (y + potrz > 287){ nowaStrona(); }
+        y += 5.5;
+        font(9);
+        var sl = zawin((roz < 0 ? 'Razem do zwrotu: ' : (roz > 0 ? 'Razem do zapłaty: ' : 'Razem: ')) + slownie(roz) + ' ' + wl, R0 - L0);
+        sl.forEach(function (t, i){ tekst(t, L0, y + i * 4); });
+        y += (sl.length - 1) * 4 + 5;
+        var TK = [['l', 30], ['n', 22], ['s', 18], ['v', 20], ['b', 22]], TX = {}, tx = R0 - 112;
+        TK.forEach(function (k){ TX[k[0]] = { x: tx, w: k[1] }; tx += k[1]; });
+        var t0 = TX.n.x, rh = 5;
+        tlo(t0, y, R0 - t0, rh); ramka(t0, y, R0 - t0, rh);
+        font(8, true); tekst('SUMA WEDŁUG STAWEK VAT w ' + wl, (t0 + R0) / 2, y + 3.5, 'center'); y += rh;
+        tlo(t0, y, R0 - t0, rh); ramka(t0, y, R0 - t0, rh);
+        font(7.5); [['n', 'Netto'], ['s', 'Stawka VAT'], ['v', 'Kwota VAT'], ['b', 'Brutto']].forEach(function (k){ tekst(k[1], TX[k[0]].x + TX[k[0]].w / 2, y + 3.5, 'center'); });
+        y += rh;
+        function wierszSumy(lab, o, stawka, gruby){
+            font(7.5, gruby, !gruby); tekst(lab, TX.l.x + TX.l.w - 2, y + 3.5, 'right');
+            font(8, gruby);
+            tekst(kw(o.netto), TX.n.x + TX.n.w - 1.5, y + 3.5, 'right'); tekst(kw(o.vat), TX.v.x + TX.v.w - 1.5, y + 3.5, 'right'); tekst(kw(o.brutto), TX.b.x + TX.b.w - 1.5, y + 3.5, 'right');
+            if (stawka) tekst(stawka, TX.s.x + TX.s.w / 2, y + 3.5, 'center');
+            kreska(t0, y + rh, R0, y + rh, 1, 0.12, '#999');
+            ['n', 's', 'v', 'b'].forEach(function (k){ kreska(TX[k].x, y, TX[k].x, y + rh, 1, 0.12, '#999'); }); kreska(R0, y, R0, y + rh, 1, 0.12, '#999');
+            y += rh;
+        }
+        W.stawki.forEach(function (o){
+            wierszSumy('przed korektą', o.przed); wierszSumy('korekta', o.kor, stTxt(o.s)); wierszSumy('po korekcie', o.po);
+            kreska(t0, y, R0, y, 1, 0.22, '#555');
+        });
+        wierszSumy('Razem:', W.razem, '', true);
+        y += 5;
+        var bx = R0 - 80;
+        tlo(bx, y, 80, 6.5); ramka(bx, y, 80, 15.5); kreska(bx, y + 6.5, R0, y + 6.5, 1); kreska(bx + 55, y, bx + 55, y + 15.5, 1);
+        font(8.5, true); tekst(roz < 0 ? 'RÓŻNICA DO ZWROTU' : (roz > 0 ? 'RÓŻNICA DO ZAPŁATY' : 'RÓŻNICA'), bx + 27.5, y + 4.6, 'center'); tekst('WALUTA', bx + 67.5, y + 4.6, 'center');
+        font(14, true); tekst(kw(Math.abs(roz)), bx + 27.5, y + 13.3, 'center'); tekst(wl, bx + 67.5, y + 13.3, 'center');
+        y += 15.5;
+        // podpisy
+        var yp = Math.max(y + 22, 268);
+        if (yp > 286){ nowaStrona(); yp = 40; }
+        kreska(L0, yp, L0 + 65, yp, 1, 0.2, '#555'); kreska(R0 - 65, yp, R0, yp, 1, 0.2, '#555');
+        font(8); tekst('wystawił', L0 + 32.5, yp + 4, 'center'); tekst('odebrał', R0 - 32.5, yp + 4, 'center');
+        // stopki
+        strony.forEach(function (c, i){
+            ctx = c.getContext('2d'); ctx.fillStyle = '#444'; font(8); tekst('Strona ' + (i + 1) + '/' + strony.length, 105, 291, 'center');
+        });
+        return strony;
+    }
+    function pdfLibGet(){
+        var l = null;
+        try { if (typeof PDFLib !== 'undefined') l = PDFLib; } catch (e){}
+        if (!l){ try { l = window.PDFLib; } catch (e){} }
+        if (!l){ try { if (typeof unsafeWindow !== 'undefined') l = unsafeWindow.PDFLib; } catch (e){} }
+        return l;
+    }
+    function dataUrlNaBajty(u){
+        var b = atob(String(u).split(',')[1] || ''), out = new Uint8Array(b.length);
+        for (var i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+        return out;
+    }
+    async function zrobPdf(jpegi, tytul){
+        var Lb = pdfLibGet();
+        if (!Lb || !Lb.PDFDocument) throw new Error('brak biblioteki pdf-lib — odśwież stronę');
+        var doc = await Lb.PDFDocument.create();
+        try { doc.setTitle(tytul); doc.setAuthor('Beliani'); doc.setCreator('HUB — Korekty faktur'); doc.setProducer('HUB'); } catch (e){}
+        for (var i = 0; i < jpegi.length; i++){
+            var img = await doc.embedJpg(dataUrlNaBajty(jpegi[i])), pg = doc.addPage([595.28, 841.89]);
+            pg.drawImage(img, { x: 0, y: 0, width: 595.28, height: 841.89 });
+        }
+        return await doc.save();
+    }
+
+    async function akceptuj(){
+        var f = KS.f; if (!f) return;
+        var bl = walidacja(f);
+        if (bl){ KS.blad = bl; rysuj(); return; }
+        var W = wylicz(f);
+        if (!W.razem.brutto && !W.razem.vat && !W.razem.netto && !confirm('Korekta nie zmienia żadnej kwoty. Wygenerować PDF mimo to?')) return;
+        KS.blad = ''; stan('rysuję PDF korekty');
+        try {
+            var logo = await wczytajLogo(), strony = rysujStrony(f, W, logo);
+            KS.podglad = strony.map(function (c){ return c.toDataURL('image/jpeg', 0.9); });
+            KS.pdf = await zrobPdf(KS.podglad, 'Faktura korygująca ' + f.nr);
+            KS.zaakc = true; KS.zapis = null;
+            log('zaakceptowana korekta ' + f.nr + ' do FV ' + f.fvNr + ': pozycji ' + W.poz.length + ', różnica brutto ' + kw(W.razem.brutto) + ' ' + f.waluta + ', VAT ' + kw(W.razem.vat) + ', stron ' + strony.length + ', ' + KS.pdf.length + ' B');
+        } catch (e){ KS.blad = 'PDF: ' + ((e && e.message) || e); log('✖ ' + KS.blad); }
+        KS.robie = ''; rysuj();
+    }
+    function pobierzPdf(){
+        if (!KS.pdf) return;
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([KS.pdf], { type: 'application/pdf' }));
+        a.download = nazwaPliku(KS.f);
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function (){ URL.revokeObjectURL(a.href); }, 4000);
+    }
+
+    // ---------- zapis w auftragu ----------
+    // Formularz wgrywania czytamy ze strony (jak Zwroty). Obserwacja 25.11.2026: osobny <form method=post
+    // enctype=multipart action=""> z jednym polem newpicfn[] — bez innych pol. Gdyby plik stal w formularzu
+    // z dziesiatkami pol (zapis calego auftragu), NIE wysylamy.
+    function formularzPliku(html, url){
+        var d = new DOMParser().parseFromString(html, 'text/html');
+        var plik = d.querySelector('input[type="file"][name="newpicfn[]"]') || d.querySelector('input[type="file"][name]');
+        if (!plik) throw new Error('na stronie auftragu nie ma pola wgrywania dokumentów — formularz się zmienił');
+        var fo = plik.closest('form');
+        if (!fo) throw new Error('pole pliku nie stoi w żadnym formularzu');
+        var pola = [];
+        fo.querySelectorAll('input, select, textarea').forEach(function (el){
+            var n = el.getAttribute('name'); if (!n) return;
+            var t = String(el.getAttribute('type') || '').toLowerCase();
+            if (t === 'file' || t === 'button' || t === 'image' || t === 'reset' || t === 'submit') return;
+            if ((t === 'checkbox' || t === 'radio') && !el.checked) return;
+            pola.push([n, el.value == null ? '' : String(el.value)]);
+        });
+        var guz = fo.querySelector('button[type="submit"][name], input[type="submit"][name], button:not([type])[name]');
+        if (guz) pola.push([guz.getAttribute('name'), String(guz.value || '')]);
+        if (pola.length > 8) throw new Error('formularz wgrywania ma ' + pola.length + ' pól (25.11 miał 0) — nie wysyłam, żeby nie zapisać całego auftragu');
+        var akcja = fo.getAttribute('action');
+        if (akcja == null || akcja === '') akcja = url;
+        else if (!/^https?:/i.test(akcja) && akcja.charAt(0) !== '/') akcja = '/' + akcja.replace(/^\.?\//, '');
+        return { akcja: akcja, pole: plik.getAttribute('name'), pola: pola };
+    }
+    async function dopiszKomentarz(objId, tekst){
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var r = await pobierz('/js_backend.php', { method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', 'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: 'fn=addComment&text=' + enc(tekst) + '&obj=auction&src=&obj_id=' + enc(objId) }, 60000, 'komentarz');
+        return r.text();
+    }
+    async function dodajKorekte(){
+        var f = KS.f;
+        if (!f) return;
+        if (!KS.zaakc || !KS.pdf){ KS.blad = 'formularz zmienił się po akceptacji — kliknij „Akceptuj” jeszcze raz'; rysuj(); return; }
+        var auf = String(f.auftrag || '').trim();
+        if (!/^\d{4,}$/.test(auf)){ KS.blad = 'wpisz numer auftragu, do którego dodać korektę'; rysuj(); return; }
+        var nazwa = nazwaPliku(f), klucz = auf + '|' + f.nr, rej = jGet(KOR_DODANE), kom = tekstKomentarza(f);
+        if (rej[klucz] && !confirm('Korekta ' + f.nr + ' była już dodawana do auftragu ' + auf + ' (' + new Date(rej[klucz].ts).toLocaleString('pl-PL')
+                                   + (rej[klucz].potw ? '' : ', zapis niepotwierdzony') + ').\nNajpierw sprawdź auftrag. Dodać mimo to?')) return;
+        if (!confirm('Wgrać „' + nazwa + '” do auftragu ' + auf + ' i dopisać komentarz?\n\n' + kom)) return;
+        KS.blad = ''; KS.zapis = null; stan('dodaję korektę do auftragu ' + auf);
+        log('Dodaj korektę ' + f.nr + ' → auftrag ' + auf + ' (' + nazwa + ', ' + KS.pdf.length + ' B)', 'start');
+        var etap = 'strona auftragu';
+        try {
+            var url = '/auction.php?number=' + encodeURIComponent(auf) + '&txnid=3';
+            var html = await (await pobierz(url, null, 90000, 'strona auftragu ' + auf)).text();
+            var objId = (html.match(/\bconst\s+auction_Id\s*=\s*["'](\d+)["']/) || [])[1] || '';
+            var pliki = plikiAuftragu(html);
+            if (pliki.indexOf(nazwa) >= 0) throw new Error('w auftragu ' + auf + ' już leży plik „' + nazwa + '” — nic nie wgrałem. Jeśli to nowa korekta, zmień jej numer');
+            var nast = nastepnyNumer(pliki, f.fvNr), moj = +(String(f.nr).split('/').pop() || 0);
+            if (f.fvNr && moj && moj < nast) throw new Error('w auftragu są już korekty do ' + f.fvNr + '/' + (nast - 1) + ' — ta powinna mieć numer ' + f.fvNr + '/' + nast + '. Popraw numer i zaakceptuj ponownie');
+            var fo = formularzPliku(html, url);
+            html = null;
+            etap = 'wysyłka pliku';
+            var fd = new FormData();
+            fo.pola.forEach(function (p){ fd.append(p[0], p[1]); });
+            fd.append(fo.pole, new File([KS.pdf], nazwa, { type: 'application/pdf' }), nazwa);
+            log('POST ' + String(fo.akcja).split('?')[0] + ', pole ' + fo.pole + ', pól ' + fo.pola.length);
+            var poHtml = await (await pobierz(fo.akcja, { method: 'POST', body: fd }, 180000, 'wysyłka pliku')).text();
+            etap = 'kontrola';
+            var widac = plikiAuftragu(poHtml).indexOf(nazwa) >= 0;
+            if (!widac){ poHtml = await (await pobierz(url, null, 90000, 'kontrola auftragu')).text(); widac = plikiAuftragu(poHtml).indexOf(nazwa) >= 0; }
+            poHtml = null;
+            rej[klucz] = { ts: Date.now(), plik: nazwa, potw: widac }; jSet(KOR_DODANE, rej);
+            if (!widac){
+                KS.zapis = { ok: false, t: 'Plik wysłany, ale na stronie auftragu ' + auf + ' go nie widzę. NIE dodawaj drugi raz — otwórz auftrag i sprawdź „Attached documents”. Komentarza nie dopisałem.' };
+                log('⚠ plik niewidoczny po wysyłce — komentarz wstrzymany', 'koniec');
+                return;
+            }
+            etap = 'komentarz';
+            if (!objId) throw new Error('plik wgrany, ale nie znam identyfikatora komentarzy auftragu — dopisz komentarz ręcznie');
+            await dopiszKomentarz(objId, kom);
+            KS.zapis = { ok: true, t: '✔ „' + nazwa + '” wgrany do auftragu ' + auf + ' i komentarz dopisany.' };
+            log('✔ wgrany ' + nazwa + ', komentarz dopisany', 'koniec');
+        } catch (e){
+            var t = (e && e.message) || String(e);
+            if (etap === 'wysyłka pliku'){
+                t += ' — plik MÓGŁ dojść: sprawdź auftrag, zanim spróbujesz znowu';
+                rej[klucz] = { ts: Date.now(), plik: nazwa, potw: false }; jSet(KOR_DODANE, rej);
+            }
+            KS.zapis = { ok: false, t: '✖ ' + t };
+            log('✖ ' + etap + ': ' + t, 'koniec');
+        } finally { KS.robie = ''; rysuj(); }
+    }
+
+    // ---------- ekran ----------
+    var btn = document.createElement('button');
+    btn.id = 'kor-btn';
+    btn.textContent = '🧾 Korekty';
+    btn.style.cssText = 'position:fixed;top:430px;right:20px;z-index:999999;padding:10px 15px;background:#FF2F00;color:#fff;'
+                      + 'border:none;border-radius:8px;cursor:pointer;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.2)';
+    var panel = document.createElement('div');
+    panel.id = 'kor-panel';
+    panel.style.cssText = 'display:none;position:fixed;top:120px;right:20px;z-index:999999;background:white;border:1px solid #ccc;'
+                        + 'border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:16px;width:min(1180px, calc(100vw - 40px));'
+                        + 'font-family:sans-serif;font-size:12px;max-height:calc(100vh - 140px);overflow-y:auto';
+    // Tresc w osobnym pojemniku: krzyzyk launchera (ensureClosers) nie znika przy przerysowaniu.
+    var tresc = document.createElement('div');
+    tresc.id = 'kor-tresc';
+    panel.appendChild(tresc);
+    (document.body || document.documentElement).appendChild(btn);
+    (document.body || document.documentElement).appendChild(panel);
+    var pierwszy = true;
+    btn.onclick = function (){
+        var otw = panel.style.display === 'none';
+        panel.style.display = otw ? 'block' : 'none';
+        if (otw){ if (pierwszy){ pierwszy = false; if (!KS.f) wczytajSzkic(); } rysuj(); }
+    };
+
+    var GUZ = 'padding:3px 9px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:11px';
+    var GUZ_GL = 'padding:6px 14px;border:none;border-radius:7px;background:#FF2F00;color:#fff;cursor:pointer;font-size:12px;font-weight:600';
+    var INP = 'font-size:11px;padding:2px 4px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box';
+    var TH = 'padding:3px 4px;text-align:right;font-weight:600;white-space:nowrap';
+    var TD = 'padding:2px 4px;text-align:right;white-space:nowrap';
+
+    function selStawka(attr, v){
+        var lista = KOR_STAWKI.slice(); if (isFinite(+v) && lista.indexOf(+v) < 0) lista.push(+v);
+        return '<select ' + attr + ' style="' + INP + '">' + lista.map(function (s){ return '<option value="' + s + '"' + (+v === s ? ' selected' : '') + '>' + stTxt(s) + '</option>'; }).join('') + '</select>';
+    }
+    function pole(k, lab, w, typ){
+        var v = KS.f[k] == null ? '' : KS.f[k];
+        return '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#555">' + esc(lab)
+             + '<input data-k="' + k + '" type="' + (typ || 'text') + '" value="' + esc(v) + '" style="' + INP + ';width:' + (w || 120) + 'px;font-size:12px;color:#000"></label>';
+    }
+    function rysuj(){
+        if (panel.style.display === 'none') return;
+        var sc = panel.scrollTop, h = '', otw = otwartyAuftrag();
+        h += '<div style="font-size:15px;font-weight:700;margin-bottom:4px">🧾 Korekty faktur</div>'
+           + '<div style="font-size:11px;color:#555;margin-bottom:8px">Faktura korygująca do faktury wysłanej klientowi (Beliani PL, po polsku). '
+           + 'Dane bierzesz z auftragu (faktura z protokołu e-maili) albo z PDF-u faktury, poprawiasz w formularzu, akceptujesz — PDF trafia do „Attached documents” auftragu z komentarzem. '
+           + 'Kwoty po korekcie liczę sam (od brutto, VAT = brutto − netto), więc wychodzą spójnie także wtedy, gdy prologistics policzył inaczej.</div>';
+        h += '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">'
+           + '<label style="display:flex;flex-direction:column;font-size:10px;color:#555">Auftrag<input id="kor-auf" value="' + esc(KS.wejAuf) + '" style="' + INP + ';width:100px;font-size:12px"></label>'
+           + '<label style="display:flex;flex-direction:column;font-size:10px;color:#555">albo nr faktury<input id="kor-fv" value="' + esc(KS.wejFv) + '" style="' + INP + ';width:100px;font-size:12px"></label>'
+           + '<button data-a="auftrag" style="' + GUZ_GL + '"' + (KS.robie ? ' disabled' : '') + '>Dane z auftragu</button>'
+           + (otw ? '<button data-a="otwarty" style="' + GUZ_GL + ';background:#750000"' + (KS.robie ? ' disabled' : '')
+                    + ' title="Dane z auftragu otwartego w tej karcie — bez wpisywania numeru">📍 Otwarty auftrag ' + esc(otw.nr) + '</button>' : '')
+           + '<label id="kor-drop" style="border:2px dashed #FFCCB7;border-radius:8px;padding:5px 12px;background:#F6E7E6;color:#750000;cursor:pointer;font-size:12px">📎 PDF faktury z pliku'
+           + '<input id="kor-plik" type="file" accept=".pdf,application/pdf" style="display:none"></label>'
+           + '<button data-a="pusty" style="' + GUZ + '">Pusty formularz</button>'
+           + (KS.f ? '<button data-a="wyczysc" style="' + GUZ + '">Wyczyść</button>' : '')
+           + '</div>';
+        if (KS.robie) h += '<div style="margin:8px 0;color:#750000">⏳ ' + esc(KS.robie) + '…</div>';
+        if (KS.blad) h += '<div style="margin:8px 0;padding:6px 8px;background:#fde8e8;border:1px solid #f5b5b5;border-radius:6px;color:#8a0000">✖ ' + esc(KS.blad) + '</div>';
+        if (KS.info) h += '<div style="margin:8px 0;padding:6px 8px;background:#fff8e1;border:1px solid #f3d27a;border-radius:6px;color:#6b4e00">ℹ ' + esc(KS.info) + '</div>';
+        if (KS.A && KS.A.wersje && KS.A.wersje.length) h += rysujWersje();
+        if (KS.f) h += rysujFormularz();
+        h += '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:11px;color:#666">📄 Log (' + KOR_LOG.length + ')</summary>'
+           + '<pre style="max-height:200px;overflow:auto;font-size:10px;background:#f7f7f7;padding:6px;white-space:pre-wrap">' + esc(KOR_LOG.slice(-200).join('\n')) + '</pre></details>';
+        tresc.innerHTML = h;
+        panel.scrollTop = sc;
+    }
+    function rysujWersje(){
+        var A = KS.A, h = '<div style="margin-top:12px;padding:8px;border:1px solid #DBD9D7;border-radius:8px">'
+            + '<b style="color:#750000">Faktura wysłana klientowi — auftrag ' + esc(A.nr) + '</b>'
+            + '<span style="font-size:10px;color:#666"> · wybierz wersję, którą korygujesz (klient mógł dostać fakturę kilka razy, po zmianach auftragu kwoty się różnią)</span>'
+            + '<table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11px"><tr style="background:#F6E7E6">'
+            + '<th></th><th style="text-align:left;padding:3px">Wysłana</th><th style="text-align:left">Mail</th><th style="text-align:left">Nr / data FV</th><th style="text-align:left">Stawki</th>'
+            + '<th style="' + TH + '">Netto</th><th style="' + TH + '">VAT</th><th style="' + TH + '">Brutto</th><th style="text-align:left;padding:3px">Kontrola sum</th></tr>';
+        var bazaB = null, rozne = false;
+        A.wersje.forEach(function (w, i){
+            var F = w.fakt, s = sumyPoz(F.poz), zgodne = F.sumy.brutto == null || F.sumy.brutto === s.brutto;
+            if (bazaB == null) bazaB = s.brutto; else if (bazaB !== s.brutto) rozne = true;
+            h += '<tr style="border-top:1px solid #eee' + (i === A.wyb ? ';background:#fff4ef;font-weight:600' : '') + '">'
+               + '<td><input type="radio" name="kor-wersja" data-a="wersja" data-i="' + i + '"' + (i === A.wyb ? ' checked' : '') + '></td>'
+               + '<td style="padding:3px;white-space:nowrap">' + esc(w.data) + '</td><td>' + esc(w.szablon) + '</td>'
+               + '<td>' + esc((F.nr || '?') + ' z ' + (F.data || '?')) + '</td><td>' + esc(stawkiPoz(F.poz)) + '</td>'
+               + '<td style="' + TD + '">' + kw(s.netto) + '</td><td style="' + TD + '">' + kw(s.vat) + '</td><td style="' + TD + '">' + kw(s.brutto) + ' ' + esc(F.waluta) + '</td>'
+               + '<td style="padding:3px">' + (zgodne ? '✔' : '⚠ suma na fakturze ' + kw(F.sumy.brutto)) + (F.uwagi.length ? ' · ' + esc(F.uwagi.join('; ')) : '') + '</td></tr>';
+        });
+        h += '</table>';
+        if (rozne) h += '<div style="margin-top:4px;font-size:11px;color:#8a5a00">⚠ Wysłane wersje różnią się kwotami — korekta musi poprawiać tę, którą klient ma jako obowiązującą.</div>';
+        var bz = A.biezaca;
+        if (bz && bz.poz && bz.poz.length){
+            var sb = sumyPoz(bz.poz);
+            h += '<div style="margin-top:4px;font-size:11px;color:#444">Stan bieżący auftragu: ' + bz.poz.length + ' poz., stawki ' + esc(stawkiPoz(bz.poz))
+               + ', netto ' + kw(sb.netto) + ', VAT ' + kw(sb.vat) + ', brutto ' + kw(sb.brutto) + ' ' + esc(bz.waluta) + '</div>';
+        }
+        return h + '</div>';
+    }
+    // ---------- szybka korekta (prosba 25.11.2026: „o ile ma byc mniejsza i artykul, albo zwrot VAT") ----------
+    // Tylko wypelnia „po korekcie" — liczone od kwot Z FAKTURY (nie od tego, co juz stoi w formularzu), wynik widac
+    // w pozycjach i mozna go poprawic recznie. Wartosci pol czytamy z ekranu w chwili klikniecia.
+    function rysujSzybka(f){
+        function opcje(zCala, wyb){
+            return (zCala ? '<option value="-1"' + (wyb === '-1' ? ' selected' : '') + '>cała faktura (proporcjonalnie)</option>' : '')
+                 + f.poz.map(function (p, i){
+                       if (!p.przed.brutto) return '';
+                       return '<option value="' + i + '"' + (wyb === String(i) ? ' selected' : '') + '>' + (i + 1) + '. '
+                            + esc(String(p.nazwa).slice(0, 48)) + ' (' + kw(p.przed.brutto) + ')</option>';
+                   }).join('');
+        }
+        return '<div style="margin-top:10px;padding:8px;border:1px solid #DBD9D7;border-radius:8px;background:#fffaf8">'
+             + '<b style="color:#750000">Szybka korekta</b> <span style="font-size:10px;color:#666">wypełnia „po korekcie” od kwot z faktury — wynik widzisz w pozycjach i możesz go poprawić</span>'
+             + '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;font-size:11px;align-items:center">'
+             + '<span>Obniżka: <select id="kor-q-poz" style="' + INP + ';max-width:330px">' + opcje(true, KS.q.poz) + '</select> o '
+             + '<input id="kor-q-kw" value="' + esc(KS.q.kw) + '" placeholder="kwota" style="' + INP + ';width:70px;text-align:right"> ' + esc(f.waluta || 'PLN')
+             + ' brutto <button data-a="q-obnizka" style="' + GUZ + '">Zastosuj</button></span>'
+             + '<span>Zwrot towaru: <select id="kor-q-poz2" style="' + INP + ';max-width:330px">' + opcje(false, KS.q.poz2) + '</select> sztuk '
+             + '<input id="kor-q-il" value="' + esc(KS.q.il) + '" style="' + INP + ';width:40px;text-align:right"> <button data-a="q-zwrot" style="' + GUZ + '">Zastosuj</button></span>'
+             + '<button data-a="q-vat" style="' + GUZ + '" title="Wszystkie pozycje: stawka 0%, netto jak na fakturze — klient dostaje zwrot VAT (jak korekta 12112933/1)">Zwrot VAT → 0% (netto bez zmian)</button>'
+             + '</div></div>';
+    }
+    // Zwraca tekst bledu albo ''.
+    function szybka(a, f){
+        function v(id){ var e = tresc.querySelector('#' + id); return e ? e.value : ''; }
+        // ta sama ilosc i stawka co na fakturze, brutto pozycji = nowe (grosze); cena z zapasem cyfr, zeby q × cena wrocilo co do grosza
+        function linia(p, bruttoNowe){
+            var q = p.przed.ilosc || 1;
+            p.po = { ilosc: q, stawka: p.przed.stawka, trzymaj: false,
+                     cenaB: (bruttoNowe === p.przed.brutto) ? null : String(+(bruttoNowe / q / 100).toFixed(6)) };
+        }
+        if (a === 'q-vat'){
+            f.tryb = 'netto';
+            f.poz.forEach(function (p){ p.po = { ilosc: p.przed.ilosc, stawka: 0, trzymaj: p.przed.stawka !== 0, cenaB: null }; });
+            if (!f.powod) f.powod = 'Zmiana stawki VAT';
+            log('szybka korekta: zwrot VAT → 0%, netto bez zmian');
+            return '';
+        }
+        if (a === 'q-zwrot'){
+            var i = parseInt(v('kor-q-poz2'), 10), p = f.poz[i], n = liczba(v('kor-q-il'));
+            if (!p) return 'wybierz pozycję, której towar wraca';
+            if (!isFinite(n) || n <= 0 || n > p.przed.ilosc) return 'liczba zwracanych sztuk musi być od 1 do ' + il(p.przed.ilosc);
+            p.po = { ilosc: Math.round((p.przed.ilosc - n) * 1000) / 1000, stawka: p.przed.stawka, trzymaj: false, cenaB: null };
+            if (!f.powod) f.powod = 'Zwrot towaru';
+            log('szybka korekta: zwrot ' + n + ' szt., poz. ' + (i + 1));
+            return '';
+        }
+        var kwG = gr(v('kor-q-kw')), sel = parseInt(v('kor-q-poz'), 10);
+        if (kwG == null || kwG <= 0) return 'wpisz kwotę obniżki brutto, np. 50 albo 50,00';
+        if (sel >= 0){
+            var p1 = f.poz[sel];
+            if (!p1) return 'wybierz pozycję do obniżki';
+            if (kwG > p1.przed.brutto) return 'obniżka ' + kw(kwG) + ' jest większa niż wartość pozycji ' + kw(p1.przed.brutto);
+            linia(p1, p1.przed.brutto - kwG);
+        } else {
+            // cala faktura: udzialy wg brutto pozycji, ostatnia pozycja bierze reszte zaokraglen
+            var el = f.poz.filter(function (x){ return x.przed.brutto > 0; }), suma = el.reduce(function (s, x){ return s + x.przed.brutto; }, 0);
+            if (!suma) return 'na fakturze nie ma pozycji z kwotą';
+            if (kwG > suma) return 'obniżka ' + kw(kwG) + ' jest większa niż suma faktury ' + kw(suma);
+            var rozdane = 0, udzialy = el.map(function (x, k){
+                var u = (k === el.length - 1) ? (kwG - rozdane) : zaokr(kwG * x.przed.brutto / suma);
+                rozdane += u; return u;
+            });
+            if (el.some(function (x, k){ return udzialy[k] > x.przed.brutto; })) return 'nie da się rozłożyć obniżki ' + kw(kwG) + ' — wpisz ją przy pozycji';
+            el.forEach(function (x, k){ linia(x, x.przed.brutto - udzialy[k]); });
+        }
+        if (!f.powod) f.powod = 'Rabat / obniżka ceny';
+        log('szybka korekta: obniżka ' + kw(kwG) + (sel >= 0 ? ', poz. ' + (sel + 1) : ', proporcjonalnie'));
+        return '';
+    }
+    function rysujFormularz(){
+        var f = KS.f, W = wylicz(f), K = kontrola(f, W), h = '';
+        h += '<div style="margin-top:12px;padding:8px;border:1px solid #DBD9D7;border-radius:8px">'
+           + '<b style="color:#750000">Dokument</b><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">'
+           + pole('nr', 'Nr korekty', 120) + pole('dataWyst', 'Data wystawienia', 130, 'date') + pole('miejsce', 'Miejsce wystawienia', 100)
+           + pole('termin', 'Termin płatności', 130, 'date') + pole('dataDost', 'Data zakończenia dostawy/usługi', 130, 'date')
+           + pole('forma', 'Forma płatności', 100) + pole('waluta', 'Waluta', 50) + '</div>'
+           + '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">' + pole('fvNr', 'Faktura korygowana nr', 110) + pole('fvData', 'z dnia (dd.mm.rrrr)', 100)
+           + '<label style="display:flex;flex-direction:column;gap:2px;font-size:10px;color:#555">Powód korekty'
+           + '<span style="display:flex;gap:4px"><select data-a="powod-lista" style="' + INP + ';font-size:12px"><option value="">— wybierz —</option>'
+           + KOR_POWODY.map(function (p){ return '<option' + (f.powod === p ? ' selected' : '') + '>' + esc(p) + '</option>'; }).join('') + '</select>'
+           + '<input data-k="powod" value="' + esc(f.powod) + '" style="' + INP + ';width:320px;font-size:12px;color:#000" placeholder="albo wpisz własny"></span></label>'
+           + pole('auftrag', 'Auftrag (dla „Dodaj korektę”)', 110) + '</div></div>';
+        h += '<div style="margin-top:8px;display:grid;grid-template-columns:repeat(3,1fr);gap:8px">'
+           + [['sprzedawca', 'Sprzedawca'], ['nabywca', 'Nabywca'], ['odbiorca', 'Odbiorca']].map(function (b){
+                 return '<label style="display:flex;flex-direction:column;font-size:10px;color:#555">' + b[1]
+                      + '<textarea data-k="' + b[0] + '" rows="6" style="' + INP + ';font-size:11px;color:#000;resize:vertical">' + esc(f[b[0]]) + '</textarea></label>';
+             }).join('') + '</div>';
+        h += rysujSzybka(f);
+        // pozycje
+        var bz = KS.A && KS.A.biezaca, mozeBz = bz && bz.poz && bz.poz.length === f.poz.length;
+        h += '<div style="margin-top:10px;padding:8px;border:1px solid #DBD9D7;border-radius:8px">'
+           + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b style="color:#750000">Pozycje</b>'
+           + '<span style="font-size:11px">Stawka po korekcie dla wszystkich: ' + selStawka('id="kor-st-all"', 0) + ' <button data-a="stawka-all" style="' + GUZ + '">Zastosuj</button></span>'
+           + '<span style="font-size:11px">przy zmianie stawki zachowaj: <label><input type="radio" name="kor-tryb" data-k="tryb" value="netto"' + (f.tryb !== 'brutto' ? ' checked' : '') + '> netto (VAT do zwrotu)</label> '
+           + '<label><input type="radio" name="kor-tryb" data-k="tryb" value="brutto"' + (f.tryb === 'brutto' ? ' checked' : '') + '> brutto</label></span>'
+           + '<button data-a="storno" style="' + GUZ + '" title="Ceny po korekcie na 0, ilości bez zmian (jak korekta 12095007/1)">Storno całości</button>'
+           + '<button data-a="przywroc" style="' + GUZ + '">Po korekcie = jak na fakturze</button>'
+           + (mozeBz ? '<button data-a="biezacy" style="' + GUZ + '" title="Ilość, cena brutto i stawka z bieżącej faktury auftragu">Po korekcie = stan bieżący auftragu</button>' : '')
+           + '<button data-a="edytuj" style="' + GUZ + '">' + (KS.edytuj ? '✔ Koniec edycji danych faktury' : '✏ Edytuj dane faktury') + '</button>'
+           + '<button data-a="dodaj-poz" style="' + GUZ + '">+ pozycja</button></div>';
+        h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:11px">'
+           + '<tr style="background:#F6E7E6"><th></th><th></th><th colspan="6" style="text-align:center;border-left:2px solid #fff">PRZED KOREKTĄ (faktura)</th>'
+           + '<th colspan="6" style="text-align:center;border-left:2px solid #fff">PO KOREKCIE</th><th colspan="2" style="text-align:center;border-left:2px solid #fff">KOREKTA</th><th></th></tr>'
+           + '<tr style="background:#F6E7E6"><th style="padding:3px">Lp</th><th style="text-align:left">Towar / usługa</th>'
+           + '<th style="' + TH + ';border-left:2px solid #fff">Ilość</th><th style="' + TH + '">Cena netto</th><th style="' + TH + '">VAT</th><th style="' + TH + '">Netto</th><th style="' + TH + '">Kw. VAT</th><th style="' + TH + '">Brutto</th>'
+           + '<th style="' + TH + ';border-left:2px solid #fff">Ilość</th><th style="' + TH + '">Cena brutto</th><th style="' + TH + '">VAT</th><th style="' + TH + '">Netto</th><th style="' + TH + '">Kw. VAT</th><th style="' + TH + '">Brutto</th>'
+           + '<th style="' + TH + ';border-left:2px solid #fff">VAT</th><th style="' + TH + '">Brutto</th><th></th></tr>';
+        W.poz.forEach(function (x, i){
+            var p = f.poz[i], a = x.a, P = x.p, kk = x.k, e = KS.edytuj;
+            function wej(pole, v, w){ return '<input data-poz="' + i + '" data-pole="' + pole + '" value="' + esc(v) + '" style="' + INP + ';width:' + (w || 64) + 'px;text-align:right">'; }
+            var cbV = (p.po.cenaB != null && !p.po.trzymaj) ? p.po.cenaB : kwP(P.cenaB);
+            h += '<tr style="border-top:1px solid #eee;vertical-align:top"><td style="padding:3px">' + (i + 1) + '</td>'
+               + '<td><textarea data-poz="' + i + '" data-pole="nazwa" rows="' + Math.min(3, Math.max(1, Math.ceil(String(p.nazwa).length / 42))) + '" style="' + INP + ';width:260px;resize:vertical">' + esc(p.nazwa) + '</textarea></td>'
+               + '<td style="' + TD + ';border-left:2px solid #f3e1dd">' + (e ? wej('przed.ilosc', a.ilosc, 44) : il(a.ilosc)) + '</td>'
+               + '<td style="' + TD + '">' + (e ? wej('przed.cenaN', kwP(a.cenaN)) : kw(a.cenaN)) + '</td>'
+               + '<td style="' + TD + '">' + (e ? selStawka('data-poz="' + i + '" data-pole="przed.stawka"', a.stawka) : stTxt(a.stawka)) + '</td>'
+               + '<td style="' + TD + '">' + (e ? wej('przed.netto', kwP(a.netto)) : kw(a.netto)) + '</td>'
+               + '<td style="' + TD + '">' + (e ? wej('przed.vat', kwP(a.vat)) : kw(a.vat)) + '</td>'
+               + '<td style="' + TD + '">' + (e ? wej('przed.brutto', kwP(a.brutto)) : kw(a.brutto)) + '</td>'
+               + '<td style="' + TD + ';border-left:2px solid #f3e1dd">' + wej('po.ilosc', p.po.ilosc, 44) + '</td>'
+               + '<td style="' + TD + '">' + wej('po.cenaB', cbV) + (p.po.trzymaj ? '<div style="font-size:9px;color:#777">netto stałe</div>' : '') + '</td>'
+               + '<td style="' + TD + '">' + selStawka('data-poz="' + i + '" data-pole="po.stawka"', P.stawka) + '</td>'
+               + '<td style="' + TD + '">' + kw(P.netto) + '</td><td style="' + TD + '">' + kw(P.vat) + '</td><td style="' + TD + ';font-weight:600">' + kw(P.brutto) + '</td>'
+               + '<td style="' + TD + ';border-left:2px solid #f3e1dd;color:' + (kk.vat ? '#750000' : '#999') + '">' + kw(kk.vat) + '</td>'
+               + '<td style="' + TD + ';font-weight:600;color:' + (kk.brutto ? '#750000' : '#999') + '">' + kw(kk.brutto) + '</td>'
+               + '<td><button data-a="usun-poz" data-i="' + i + '" style="' + GUZ + ';padding:1px 6px" title="Usuń pozycję">✕</button></td></tr>';
+        });
+        h += '</table></div></div>';
+        // podsumowanie
+        var roz = W.razem.brutto, wl = f.waluta || 'PLN';
+        h += '<div style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">'
+           + '<div style="padding:8px;border:1px solid #DBD9D7;border-radius:8px"><b style="color:#750000">Suma według stawek VAT</b>'
+           + '<table style="border-collapse:collapse;margin-top:4px;font-size:11px"><tr style="background:#F6E7E6"><th style="padding:3px 6px">Stawka</th><th></th>'
+           + '<th style="' + TH + '">Netto</th><th style="' + TH + '">VAT</th><th style="' + TH + '">Brutto</th></tr>';
+        W.stawki.forEach(function (o){
+            [['przed korektą', o.przed], ['korekta', o.kor], ['po korekcie', o.po]].forEach(function (r, j){
+                h += '<tr style="border-top:1px solid ' + (j ? '#f2f2f2' : '#ddd') + '"><td style="padding:2px 6px;font-weight:600">' + (j === 1 ? stTxt(o.s) : '') + '</td>'
+                   + '<td style="padding:2px 6px;font-style:italic;color:#555">' + r[0] + '</td><td style="' + TD + '">' + kw(r[1].netto) + '</td>'
+                   + '<td style="' + TD + '">' + kw(r[1].vat) + '</td><td style="' + TD + '">' + kw(r[1].brutto) + '</td></tr>';
+            });
+        });
+        h += '<tr style="border-top:2px solid #ccc;font-weight:700"><td></td><td style="padding:2px 6px">Razem</td><td style="' + TD + '">' + kw(W.razem.netto) + '</td>'
+           + '<td style="' + TD + '">' + kw(W.razem.vat) + '</td><td style="' + TD + '">' + kw(W.razem.brutto) + '</td></tr></table>'
+           + '<div style="margin-top:6px;font-size:13px;font-weight:700;color:#750000">' + (roz < 0 ? 'Różnica do zwrotu' : (roz > 0 ? 'Różnica do zapłaty' : 'Różnica')) + ': ' + kw(Math.abs(roz)) + ' ' + esc(wl) + '</div>'
+           + '<div style="font-size:11px;color:#555">słownie: ' + esc(slownie(roz)) + ' ' + esc(wl) + '</div></div>';
+        h += '<div style="flex:1;min-width:320px;padding:8px;border:1px solid #DBD9D7;border-radius:8px"><b style="color:#750000">Kontrola netto / brutto</b><ul style="margin:4px 0 0 0;padding-left:18px;font-size:11px">'
+           + K.map(function (x){ return '<li style="color:' + (x.z === 'ok' ? '#1b5e20' : (x.z === 'bl' ? '#8a0000' : '#8a5a00')) + '">' + (x.z === 'ok' ? '✔ ' : (x.z === 'bl' ? '✖ ' : '⚠ ')) + esc(x.t) + '</li>'; }).join('')
+           + '</ul></div></div>';
+        // akceptacja i zapis
+        h += '<div style="margin-top:10px;padding:8px;border:1px solid #DBD9D7;border-radius:8px">'
+           + '<label style="display:flex;flex-direction:column;font-size:10px;color:#555">Komentarz w auftragu po dodaniu'
+           + '<input data-k="komentarz" value="' + esc(tekstKomentarza(f)) + '" style="' + INP + ';font-size:12px;color:#000;width:100%"></label>'
+           + '<div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">'
+           + '<button data-a="akceptuj" style="' + GUZ_GL + '"' + (KS.robie ? ' disabled' : '') + '>✔ Akceptuj i pokaż PDF</button>';
+        if (KS.zaakc && KS.pdf){
+            h += '<button data-a="pdf" style="' + GUZ + ';font-size:12px;padding:6px 12px">📄 Pobierz PDF (' + esc(nazwaPliku(f)) + ')</button>'
+               + '<button data-a="dodaj" style="' + GUZ_GL + ';background:#750000"' + (KS.robie ? ' disabled' : '') + '>➕ Dodaj korektę do auftragu ' + esc(f.auftrag || '?') + '</button>';
+        } else h += '<span style="font-size:11px;color:#666">Po akceptacji zobaczysz PDF i odblokuje się „Dodaj korektę”. Każda zmiana w formularzu cofa akceptację.</span>';
+        h += '</div>';
+        if (KS.zapis) h += '<div style="margin-top:8px;padding:6px 8px;border-radius:6px;' + (KS.zapis.ok ? 'background:#e8f5e9;border:1px solid #a5d6a7;color:#1b5e20' : 'background:#fde8e8;border:1px solid #f5b5b5;color:#8a0000') + '">' + esc(KS.zapis.t) + '</div>';
+        if (KS.zaakc && KS.podglad) h += '<div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;align-items:center;background:#eee;padding:8px;border-radius:6px">'
+           + KS.podglad.map(function (u){ return '<img src="' + u + '" style="width:100%;max-width:760px;box-shadow:0 1px 6px rgba(0,0,0,.25);background:#fff">'; }).join('') + '</div>';
+        return h + '</div>';
+    }
+
+    // ---------- zdarzenia ----------
+    function ustaw(el){
+        var f = KS.f; if (!f) return false;
+        var k = el.getAttribute('data-k');
+        if (k){
+            if (k === 'tryb'){
+                if (!el.checked) return false;
+                f.tryb = el.value;
+                f.poz.forEach(function (p){ if (p.po.stawka !== p.przed.stawka && (p.po.cenaB == null || p.po.trzymaj)){ p.po.trzymaj = (f.tryb === 'netto'); if (!p.po.trzymaj) p.po.cenaB = null; } });
+            } else if (k === 'komentarz') f.komentarz = el.value;
+            else f[k] = el.value;
+            return true;
+        }
+        var i = +el.getAttribute('data-poz'), pl = el.getAttribute('data-pole'), p = f.poz[i], v = el.value;
+        if (!p || !pl) return false;
+        if (pl === 'nazwa') p.nazwa = v;
+        else if (pl === 'po.ilosc'){ var q = liczba(v); p.po.ilosc = isFinite(q) ? q : 0; }
+        else if (pl === 'po.cenaB'){ p.po.cenaB = v; p.po.trzymaj = false; }
+        else if (pl === 'po.stawka'){
+            var s = liczba(v); p.po.stawka = isFinite(s) ? s : 0;
+            if (p.po.stawka === p.przed.stawka){ p.po.trzymaj = false; p.po.cenaB = null; }
+            else if (f.tryb !== 'brutto' && (p.po.cenaB == null || p.po.trzymaj)) p.po.trzymaj = true;
+        }
+        else if (pl === 'przed.ilosc'){ var q2 = liczba(v); p.przed.ilosc = isFinite(q2) ? q2 : 0; }
+        else if (pl === 'przed.stawka'){ var s2 = liczba(v); p.przed.stawka = isFinite(s2) ? s2 : 0; }
+        else if (/^przed\.(cenaN|netto|vat|brutto)$/.test(pl)){ var g = gr(v); p.przed[pl.split('.')[1]] = (g == null ? 0 : g); }
+        else return false;
+        return true;
+    }
+    // Przerysowanie po „change" odkladamy o takt: przy Tab fokus zdazy przejsc na nastepne pole i oddajemy mu go.
+    // Gdy „change" przyszedl z klikniecia (pole traci fokus przy wcisnieciu myszy na guziku), czekamy do puszczenia
+    // myszy — inaczej guzik znika spod kursora miedzy mousedown a mouseup i klik przepada.
+    var myszWdol = false, czekaRys = false;
+    panel.addEventListener('mousedown', function (){ myszWdol = true; }, true);
+    document.addEventListener('mouseup', function (){
+        if (!myszWdol) return;
+        myszWdol = false;
+        if (czekaRys){ czekaRys = false; setTimeout(rysuj, 0); }
+    }, true);
+    function poZmianie(){
+        if (myszWdol){ czekaRys = true; return; }
+        setTimeout(function (){
+            var a = document.activeElement, klucz = null, poz = null;
+            if (a && tresc.contains(a)){ klucz = a.getAttribute('data-k') || a.getAttribute('data-pole') || a.id; poz = a.getAttribute('data-poz'); }
+            rysuj();
+            if (klucz){
+                var sel = poz != null ? '[data-poz="' + poz + '"][data-pole="' + klucz + '"]' : ('[data-k="' + klucz + '"]');
+                var n = tresc.querySelector(sel) || (klucz ? document.getElementById(klucz) : null);
+                if (n && n.type !== 'radio'){ try { n.focus(); if (n.select && n.tagName === 'INPUT') n.select(); } catch (e){} }
+            }
+        }, 0);
+    }
+    tresc.addEventListener('input', function (e){
+        var el = e.target;
+        if (el.id === 'kor-auf'){ KS.wejAuf = el.value; return; }
+        if (el.id === 'kor-fv'){ KS.wejFv = el.value; return; }
+        if (/^kor-q-/.test(el.id)){ KS.q[el.id.slice(6)] = el.value; return; }
+        if (el.tagName === 'SELECT' || el.type === 'radio') return;
+        if (ustaw(el)) poUstaw(el);
+    });
+    // Komentarz i numer auftragu nie stoja na PDF-ie — ich zmiana nie cofa akceptacji.
+    function poUstaw(el){
+        var k = el.getAttribute('data-k');
+        if (k === 'komentarz' || k === 'auftrag') zapiszSzkic(); else zmiana();
+    }
+    tresc.addEventListener('change', function (e){
+        var el = e.target;
+        if (el.id === 'kor-plik'){ var fl = el.files && el.files[0]; el.value = ''; zPliku(fl); return; }
+        if (el.id === 'kor-auf' || el.id === 'kor-fv' || el.id === 'kor-st-all') return;
+        if (el.getAttribute('data-a') === 'powod-lista'){ if (KS.f && el.value){ KS.f.powod = el.value; zmiana(); poZmianie(); } return; }
+        if (el.getAttribute('data-a') === 'wersja'){
+            var i = +el.getAttribute('data-i');
+            if (KS.A && KS.A.wersje[i]){ KS.A.wyb = i; budujFormularz(KS.A.wersje[i].fakt, KS.A, true); log('wybrana wersja faktury wysłana ' + KS.A.wersje[i].data); rysuj(); }
+            return;
+        }
+        if (ustaw(el)){ poUstaw(el); poZmianie(); }
+    });
+    tresc.addEventListener('keydown', function (e){
+        if (e.key === 'Enter' && (e.target.id === 'kor-auf' || e.target.id === 'kor-fv')){ e.preventDefault(); if (!KS.robie) zAuftragu(); }
+    });
+    tresc.addEventListener('click', function (e){
+        var b = e.target.closest('[data-a]');
+        if (!b || b.tagName === 'SELECT' || b.type === 'radio') return;
+        var a = b.getAttribute('data-a'), f = KS.f;
+        if (a === 'auftrag'){ if (!KS.robie) zAuftragu(); return; }
+        if (a === 'otwarty'){ var o = otwartyAuftrag(); if (o && !KS.robie) zAuftragu(o); return; }
+        if (a === 'pusty'){
+            if (f && !confirm('Wyczyścić formularz i zacząć od pustego?')) return;
+            KS.A = null; KS.blad = ''; KS.info = ''; KS.edytuj = true;
+            budujFormularz({ nr: '', data: '', waluta: 'PLN', poz: [], sumy: {}, uwagi: [],
+                             sprzedawca: 'Beliani (PL) GmbH\nHaldenstrasse 5\n6340 Baar\nSzwajcaria\nNIP DE435451066', nabywca: '', odbiorca: '' }, null);
+            KS.fakt = null; rysuj(); return;
+        }
+        if (a === 'wyczysc'){ if (!confirm('Wyczyścić formularz?')) return; KS.f = null; KS.A = null; KS.fakt = null; KS.blad = ''; KS.info = ''; zmiana(); rysuj(); return; }
+        if (!f) return;
+        if (a === 'stawka-all'){
+            var s = liczba((tresc.querySelector('#kor-st-all') || {}).value);
+            if (!isFinite(s)) return;
+            f.poz.forEach(function (p){
+                p.po.stawka = s;
+                if (s === p.przed.stawka){ p.po.trzymaj = false; p.po.cenaB = null; }
+                else if (f.tryb !== 'brutto'){ p.po.trzymaj = true; }
+                else { p.po.trzymaj = false; }
+            });
+            zmiana(); rysuj(); return;
+        }
+        if (a === 'storno'){ f.poz.forEach(function (p){ p.po.cenaB = '0'; p.po.trzymaj = false; }); if (!f.powod) f.powod = 'Anulowanie zamówienia'; zmiana(); rysuj(); return; }
+        if (a === 'przywroc'){ f.poz.forEach(function (p){ p.po = { ilosc: p.przed.ilosc, cenaB: null, stawka: p.przed.stawka, trzymaj: false }; }); zmiana(); rysuj(); return; }
+        if (a === 'biezacy'){
+            var bz = KS.A && KS.A.biezaca;
+            if (!bz || bz.poz.length !== f.poz.length) return;
+            f.poz.forEach(function (p, i){
+                var c = bz.poz[i];
+                p.po = { ilosc: c.ilosc, stawka: c.stawka, trzymaj: false, cenaB: c.ilosc ? String(Math.round(c.brutto / c.ilosc) / 100) : '0' };
+                if (c.ilosc === p.przed.ilosc && c.brutto === p.przed.brutto && c.stawka === p.przed.stawka) p.po.cenaB = null;
+            });
+            zmiana(); rysuj(); return;
+        }
+        if (a === 'q-obnizka' || a === 'q-zwrot' || a === 'q-vat'){
+            var qb = szybka(a, f);
+            KS.blad = qb || ''; if (!qb) zmiana(); rysuj(); return;
+        }
+        if (a === 'edytuj'){ KS.edytuj = !KS.edytuj; zmiana(); rysuj(); return; }
+        if (a === 'dodaj-poz'){ f.poz.push(pustaPozycja()); KS.edytuj = true; zmiana(); rysuj(); return; }
+        if (a === 'usun-poz'){ var i = +b.getAttribute('data-i'); if (f.poz[i] && confirm('Usunąć pozycję ' + (i + 1) + '?')){ f.poz.splice(i, 1); zmiana(); rysuj(); } return; }
+        if (a === 'akceptuj'){ if (!KS.robie) akceptuj(); return; }
+        if (a === 'pdf'){ pobierzPdf(); return; }
+        if (a === 'dodaj'){ if (!KS.robie) dodajKorekte(); return; }
+    });
+    panel.addEventListener('dragover', function (e){ if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0){ e.preventDefault(); } });
+    panel.addEventListener('drop', function (e){
+        var fl = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (!fl) return;
+        e.preventDefault(); zPliku(fl);
+    });
+})();
+    }
+
 
     const MODULES = [
         { id: 'vies',     name: 'Kurs walut + VIES/KRS/GUS', test: () => onProlo() || onGus(), init: init_vies },
@@ -130191,6 +131666,7 @@
         { id: 'ins',      name: 'Ksiegowanie INS',           test: onProlo,   init: init_ins },
         { id: 'ucod',     name: 'Unpaid COD',                test: onProlo,   init: init_ucod },
         { id: 'cod',      name: 'COD — pobrania przewoźników', test: onProlo, init: init_cod },
+        { id: 'korekty',  name: 'Korekty faktur',            test: onProlo,   init: init_korekty },
         { id: 'zwr',      name: 'Zwroty',                    test: onProlo,   init: init_zwr },
         { id: 'zwrop',    name: 'Zwroty — wykonawca eupago', test: onEupago,  init: init_zwrop },
         { id: 'ksieg',    name: 'Ksiegowanie w tickecie',    test: onProlo,   init: init_ksieg },
@@ -130290,6 +131766,7 @@
             .bl-panel[data-bl-mod="auftrag"] {--bl-tint:#9FC5E8;}
             .bl-panel[data-bl-mod="bank"]    {--bl-tint:#D5A6BD;}
             .bl-panel[data-bl-mod="cod"]     {--bl-tint:#EA9999;}
+            .bl-panel[data-bl-mod="korekty"] {--bl-tint:#F4CCCC;}
             .bl-panel[data-bl-mod="recon"]   {--bl-tint:#8E7CC3;}
         `);
 
@@ -130309,6 +131786,7 @@
             { sel: '#auftrag-panel',    mod: 'auftrag',  w: 1180 },
             { sel: '#bank-panel',       mod: 'bank',     w: 960  },
             { sel: '#cod-panel',        mod: 'cod',      w: 960  },
+            { sel: '#kor-panel',        mod: 'korekty',  w: 1180 },
             { sel: '#rcn-panel',        mod: 'recon',    w: 1100 },
             { sel: '#tis-panel',        mod: 'testissue', w: 1100 },
         ];
@@ -130483,6 +131961,7 @@
             { id:'ins',      icon:svgIco('<path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 14.85a12 12 0 0 1 -8.5 -14.85a12 12 0 0 0 8.5 -3"/><path d="M9 12l2 2l4 -4"/>'), label:'Ksiegowanie INS', sel:'#ins-btn' },
             { id:'ucod',     icon:svgIco('<path d="M3 8l7.89 5.26a2 2 0 0 0 2.22 0l7.89 -5.26"/><rect x="3" y="5" width="18" height="14" rx="2"/>'), label:'Unpaid COD', sel:'#ucod-btn' },
             { id:'cod',      icon:svgIco('<path d="M3 7h11v9h-11z"/><path d="M14 10h4l3 3v3h-7z"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/>'), label:'COD — pobrania przewoźników', sel:'#cod-btn' },
+            { id:'korekty',  icon:svgIco('<path d="M5 21v-16a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v16l-3 -2l-2 2l-2 -2l-2 2l-2 -2l-3 2"/><path d="M9 7h6"/><path d="M9 11h6"/><path d="M13 15h2"/>'), label:'Korekty faktur', sel:'#kor-btn' },
             { id:'zwr',      icon:svgIco('<path d="M12 3v18"/><path d="M17 8a4 4 0 0 0 -4 -3h-2a3 3 0 0 0 0 6h2a3 3 0 0 1 0 6h-2a4 4 0 0 1 -4 -3"/>'), label:'Zwroty', sel:'#zwr-btn' },
             { id:'refund',   icon:svgIco('<circle cx="10" cy="10" r="7"/><path d="M21 21l-6 -6"/>'), label:'Refund Checker', sel:'#refund-btn' },
             { id:'vies',     icon:svgIco('<path d="M17.2 7a6 7 0 1 0 0 10"/><path d="M4 10h9"/><path d="M4 14h9"/>'), label:'Kurs walut', sel:'#oandaKursBtn' },
@@ -130513,6 +131992,7 @@
             { sel: '#mkt-panel',        needX: false },
             { sel: '#bank-panel',       needX: false },
             { sel: '#cod-panel',        needX: true },
+            { sel: '#kor-panel',        needX: true },
             { sel: '#ins-panel',        needX: true },
             { sel: '#refund-panel',     needX: true },
             { sel: '#klient-panel',     needX: true },
