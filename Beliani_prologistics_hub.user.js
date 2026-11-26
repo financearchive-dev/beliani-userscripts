@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.28
+// @version      5.63.29
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -43,6 +43,8 @@
 // @connect      www.backend-rates.bazg.admin.ch
 // @connect      backend-rates.bazg.admin.ch
 // @connect      prologistics.info
+// @connect      127.0.0.1
+// @connect      localhost
 // @connect      clientes.eupago.pt
 // @connect      mirakl.net
 // @connect      empik.com
@@ -208,7 +210,9 @@
         { id: 'tis', nazwa: 'TEST Issue — spółki', url: 'https://script.google.com/macros/s/AKfycbyDCIR0IYjcMOJIfzDlEXNAHk3v8aJnXl1tLtvB1LXRKTZ3rigYIGXpNirHjDBxJrAS/exec' },
         { id: 'f1', nazwa: 'Furniture 1 / Trademax', url: 'https://script.google.com/a/macros/beliani.com/s/AKfycbznTDhSNHPzcIf1X8YPcouzq_rjkcmDEJM_Euv4vzcZHK0NtXbQultM2QCSsK7nZlXR/exec' },
         { id: 'rcn', nazwa: 'Reconciliation — mapowania', url: 'https://script.google.com/macros/s/AKfycbzmW39JkoDLN582PJpo-tPDHvmABDfB-V5Ko6vxBKd-AAsJdMcEdQzvYM7pfo1AJu7d/exec' },
-        { id: 'rcnz', nazwa: 'Reconciliation — zapis', url: 'https://script.google.com/macros/s/AKfycbxHXe5KI9hfdFtaf7nB-vdc9nMF65fg3Si-Hmra8UiEMWdt9bxHnv2yhhSok5mHqwfm/exec' }
+        { id: 'rcnz', nazwa: 'Reconciliation — zapis', url: 'https://script.google.com/macros/s/AKfycbxHXe5KI9hfdFtaf7nB-vdc9nMF65fg3Si-Hmra8UiEMWdt9bxHnv2yhhSok5mHqwfm/exec' },
+        // Mailiani (program do poczty, COD) — HUB przekazuje mu ten adres i klucz przez most (init_cod, mostKonfig)
+        { id: 'mailiani', nazwa: 'Mailiani — rejestr COD', url: 'https://script.google.com/macros/s/AKfycbyY_NtxLQG-SHRURIbtFzTKeIBTU-RZvUFLRE1v8DJ75_OxF7EuhUpVw05bmcVoQfHwoA/exec' }
     ];
     // Nadpisanie adresu (⚙ Ustawienia -> Połączenia). Wbudowany adres wystarcza, dopoki wdrozenie
     // zyje pod tym samym URL-em — a zyje, bo wydajemy NOWA WERSJE tego samego wdrozenia. Nadpisanie
@@ -88826,6 +88830,25 @@
     function nfSzukaj(job, nr){
         return (nfPoCzym(job) === 'faktura') ? joyFind(nr) : crFind(nr);
     }
+    // Odnosnik z wiersza NOT FOUND prosto do prologistics (prosba uzytkownika 26.11.2026, paczka 2368773): wyszukiwarka
+    // tym samym kryterium, ktorym HUB szuka auftragu (nfPoCzym) — numer fulfilmentu, a przy OBI CH numer faktury
+    // (what=invoice_number dziala adresem: faktura 11476647 → lista z auftragiem 15488062, odczyt 26.11.2026). Przy jednym
+    // trafieniu prologistics przechodzi od razu na auftrag (18669912-A → 16127397), przy kilku pokazuje liste ze skasowanymi
+    // przekreslonymi. Nie zalezy od wyniku sprawdzania (mkNfState), wiec jest tez przed nim i po przeladowaniu strony.
+    function nfSzukajUrl(job, nr){
+        const n = String(nr == null ? '' : nr).trim();
+        if (!n) return '';
+        return (nfPoCzym(job) === 'faktura')
+            ? ('/search.php?what=invoice_number&invoice_number=' + encodeURIComponent(n))
+            : ('/search.php?what=ff_number&ff_number=' + encodeURIComponent(n));
+    }
+    // Numer jako odnosnik (tekst = sam numer). Pusty numer — pusty napis, opis braku zostaje przy wywolujacym.
+    function nfNumerLink(job, nr){
+        const u = nfSzukajUrl(job, nr);
+        if (!u) return '';
+        return '<a href="' + esc(u) + '" target="_blank" title="Otwórz w prologistics — wyszukiwarka po ' + esc(nfPoCzymOpis(job))
+             + ' (jeden auftrag: od razu jego strona)">' + esc(String(nr).trim()) + '</a>';
+    }
     const mkNfState = {};        // numer -> { kand: [...], stan, err, zaks }
     // Czy trwa operacja, ktorej komunikatow nie wolno zagluszac (zapis z widoku paczki, import, ksiegowanie, zwroty).
     function mkZajety(){ return !!(mkImpBieg || mkWid.imp || mkWid.book || refBusy); }
@@ -89733,7 +89756,7 @@
                     else { msg = 'import nie znalazł auftragu — HUB szuka go po numerze (obok)'; colr = '#888'; }
                 }
                 h += '<tr style="border-top:1px solid #f1f5f9"><td style="padding:2px 6px;font-weight:700">'
-                  +  (id ? esc(id) : '<span style="color:#c00">brak numeru w paczce</span>')
+                  +  (id ? nfNumerLink(job, id) : '<span style="color:#c00">brak numeru w paczce</span>')
                   +  (au ? (' <a href="' + esc(au.url) + '" target="_blank" style="font-weight:400">' + esc(au.label) + '</a>') : '')
                   +  '</td>'
                   +  (maZrod ? ('<td style="padding:2px 6px;font-family:monospace;font-size:10px">' + nfZrodlo(zrod, id) + '</td>') : '')
@@ -91410,7 +91433,8 @@
                           + esc(w.p.j.impId) + '</a> <button class="mk-prob-otw mk-lnk" data-k="' + esc(w.p.k) + '">🔍 otwórz</button></td>'
                           + '<td style="' + td + '">' + esc(w.p.j.date || '') + '</td>'
                           + '<td style="' + td + ';font-weight:700;color:' + (nf ? '#b91c1c' : '#c47f00') + '">' + esc(w.t) + '</td>'
-                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + esc(nfNumer(w.x)) + '</td>'
+                          // NOT FOUND nie ma auftragu w wierszu paczki — numer prowadzi do wyszukiwarki prologistics (nfNumerLink).
+                          + '<td style="' + td + ';font-family:ui-monospace,monospace">' + ((nf && nfNumer(w.x)) ? nfNumerLink(w.p.j, nfNumer(w.x)) : esc(nfNumer(w.x))) + '</td>'
                           + '<td style="' + td + ';text-align:right">' + f2(impNum(w.x.amount)) + '</td>'
                           + '<td style="' + td + ';text-align:right">' + (nf ? '—' : f2(impNum(w.x.open_amount))) + '</td>'
                           + '<td style="' + td + '">' + (au ? ('<a href="' + esc(au.url) + '" target="_blank">' + esc(au.label) + '</a>') : '—') + '</td>'
@@ -128560,7 +128584,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'b5db7b8 · 25.11.2026 13:50';
+    const HUB_BUDOWA = 'f1a9995 · 26.11.2026 13:48';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -129077,7 +129101,23 @@
         futar:  { nazwa: 'Futár',  plik: 'FUTAR', waluta: 'HUF', bank: '126', booking: '2', konto: '1085',
                   nazwaUst: /^cod\s*futar$/i,       kol: { opis: 4, kwota: 5 }, auf: true, hu: 'futar', przecinek: true },
         hdt:    { nazwa: 'HDT',    plik: 'HDT HUF', waluta: 'HUF', bank: '221', booking: '2', konto: '1372',
-                  nazwaUst: /^cod\s*hdt\s*huf$/i,   kol: { opis: 3, kwota: 7 }, auf: true, hu: 'hdt', przecinek: true }
+                  nazwaUst: /^cod\s*hdt\s*huf$/i,   kol: { opis: 3, kwota: 7 }, auf: true, hu: 'hdt', przecinek: true },
+        // Tylko z Mailiani (26.11.2026) — HUB nie czyta tych plików sam (brak ich w COD_KOLEJ). Ustawienia odczytane
+        // z /api/bankSettings/index/ 26.11.2026: 208 „COD RON GLS” (auftrag;kwota, jak paczka 2347517 zespołu),
+        // 251 „Zadbano CZ” (Nr zewnętrzny w kol. 5, Kwota COD w kol. 8; booking 1).
+        glsro:  { nazwa: 'GLS RO', plik: 'GLS RON', waluta: 'RON', bank: '208', booking: '2', konto: '1097',
+                  nazwaUst: /^cod\s*ron\s*gls$/i,   kol: { opis: 1, kwota: 2 }, auf: true, sumaWPliku: true },
+        zadbano: { nazwa: 'Zadbano CZ', plik: 'Zadbano CZ', waluta: 'CZK', bank: '251', booking: '1', konto: '1450',
+                  nazwaUst: /^zadbano\s*cz$/i,      kol: { opis: 5, kwota: 8 }, auf: true, sumaWPliku: true },
+        // Zadbano PL (PLN, Zleceniodawca BELIANI.PL) — istniejące ustawienie 75 „COD DTS” (konto 1079, sprzedawca Beliani PL,
+        // booking 2 = auftrag + nazwisko; 440 paczek zespołu do 26.01.2026). Plik jak Ambro: data;klient;auftrag/3/1;kwota.
+        zadbanopl: { nazwa: 'Zadbano PL', plik: 'Zadbano PL', waluta: 'PLN', bank: '75', booking: '2', konto: '1079',
+                  nazwaUst: /^cod\s*dts$/i,         kol: { opis: 3, kwota: 4 }, auf: true, sumaWPliku: true },
+        // DHL PL — ustawienie 160 „COD DHL PL” (konto 1093, booking 2, Beliani PL): data;klient;auftrag;kwota, jak pliki zespołu
+        // do 28.08.2026. Od września zespół księguje DHL wprost na auftragach (1093) — przed importem HUB sprawdza, czy auftragi
+        // nie są już opłacone (mostOplacone), żeby nie zaksięgować drugi raz.
+        dhlpl:  { nazwa: 'DHL PL', plik: 'DHL PL', waluta: 'PLN', bank: '160', booking: '2', konto: '1093',
+                  nazwaUst: /^cod\s*dhl\s*pl$/i,    kol: { opis: 3, kwota: 4 }, auf: true, sumaWPliku: true }
     };
     var COD_KOLEJ = ['ambro', 'glspl', 'inpost', 'ptt', 'glshu', 'futar', 'hdt'];
     var COD_BLOCK = 'booking_without_assign';           // = przycisk „Book on main account"
@@ -129603,7 +129643,7 @@
         var P = COD_PRZEW[z.przew], dPl = isoPl(z.data), w = [];
         z.poz.forEach(function (p){
             var kt = kwotaTxt(p.kwota, ust.przecinek);
-            if (z.przew === 'ambro') w.push([dPl, p.nazwa || '', p.opis, kt]);
+            if (z.przew === 'ambro' || z.przew === 'zadbanopl' || z.przew === 'dhlpl') w.push([dPl, p.nazwa || '', p.opis, kt]);
             else if (z.przew === 'ptt'){ var a = p.w.slice(); a[9] = kt; w.push(a); }
             else if (p.w){ var b = p.w.slice(); b[p.kolKw] = kt; w.push(b); }
             else w.push([p.opis, kt]);
@@ -129627,6 +129667,21 @@
         return j.parsing_list.filter(function (x){ return x && String(x.bank_id) === String(bank); })
             .sort(function (a, b){ return (Number(b.file_id) || 0) - (Number(a.file_id) || 0); });
     }
+    // Paczka usunięta w Import payments nie znika: przechodzi na listę inactive=1 (sprawdzone 26.11.2026 na 2369321 —
+    // dalej czytelna, 15 wierszy). Taka paczka nie jest „już w imporcie” i nie blokuje ponownego wgrania pliku.
+    var COD_NIEAKT = {};
+    async function nieaktywne(bank, swiezo){
+        var e = COD_NIEAKT[bank];
+        if (e && !swiezo && Date.now() - e.t < 300000) return e.ids;
+        var r = await fetch('/api/importPayments/?booking_method=manual&date_type=import_date&inactive=1&page=1&type=Payment&bank_name='
+                            + encodeURIComponent(bank), { credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' przy liście usuniętych paczek ' + bank);
+        var j = await r.json(), ids = {};
+        ((j && j.parsing_list) || []).forEach(function (x){ if (x && String(x.bank_id) === String(bank)) ids[String(x.file_id)] = 1; });
+        COD_NIEAKT[bank] = { t: Date.now(), ids: ids };
+        return ids;
+    }
+    async function nieaktywneBezpiecznie(bank){ try { return await nieaktywne(bank); } catch (e){ return {}; } }
     async function paczka(id){
         var r = await fetch('/api/importPayments/index/' + encodeURIComponent(id) + '/?', {
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
@@ -129717,18 +129772,26 @@
     // to lapie takze pliki wgrane recznie przez zespol pod inna nazwa.
     async function duble(wyn){
         var b = [], u = [], P = COD_PRZEW[wyn.przew];
-        var m = zlecenia();
+        var m = zlecenia(), usun = await nieaktywneBezpiecznie(P.bank);
         Object.keys(m).forEach(function (k){
             var z = m[k];
-            if (z && z.hash === wyn.hash) b.push('ten sam plik poszedł już do importu ' + (z.impId ? ('— paczka ' + z.impId) : '(numer paczki nieznany)')
-                                                 + ', data ' + isoPl(z.data) + ' (' + czasPl(z.czas) + ')');
+            if (!z || z.hash !== wyn.hash) return;
+            if (z.stan === 'usunieta' || (z.impId && usun[String(z.impId)])){
+                u.push('paczka ' + z.impId + ' z tym plikiem jest usunięta w prologistics — można wgrać jeszcze raz');
+                if (z.stan !== 'usunieta'){ z.stan = 'usunieta'; zapiszZ(z); }
+                return;
+            }
+            b.push('ten sam plik poszedł już do importu ' + (z.impId ? ('— paczka ' + z.impId) : '(numer paczki nieznany)')
+                   + ', data ' + isoPl(z.data) + ' (' + czasPl(z.czas) + ')');
         });
         if (wyn.hashBank){
             var mb = jGet(COD_BANK_KEY);
             Object.keys(mb).forEach(function (k){
                 var e = mb[k];
-                if (e && e.hash === wyn.hashBank && !e.ukryty && (e.impId || e.stan === 'wysylka' || e.stan === 'niepewne'))
+                if (e && e.hash === wyn.hashBank && !e.ukryty && (e.impId || e.stan === 'wysylka' || e.stan === 'niepewne')){
+                    if (e.impId && usun[String(e.impId)]){ u.push('paczka ' + e.impId + ' (Bank Import) jest usunięta w prologistics'); return; }
                     b.push('ten plik poszedł już przez Bank Import przy wpłacie z ' + isoPl(e.data) + (e.impId ? (' — paczka ' + e.impId) : ''));
+                }
             });
         }
         try {
@@ -129764,7 +129827,16 @@
     function analiza(z, d){
         var plik = {}, P = COD_PRZEW[z.przew] || {};
         (z.poz || []).forEach(function (p){ var k = klucz(p.opis); (plik[k] = plik[k] || []).push(p); });
-        var out = { ok: [], check: [], nf: [], zaks: [], niezgodne: [], zlyZaks: [], nfAuf: [], nfTrack: [], doKs: [], bezPliku: [], inne: [] };
+        var out = { ok: [], check: [], nf: [], zaks: [], niezgodne: [], zlyZaks: [], nfAuf: [], nfTrack: [], doKs: [], bezPliku: [], inne: [], inna: [] };
+        var zp = zlecenie(z.id) || z, zt = zp.track || {}, zpp = zp.przep || {};
+        // Auftrag PEWNY: ten sam co w pliku albo wskazany przez HUB jednoznacznie (wyszukiwarka po numerze przesyłki,
+        // przepięcie potwierdzone odczytem). Dopasowanie prologistics po samym nazwisku pewnym nie jest (paczka 2342876).
+        var pewny = function (x, fp, a){
+            if (!a) return false;
+            if (fp.auf) return a === fp.auf;
+            var e = zt[String(x.id)], e2 = zpp[String(x.id)];
+            return !!((e && e.nums && e.nums.length === 1 && String(e.nums[0]) === a) || (e2 && e2.stan === 'ok' && String(e2.na) === a));
+        };
         d.rows.forEach(function (x){
             var k = klucz(x.payment_descr), kand = plik[k] || [], kw = liczba(x.amount);
             var fp = kand.filter(function (p){ return kw != null && Math.abs(p.kwota - kw) < 0.005; })[0] || kand[0] || null;
@@ -129779,6 +129851,9 @@
             else if (st === 'NOT FOUND'){ out.nf.push(w); if (fp.auf && !a) out.nfAuf.push(w); else if (P.track && !a && !fp.auf) out.nfTrack.push(w); }
             else out.inne.push(w);
             if (st === 'OK' && !zaksiegowany(x) && !zly) out.doKs.push(w);
+            // Inna kwota niż open amount przy pewnym auftragu (decyzja 26.11.2026): księgujemy całość (status → OK),
+            // a open amount, który zostanie, odbijamy na CS Finance rynku auftragu.
+            if ((st === 'CHECK' || st === 'NOT FOUND') && !zaksiegowany(x) && !zly && kw != null && pewny(x, fp, a)) out.inna.push(w);
         });
         out.sumaKs = r2(out.doKs.reduce(function (s, w){ return s + (liczba(w.x.amount) || 0); }, 0));
         return out;
@@ -129930,7 +130005,7 @@
               + '<div id="cod-drop" style="border:2px dashed #FFCCB7;border-radius:8px;padding:14px;text-align:center;background:#F6E7E6;color:#750000">'
               + '📎 Upuść tu pliki albo <label style="text-decoration:underline;cursor:pointer">wybierz z dysku'
               + '<input id="cod-plik" type="file" multiple accept=".xls,.xlsx,.csv,.txt" style="display:none"></label></div>';
-        h += rysujNowe() + rysujZlecenia();
+        h += rysujMost() + rysujNowe() + rysujZlecenia();
         h += '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:11px;color:#666">📄 Log (' + COD_LOG.length + ')</summary>'
            + '<pre style="max-height:220px;overflow:auto;font-size:10px;background:#f7f7f7;padding:6px;white-space:pre-wrap">'
            + esc(COD_LOG.slice(-300).join('\n')) + '</pre></details>';
@@ -129991,12 +130066,13 @@
         if (z.stan === 'wysylka') return '<b style="color:#c47f00">wysyłka bez odpowiedzi</b> — nie wiem, czy paczka powstała';
         if (z.stan === 'niepewne') return '<b style="color:#c47f00">numer paczki nieznany</b>' + (z.blad ? (' — ' + esc(z.blad)) : '');
         if (z.stan === 'zaksiegowane') return '<b style="color:#15803d">zaksięgowane</b>';
+        if (z.stan === 'usunieta') return '<b style="color:#888">paczka usunięta w prologistics</b>';
         return '<b style="color:#1d4ed8">zaimportowane</b>';
     }
     function rysujZlecenia(){
         var m = zlecenia(), ids = Object.keys(m).sort(function (a, b){ return String(m[b].czas).localeCompare(String(m[a].czas)); });
         if (!ids.length) return '';
-        var otw = ids.filter(function (id){ return m[id].stan !== 'zaksiegowane' || (S.anal[id] && zostaje(S.anal[id])); });
+        var otw = ids.filter(function (id){ return m[id].stan !== 'usunieta' && (m[id].stan !== 'zaksiegowane' || (S.anal[id] && zostaje(S.anal[id]))); });
         var zak = ids.filter(function (id){ return otw.indexOf(id) < 0; });
         var h = '<div style="margin-top:14px"><b>Importy pobrań (' + ids.length + ')</b></div>';
         otw.forEach(function (id){ h += rysujZ(m[id]); });
@@ -130027,18 +130103,23 @@
             g += '<button data-cod-szukaj="' + esc(z.id) + '" style="' + GUZ + '">🔍 Szukaj paczki</button>';
         if (z.impId && !z.lekki) g += '<button data-cod-spr="' + esc(z.id) + '" style="' + GUZ + '">↻ Sprawdź paczkę</button>';
         if (z.lekki) g += '<span style="font-size:10px;color:#888">starsze niż 14 dni — HUB pamięta już tylko odcisk pliku</span>';
-        if (a && a.doKs.length && z.impId)
-            g += '<button data-cod-ks="' + esc(z.id) + '" style="' + GUZ_GL + ';padding:3px 10px;font-size:11px">▶ Zaksięguj OK (' + a.doKs.length + ' · ' + tys(a.sumaKs) + ')</button>';
+        if (a && (a.doKs.length || a.inna.length) && z.impId){
+            var innaS = r2(a.inna.reduce(function (s, w){ return s + (liczba(w.x.amount) || 0); }, 0));
+            g += '<button data-cod-ks="' + esc(z.id) + '" style="' + GUZ_GL + ';padding:3px 10px;font-size:11px" title="'
+               + (a.inna.length ? 'Wiersze z inną kwotą (auftrag pewny): status → OK, cała kwota na auftrag, open amount → CS Finance rynku' : '') + '">▶ Zaksięguj OK ('
+               + a.doKs.length + (a.inna.length ? (' + ' + a.inna.length + ' z inną kwotą') : '') + ' · ' + tys(r2(a.sumaKs + innaS)) + ')</button>';
+        }
         if (a && a.check.length && z.impId)
             g += '<button data-cod-chkok="' + esc(z.id) + '" style="' + GUZ + '">✏ Ustaw CHECK na OK (' + a.check.length + ')</button>';
         if (a && a.nfAuf.length && z.impId)
             g += '<button data-cod-nfauf="' + esc(z.id) + '" style="' + GUZ + '">🔗 Przypisz auftragi z pliku do NOT FOUND (' + a.nfAuf.length + ')</button>';
         if (a && a.nfTrack.length && z.impId)
             g += '<button data-cod-nftrack="' + esc(z.id) + '" style="' + GUZ + '">🔍 Szukaj auftragów po numerze przesyłki (' + a.nfTrack.length + ')</button>';
+        if (z.stan === 'usunieta') g = '';   // paczka usunięta w prologistics — nic tu nie księgujemy ani nie przepinamy
         g += '<button data-cod-zap="' + esc(z.id) + '" style="' + GUZ + ';color:#888">✕ Zapomnij</button>';
         h += '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' + (zaj ? '<span style="font-size:11px;color:#750000">⏳ ' + esc(zaj) + '</span>' : g) + '</div>';
         if (S.msg[z.id]) h += '<div style="margin-top:4px;font-size:11px;color:' + (S.msg[z.id].k || '#333') + '">' + S.msg[z.id].t + '</div>';
-        if (a) h += rysujAnalize(z, a);
+        if (a && z.stan !== 'usunieta') h += rysujAnalize(z, a);
         return h + '</div>';
     }
     function rysujAnalize(z, a){
@@ -130071,6 +130152,17 @@
             });
             h += '<div style="margin-top:3px;color:#c47f00">🔍 NOT FOUND po numerze przesyłki (' + a.nfTrack.length + ') — wskaż auftrag ręcznie: ' + szczeg.join('; ') + '</div>';
         }
+        if (a.inna.length) h += '<div style="color:#1d4ed8;margin-top:3px">💱 Inna kwota przy pewnym auftragu (' + a.inna.length + ') — „▶ Zaksięguj OK” ustawi OK, '
+            + 'zaksięguje całą kwotę i odbije open amount na CS Finance rynku: '
+            + a.inna.map(function (w){ return linkAuf(w.a) + ' (wpłata ' + tys(liczba(w.x.amount)) + ', open ' + esc(txt(w.x.open_amount) || '—') + ')'; }).join(', ') + '</div>';
+        var innZ = (zlecenie(z.id) || {}).inna || {};
+        var innW = Object.keys(innZ).map(function (k){ return innZ[k]; }).filter(function (e){ return e.odbite || e.koncowka || e.bladOdb || e.k8100; });
+        if (innW.length) h += '<div style="margin-top:3px;color:#374151">↩ Po księgowaniu z inną kwotą: ' + innW.map(function (e){
+            return linkAuf(e.auf) + ' — ' + (e.odbite ? ('open ' + tys(e.odbite.open) + ' odbity na ' + esc(e.odbite.kto))
+                 : e.koncowka ? ('końcówka ' + tys((e.k8100 && e.k8100.kwota) != null ? e.k8100.kwota : e.openPo) + ' → 8100')
+                 : (e.k8100 && e.k8100.stan !== 'ok') ? ('<span style="color:#c00">końcówka ' + tys(e.k8100.kwota) + ' NIE weszła na 8100: ' + esc(e.k8100.blad || 'bez potwierdzenia') + '</span>')
+                 : ('<span style="color:#c00">odbicie NIE wyszło: ' + esc(e.bladOdb) + ' — odbij ręcznie</span>'));
+        }).join('; ') + '</div>';
         if (a.zlyZaks.length) h += '<div style="color:#c00;margin-top:3px">✖ Zaksięgowane na INNYM auftragu niż w pliku — popraw ręcznie: '
             + a.zlyZaks.map(function (w){ return esc(w.fp.opis) + ': ' + linkAuf(w.a) + ' zamiast ' + linkAuf(w.fp.auf) + ' (' + tys(liczba(w.x.amount)) + ')'; }).join(', ') + '</div>';
         if (a.niezgodne.length) h += '<div style="color:#c00;margin-top:3px">✖ Auftrag inny niż w pliku (nie księguję): '
@@ -130126,9 +130218,10 @@
     }
 
     // ---------- wysylka do importu ----------
-    async function wyslijWszystkie(){
+    // tylko = lista z mostu Mailiani (automatyczny import) — wtedy bez okna potwierdzenia, reszta bez zmian.
+    async function wyslijWszystkie(tylko){
         if (S.wysylam) return;
-        var lst = S.nowe.filter(gotowy);
+        var lst = (Array.isArray(tylko) ? tylko : S.nowe).filter(gotowy);
         if (!lst.length) return;
         var ust = {};
         try {
@@ -130143,7 +130236,7 @@
             return '• ' + P.nazwa + ': ' + n.wyn.n + ' poz., ' + tys(n.wyn.suma) + ' ' + P.waluta + ' → import ' + P.bank + ' „' + u.nazwa + '” ('
                  + (u.konto || ('konto ' + P.konto)) + '), data paczki ' + isoPl(n.data) + (n.mimo ? '  ⚠ MIMO podejrzenia dubla' : '');
         }).join('\n');
-        if (!confirm('Wysłać do importu ' + lst.length + ' plik(ów)?\n\n' + txtc
+        if (!Array.isArray(tylko) && !confirm('Wysłać do importu ' + lst.length + ' plik(ów)?\n\n' + txtc
             + '\n\nKażdy plik to osobna paczka w Import payments. Po imporcie sprawdzę auftragi z pliku (inny auftrag niż w pliku przepnę sam) '
             + 'i pokażę guzik „Zaksięguj OK” — samo wysłanie niczego nie księguje.')) return;
         S.wysylam = true; mow('nowe', '⏳ wysyłam…', '#750000'); rysuj();
@@ -130153,7 +130246,7 @@
             var n = lst[k], P = COD_PRZEW[n.wyn.przew], u = ust[n.wyn.przew];
             var zid = 'c' + Date.now().toString(36) + k;
             var z = { id: zid, przew: n.wyn.przew, plik: n.plik, hash: n.wyn.hash, hashBank: n.wyn.hashBank, n: n.wyn.n, suma: n.wyn.suma,
-                      data: n.data, bank: P.bank, booking: u.booking, naglowek: n.wyn.naglowek,
+                      data: n.data, bank: P.bank, booking: u.booking, naglowek: n.wyn.naglowek, mailiani: n.mailiani || '',
                       poz: n.wyn.poz.map(function (p){ return { opis: p.opis, auf: p.auf || '', txn: p.txn || '', kwota: p.kwota, nazwa: p.nazwa || '', w: p.w || null, kolKw: p.kolKw }; }),
                       stan: 'wysylka', czas: czas(), impId: '' };
             var plik = plikImportu(z, u);
@@ -130176,10 +130269,13 @@
                 S.nowe.splice(S.nowe.indexOf(n), 1);
                 wyslane++;
                 if (wy.impId) sprawdzZ(zid, true);
+                if (n.mailiani) mostWynik(n.mailiani, wy.impId, wy.impId ? ('wysłane do importu z HUB-a' + (n.reczny ? ' (zlecone w Mailiani)' : (n.auto ? ' (automatycznie)' : '')) + ', data paczki ' + isoPl(n.data) + ' — paczka ' + wy.impId)
+                                                                  : ('wysłane, ale bez numeru paczki — ' + wy.opis), true, false);
             } catch (e){
                 z.stan = 'niepewne'; z.blad = (e && e.message) || String(e); zapiszZ(z);
                 log('✖ wysyłka', P.nazwa, z.blad);
                 S.nowe.splice(S.nowe.indexOf(n), 1);
+                if (n.mailiani) mostWynik(n.mailiani, '', 'wysyłka niepewna — ' + z.blad + ' (sprawdź w panelu COD HUB-a)', true, false);
             }
         }
         hubDz('COD', 'koniec', 'wysłane ' + wyslane + ' z ' + lst.length);
@@ -130190,7 +130286,7 @@
 
     // ---------- sprawdzenie paczki ----------
     async function sprawdzZ(id, poImporcie){
-        var z = zlecenie(id); if (!z || !z.impId || z.lekki || S.zajete[id]) return;
+        var z = zlecenie(id); if (!z || !z.impId || z.lekki || S.zajete[id] || z.stan === 'usunieta') return;
         S.zajete[id] = 'czytam paczkę ' + z.impId + '…'; rysuj();
         try {
             var d = await paczka(z.impId);
@@ -130327,8 +130423,174 @@
     }
 
     // ---------- ksiegowanie ----------
-    async function zaksieguj(id){
-        var z = zlecenie(id); if (!z || !z.impId || S.zajete[id]) return;
+    // ---------- inna kwota: odbicie open amount na CS Finance rynku (26.11.2026) ----------
+    // Ten sam mechanizm co w Bank Imporcie (bkPoDelete / bkOdbij w init_bank — z COD go nie widać, domknięcia):
+    // js_backend.php fn=reassignComment — jeden zapis dopisuje komentarz i przestawia odpowiedzialnego na „CS<KRAJ>Finance”.
+    // Lista loginów zamknięta (pamięć cs-finance-per-rynek): nieznany rynek = „odbij ręcznie”, nie zgadujemy loginu.
+    var COD_CS_RYNEK = {
+        AT: 'Paymentcsde', CH: 'Paymentcsde', DE: 'Paymentcsde', SK: 'CSCZFinance',
+        BE: 'CSBEFinance', CZ: 'CSCZFinance', DK: 'CSDKFinance', ES: 'CSESFinance',
+        FI: 'CSFIFinance', FR: 'CSFRFinance', HR: 'CSHRFinance', HU: 'CSHUFinance',
+        IT: 'CSITFinance', NL: 'CSNLFinance', NO: 'CSNOFinance', PL: 'CSPLFinance',
+        PT: 'CSPTFinance', RO: 'CSROFinance', SE: 'CSSEFinance', SI: 'CSSIFinance',
+        UK: 'CSUKFinance'
+    };
+    function codKrajAuftragu(html){
+        var t = String(html || ''), m = t.match(/Beliani\s+([A-Z]{2})\s*(?:<[^>]*>\s*)*=/);
+        if (m) return m[1];
+        m = t.match(/mobile\s+shop\s+([A-Z]{2})\b/i);
+        return m ? m[1].toUpperCase() : '';
+    }
+    function codObjId(doc, html){
+        var el = doc && (doc.querySelector('[data-obj-id][data-obj="auction"]') || doc.querySelector('[data-obj-id]'));
+        var v = el ? String(el.getAttribute('data-obj-id') || '').trim() : '';
+        if (/^\d+$/.test(v)) return v;
+        var m = String(html || '').match(/data-obj-id=["'](\d+)["']/);
+        return m ? m[1] : '';
+    }
+    function codLiczbaStrony(s){
+        var t = String(s || '').replace(/[\s'  ]/g, '');
+        if (t.indexOf('.') >= 0) t = t.replace(/,/g, ''); else t = t.replace(',', '.');
+        var v = parseFloat(t);
+        return isFinite(v) ? v : null;
+    }
+    // Saldo „Auftrag value - Total of Payments” — to, po którym stoi waluta (pierwsze bywa „(0.00)” bez waluty).
+    function codOpenStrony(doc){
+        var tx = (doc && doc.body ? doc.body.textContent : '').replace(/\s+/g, ' ');
+        var m = tx.match(/Auftrag value\s*-\s*Total of Payments\s*:\s*(?:€|£|Kč|Ft|zł|lei|[A-Z]{3})\s*(-?\d[\d.,'   ]*)/i);
+        return m ? codLiczbaStrony(m[1]) : null;
+    }
+    async function codOdbij(tekst, objId, kto){
+        var enc = function (v){ return encodeURIComponent(v).replace(/%20/g, '+'); };
+        var r = await fetch('/js_backend.php', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', 'x-requested-with': 'XMLHttpRequest', 'accept': '*/*' },
+            body: 'fn=reassignComment&username=' + enc(kto) + '&obj=auction&obj_id=' + enc(objId) + '&comment=' + enc(tekst) + '&field=responsible' });
+        if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?') + ' przy odbiciu na CS');
+        return r.text();
+    }
+    // Po księgowaniu: każdy zaksięgowany wiersz z inną kwotą → odczyt auftragu → open 0: nic; |open| ≤ 2 EUR (MOST_PROG):
+    // końcówka zostaje (8100 — osobno); więcej: komentarz z saldem i odpowiedzialny „CS<KRAJ>Finance”. Każdy auftrag raz.
+    async function codOdbijInne(id, po){
+        var z = zlecenie(id), P = COD_PRZEW[(z || {}).przew] || {}, prog = MOST_PROG[P.waluta] || 0;
+        var wynik = { odbite: [], koncowki: [], bledy: [], bledy8100: [] };
+        if (!z || !z.inna) return wynik;
+        var rids = Object.keys(z.inna);
+        for (var i = 0; i < rids.length; i++){
+            var rid = rids[i], e = z.inna[rid];
+            if (e.odbite || e.zero || e.koncowka || e.bladOdb === 'stop') continue;
+            if (e.k8100 && e.k8100.stan === 'blad' && (e.k8100.proby || 0) >= 2) continue;   // dwie nieudane próby — tylko ręcznie
+            if (!po[rid] || !zaksiegowany(po[rid])) continue;           // wiersz nie wszedł — nie ma czego odbijać
+            try {
+                var html = await (await fetch('/auction.php?number=' + encodeURIComponent(e.auf) + '&txnid=3', { credentials: 'same-origin' })).text();
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var open = codOpenStrony(doc);
+                if (open == null) throw new Error('nie odczytałem open amount auftragu');
+                e.openPo = open;
+                if (Math.abs(open) < 0.005){
+                    if (e.k8100 && e.k8100.stan !== 'ok'){ e.k8100.stan = 'ok'; e.koncowka = true; }   // poprzedni zapis 8100 jednak wszedł
+                    else e.zero = true;
+                    zapiszZ(z);
+                    continue;
+                }
+                if (Math.abs(open) <= prog){
+                    // Końcówka w progu 2 EUR → 8100 na auftragu. Ślad PRZED zapisem; po zapisie odczyt musi pokazać open 0.
+                    e.k8100 = { stan: 'wysylka', czas: czas(), kwota: open, proby: ((e.k8100 && e.k8100.proby) || 0) + 1 };
+                    zapiszZ(z);
+                    try {
+                        await codNa8100(e.auf, open, z.data, 'COD ' + (P.nazwa || z.przew) + ' paczka ' + z.impId + ' — końcówka ' + f2c(open) + ' na 8100');
+                        var html2 = await (await fetch('/auction.php?number=' + encodeURIComponent(e.auf) + '&txnid=3', { credentials: 'same-origin' })).text();
+                        var open2 = codOpenStrony(new DOMParser().parseFromString(html2, 'text/html'));
+                        if (open2 == null || Math.abs(open2) >= 0.005) throw new Error('po zapisie open amount dalej ' + f2c(open2));
+                        e.k8100.stan = 'ok'; e.koncowka = true;
+                        wynik.koncowki.push({ auf: e.auf, open: open });
+                        log('paczka', z.impId, 'auftrag', e.auf, 'końcówka', f2c(open), '→ 8100');
+                    } catch (ex8){
+                        e.k8100.stan = 'blad'; e.k8100.blad = (ex8 && ex8.message) || String(ex8);
+                        wynik.bledy8100.push({ auf: e.auf, open: open, blad: e.k8100.blad });
+                        log('✖ paczka', z.impId, 'auftrag', e.auf, 'końcówka na 8100:', e.k8100.blad);
+                    }
+                    zapiszZ(z);
+                    continue;
+                }
+                var kraj = codKrajAuftragu(html), kto = COD_CS_RYNEK[kraj] || '';
+                if (!kto) throw new Error('nie znam CS Finance rynku „' + (kraj || '?') + '”');
+                var oid = codObjId(doc, html);
+                if (!oid) throw new Error('nie odczytałem obj_id auftragu');
+                var tekst = 'COD ' + (P.nazwa || z.przew) + ' (paczka ' + z.impId + '): wpłata ' + f2c(e.kwota) + ' ' + (P.waluta || '')
+                          + ' zaksięgowana przy open ' + (e.openPrzed == null ? '?' : f2c(e.openPrzed))
+                          + ' — Auftrag value - Total of Payments: ' + f2c(open);
+                await codOdbij(tekst, oid, kto);
+                e.odbite = { kto: kto, czas: czas(), open: open };
+                wynik.odbite.push({ auf: e.auf, open: open, kto: kto });
+                log('paczka', z.impId, 'auftrag', e.auf, 'open', f2c(open), '→ odbity na', kto);
+            } catch (ex){
+                e.bladOdb = (ex && ex.message) || String(ex);
+                wynik.bledy.push({ auf: e.auf, blad: e.bladOdb });
+                log('✖ paczka', z.impId, 'auftrag', e.auf, 'odbicie na CS:', e.bladOdb);
+            }
+            zapiszZ(z);
+        }
+        return wynik;
+    }
+    function f2c(v){ return (v == null || !isFinite(v)) ? '?' : Number(v).toFixed(2); }
+
+    // ---------- końcówka do 2 EUR na 8100 (26.11.2026) ----------
+    // Tak jak moduł Księgowanie (submitBookPayment, w init_ksieg — z COD go nie widać): strona auftragu w ukrytej ramce,
+    // formularz #book „Make payment” (sprawdzony odczytem na 16238495: Date_Month/Day/Year, account z „8100, Non-operating
+    // Income penalties”, amount, paycomment, #make-payment). Kwota = open amount ze znakiem, więc auftrag schodzi na 0.
+    var COD_RAMKA = null;
+    function codUrlAuftragu(auf){ return '/auction.php?number=' + encodeURIComponent(auf) + '&txnid=3'; }
+    function codRamka(){
+        if (COD_RAMKA && COD_RAMKA.parentNode) return COD_RAMKA;
+        var f = document.createElement('iframe');
+        f.style.cssText = 'position:fixed;left:-2000px;top:-2000px;width:1200px;height:900px;opacity:0;pointer-events:none;z-index:-1';
+        document.body.appendChild(f);
+        COD_RAMKA = f;
+        return f;
+    }
+    function codRamkaLaduj(f, url, ms){
+        return new Promise(function (ok, nie){
+            var t = setTimeout(function (){ f.onload = null; nie(new Error('strona auftragu nie przeładowała się w ' + Math.round(ms / 1000) + ' s')); }, ms);
+            f.onload = function (){ clearTimeout(t); f.onload = null; ok(); };
+            if (url) f.src = url;
+        });
+    }
+    function codUstaw(win, el, v){
+        if (!el) return false;
+        var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+        if (d && d.set) d.set.call(el, v); else el.value = v;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        try { if (win && win.$) win.$(el).trigger('change'); } catch (e){}
+        return String(el.value) === String(v);
+    }
+    async function codNa8100(auf, kwota, dataIso, komentarz){
+        var f = codRamka();
+        await codRamkaLaduj(f, codUrlAuftragu(auf), 30000);
+        var doc = f.contentDocument, win = f.contentWindow;
+        var form = doc && (doc.querySelector('form#book') || Array.prototype.find.call(doc.querySelectorAll('form'), function (x){ return x.querySelector('#make-payment'); }));
+        if (!form) throw new Error('na auftragu nie ma formularza „Make payment”');
+        var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dataIso || ''));
+        if (!m) throw new Error('zła data: ' + dataIso);
+        var okD = codUstaw(win, form.querySelector('select[name="Date_Month"]'), m[2]) || codUstaw(win, form.querySelector('select[name="Date_Month"]'), String(parseInt(m[2], 10)));
+        okD = codUstaw(win, form.querySelector('select[name="Date_Day"]'), String(parseInt(m[3], 10))) && okD;
+        okD = codUstaw(win, form.querySelector('select[name="Date_Year"]'), m[1]) && okD;
+        if (!okD) throw new Error('formularz nie przyjął daty ' + isoPl(dataIso));
+        var acc = form.querySelector('select[name="account"]');
+        if (!acc || !Array.prototype.some.call(acc.options, function (o){ return o.value === '8100'; })) throw new Error('konta 8100 nie ma na liście formularza');
+        codUstaw(win, acc, '8100');
+        if (!codUstaw(win, form.querySelector('input[name="amount"]'), Number(kwota).toFixed(2))) throw new Error('formularz nie przyjął kwoty');
+        codUstaw(win, form.querySelector('input[name="paycomment"]'), komentarz || '');
+        var guz = form.querySelector('#make-payment');
+        if (!guz) throw new Error('brak przycisku „Make payment”');
+        var przeladowanie = codRamkaLaduj(f, null, 30000);
+        guz.click();
+        await przeladowanie;
+    }
+
+    // bezPytania = import z Mailiani z „księguj od razu” — te same kontrole i blokady, tylko bez okna potwierdzenia
+    async function zaksieguj(id, bezPytania){
+        var z = zlecenie(id); if (!z || !z.impId || S.zajete[id] || z.stan === 'usunieta') return;
         // Zajete OD RAZU, przed czekaniem na blokade. Dotad S.zajete stawalo dopiero po 400 ms, a blokada()
         // przepuszcza wlasna karte — drugie klikniecie w tym czasie odpalalo drugi przebieg, ktory po drugim „OK"
         // ksiegowal te same wiersze jeszcze raz (wzor dubla z paczki 2259365, przeglad 19.11.2026).
@@ -130358,15 +130620,38 @@
                 z = zlecenie(id) || z; a = analiza(z, d);
             }
             S.anal[id] = a; S.d[id] = d;
-            if (!a.doKs.length){ mow(id, 'Nie ma czego księgować: brak wierszy OK bez płatności z auftragiem zgodnym z plikiem.', '#c47f00'); return; }
+            if (!a.doKs.length && !a.inna.length){ mow(id, 'Nie ma czego księgować: brak wierszy OK bez płatności z auftragiem zgodnym z plikiem.', '#c47f00'); return; }
             var P = COD_PRZEW[z.przew] || {};
+            var innaN = a.inna.length, innaSuma = r2(a.inna.reduce(function (s, w){ return s + (liczba(w.x.amount) || 0); }, 0));
             // Paczka zostaje zajeta takze na czas pytania — przerysowanie nie wystawia w tym czasie aktywnego guzika.
             S.zajete[id] = 'czekam na potwierdzenie…'; rysuj();
-            if (!confirm('Zaksięgować ' + a.doKs.length + ' wierszy OK z paczki ' + z.impId + ' („' + COD_BLOCK_OPIS + '”)?\n\n'
-                + 'Przewoźnik: ' + P.nazwa + '\nSuma: ' + tys(a.sumaKs) + ' ' + (P.waluta || '') + '\nData paczki: ' + isoPl(z.data)
-                + (a.check.length ? ('\n\nCHECK (' + a.check.length + ') i NOT FOUND (' + a.nf.length + ') zostają w paczce — nie księguję ich.') : (a.nf.length ? ('\n\nNOT FOUND (' + a.nf.length + ') zostaje w paczce.') : ''))
+            var resztaCh = a.check.length - a.inna.filter(function (w){ return w.st === 'CHECK'; }).length;
+            var resztaNf = a.nf.length - a.inna.filter(function (w){ return w.st === 'NOT FOUND'; }).length;
+            if (bezPytania !== true && !confirm('Zaksięgować ' + (a.doKs.length + innaN) + ' wierszy z paczki ' + z.impId + ' („' + COD_BLOCK_OPIS + '”)?\n\n'
+                + 'Przewoźnik: ' + P.nazwa + '\nSuma: ' + tys(r2(a.sumaKs + innaSuma)) + ' ' + (P.waluta || '') + '\nData paczki: ' + isoPl(z.data)
+                + (innaN ? ('\n\nW tym ' + innaN + ' z INNĄ KWOTĄ niż open amount (auftrag pewny — z pliku albo po numerze przesyłki): ustawię je na OK, '
+                           + 'zaksięguję całą kwotę, a open amount, który zostanie, odbiję na CS Finance rynku auftragu:\n'
+                           + a.inna.slice(0, 10).map(function (w){ return '  • ' + w.a + ': wpłata ' + tys(liczba(w.x.amount)) + ', open ' + (txt(w.x.open_amount) || '—'); }).join('\n')) : '')
+                + ((resztaCh > 0 || resztaNf > 0) ? ('\n\nZostaje w paczce: CHECK ' + Math.max(0, resztaCh) + ', NOT FOUND ' + Math.max(0, resztaNf) + ' (auftrag niepewny).') : '')
                 + (a.niezgodne.length ? ('\n\n' + a.niezgodne.length + ' wierszy z auftragiem innym niż w pliku też zostaje.') : ''))) return;
             if (!blokadaMoja(z.impId)){ mow(id, '✖ Blokadę paczki przejęła inna karta, gdy okno było otwarte — nic nie wysłałem.', '#c00'); return; }
+            if (innaN){
+                // Ślad PRZED zapisem: te wiersze idą na OK i dostaną po księgowaniu odbicie open amount na CS.
+                z = zlecenie(id) || z; z.inna = z.inna || {};
+                a.inna.forEach(function (w){
+                    var rid = String(w.x.id);
+                    if (!z.inna[rid]) z.inna[rid] = { auf: w.a, kwota: liczba(w.x.amount), openPrzed: liczba(w.x.open_amount), czas: czas() };
+                });
+                zapiszZ(z);
+                S.zajete[id] = 'ustawiam ' + innaN + ' wierszy z inną kwotą na OK…'; rysuj();
+                hubDz('COD', 'start', 'paczka ' + z.impId + ': inna kwota → OK, wierszy ' + innaN);
+                for (var iI = 0; iI < a.inna.length; iI++){
+                    var xi = a.inna[iI].x;
+                    if (String(xi.state || '').trim().toUpperCase() !== 'OK') await ustawStan(z.impId, String(xi.id), 'OK');
+                }
+                d = await paczka(z.impId); a = analiza(z, d); S.anal[id] = a; S.d[id] = d;
+                log('paczka', z.impId, 'inna kwota → OK:', innaN, '| do księgowania teraz:', a.doKs.length);
+            }
             S.zajete[id] = 'księguję ' + a.doKs.length + ' wierszy…'; rysuj();
             var d2 = await paczka(z.impId), swieze = {};
             d2.rows.forEach(function (x){ swieze[String(x.id)] = x; });
@@ -130388,10 +130673,30 @@
             S.anal[id] = a3; S.d[id] = d3;
             if (!a3.doKs.length && !a3.check.length && !a3.nf.length && !a3.niezgodne.length){ z.stan = 'zaksiegowane'; }
             z.booked = true; zapiszZ(z);
-            log('✔ paczka', z.impId, 'zaksięgowane', weszlo, 'z', ids.length, 'po', Math.round((Date.now() - t0) / 1000), 's');
-            hubDz('COD', 'koniec', 'paczka ' + z.impId + ': zaksięgowane ' + weszlo + ' z ' + ids.length);
+            // Inna kwota: open amount, który został na auftragu, idzie na CS Finance rynku (komentarz z saldem)
+            var odb = { odbite: [], koncowki: [], bledy: [] };
+            if (Object.keys((zlecenie(id) || {}).inna || {}).length){
+                S.zajete[id] = 'odbijam open amount na CS rynku…'; rysuj();
+                odb = await codOdbijInne(id, po);
+                z = zlecenie(id) || z;
+            }
+            var odbOpis = (odb.odbite.length ? (' Open amount odbity na CS: ' + odb.odbite.map(function (o){ return o.auf + ' (' + tys(o.open) + ' → ' + o.kto + ')'; }).join(', ') + '.') : '')
+                        + (odb.koncowki.length ? (' Końcówki do 2 EUR na 8100: ' + odb.koncowki.map(function (o){ return o.auf + ' (' + tys(o.open) + ')'; }).join(', ') + '.') : '')
+                        + ((odb.bledy8100 || []).length ? (' ✖ Końcówka na 8100 NIE weszła: ' + odb.bledy8100.map(function (o){ return o.auf + ' (' + tys(o.open) + ') — ' + o.blad; }).join('; ') + ' — zaksięguj ręcznie.') : '')
+                        + (odb.bledy.length ? (' ✖ Odbicie NIE wyszło: ' + odb.bledy.map(function (o){ return o.auf + ' — ' + o.blad; }).join('; ') + ' — odbij ręcznie.') : '');
+            if (z.mailiani && weszlo){
+                var zost = [];
+                if (a3.check.length) zost.push('CHECK ' + a3.check.length);
+                if (a3.nf.length) zost.push('NOT FOUND ' + a3.nf.length);
+                if (a3.niezgodne.length) zost.push('auftrag inny niż w pliku ' + a3.niezgodne.length);
+                mostWynik(z.mailiani, z.impId, 'zaksięgowane ' + weszlo + ' z ' + ids.length + ' wierszy (paczka ' + z.impId + ', data ' + isoPl(z.data) + ')'
+                    + (zost.length ? (' — zostało do ręcznego w panelu COD: ' + zost.join(', ')) : '') + odbOpis, true, true);
+            }
+            log('✔ paczka', z.impId, 'zaksięgowane', weszlo, 'z', ids.length, 'po', Math.round((Date.now() - t0) / 1000), 's', odbOpis);
+            hubDz('COD', 'koniec', 'paczka ' + z.impId + ': zaksięgowane ' + weszlo + ' z ' + ids.length + odbOpis);
             mow(id, (weszlo === ids.length ? '✔ ' : '⚠ ') + 'Zaksięgowane ' + weszlo + ' z ' + ids.length + ' wierszy.'
-                + (weszlo < ids.length ? ' Pozostałe nie mają płatności po odczycie — sprawdź paczkę w prologistics.' : ''), weszlo === ids.length ? '#15803d' : '#c47f00');
+                + (weszlo < ids.length ? ' Pozostałe nie mają płatności po odczycie — sprawdź paczkę w prologistics.' : '') + esc(odbOpis),
+                (weszlo === ids.length && !odb.bledy.length) ? '#15803d' : '#c47f00');
         } catch (e){
             mow(id, '✖ ' + esc((e && e.message) || e) + ' — jeśli zapis poszedł, przy następnym kliknięciu najpierw sprawdzę, czy paczka się uspokoiła.', '#c00');
             log('✖ księgowanie', z.impId, (e && e.message) || e);
@@ -130428,6 +130733,514 @@
         usunZ(id); delete S.anal[id]; delete S.msg[id]; delete S.d[id];
         rysuj();
     }
+
+    // ---------- most do Mailiani (26.11.2026) ----------
+    // Mailiani — program na tym komputerze (http://127.0.0.1:47811) — czyta zestawienia COD z poczty invoices@ i robi
+    // z nich te same pliki importu, co ten moduł. To, co wymaga sesji prologistics, robi HUB: co 2 minuty pyta Mailiani
+    // o zadania (GM_xmlhttpRequest z kluczem mostu; zwykły fetch strony do 127.0.0.1 blokuje Chrome) i:
+    //  1) sprawdza, czy zestawienie jest już w prologistics — ta sama logika co duble(): pamięć modułu, pamięć Bank
+    //     Importu, wiersze paczek ustawienia z 60 dni, „już jest” od połowy pozycji;
+    //  2) szuka wpływu w imporcie bankowym kraju (PL 220, HU 24, RO 236): kwota co do grosza, wpływ nie wcześniej niż
+    //     2 dni przed zestawieniem, nadawca wyglądający na przewoźnika (MOST_NADAWCA);
+    //  3) zestawienia z „Wgraj do prologistics” wstawia do „Nowe pliki” — wysyła człowiek, jak plik upuszczony;
+    //  4) przy automatycznym imporcie (włącza się w Mailiani) wysyła sam, ale TYLKO gdy wpływ jest od tego przewoźnika,
+    //     duble() nic nie znalazło, plik jest bez błędów, a ustawienie importu przechodzi kontrolę ustawienie().
+    //     Data paczki = dzień wpływu. Księgowanie zostaje ręczne („Zaksięguj OK”).
+    // Mailiani wyłączony albo bez klucza — moduł działa jak dotąd, most milczy.
+    var MOST_URL = 'http://127.0.0.1:47811';
+    // Klucz wbudowany — ten sam stoi w Mailiani (mailiani.py, KLUCZ_MOSTU_WBUD). Most działa bez wklejania klucza;
+    // klucz wklejony w panelu ma pierwszeństwo. Mailiani słucha tylko na 127.0.0.1 tego komputera.
+    var MOST_KLUCZ_WBUD = 'NoycmFUcrjIlCmUwGb1SX0tW_m6SzLtR';
+    var MOST_KEY = 'cod_mailiani';                 // { klucz, wl }
+    var MOST_LOCK = 'cod_mailiani_karta';          // { karta, t } — pyta jedna karta naraz
+    var MOST = { trwa: false, czas: '', stan: '', blad: '', auto: null };
+    var MOST_CACHE = { listy: {}, wiersze: {}, auf: {} };   // listy paczek 5 min, wiersze paczek 30 min, open auftragu 30 min
+    // Czy auftragi z pliku są już opłacone (open amount 0). Najwyżej 4 auftragi na zestawienie (strona auftragu jest ciężka),
+    // wynik w pamięci 30 min. { n: ile opłaconych, z: ile sprawdzonych, nr: [opłacone] }.
+    async function mostOplacone(wyn){
+        var nr = [], wynik = { n: 0, z: 0, nr: [] };
+        (wyn.poz || []).forEach(function (p){ if (p.auf && nr.indexOf(p.auf) < 0 && nr.length < 4) nr.push(p.auf); });
+        for (var i = 0; i < nr.length; i++){
+            var e = MOST_CACHE.auf[nr[i]];
+            if (!e || Date.now() - e.t > 1800000){
+                try {
+                    var html = await (await fetch('/auction.php?number=' + encodeURIComponent(nr[i]) + '&txnid=3', { credentials: 'same-origin' })).text();
+                    e = MOST_CACHE.auf[nr[i]] = { t: Date.now(), open: codOpenStrony(new DOMParser().parseFromString(html, 'text/html')) };
+                } catch (ex){ e = { t: Date.now(), open: null }; }
+                await czekaj(150);
+            }
+            if (e.open == null) continue;
+            wynik.z++;
+            if (Math.abs(e.open) < 0.005){ wynik.n++; wynik.nr.push(nr[i]); }
+        }
+        return wynik;
+    }
+    var MOST_NADAWCA = { ambro: /ambro/i, glspl: /general\s*logistics|\bgls\b/i, inpost: /inpost/i, dhlpl: /\bdhl\b/i,
+                         glshu: /\bgls\b|general\s*log/i, hdt: /\bhdt\b|ge\s*logisztika/i, futar: /fut[aá]r/i,
+                         ptt: /posta\s*tabita|\bptt\b/i, glsro: /\bgls\b|general\s*logistics/i, zadbano: /zadbano|\bdts\b/i,
+                         zadbanopl: /zadbano|\bdts\b/i };   // Zadbano PL (26.11.2026): wpłata na BNP SP, bez importu — tylko wpłata i IRENKA
+    var MOST_AUTO_MAX = 10;                        // najwyżej tyle plików jednym automatycznym przebiegiem
+    var MOST_BYLY = {};                            // zestawienia z Mailiani już raz wstawione na listę w tej karcie
+
+    function mostUst(){ return jGet(MOST_KEY); }
+    // Mailiani dostaje od HUB-a adres swojego Apps Scriptu (HUB_WDROZENIA 'mailiani') i wspólny klucz (⚙ Połączenia) —
+    // nikt nie wpisuje ich w Mailiani. Mailiani pokazuje tylko odcisk klucza; wysyłamy, gdy adres albo odcisk się różni.
+    async function mostSha(t){
+        try {
+            var b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
+            return Array.prototype.map.call(new Uint8Array(b), function (x){ return ('0' + x.toString(16)).slice(-2); }).join('');
+        } catch (e){ return ''; }
+    }
+    async function mostKonfig(k){
+        var url = hubUrl('mailiani'), kl = hubKlucz();
+        if (!url || !kl) return;
+        var odc = (await mostSha(kl)).slice(0, 16);
+        if (k.as_url === url && odc && k.klucz_odcisk === odc) return;
+        var r = await mostReq('POST', '/most/konfig', { as_url: url, klucz: kl });
+        log(r && r.ok ? 'Mailiani: przekazany adres i klucz Apps Scriptu (rejestr COD, Dysk, IRENKA)' : '✖ Mailiani nie przyjął adresu Apps Scriptu');
+    }
+    function mostReq(metoda, sciezka, cialo){
+        var u = mostUst();
+        return new Promise(function (ok, nie){
+            try {
+                GM_xmlhttpRequest({
+                    method: metoda, url: MOST_URL + sciezka, timeout: 20000,
+                    headers: { 'X-Mailiani-Klucz': u.klucz || MOST_KLUCZ_WBUD, 'Content-Type': 'application/json' },
+                    data: cialo ? JSON.stringify(cialo) : undefined,
+                    onload: function (r){
+                        var j = null; try { j = JSON.parse(r.responseText); } catch (e){}
+                        if (r.status === 403) return nie(new Error('Mailiani odrzucił klucz mostu — wklej go jeszcze raz'));
+                        if (r.status !== 200 || !j) return nie(new Error('Mailiani: HTTP ' + r.status));
+                        ok(j);
+                    },
+                    onerror: function (){ var e = new Error('Mailiani nie działa na tym komputerze'); e.brak = true; nie(e); },
+                    ontimeout: function (){ nie(new Error('Mailiani nie odpowiedział w 20 s')); }
+                });
+            } catch (e){ nie(e); }
+        });
+    }
+    function mostWynik(id, paczka, opis, zakonczone, zaksiegowane){
+        mostReq('POST', '/most/wynik', { id: id, paczka: paczka || '', opis: opis || '', zakonczone: !!zakonczone, zaksiegowane: !!zaksiegowane })
+            .catch(function (e){ log('✖ Mailiani (wynik):', (e && e.message) || e); });
+    }
+    function mostMoge(){
+        var l = jGet(MOST_LOCK), t = Date.now();
+        if (l.karta && l.karta !== COD_KARTA && t - (Number(l.t) || 0) < 300000) return false;
+        jSet(MOST_LOCK, { karta: COD_KARTA, t: t });
+        return true;
+    }
+    async function mostLista(bank){
+        var e = MOST_CACHE.listy[bank];
+        if (e && Date.now() - e.t < 300000) return e.L;
+        var L = await lista(bank);
+        MOST_CACHE.listy[bank] = { t: Date.now(), L: L };
+        return L;
+    }
+    async function mostWiersze(fileId){
+        var e = MOST_CACHE.wiersze[fileId];
+        if (e && Date.now() - e.t < 1800000) return e.rows;
+        var d = await paczka(fileId);
+        MOST_CACHE.wiersze[fileId] = { t: Date.now(), rows: d.rows };
+        jSet(MOST_LOCK, { karta: COD_KARTA, t: Date.now() });   // długi pierwszy przebieg — druga karta nie wchodzi w środek
+        await czekaj(120);
+        return d.rows;
+    }
+    // 1) czy zestawienie jest już w prologistics — trzy zapory jak w duble(), ale z pamięcią paczek między zestawieniami
+    async function mostCzyJest(wyn){
+        var P = COD_PRZEW[wyn.przew];
+        if (!P) return { paczka: '', opis: 'HUB nie zna ustawienia importu przewoźnika ' + wyn.przew };
+        var m = zlecenia(), ks = Object.keys(m), usun = await nieaktywneBezpiecznie(P.bank);
+        for (var i = 0; i < ks.length; i++){
+            var z = m[ks[i]];
+            if (z && (z.stan === 'usunieta' || (z.impId && usun[String(z.impId)]))) continue;   // paczka usunięta w prologistics
+            if (z && z.hash === wyn.hash && z.impId) return { paczka: z.impId, n: wyn.n, z: wyn.n, opis: 'ten sam plik poszedł już przez moduł COD HUB-a (paczka ' + z.impId + ')' };
+            if (z && z.hash === wyn.hash) return { paczka: '', stop: true, n: 0, z: wyn.n, opis: 'ten plik wysłano już z HUB-a, ale bez numeru paczki — sprawdź w panelu COD („🔍 Szukaj paczki”)' };
+        }
+        if (wyn.hashBank){
+            var mb = jGet(COD_BANK_KEY), kb = Object.keys(mb);
+            for (var j = 0; j < kb.length; j++){
+                var e = mb[kb[j]];
+                if (e && e.hash === wyn.hashBank && !e.ukryty && e.impId && !usun[String(e.impId)]) return { paczka: e.impId, n: wyn.n, z: wyn.n, opis: 'ten plik poszedł już przez Bank Import (paczka ' + e.impId + ')' };
+            }
+        }
+        var L = await mostLista(P.bank), gr = Date.now() - 60 * 86400000;
+        var bierz = L.filter(function (x, i){
+            var t = Date.parse(String(x.updated || '').replace(' ', 'T'));
+            return i < 6 || (isFinite(t) && t >= gr);
+        }).slice(0, 20);
+        var moje = {};
+        wyn.poz.forEach(function (p){ moje[klucz(p.opis) + '|' + r2(p.kwota).toFixed(2)] = 1; });
+        var naj = null;
+        for (var k = 0; k < bierz.length; k++){
+            var rows = await mostWiersze(bierz[k].file_id), n = 0, byl = {};
+            rows.forEach(function (x){
+                var kk = klucz(x.payment_descr) + '|' + (liczba(x.amount) == null ? '' : r2(liczba(x.amount)).toFixed(2));
+                if (moje[kk] && !byl[kk]){ byl[kk] = 1; n++; }
+            });
+            if (n && (!naj || n > naj.n)) naj = { id: String(bierz[k].file_id), nazwa: bierz[k].filename, n: n };
+        }
+        var prog = Math.max(1, Math.ceil(wyn.n / 2));
+        if (naj && naj.n >= prog) return { paczka: naj.id, n: naj.n, z: wyn.n, opis: 'paczka ' + naj.id + ' („' + naj.nazwa + '”) ma ' + naj.n + ' z ' + wyn.n + ' pozycji' };
+        // Bez paczki importu, a auftragi z pliku już opłacone → zespół zaksięgował zestawienie inną drogą (DHL od 09.2026: wprost
+        // na auftragach, konto 1093). Wtedy nie importujemy — drugi import zaksięgowałby te same wpłaty jeszcze raz.
+        if (P.auf){
+            var op = await mostOplacone(wyn);
+            if (op.z && op.n >= Math.max(1, Math.ceil(op.z / 2)))
+                return { paczka: '', poza: true, stop: true, n: op.n, z: op.z,
+                         opis: 'auftragi z pliku są już opłacone (' + op.n + ' z ' + op.z + ' sprawdzonych: ' + op.nr.join(', ')
+                               + ') — zestawienie zaksięgowane bez paczki importu, nie importuję' };
+        }
+        return { paczka: '', n: naj ? naj.n : 0, z: wyn.n,
+                 opis: naj ? ('nie ma w imporcie — najbliżej paczka ' + naj.id + ': ' + naj.n + ' z ' + wyn.n + ' pozycji')
+                           : ('nie ma w imporcie (sprawdzone paczki ustawienia ' + P.bank + ' z 60 dni)') };
+    }
+    // 2) wpływ w imporcie bankowym kraju: kwota co do grosza, nie wcześniej niż 2 dni przed zestawieniem
+    async function mostWplata(q, uzyte){
+        if (!q.bank) return null;
+        var L = await mostLista(q.bank);
+        var od = Date.parse(String(q.od_dnia) + 'T00:00:00') - 2 * 86400000;
+        if (!isFinite(od)) return null;
+        var bierz = L.filter(function (x){ var t = Date.parse(String(x.updated || '').replace(' ', 'T')); return isFinite(t) && t >= od; }).slice(0, 30);
+        var wz = MOST_NADAWCA[q.przew], kw = r2(q.kwota), traf = [];
+        for (var i = 0; i < bierz.length; i++){
+            var rows = await mostWiersze(bierz[i].file_id);
+            rows.forEach(function (x){
+                var a = liczba(x.amount);
+                if (a == null || Math.abs(r2(a) - kw) >= 0.005) return;
+                var d = String(x.payment_date || '').slice(0, 10);
+                if (d && Date.parse(d + 'T12:00:00') < od) return;
+                var tekst = (txt(x.customer_name) + ' · ' + txt(x.payment_descr)).trim();
+                var klucz_ = d + '|' + kw.toFixed(2) + '|' + tekst;
+                if (uzyte[klucz_]) return;
+                traf.push({ data: d, paczka: String(bierz[i].file_id), wiersz: String(x.id), opis: tekst.slice(0, 160), nadawca: wz ? wz.test(tekst) : false, k: klucz_ });
+            });
+        }
+        if (!traf.length) return null;
+        traf.sort(function (a, b){ return (b.nadawca - a.nadawca) || String(a.data).localeCompare(String(b.data)); });
+        uzyte[traf[0].k] = 1;
+        return { data: traf[0].data, paczka: traf[0].paczka, wiersz: traf[0].wiersz, bank: q.bank, nadawca: traf[0].nadawca, klucz: traf[0].k,
+                 opis: (traf[0].nadawca ? '' : '⚠ kwota się zgadza, ale nadawca nie wygląda na ' + q.przewoznik + ': ') + traf[0].opis };
+    }
+    function mostCialoWplaty(id, w){
+        return { id: id, data: w.data, paczka: w.paczka, wiersz: w.wiersz, bank: w.bank, opis: w.opis, nadawca: w.nadawca, klucz: w.klucz };
+    }
+    // 3) zestawienia z Mailiani na listę „Nowe pliki” (raz na zestawienie) + duble jak dla upuszczonego pliku
+    async function mostDoListy(lst, auto){
+        var nowe = [];
+        lst.forEach(function (q){
+            if (!q.wyn || !COD_PRZEW[q.wyn.przew]) return;
+            if (S.nowe.some(function (n){ return n.mailiani === q.id; })) return;
+            // zdjęte z listy ręcznie (🗑 / „Wyczyść listę”) nie wraca co 2 minuty — do odświeżenia strony
+            if (!auto){ if (MOST_BYLY[q.id]) return; MOST_BYLY[q.id] = 1; }
+            // nazwa z datą paczki (= data wpływu na konto), nie z datą zestawienia z maila
+            var dn = q.data || q.data_paczki || S.dataWsz;
+            var n = { plik: 'COD ' + COD_PRZEW[q.wyn.przew].plik + ' ' + isoPl(dn) + ' · z Mailiani', wyn: q.wyn, blad: '',
+                      data: dn, dataRecznie: true, duble: null, sprawdzam: false, mimo: false,
+                      mailiani: q.id, auto: !!auto, reczny: !!q.reczny, ksieguj: !!q.ksieguj };
+            S.nowe.push(n); nowe.push(n);
+        });
+        for (var i = 0; i < nowe.length; i++){
+            var n = nowe[i];
+            if (n.wyn.bledy && n.wyn.bledy.length) continue;
+            n.sprawdzam = true;
+            try { n.duble = await duble(n.wyn); }
+            catch (e){ n.duble = { bledy: ['nie sprawdziłem duplikatów: ' + ((e && e.message) || e)], uwagi: [] }; }
+            if (S.nowe.some(function (o){ return o !== n && o.wyn && o.wyn.hash === n.wyn.hash; }))
+                n.duble.bledy.push('ten sam plik jest na liście drugi raz');
+            n.sprawdzam = false;
+        }
+        if (nowe.length){ log('Mailiani →', nowe.length, auto ? 'plików do automatycznego importu' : 'plików na listę „Nowe pliki”'); mostZnaczek(); }
+        return nowe;
+    }
+    function mostZnaczek(){
+        var k = S.nowe.filter(function (n){ return n.mailiani && !n.auto; }).length;
+        btn.textContent = '🚚 COD' + (k ? ' · ' + k + ' z Mailiani' : '');
+    }
+    // szybki = co 20 s tylko zlecone „Importuj” (tani odczyt z Mailiani); pełny przebieg (import, wpłaty) co 2 min
+    async function mostPrzebieg(reczny, szybki){
+        var u = mostUst();
+        // klucz jest wbudowany (MOST_KLUCZ_WBUD) — most działa bez wklejania; bez Mailiani na komputerze szybkie pytania milkną
+        if ((u.wl === false && !reczny) || MOST.trwa || (szybki && MOST.brak)) return;
+        if (!reczny && !mostMoge()) return;
+        if (reczny) jSet(MOST_LOCK, { karta: COD_KARTA, t: Date.now() });
+        var poprz = { stan: MOST.stan, czas: MOST.czas };
+        MOST.trwa = true;
+        if (!szybki){ MOST.blad = ''; MOST.stan = 'pytam Mailiani…'; if (panel.style.display === 'block') rysuj(); }
+        var licz = { imp: 0, jest: 0, wpl: 0, auto: 0, lista: 0, ks: 0 };
+        try {
+            var j = await mostReq('GET', '/most/zlecenia' + (szybki ? '?tylko=zlecenia' : ''));
+            if (MOST.brak){ MOST.brak = false; log('Mailiani: połączono'); }
+            if (!szybki && j.konfig) await mostKonfig(j.konfig);
+            if (szybki && !(j.zlecenia || []).length){ MOST.blad = ''; MOST.stan = poprz.stan; return; }
+            MOST.auto = j.auto || null;
+            var autoWl = !!(j.auto && j.auto.wl), autoPrzew = (j.auto && j.auto.przew) || [];
+            var ksieguj = !!(j.auto && j.auto.ksieguj);      // „po imporcie od razu księguj wiersze OK” (ustawienie w Mailiani)
+            // wpływy przypisane już innym zestawieniom (Mailiani pamięta je między przebiegami) — dwa zestawienia
+            // z tą samą kwotą (np. dwa PTT po 29 869) nie dostaną jednego wpływu
+            var uzyte = {}, zrobione = {}, doAuto = [];
+            (j.zajete || []).forEach(function (k){ if (k) uzyte[k] = 1; });
+            // „Importuj” kliknięte w Mailiani — Mailiani oddaje tu tylko zestawienia z wpłatą w imporcie banku.
+            // Idą bez klikania w panelu (te same kontrole co automat); wpłata od obcego nadawcy → „Nowe pliki” dla człowieka.
+            var zl = j.zlecenia || [], recznie = {}, doListy = [];
+            for (var z0 = 0; z0 < zl.length; z0++){
+                var q0 = zl[z0], w0 = q0.wplata || {};
+                recznie[q0.id] = 1;
+                MOST.stan = 'import zlecony w Mailiani: ' + (z0 + 1) + ' z ' + zl.length + ' (' + q0.przewoznik + ')';
+                if (panel.style.display === 'block') rysuj();
+                var r0 = await mostCzyJest(q0.wyn);
+                if (r0.paczka){
+                    licz.jest++;
+                    await mostReq('POST', '/most/import', { id: q0.id, paczka: r0.paczka, n: r0.n || 0, z: r0.z || 0, opis: r0.opis || '' });
+                    continue;
+                }
+                if (r0.poza){ licz.jest++; await mostReq('POST', '/most/import', { id: q0.id, paczka: '', n: r0.n || 0, z: r0.z || 0, opis: r0.opis, poza: true }); continue; }
+                if (r0.stop){ mostWynik(q0.id, '', 'import wstrzymany — ' + r0.opis, true, false); continue; }
+                if (!w0.data) continue;
+                var p0 = { id: q0.id, wyn: q0.wyn, przewoznik: q0.przewoznik, plik_importu: q0.plik_importu,
+                           data: String(w0.data).slice(0, 10), data_paczki: q0.data_paczki, reczny: true, ksieguj: ksieguj };
+                if (w0.nadawca === true || w0.nadawca === 'True'){ if (doAuto.length < MOST_AUTO_MAX) doAuto.push(p0); }
+                else doListy.push(p0);
+            }
+            if (doListy.length){
+                var nl = await mostDoListy(doListy, false);
+                licz.lista = nl.length;
+                nl.forEach(function (n){
+                    mostWynik(n.mailiani, '', 'wpłata nie wygląda na przewoźnika — plik czeka w panelu COD HUB-a („Nowe pliki”) do sprawdzenia i wysłania', true, false);
+                });
+            }
+            // paczki zestawień „wgranych” — czy ktoś nie usunął ich w prologistics (lista inactive=1 ustawienia)
+            var pz = szybki ? [] : (j.paczki || []), usunMemo = {};
+            for (var u0 = 0; u0 < pz.length; u0++){
+                var qp = pz[u0], Pp = COD_PRZEW[qp.przew];
+                if (!Pp || !qp.paczka) continue;
+                if (!usunMemo[Pp.bank]) { try { usunMemo[Pp.bank] = await nieaktywne(Pp.bank, true); } catch (e1){ usunMemo[Pp.bank] = {}; } }
+                var us = usunMemo[Pp.bank];
+                if (!us[String(qp.paczka)]) continue;
+                licz.usun = (licz.usun || 0) + 1;
+                var mz = zlecenia();
+                Object.keys(mz).forEach(function (k){
+                    if (String(mz[k].impId) === String(qp.paczka) && mz[k].stan !== 'usunieta'){ mz[k].stan = 'usunieta'; zapiszZ(mz[k]); }
+                });
+                await mostReq('POST', '/most/usunieta', { id: qp.id, paczka: String(qp.paczka) });
+                log('Mailiani: paczka', qp.paczka, '(' + Pp.nazwa + ') usunięta w prologistics — zestawienie znowu do importu');
+            }
+            var imp = szybki ? [] : (j.importy || []).filter(function (q){ return !recznie[q.id]; });
+            for (var i = 0; i < imp.length; i++){
+                var q = imp[i];
+                MOST.stan = 'czy już w imporcie: ' + (i + 1) + ' z ' + imp.length + ' (' + q.przewoznik + ')';
+                if (panel.style.display === 'block') rysuj();
+                var r = await mostCzyJest(q.wyn);
+                licz.imp++; if (r.paczka) licz.jest++;
+                await mostReq('POST', '/most/import', { id: q.id, paczka: r.paczka || '', n: r.n || 0, z: r.z || 0, opis: r.opis || '', poza: !!r.poza });
+                // bez_auto: paczkę tego zestawienia ktoś usunął w prologistics — automat nie wgrywa jej drugi raz sam
+                if (r.paczka || r.stop || q.bez_auto || !autoWl || autoPrzew.indexOf(q.przew) < 0 || !q.bank) continue;
+                var w = (q.wplata && q.wplata.data) ? q.wplata : await mostWplata(q, uzyte);
+                if (w && !(q.wplata && q.wplata.data)){
+                    zrobione[q.id] = 1; licz.wpl++;
+                    await mostReq('POST', '/most/wplata', mostCialoWplaty(q.id, w));
+                }
+                if (w && (w.nadawca === true || w.nadawca === 'True') && doAuto.length < MOST_AUTO_MAX)
+                    doAuto.push({ id: q.id, wyn: q.wyn, przewoznik: q.przewoznik, plik_importu: q.plik_importu, data: String(w.data).slice(0, 10), data_paczki: q.data_paczki, ksieguj: ksieguj });
+            }
+            var wpl = szybki ? [] : (j.wplaty || []).filter(function (q){ return !zrobione[q.id]; });
+            for (var k = 0; k < wpl.length; k++){
+                var q2 = wpl[k];
+                MOST.stan = 'wpłata w banku: ' + (k + 1) + ' z ' + wpl.length + ' (' + q2.przewoznik + ')';
+                if (panel.style.display === 'block') rysuj();
+                var w2 = await mostWplata(q2, uzyte);
+                if (w2) licz.wpl++;
+                await mostReq('POST', '/most/wplata', w2 ? mostCialoWplaty(q2.id, w2) : { id: q2.id, brak: true });
+            }
+            if (doAuto.length && !S.wysylam){
+                MOST.stan = 'import z Mailiani: ' + doAuto.length + ' plików';
+                var na = await mostDoListy(doAuto, true);
+                var gotowe = na.filter(gotowy);
+                na.filter(function (n){ return !gotowy(n); }).forEach(function (n){
+                    var pow = (n.wyn.bledy || []).concat((n.duble && n.duble.bledy) || []).join('; ') || 'nie przeszedł kontroli';
+                    // zlecony w Mailiani: koniec zlecenia, powód widać w Mailiani; automat: spróbuje znów za 20 min
+                    mostWynik(n.mailiani, '', (n.reczny ? 'import' : 'automatyczny import') + ' wstrzymany — ' + pow, !!n.reczny, false);
+                    S.nowe.splice(S.nowe.indexOf(n), 1);
+                });
+                if (gotowe.length){
+                    log('Mailiani: import bez klikania', gotowe.length, 'plików (zlecone w Mailiani albo automat)');
+                    hubDz('COD', 'start', 'Mailiani — import bez klikania ' + gotowe.length + ' plików');
+                    await wyslijWszystkie(gotowe);
+                    // co nie wyszło (np. ustawienie importu nie przeszło kontroli), zostaje na liście dla człowieka
+                    var zostalo = gotowe.filter(function (n){ return S.nowe.indexOf(n) >= 0; });
+                    zostalo.forEach(function (n){
+                        n.auto = false;
+                        MOST_BYLY[n.mailiani] = 1;
+                        mostWynik(n.mailiani, '', (n.reczny ? 'import' : 'automatyczny import') + ' nie poszedł — ' + String((S.msg.nowe && S.msg.nowe.t) || 'bez powodu').replace(/<[^>]+>/g, '') + ' (plik czeka w panelu COD HUB-a)', !!n.reczny, false);
+                    });
+                    licz.auto = gotowe.length - zostalo.length;
+                    // „po imporcie od razu księguj”: wiersze OK z auftragiem zgodnym z plikiem — jak „▶ Zaksięguj OK”, bez pytania
+                    var wyslane = gotowe.filter(function (n){ return n.ksieguj && S.nowe.indexOf(n) < 0; });
+                    for (var g = 0; g < wyslane.length; g++){
+                        MOST.stan = 'księguję po imporcie: ' + (g + 1) + ' z ' + wyslane.length;
+                        if (await mostZaksieguj(wyslane[g].mailiani)) licz.ks++;
+                    }
+                }
+            }
+            // Dokończenie: import z Mailiani z ostatniej doby, który nie został zaksięgowany (starsza kopia HUB-a, zamknięta
+            // karta, przerwa w połączeniu) — przy włączonym „księguj od razu”, najwyżej 3 próby na paczkę.
+            if (!szybki && ksieguj && !S.wysylam){
+                var mz2 = zlecenia(), gr24 = Date.now() - 86400000;
+                var dok = Object.keys(mz2).filter(function (k){
+                    var z = mz2[k], t = Date.parse(z.czas || '');
+                    return z.mailiani && z.impId && z.stan === 'import' && !z.booked && (z.ksProby || 0) < 3
+                        && isFinite(t) && t >= gr24 && !S.zajete[k];
+                });
+                for (var d0 = 0; d0 < dok.length; d0++){
+                    var zd = zlecenie(dok[d0]); if (!zd) continue;
+                    var Pd = COD_PRZEW[zd.przew];
+                    if (Pd && (await nieaktywneBezpiecznie(Pd.bank))[String(zd.impId)]){ zd.stan = 'usunieta'; zapiszZ(zd); continue; }
+                    zd.ksProby = (zd.ksProby || 0) + 1; zapiszZ(zd);
+                    MOST.stan = 'dokańczam księgowanie paczki ' + zd.impId;
+                    log('Mailiani: dokańczam księgowanie paczki', zd.impId, '(próba ' + zd.ksProby + ' z 3)');
+                    if (await mostZaksieguj(zd.mailiani, dok[d0])) licz.ks++;
+                }
+            }
+            MOST.czas = czas();
+            MOST.stan = szybki
+                ? ('import z Mailiani: wysłane ' + licz.auto + (licz.ks ? (', zaksięgowane ' + licz.ks) : '') + (licz.jest ? (', już w imporcie ' + licz.jest) : '') + (licz.lista ? (', na listę ' + licz.lista) : ''))
+                : ('sprawdzone: ' + licz.imp + ' zestawień (już w imporcie ' + licz.jest + '), wpłat znalezionych ' + licz.wpl
+                   + (licz.auto ? (', wysłane do importu ' + licz.auto) : '') + (licz.ks ? (', zaksięgowane ' + licz.ks) : '') + (licz.lista ? (', na listę ' + licz.lista) : '')
+                   + (licz.usun ? (', usuniętych paczek ' + licz.usun) : ''));
+            if (licz.imp || licz.wpl || licz.auto || licz.lista || licz.jest || licz.usun) log('Mailiani:', MOST.stan);
+        } catch (e){
+            var t = (e && e.message) || String(e);
+            if (e && e.brak){
+                // na komputerze bez Mailiani to normalny stan, nie błąd: bez czerwonego komunikatu i bez wpisów co 2 min
+                if (!MOST.brak) log('Mailiani:', t);
+                MOST.brak = true; MOST.blad = ''; MOST.stan = '';
+            } else {
+                if (t !== MOST.blad) log('✖ Mailiani:', t);
+                MOST.brak = false;                 // Mailiani odpowiedział (np. 403), tylko z błędem
+                MOST.blad = t; MOST.stan = '';
+            }
+        } finally {
+            MOST.trwa = false;
+            mostZnaczek();
+            // szybki przebieg bez zmian nie przerysowuje panelu (co 20 s gubiłby to, co człowiek właśnie wpisuje)
+            var zmiana = !szybki || MOST.stan !== poprz.stan || MOST.czas !== poprz.czas;
+            if (zmiana && panel.style.display === 'block') rysuj();
+        }
+    }
+    // Księgowanie paczki zaraz po imporcie z Mailiani: czeka, aż HUB skończy sprawdzać paczkę (sprawdzZ po imporcie)
+    // i aż prologistics pokaże wiersze, potem zaksieguj(…, true). Zwraca true, gdy coś weszło.
+    async function mostZaksieguj(mailianiId, zidPodany){
+        var m = zlecenia(), zid = zidPodany || Object.keys(m).filter(function (k){ return m[k].mailiani === mailianiId && m[k].impId && m[k].stan !== 'usunieta'; })
+            .sort(function (a, b){ return String(m[b].czas).localeCompare(String(m[a].czas)); })[0];
+        if (!zid) return false;
+        var z = m[zid];
+        for (var i = 0; i < 60 && S.zajete[zid]; i++) await czekaj(1000);
+        try {
+            for (var k = 0; k < 6; k++){
+                var d = await paczka(z.impId);
+                if (d.rows.length) break;
+                await czekaj(10000);
+            }
+        } catch (e){}
+        await zaksieguj(zid, true);
+        var po = zlecenie(zid) || {}, pow = '';
+        if (!po.booked){
+            pow = String((S.msg[zid] && S.msg[zid].t) || 'nie wiem dlaczego').replace(/<[^>]+>/g, '');
+            mostWynik(mailianiId, z.impId, 'zaimportowane (paczka ' + z.impId + ', data ' + isoPl(z.data) + '), ale NIE zaksięgowane — ' + pow + ' (dokończ w panelu COD)', true, false);
+        }
+        // Coś zostało do ręcznej roboty → Mailiani wysyła maila do osoby od rynku (CZ/HU/RO, PL) z linkiem do paczki.
+        var prob = mostProblemy(zid, pow);
+        if (prob.length){
+            try { await mostReq('POST', '/most/problem', { id: mailianiId, paczka: z.impId, przew: z.przew, problemy: prob }); }
+            catch (e){ log('✖ Mailiani (problemy paczki ' + z.impId + '):', (e && e.message) || e); }
+        }
+        return !!po.booked;
+    }
+    // Próg różnicy open amount ↔ kwota: 2 EUR — końcówki do tej kwoty idą na 8100, większa różnica do odbicia przez CS
+    // (użytkownik 26.11.2026: „do 2 euro, bo się zmieniało”; Bank Import HVB ma w kodzie 2,50 jako domyślne, ustawialne).
+    // Przeliczone przybliżonym kursem (PLN 4,30, CZK 25, HUF 400, RON 5); różnica w tym progu nie robi maila.
+    var MOST_PROG = { EUR: 2, PLN: 8.6, CZK: 50, HUF: 800, RON: 10 };
+    function mostProblemy(zid, powod){
+        var z = zlecenie(zid) || {}, a = S.anal[zid], P = COD_PRZEW[z.przew] || {}, prog = MOST_PROG[P.waluta] || 0, out = [];
+        var poz = function (rodzaj, w, tekst, extra){
+            var o = { rodzaj: rodzaj, auf: (w && w.fp && w.fp.auf) || '', aufPaczka: (w && w.a) || '', opis: w ? txt(w.x.payment_descr) : '',
+                      kwota: w ? liczba(w.x.amount) : null, tekst: tekst };
+            for (var k in (extra || {})) o[k] = extra[k];
+            out.push(o);
+        };
+        if (powod) poz('niezaksiegowane', null, 'paczka nie została zaksięgowana — ' + powod);
+        if (!a) return out;
+        a.zlyZaks.forEach(function (w){
+            poz('dopasowanie', w, 'zaksięgowane na INNYM auftragu: ' + w.a + ' zamiast ' + w.fp.auf + ' z pliku — do przeksięgowania');
+        });
+        a.niezgodne.forEach(function (w){
+            poz('dopasowanie', w, 'złe dopasowanie: w pliku auftrag ' + w.fp.auf + ', prologistics podpiął ' + w.a + ' — HUB nie zdołał przepiąć, wiersz niezaksięgowany');
+        });
+        a.check.forEach(function (w){
+            var kw = liczba(w.x.amount), op = liczba(w.x.open_amount), r = (kw != null && op != null) ? r2(op - kw) : null;
+            if (r != null && Math.abs(r) <= prog) return;           // końcówka w progu 2 EUR — bez maila
+            poz('open', w, (op === 0 ? 'auftrag jest już opłacony (open amount 0), a z pliku przyszło ' + tys(kw) + ' ' + (P.waluta || '')
+                                     : 'open amount ' + tys(op) + ' ≠ kwota z pliku ' + tys(kw) + ' ' + (P.waluta || '') + ' (różnica ' + tys(r) + ')')
+                           + ' — ponad 2 EUR, do odbicia na CS', { open: op, roznica: r });
+        });
+        a.nf.forEach(function (w){
+            poz('notfound', w, 'NOT FOUND — prologistics nie znalazł auftragu ' + ((w.fp && w.fp.auf) || txt(w.x.payment_descr)));
+        });
+        // Inna kwota przy pewnym auftragu: zaksięgowana i odbita na CS — bez maila. Mail tylko, gdy odbicie nie wyszło.
+        var inn = (zlecenie(zid) || {}).inna || {};
+        Object.keys(inn).forEach(function (rid){
+            var e = inn[rid];
+            if (e.bladOdb && !e.odbite) out.push({ rodzaj: 'odbicie', auf: e.auf, aufPaczka: e.auf, kwota: e.kwota, opis: '',
+                tekst: 'zaksięgowane ' + tys(e.kwota) + ' ' + (P.waluta || '') + ' przy open ' + (e.openPrzed == null ? '?' : tys(e.openPrzed))
+                       + ', ale odbicie open amount na CS Finance rynku NIE wyszło (' + e.bladOdb + ') — odbij ręcznie' });
+            if (e.k8100 && e.k8100.stan !== 'ok') out.push({ rodzaj: '8100', auf: e.auf, aufPaczka: e.auf, kwota: e.kwota, opis: '',
+                tekst: 'końcówka ' + tys(e.k8100.kwota) + ' ' + (P.waluta || '') + ' (do 2 EUR) NIE weszła na 8100 (' + (e.k8100.blad || 'zapis bez potwierdzenia')
+                       + ') — zaksięguj ręcznie na auftragu, konto 8100' });
+        });
+        a.bezPliku.forEach(function (w){
+            poz('bezpliku', w, 'w paczce jest wiersz spoza pliku: „' + txt(w.x.payment_descr) + '” ' + tys(liczba(w.x.amount)));
+        });
+        return out;
+    }
+    function rysujMost(){
+        var u = mostUst(), a = MOST.auto;
+        var stan = MOST.trwa ? ('⏳ ' + esc(MOST.stan))
+                 : MOST.brak ? '<span style="color:#888">nie działa na tym komputerze</span>'
+                 : MOST.blad ? '<span style="color:#c00">✖ ' + esc(MOST.blad) + '</span>'
+                 : MOST.czas ? ('ostatnio ' + esc(czasPl(MOST.czas)) + ' · ' + esc(MOST.stan)) : 'czekam na pierwsze połączenie';
+        return '<details style="margin-top:12px;border:1px solid #DBD9D7;border-radius:8px;padding:6px 9px">'
+             + '<summary style="cursor:pointer;font-size:12px"><b style="color:#750000">🔗 Mailiani</b> · ' + stan
+             + (a ? (' · automatyczny import: <b>' + (a.wl ? 'WŁĄCZONY' : 'wyłączony') + '</b>'
+                     + ' · księgowanie po imporcie: <b>' + (a.ksieguj ? 'od razu' : 'ręczne') + '</b>') : '') + '</summary>'
+             + '<div style="font-size:11px;color:#555;margin:6px 0">Mailiani (program na tym komputerze) czyta zestawienia COD z poczty invoices@. '
+             + 'Co 2 minuty HUB sprawdza dla niego, czy zestawienie jest już w imporcie i czy wpłata weszła na konto (PL 220, HU 24, RO 236). '
+             + '„Importuj” w Mailiani (HUB odbiera je co 20 s): plik idzie sam, gdy wpłata jest w imporcie banku (data paczki = data wpłaty); '
+             + 'przy wpłacie od innego nadawcy plik czeka niżej w „Nowe pliki”. Automatyczny import (bez klikania) i „księguj od razu po imporcie” '
+             + '(wiersze OK z auftragiem zgodnym z plikiem, jak „▶ Zaksięguj OK”) ustawia się w Mailiani → Ustawienia.</div>'
+             + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+             + '<input id="cod-most-klucz" type="password" autocomplete="off" style="font-size:11px;width:330px;padding:3px 6px" placeholder="'
+             + (u.klucz ? 'własny klucz zapisany — wklej nowy, żeby zmienić' : 'klucz jest wbudowany — wklej tylko, gdy Mailiani ma inny') + '">'
+             + '<button id="cod-most-zapisz" style="' + GUZ + '">Zapisz klucz</button>'
+             + '<button id="cod-most-teraz" style="' + GUZ + '"' + (MOST.trwa ? ' disabled' : '') + '>↻ Sprawdź teraz</button>'
+             + '<label style="font-size:11px"><input id="cod-most-wl" type="checkbox"' + (u.wl === false ? '' : ' checked') + '> pytaj co 2 min</label>'
+             + '</div></details>';
+    }
+    function mostPodepnij(){
+        var k = panel.querySelector('#cod-most-zapisz');
+        if (k) k.onclick = function (){
+            var v = (panel.querySelector('#cod-most-klucz') || {}).value || '';
+            v = v.trim();
+            if (!v) return;
+            var u = mostUst(); u.klucz = v; if (u.wl == null) u.wl = true; jSet(MOST_KEY, u);
+            MOST.blad = ''; log('Mailiani: klucz mostu zapisany');
+            mostPrzebieg(true);
+        };
+        var t = panel.querySelector('#cod-most-teraz'); if (t) t.onclick = function (){ mostPrzebieg(true); };
+        var w = panel.querySelector('#cod-most-wl');
+        if (w) w.onchange = function (){ var u = mostUst(); u.wl = w.checked; jSet(MOST_KEY, u); rysuj(); };
+    }
+    setTimeout(function (){ mostPrzebieg(false); }, 15000);
+    setInterval(function (){ mostPrzebieg(false); }, 120000);
+    setInterval(function (){ mostPrzebieg(false, true); }, 20000);
 
     // ---------- podpiecie zdarzen ----------
     function dragCo(ev){
@@ -130487,6 +131300,7 @@
         co('data-cod-nftrack', nfTrackReczne);
         co('data-cod-szukaj', szukaj);
         co('data-cod-zap', zapomnij);
+        mostPodepnij();
     }
 })();
     }
