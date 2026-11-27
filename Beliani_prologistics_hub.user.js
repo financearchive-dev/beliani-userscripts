@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beliani — narzędzia prologistics (hub)
 // @namespace    beliani.finance
-// @version      5.63.29
+// @version      5.63.30
 // @description  Wszystkie skrypty w jednym pliku, dostępne z jednego guzika „Narzędzia" (launcher). Moduły włączasz/wyłączasz w launcherze (⚙ Moduły) lub w menu Tampermonkey/ScriptCat. Źródła: Księgowanie 3.62, Kurs+VIES 1.17, Refund 2.1, SEPA 1.5, Issue Log 0.24, Zmiana typu 2.2, Allegro 3.5.
 // @author       Finance
 // @match        https://www.prologistics.info/*
@@ -3151,7 +3151,18 @@
         // 16.11.2026 — MediaMarkt Saturn CH (import 269; bez wpisu pole konta przy nocie zwrotu pokazuje nieznane konto)
         "1468":"MediaMarkt Saturn Beliani Switzerland GmbH",
         // 25.11.2026 — Payback DE (konto rozliczeniowe Mirakla; bez wpisu pole konta przy nocie zwrotu pokazuje nieznane konto)
-        "1470":"Payback DE Beliani DE"
+        "1470":"Payback DE Beliani DE",
+        // 27.11.2026 — XXXLutz SI (import 264) i Vente Unique NO (konta odczytane z /accounts.php; bez wpisu „nieznane konto")
+        "1464":"XXXLutz SI Beliani (Europe) GmbH",
+        "1469":"Vente Unique NO Beliani (Norge) GmbH",
+        // 27.11.2026 — konta ustawien importu XXXLutz CZ/RO/HU (265/266/270) i Vente DK/SE/UK (271/268/256), z account_name ustawien
+        "1465":"XXXLutz CZ Beliani (DE) GmbH",
+        "1462":"XXXLutz RO Beliani (EU) GmbH",
+        "1466":"XXXLutz HU Beliani (DE) GmbH",
+        "1467":"XXXLutz SK Beliani (DE) GmbH",
+        "1457":"Vente Unique DK Beliani (DE) GmbH",
+        "1456":"Vente Unique SE Beliani (DE) GmbH",
+        "1454":"Vente Unique UK Beliani (UK) GmbH"
     };
 
     function getAccountLabel(num) {
@@ -30719,6 +30730,40 @@
         //  * miasto-panstwo (HK, SG, MO) — miastem jest nazwa kraju, a nie „Unit1003" z pierwszego czlonu;
         //  * kod pocztowy zdejmowany przed szukaniem miasta (Atlas: „Maldon Essex England CM98LZ");
         //  * „Bazhou City Langfang City" — miastem jest pierwszy czlon z „City".
+        /* Miasto z adresu BEZ PRZECINKOW (27.11.2026). pbTown dzieli adres po przecinkach, a jeden dlugi czlon z „ROAD",
+           „PARK" albo „DISTRICT" odpada w calosci — wiec przy takich adresach miasta nie bylo wcale i trzeba je bylo wpisywac:
+             „SUNSHINE INDUSTRIAL PARK ANJI ECONOMIC DEVELOPMENT ZONE ZHEJIANG PROVINCE CHINA"  (Anji Qiyao)
+             „East Road South One Huang Chong industrial park Bei Jiao Shen De District Foshan City Guangdong China" (Espatio)
+             „Rongxi Village Zhuqi County Minhou Fujian China"  (Fuzhou YongYuan)
+             „NO.9 LONGBANG ROAD LONGMEN TOWN ANXI COUNTY QUANZHOU FUJIAN CHINA"  (Quanzhou Zhongshang)
+           1) ostatnie „<slowo> City" (dwa slowa, gdy tabela kodow zna taka nazwe: „Dong Guan City");
+           2) Chiny: od konca, pomijajac kraj, prowincje i slowa strefy (ECONOMIC DEVELOPMENT ZONE…), PIERWSZE inne slowo
+              musi byc nazwa z tabeli kodow pocztowych (pnaMapy, GeoNames) — inaczej nic. Dalej w glab nie szukamy:
+              „… XINGHUA ROAD" nie moze dac miasta Xinghua.                                                               */
+        var PAIN_MIASTO_POMIN = /^(?:PROVINCE|SHENG|CHINA|PR|P|R|COUNTY|CITY|SHI|DISTRICT|ECONOMIC|ECONOMICAL|DEVELOPMENT|ZONE|INDUSTRIAL|INDUSTRY|PARK|AREA|HIGH|HI|TECH|NEW|TECHNOLOGY|TECHNOLOGICAL|SCIENCE|BONDED|FREE|TRADE|EXPORT|PROCESSING|AND)$/;
+        function painMiastoBezPrzecinkow(addr, ctry){
+            var t = pbStripCtry(String(addr == null ? '' : addr).replace(/\s*\n\s*/g, ' '));
+            if (!t) return '';
+            var m = null;
+            try { m = pnaMapy(); } catch (e){ m = null; }
+            function znana(s){ return !!(m && m.cnNazwa && m.cnNazwa[pnaRdzen(s)]); }
+            function zle(n){ return !n || PB_NOTOWN.test(n) || PB_PROV.test(n) || PB_STREFA_OGOLNE.test(n) || PAIN_ADR_OGOLNE.test(n); }
+            var sl = t.replace(/[^A-Za-z'\- ]+/g, ' ').split(/\s+/).filter(Boolean);
+            for (var i = sl.length - 1; i >= 1; i--){
+                if (!/^city$/i.test(sl[i])) continue;
+                var w1 = sl[i - 1], w2 = i >= 2 ? (sl[i - 2] + ' ' + sl[i - 1]) : '';
+                if (w2 && znana(w2) && !zle(pbNorm(sl[i - 2]))) return w2;
+                if (w1.length >= 3 && !zle(pbNorm(w1))) return w1;
+            }
+            if (String(ctry || '').toUpperCase() !== 'CN' || !m) return '';
+            for (var j = sl.length - 1; j >= 0; j--){
+                var n = pbNorm(sl[j]);
+                if (!n || PB_PROV.test(n) || PAIN_MIASTO_POMIN.test(n)) continue;
+                if (j > 0 && znana(sl[j - 1] + ' ' + sl[j]) && !zle(pbNorm(sl[j - 1]))) return sl[j - 1] + ' ' + sl[j];
+                return (sl[j].length >= 3 && !zle(n) && znana(sl[j])) ? sl[j] : '';
+            }
+            return '';
+        }
         function painGeoZPI(b){
             var g = piBankGeo(b), addr = String((b && b.addr) || '');
             var t = ' ' + pbNorm(addr) + ' ';
@@ -30729,6 +30774,7 @@
                 var a2 = pbStripCtry(addr.replace(/\s*\n\s*/g, ', ')), tr = a2.toUpperCase().match(re) || [];
                 if (tr.length === 1){ var ix = a2.toUpperCase().indexOf(tr[0]); a2 = a2.slice(0, ix) + ' ' + a2.slice(ix + tr[0].length); g.town = pbTown(a2); }
             }
+            if (!String(g.town || '').trim()){ var mb = painMiastoBezPrzecinkow(addr, g.ctry); if (mb){ g.town = mb; g.bezPrzecinkow = true; } }
             var m = String(g.town || '').match(/^(.+?)\s+city\s+\S/i);
             if (m) g.town = m[1].trim();
             // Wielka Brytania: hrabstwo doklejone do miasta („Maldon Essex", Atlas 14239, 16.11.2026) idzie do CtrySubDvsn.
@@ -30763,6 +30809,14 @@
             if (re){
                 var tr = t.match(re) || [];
                 if (tr.length === 1){ pst = tr[0].replace(/\s+/g, ''); t = t.replace(tr[0], ' '); }
+                // Kilka liczb w ksztalcie kodu (27.11.2026, KER/First Flames: „LOT 11897 … 84200 MUAR, JOHOR") — kodem jest ta,
+                // ktora stoi TUZ przy miescie („84200 MUAR" albo „MUAR 84200"). Inaczej jak dotad: nic.
+                else if (tr.length > 1 && String(town || '').trim()){
+                    var tw = painAdrRe(String(town).trim());
+                    var mk = t.match(new RegExp('(^|[^0-9])(' + re.source.replace(/^\\b|\\b$/g, '') + ')[\\s,]+' + tw + '(?![A-Za-z])', 'i'))
+                          || t.match(new RegExp('(^|[^A-Za-z])' + tw + '[\\s,]+(' + re.source.replace(/^\\b|\\b$/g, '') + ')(?![0-9])', 'i'));
+                    if (mk){ pst = mk[2].replace(/\s+/g, ''); t = t.replace(new RegExp('(^|[^0-9])' + mk[2].replace(/\s/g, '\\s?') + '(?![0-9])'), '$1 '); }
+                }
             }
             if (String(town || '').trim())
                 t = t.replace(new RegExp('(^|[^A-Za-z0-9])' + painAdrRe(String(town).trim()) + '(?:\\s+(?:city|shi))?(?![A-Za-z0-9])', 'gi'), '$1');
@@ -31115,6 +31169,19 @@
             for (var i = 0; i < war.length; i++) if (war[i].zapis === w) return war[i];
             return null;   // tego zapisu juz nie ma (zmiana w P/I albo na karcie) — wraca regula
         }
+        /* Zapis DOMYSLNY, gdy czlowiek nic nie wybral (27.11.2026). KER Global (karta 2265, sam balance): karta „7111228910",
+           P/I „711-122891-0" — regula zrodla (balance = karta) dawala zapis BEZ myslnikow, a dostawca podaje numer z myslnikami
+           („w KER proponuje konto bez -"). Myslnik jest czescia zapisu numeru (HK, Malezja, Indonezja — pain-konto-z-myslnikami),
+           wiec domyslnie idzie zapis Z separatorami: najpierw z P/I, potem z karty / naglowka. Gdy zaden wariant ich nie ma —
+           regula jak dotad (null). Rachunek sie nie zmienia: warianty maja te same znaki (painAccWarianty).            */
+        function painAccWarDomyslny(war){
+            if (!war || war.length < 2) return null;
+            if (/[-\/.]/.test(war[0].zapis)) return null;          // regula juz daje zapis z separatorami
+            var z = war.filter(function (x){ return /[-\/.]/.test(x.zapis); });
+            if (!z.length) return null;
+            var w = z.filter(function (x){ return x.src === 'pi'; })[0] || z[0];
+            return { acc: w.acc, zapis: w.zapis, src: w.src, domyslny: true };
+        }
         var PAIN_WAR_SRC = { pi: 'P/I', karta: 'karta dostawcy', naglowek: 'poprawka w nagłówku', reczne: 'ręcznie', system: 'konto w systemie' };
         function painAccWarHtml(r){
             var w = r.accWar || [];
@@ -31140,7 +31207,7 @@
             var zr = hasDep ? (hasBal ? 'combined' : 'depo') : 'bal', w = [];
             try { w = painAccWarianty(G, zr, painKontoPlatnosci(G, zr)); } catch (e){ return ''; }
             if (w.length < 2) return '';
-            var wyb = painAccWarWybrany(w) || w[0];
+            var wyb = painAccWarWybrany(w) || painAccWarDomyslny(w) || w[0];
             return '<span style="margin-left:8px;background:#0a58ca;color:#fff;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;cursor:help" title="'
                 + pcAttr('Ten sam rachunek jest zapisany na dwa sposoby:\n' + w.map(function (x){ return '  ' + x.zapis + '   (' + (PAIN_WAR_SRC[x.src] || x.src) + ')'; }).join('\n')
                     + '\n\nDo pliku pain.001 idzie: ' + wyb.zapis + '\nZapis wybierzesz w oknie przelewów („🏦 Przelewy / pain.001"), przy tym dostawcy.')
@@ -31291,7 +31358,8 @@
             if (r.accSrc === 'reczne') return 'wpisane ręcznie w oknie przelewów';
             // Wybrany zapis numeru (↹) z innego zrodla niz regula — rachunek ten sam, ale do pliku idzie ten zapis.
             // Do 5.63.11 pod polem stalo samo „z karty dostawcy (balance)", choc w polu i w pliku byl zapis z P/I.
-            var zap = (r.accWarSrc && r.accWarSrc !== r.accSrc) ? (', zapis numeru: ' + (PAIN_WAR_SRC[r.accWarSrc] || r.accWarSrc) + ' (wybrany ↹)') : '';
+            var zap = (r.accWarSrc && r.accWarSrc !== r.accSrc) ? (', zapis numeru: ' + (PAIN_WAR_SRC[r.accWarSrc] || r.accWarSrc)
+                + (r.accWarDom ? ' (z myślnikami — domyślnie, zmienisz przy ↹)' : ' (wybrany ↹)')) : '';
             if (r.accSrc === 'pi') return 'z P/I depozytu' + zap;
             var skad = r.accSrc === 'naglowek' ? 'z nagłówka dostawcy (poprawka ręczna)' : 'z karty dostawcy';
             return (r.accSrcWhy ? (skad + ' — P/I depozytu nie dało numeru') : (skad + (r.zrodlo === 'bal' ? ' (balance)' : ''))) + zap;
@@ -31326,7 +31394,7 @@
                 // wylacza: przy regule depozytu do pliku i tak idzie numer z P/I, wiec sama
                 // poprawka jest tylko jednym z wariantow zapisu (zrodlo „poprawka w naglowku").
                 var accWar = accRecznie ? [] : painAccWarianty(G, W.zr, kz);
-                var accWarW = painAccWarWybrany(accWar);
+                var accWarW = painAccWarWybrany(accWar) || painAccWarDomyslny(accWar);
                 if (accWarW) kz.acc = accWarW.acc;
                 var accV = String(V('acc', kz.acc || ''));
                 // Waluta przy numerze („(USD)") nie idzie do banku; dopisek nieczytelny
@@ -31462,7 +31530,7 @@
                     acc: accV,
                     accZdjete: accCz.zdjete, accNieczyt: !accCz.czytelne, accProp: accCz.prop, accPropWiele: accCz.propWiele,
                     // Zapisy tego samego rachunku do wyboru i ten, ktory idzie do pliku.
-                    accWar: accWar, accWarWyb: painAcctOthr(accV), accWarSrc: accWarW ? accWarW.src : '',
+                    accWar: accWar, accWarWyb: painAcctOthr(accV), accWarSrc: accWarW ? accWarW.src : '', accWarDom: !!(accWarW && accWarW.domyslny),
                     // Skad numer: 'pi' | 'karta' | 'naglowek' | 'reczne'; accSrcWhy — czemu nie z P/I depozytu.
                     accSrc: accSrc, accSrcWhy: accRecznie ? '' : (kz.why || ''), accRozne: !accRecznie && !!kz.rozne,
                     accKarta: kz.karta || '', accBlokInne: blokInne, blokPasuje: !!wb.pasuje,
@@ -37950,6 +38018,21 @@
             }
             return { g: g, adj: null };
         }
+        // Wiersz bez kontenera z KWOTA DODATNIA, ktory oddaje roszczenie zamowienia (27.11.2026): numer roszczenia z opisu
+        // wiersza („penalty 1396") jest wsrod roszczen zamowienia (pcPenComments, „overpayment no. 1396"), a kwota wiersza
+        // rowna sie kwocie roszczenia co do grosza. Rodzaju nie porownujemy — opis mowi „penalty", system „overpayment",
+        // numer jest jeden. -> opis roszczenia („overpayment 1396: 272.00") albo ''.
+        function pcZwrotRoszczenia(r, w, pens){
+            if (w == null || !isFinite(w) || w <= 0.004) return '';
+            var nr = [];
+            try { (pcParsePenalties((r && r.note) || '') || []).forEach(function (x){ var d = String(x).replace(/\D+/g, ''); if (d && nr.indexOf(d) < 0) nr.push(d); }); } catch (e){ nr = []; }
+            if (!nr.length) return '';
+            var traf = (pens || []).filter(function (p){
+                if (!p || !isFinite(p.amt) || Math.abs(Math.abs(p.amt) - w) >= 0.005) return false;
+                return (p.nos || []).some(function (x){ return nr.indexOf(String(x).replace(/\D+/g, '')) >= 0; });
+            })[0];
+            return traf ? (((traf.nos && traf.nos[0]) || 'roszczenie') + ': ' + Math.abs(traf.amt).toFixed(2)) : '';
+        }
         // Dopasowuje kazdy wklejony wiersz balance do wlasnego komentarza (jeden komentarz = jedna platnosc).
         // rows -> [{ok|warn|bad, msg, title}] w tej samej kolejnosci.
         function pcMatchBalRows(rows, cands, pens){
@@ -38012,8 +38095,17 @@
                     return { ok: true, msg: 'kwota + kontener' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) };
                 });
             // 2) kwota sie zgadza, komentarz bez kontenera
+            //    Wiersz bez kontenera, ktory ODDAJE roszczenie tego zamowienia (pcZwrotRoszczenia) — kontenera tu nie ma i miec
+            //    nie moze, wiec to zgodnosc, nie uwaga (27.11.2026, HK FOCUS 18135: „272.00 USD penalty 1396", w zamowieniu
+            //    „overpayment no. 1396 −272.00" odciagniete omylkowo, komentarz „272.00 USD" bez kontenera).
             pass(function(c, w, rc, adjs){ return !c.cont ? pcCandHit(c, w, adjs) : null; },
-                function(c, w, rc, adjs, h){ return { warn: true, msg: 'kwota OK, komentarz bez kontenera' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) }; });
+                function(c, w, rc, adjs, h, r){
+                    var zw = !rc ? pcZwrotRoszczenia(r, w, pens) : '';
+                    if (zw) return { ok: true, roszcz: true, msg: 'kwota OK — zwrot roszczenia (' + zw + '), kontener niepotrzebny' + withPen(h),
+                                     title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h)
+                                          + '\nWiersz bez kontenera oddaje roszczenie tego zamówienia — numer z opisu wiersza, kwota równa roszczeniu.' };
+                    return { warn: true, msg: 'kwota OK, komentarz bez kontenera' + withPen(h), title: 'Komentarz: ' + pcCandDesc(c) + penTtl(h) };
+                });
             // 3) kwota sie zgadza, ale kontener inny
             pass(function(c, w, rc, adjs){ return pcCandHit(c, w, adjs); },
                 function(c, w, rc, adjs, h){ return { warn: true, msg: 'kwota OK, kontener w komentarzu: ' + (c.contRaw || '?') + withPen(h), title: 'Wklejony kontener: ' + (rc || '?') + '\nKomentarz: ' + pcCandDesc(c) + penTtl(h) }; });
@@ -38695,7 +38787,9 @@
             'CHINA': 'CN', 'P R CHINA': 'CN', 'PR CHINA': 'CN', 'PEOPLES REPUBLIC OF CHINA': 'CN', 'MAINLAND CHINA': 'CN',
             'HONG KONG': 'HK', 'HONGKONG': 'HK', 'HK': 'HK', 'MACAU': 'MO', 'MACAO': 'MO',
             'TAIWAN': 'TW', 'VIETNAM': 'VN', 'VIET NAM': 'VN', 'INDONESIA': 'ID', 'INDIA': 'IN',
-            'SINGAPORE': 'SG', 'MALAYSIA': 'MY', 'THAILAND': 'TH', 'PHILIPPINES': 'PH', 'CAMBODIA': 'KH',
+            // „WEST MALAYSIA" przed „MALAYSIA" (27.11.2026): pbStripCtry zdejmuje klucze po kolei, a samo „MALAYSIA"
+            // zostawialo z „…, 84200 MUAR, JOHOR, WEST MALAYSIA" miasto „WEST" (KER, First Flames).
+            'SINGAPORE': 'SG', 'WEST MALAYSIA': 'MY', 'EAST MALAYSIA': 'MY', 'PENINSULAR MALAYSIA': 'MY', 'MALAYSIA': 'MY', 'THAILAND': 'TH', 'PHILIPPINES': 'PH', 'CAMBODIA': 'KH',
             'MYANMAR': 'MM', 'BANGLADESH': 'BD', 'PAKISTAN': 'PK', 'SRI LANKA': 'LK', 'NEPAL': 'NP',
             'JAPAN': 'JP', 'SOUTH KOREA': 'KR', 'REPUBLIC OF KOREA': 'KR', 'KOREA': 'KR',
             'TURKEY': 'TR', 'TURKIYE': 'TR', 'UNITED ARAB EMIRATES': 'AE', 'UAE': 'AE',
@@ -38707,7 +38801,9 @@
             'UNITED STATES': 'US', 'USA': 'US', 'BRAZIL': 'BR', 'MEXICO': 'MX', 'UKRAINE': 'UA'
         };
         // Regiony/prowincje — to nie sa miasta, przeskakujemy je szukajac TwnNm.
-        var PB_PROV = /^(?:HUNAN|FUJIAN|ZHEJIANG|GUANGDONG|JIANGSU|SHANDONG|HEBEI|HENAN|HUBEI|ANHUI|JIANGXI|SHANXI|SHAANXI|LIAONING|JILIN|HEILONGJIANG|SICHUAN|YUNNAN|GUIZHOU|GANSU|QINGHAI|HAINAN|GUANGXI|NINGXIA|XINJIANG|XIZANG|TIBET|INNER MONGOLIA|NEI MONGGOL|JAVA|WEST JAVA|EAST JAVA|CENTRAL JAVA|BALI|SUMATRA)$/;
+        var PB_PROV = /^(?:HUNAN|FUJIAN|ZHEJIANG|GUANGDONG|JIANGSU|SHANDONG|HEBEI|HENAN|HUBEI|ANHUI|JIANGXI|SHANXI|SHAANXI|LIAONING|JILIN|HEILONGJIANG|SICHUAN|YUNNAN|GUIZHOU|GANSU|QINGHAI|HAINAN|GUANGXI|NINGXIA|XINJIANG|XIZANG|TIBET|INNER MONGOLIA|NEI MONGGOL|JAVA|WEST JAVA|EAST JAVA|CENTRAL JAVA|BALI|SUMATRA|JOHOR|KEDAH|KELANTAN|NEGERI SEMBILAN|PAHANG|PERAK|PERLIS|SABAH|SARAWAK|SELANGOR|TERENGGANU|PULAU PINANG)$/;
+        // Stany Malezji (27.11.2026): „…, 84200 MUAR, JOHOR, MALAYSIA" dawalo miasto JOHOR (Wegmans), a Muar szedl do ulicy.
+        // Bez MELAKA i PENANG — tam stan i miasto nosza te sama nazwe i miasto by przepadlo.
         var PB_NOTOWN = /\b(?:PROVINCE|PREFECTURE|COUNTY|DISTRICT|WARD|BLOCK|VILLAGE|TOWNSHIP|ROAD|RD|STREET|AVENUE|AVE|LANE|BUILDING|BLDG|FLOOR|ROOM|RM|SUITE|UNIT|NO|ZONE|PARK|INDUSTRIAL|PLAZA|TOWER|CENTRE|CENTER|BOX|HARBOUR|HARBOR|GATEWAY|WHARF|QUAY|MALL|HOUSE|ESTATE|GARDEN|GARDENS|COURT|MANSION|TERRACE|HIGHWAY|HWY|SECTION|FLAT|ANNEX)\b/;
         function pbNorm(s){ return String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
         function pbFindCtry(txt){
@@ -46875,12 +46971,34 @@
         'Mirakl (Hobbybox) · Hobbybox DK': { bank: '260', booking: '9', acct: '1541' },
         // XXXLutz HR i SE: panel marketplace.xxxlgroup.com, sklepy 7077 (EUR) i 7100 (SEK) — w MK_SHOPID z jawnymi nazwami.
         // HR: import 261 „xxx Lutz HR" (z /api/bankSettings/index/, 21.10.2026), konto 1463 „XXXLutz HR Beliani (Europe) GmbH".
-        // SE: konto 1536 „XXXLutz SE Beliani (DE) GmbH" jest w planie kont, ale ustawienia importu jeszcze nie ma (ostatni numer 261) —
-        // numer zostaje pusty do wyboru w ⚙ Konta po jego zalozeniu (modul podpowie go po nazwie). Booking 9 („Fulfillment No")
-        // PRZEZ ANALOGIE do pozostalych sklepow Mirakla — NIE odczytany z ustawienia (jego pol nie czyta zaden znany adres API);
-        // gdyby paczka weszla w calosci jako NOT FOUND, przestaw na 12 („Invoice No"), jak przy OBI CH.
+        // SE: konto 1536 „XXXLutz SE Beliani (DE) GmbH"; do 27.11.2026 bez importu (21.10 ustawienia jeszcze nie bylo), od 27.11 import 263.
+        // Booking 9 („Fulfillment No") odczytany 27.11 z def_booking_setting ustawien 261/263/264/265/266/270 (/api/bankSettings/index/<id>/).
         'Mirakl (XXXLutz) · XXXLutz HR': { bank: '261', booking: '9', acct: '1463' },
-        'Mirakl (XXXLutz) · XXXLutz SE': { bank: '', booking: '9', acct: '1536' },
+        // XXXLutz SE, CZ, RO, HU — ustawienia zalozone przez zespol (odczyt /api/bankSettings/index/<id>/ 27.11.2026): wszystkie booking 9,
+        // data kol. 3, numer kol. 5, kwota kol. 15 (domyslny MK_HDR), sprzedawca „Beliani SE/CZ/RO/HU". Waluty ustawien zespol poprawil
+        // 27.11 z EUR na walute sklepu (panel: SE SEK, CZ CZK, RO RON, HU HUF) — odczytane ponownie po poprawce.
+        'Mirakl (XXXLutz) · XXXLutz SE': { bank: '263', booking: '9', acct: '1536' },   // 263 „XXX Lutz SE", SEK
+        'Mirakl (XXXLutz) · XXXLutz CZ': { bank: '265', booking: '9', acct: '1465' },   // 265 „xxx Lutz CZ", CZK
+        'Mirakl (XXXLutz) · XXXLutz RO': { bank: '266', booking: '9', acct: '1462' },   // 266 „xxx Lutz RO", RON
+        'Mirakl (XXXLutz) · XXXLutz HU': { bank: '270', booking: '9', acct: '1466' },   // 270 „xxx LUTZ HU", HUF (sklep 7163)
+        // SK (sklep 7195, EUR): konto 1467 jest, ustawienia importu 27.11.2026 brak (lista 271 ustawien, ostatnie 274) — bank pusty.
+        'Mirakl (XXXLutz) · XXXLutz SK': { bank: '', booking: '9', acct: '1467' },
+        // Vente DK, SE, UK — klucze to nazwy z panelu (jak DE i CH wyzej). Ustawienia (odczyt 27.11.2026): 271 „Vente Unique DK" DKK,
+        // konto 1457, sprzedawca Beliani DK; 268 „Vente unique SE" SEK (poprawione z EUR 27.11), 1456, Beliani SE; 256 „VENTE UNIQUE UK"
+        // GBP, 1454, Beliani UK + Design_UK. Booking 9, numer kol. 5, kwota kol. 15. Bez seeda 26.11 paczka DK poszla na 256 (UK) z
+        // reki w ⚙ Konta i wrocila jako NOT FOUND — import szuka auftragu tylko u sprzedawcow ustawienia.
+        'Mirakl (Vente) · Beliani DK': { bank: '271', booking: '9', acct: '1457' },
+        'Mirakl (Vente) · Beliani SE': { bank: '268', booking: '9', acct: '1456' },
+        'Mirakl (Vente) · Beliani UK': { bank: '256', booking: '9', acct: '1454' },
+        // XXXLutz SI (sklep 6254, EUR): import 264 „xxx Lutz SI" — odczyt /api/bankSettings/index/264/ z 27.11.2026: EUR, konto 1464
+        // „XXXLutz SI Beliani (Europe) GmbH", booking 9 (Fulfillment No), data kol. 3 (%d/%m/%Y), numer kol. 5, kwota kol. 15 —
+        // domyslny uklad MK_HDR, wiec bez wpisu w MK_KOL_KWOTA. Sprzedawca ustawienia: „Beliani SI" (import szuka auftragow tylko u niego).
+        'Mirakl (XXXLutz) · XXXLutz SI': { bank: '264', booking: '9', acct: '1464' },
+        // Vente Unique NO (sklep 26269 „Beliani NO", NOK; klucz to nazwa z panelu, jak przy DE i CH wyzej). Konto 1469
+        // „Vente Unique NO Beliani (Norge) GmbH" z /accounts.php (27.11.2026). Ustawienie importu 274 „Vente Unique NO" zespol zalozyl
+        // 27.11.2026 jako kopie 271 DK: konto 1469, sprzedawca Beliani NO, booking 9, numer kol. 5, kwota kol. 15 — ale z waluta DKK
+        // (odczyt /api/bankSettings/index/274/); do poprawy na NOK w prologistics, zanim pojdzie pierwsza paczka.
+        'Mirakl (Vente) · Beliani NO': { bank: '274', booking: '9', acct: '1469' },
         // e-Price IT: bez importu (w prologistics nie ma ustawienia importu na 1061, odczyt 12.11.2026) — zamowienia
         // ksiegujemy wprost na auftragach (epcKsieguj). Wystarczy konto rozliczeniowe 1061 „ePrice Beliani IT".
         'Mirakl (ePrice) · e-Price IT': { bank: '', booking: '', acct: '1061' },
@@ -47010,6 +47128,28 @@
                 ['bank', 'acct'].forEach(function (f){ if (!nw[f] && st[f]){ nw[f] = st[f]; add++; } });
             });
             migMark('sklepy-klucze-563');
+        }
+        // XXXLutz SI i Vente NO byly w MK_SHOPID przed seedem (SI od 06.11), wiec ktos mogl juz zapisac ich klucz z pustym
+        // kontem albo importem — seed takiego klucza nie tknie. Uzupelniamy WYLACZNIE puste pola; wpisu czlowieka nie ruszamy.
+        if (!migDone('si-no-ustawienia-2711')){
+            ['Mirakl (XXXLutz) · XXXLutz SI', 'Mirakl (Vente) · Beliani NO'].forEach(function (k){
+                const st = d[k], sd = MK_SET_SEED[k];
+                if (!st || !sd || skas.indexOf(k) >= 0) return;
+                ['bank', 'acct', 'booking'].forEach(function (f){ if (!st[f] && sd[f]){ st[f] = sd[f]; add++; } });
+            });
+            migMark('si-no-ustawienia-2711');
+        }
+        // XXXLutz SE mial w seedzie pusty import (od 21.10), CZ/RO/HU i Vente DK/SE/UK nie mialy seeda — ich klucze mogly juz
+        // powstac z pustymi polami (seed SE, „Zapisz" w ⚙ Konta, przelot). Znow wylacznie puste pola; wpis czlowieka zostaje.
+        if (!migDone('importy-lutz-vente-2711')){
+            ['Mirakl (XXXLutz) · XXXLutz SE', 'Mirakl (XXXLutz) · XXXLutz CZ', 'Mirakl (XXXLutz) · XXXLutz RO',
+             'Mirakl (XXXLutz) · XXXLutz HU', 'Mirakl (Vente) · Beliani DK', 'Mirakl (Vente) · Beliani SE',
+             'Mirakl (Vente) · Beliani UK', 'Mirakl (Vente) · Beliani NO'].forEach(function (k){
+                const st = d[k], sd = MK_SET_SEED[k];
+                if (!st || !sd || skas.indexOf(k) >= 0) return;
+                ['bank', 'acct', 'booking'].forEach(function (f){ if (!st[f] && sd[f]){ st[f] = sd[f]; add++; } });
+            });
+            migMark('importy-lutz-vente-2711');
         }
         if (add) setSave(d);
         return d;
@@ -47206,6 +47346,11 @@
         ["1468", "MediaMarkt Saturn Beliani Switzerland GmbH", 1],
         // Dopisane recznie 25.11.2026 — konto Payback DE (aktywne), odczytane z /accounts.php.
         ["1470", "Payback DE Beliani DE", 1],
+        // Dopisane recznie 27.11.2026 — XXXLutz SI (konto ustawienia importu 264) i Vente Unique NO, odczytane z /accounts.php.
+        ["1464", "XXXLutz SI Beliani (Europe) GmbH", 1], ["1469", "Vente Unique NO Beliani (Norge) GmbH", 1],
+        // Dopisane recznie 27.11.2026 — konta ustawien importu 265 (XXXLutz CZ) i 270 (XXXLutz HU), z account_name ustawien.
+        ["1465", "XXXLutz CZ Beliani (DE) GmbH", 1], ["1466", "XXXLutz HU Beliani (DE) GmbH", 1],
+        ["1467", "XXXLutz SK Beliani (DE) GmbH", 1],
         ["1611", "Forderungen Tulip", 1], ["1745", "BCE Verbindlichkeiten", 1],
         ["1756", "Beliani International", 1], ["1770", "Umsatzsteuer 0% DE Out of country, within EU", 1], ["1774", "Umsatzsteuer 23% SK", 1],
         ["1775", "Umsatzsteuer 16% DE", 1], ["1776", "Umsatzsteuer 19% DE", 1], ["1801", "Umsatzsteuer 21% BE", 1],
@@ -48468,7 +48613,9 @@
     // LT od 17.09.2026: bez niego „Furniture 1 LT" nie mialo kraju, mkNazwaDoArkusza schodzila do konta
     // 1124 i dawala „Furniture 1 FI". Poza F1 zadna etykieta w module nie konczy sie na „ LT".
     // HR od 21.10.2026 (XXXLutz HR, sklep 7077): bez niego „XXXLutz HR" nie mialo kraju i nazwa do arkusza schodzila do konta.
-    const MK_KRAJE = ('PL CZ SK HU RO DE AT CH FR IT ES PT NL BE LU UK SE NO DK FI EU IE LT HR')
+    // SI od 27.11.2026 (XXXLutz SI, sklep 6254) — z tego samego powodu. Konta „Erlös … SI" tez koncza sie na SI, ale tak samo
+    // jak „Erlös … HR" nie sa kontami rozliczeniowymi zlecen (mkEtykietaZKonta czyta konto zlecenia, mkAcctGuess ich nie bierze).
+    const MK_KRAJE = ('PL CZ SK HU RO DE AT CH FR IT ES PT NL BE LU UK SE NO DK FI EU IE LT HR SI')
                      .split(' ');
     function mkKrajZ(v){
         const m = String(v == null ? '' : v).trim().match(/[\s\-_]([A-Za-z]{2})$/);
@@ -49800,6 +49947,11 @@
         "269": "MediaMarkt Saturn CH",
         // 272 „Payback DE" — odczytane 25.11.2026 z /api/bankSettings/index/272/ (EUR, konto 1470, booking 9).
         "272": "Payback DE",
+        // 264 „xxx Lutz SI" — odczytane 27.11.2026 z /api/bankSettings/index/264/ (EUR, konto 1464, booking 9, sprzedawca Beliani SI).
+        "264": "xxx Lutz SI",
+        // Odczytane 27.11.2026 z /api/bankSettings/index/<id>/ — XXXLutz SE/CZ/RO/HU i Vente DK/SE/UK (waluty, konta: MK_SET_SEED).
+        "263": "XXX Lutz SE", "265": "xxx Lutz CZ", "266": "xxx Lutz RO", "270": "xxx LUTZ HU",
+        "271": "Vente Unique DK", "268": "Vente unique SE", "256": "VENTE UNIQUE UK", "274": "Vente Unique NO",
         // 254 „Limango DE NEW" — panel Mirakla. Osobne ustawienie od 200 „Limango DE" (stary dashboard),
         // bo pliki maja inny uklad: 200 czyta numer z kol. 1 i kwote z 8, a 254 numer z 5, kwote z 14, date z 3.
         // Odczytane 26.10.2026 z /api/bankSettings/index/254/ (EUR, konto 1515, booking 9).
@@ -50030,11 +50182,15 @@
         'VENTE UNIQUE|BE':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|CH':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|DE':                   'https://venteunique-prod.mirakl.net/',
+        // DK i NO dopisane 27.11.2026 — oba sklepy sa na tym samym loginie (26224 DK, 26269 NO); bez wpisu „Vente Unique DK/NO"
+        // nie bylo celem z kraju, a z nim waluty sklepu (DKK, NOK) dla zlecen z arkusza.
+        'VENTE UNIQUE|DK':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|ES':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|FR':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|IT':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|LU':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|NL':                   'https://venteunique-prod.mirakl.net/',
+        'VENTE UNIQUE|NO':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|PL':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|PT':                   'https://venteunique-prod.mirakl.net/',
         'VENTE UNIQUE|SE':                   'https://venteunique-prod.mirakl.net/',
@@ -50052,8 +50208,11 @@
         'XXXLUTZ|CZ':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|DE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|HR':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|HU':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
         'XXXLUTZ|RO':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
-        'XXXLUTZ|SE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
+        'XXXLUTZ|SE':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|SI':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/',
+        'XXXLUTZ|SK':                        'https://marketplace.xxxlgroup.com/marketplace-dashboard/'
     };
     // Adres panelu dla zlecenia. Kraj bierzemy z nazwy sklepu — tak samo jak przy
     // zgadywaniu konta w mkAcctGuess. Marka („Vente Unique") bywa inna niz sklep
@@ -51592,20 +51751,33 @@
         // osoby DE i PL, wiec piec wplat VEN z 03.11 nie znalazlo rozliczenia — przelot w ogole nie
         // zajrzal do pozostalych krajow. Nazwy NIE wpisujemy: panel podaje „Beliani AT" itd. i tak
         // samo jak dotad z niej powstaje etykieta i klucz ustawien (DE, PL juz tak dzialaja).
+        // WALUTA (27.11.2026): sklepy spoza strefy euro maja „kraj" i „cur" — odczyt shops/current i cykli kazdego sklepu
+        // po przelaczeniu: CH CHF, DK DKK, NO NOK, PL PLN, SE SEK, UK GBP; pozostale EUR. Bez nich zlecenie z arkusza
+        // albo reczne na „Vente Unique DK" stalo w EUR (23.11: 1632.85 DKK jako „EUR" w nazwie pliku importu). Nazwy
+        // sklepu dalej nie ma, wiec mkWalutaSklepu dopasowuje te wpisy po hoscie i kraju z nazwy („Beliani DK",
+        // „Vente Unique DK" -> DK).
         '20237': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // AT
         '2484':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // BE
-        '2485':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // CH
+        '2485':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'CH', cur: 'CHF' },
         '2337':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // DE
-        '26224': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // DK
+        '26224': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'DK', cur: 'DKK' },
         '2162':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // ES
         '2194':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // IT
         '20239': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // LU
         '2781':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // NL
-        '26269': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // NO
-        '4088':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // PL
+        // NO (27.11.2026): shops/current „Beliani NO", NOK; jeden cykl 687ba3ed (voucher 000156, 20.03–20.11.2026,
+        // VEN304911, 915.85 NOK = zamowienie 1127.20 + VAT 281.80 − VAT odprowadzony przez operatora 281.80 − prowizja 211.35).
+        '26269': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'NO', cur: 'NOK' },
+        '4088':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'PL', cur: 'PLN' },
         '2780':  { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // PT
-        '26223': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // SE
-        '26268': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net' }, // UK
+        '26223': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'SE', cur: 'SEK' },
+        '26268': { mp: 'Mirakl (Vente)', brand: 'Vente Unique', short: 'Vente', host: 'venteunique-prod.mirakl.net',
+                   kraj: 'UK', cur: 'GBP' },
         // Shop ID wprost z kolumny „Shop ID" trzech prawdziwych eksportow Carrefoura —
         // ta sama wartosc w kazdym wierszu kazdego z nich, tak jak przy pozostalych.
         // Jawna nazwa (03.11.2026): panel nazywa ten sklep „Beliani France", wiec bez niej zlecenie po pobraniu rozliczenia
@@ -51680,17 +51852,20 @@
         // 2026 XXXLutz DE: klucz ustawien jest wtedy wlasny i od razu zgodny z etykieta
         // w _Markety, zamiast „Beliani CZ" z panelu. Konto RO: 1462 „XXXLutz RO Beliani (EU)
         // GmbH"; konta CZ w planie kont z 15.09.2026 nie ma.
+        // Waluty (odczyt shops/current po przelaczeniu, 27.11.2026): CZ w CZK, RO w RON — inaczej niz HR/SI/DE/AT (EUR).
         '7031': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
-                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CZ' },
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CZ', cur: 'CZK' },
         '7044': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
-                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz RO' },
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz RO', cur: 'RON' },
         // XXXLutz HR i SE — ten sam panel i login; lista sklepow z 21.10.2026: 2026 Beliani, 3752 AT, 6346 CH (Manual suspension),
         // 7031 CZ, 7077 HR, 7163 HU (Pending approval), 7012 MMX AT, 6740 MMX DE, 7044 RO, 7100 SE, 6254 SI (Pending approval).
         // shops/current po przelaczeniu: 7077 „Beliani HR" EUR (cykle c842a1ed 6134.52 i 1c9d1ede 1039.92), 7100 „Beliani SE" SEK
         // (cykl f5e0cfd2 1128.39). Nazwy jawne jak przy CZ i RO; „cur" — waluta wyplaty sklepu (czyta ja mkWalutaSklepu, bo regula
         // XXXLutz nie ma waluty: zlecenie z arkusza na „XXXLutz SE" ma byc w SEK, a nie w domyslnych EUR). CH i HU: jeszcze nie wpisane.
         // SI dopisane 06.11.2026: wyciag Postbank 47770467 ma wplate „LES-MMS trgovska druzba d.o.o. … for shop 6254" (78,96 EUR),
-        // czyli sklep 6254 jest juz zywy (mimo „Pending approval" z 21.10). Waluta EUR. Konto i ustawienie importu — w ⚙ Konta.
+        // czyli sklep 6254 jest juz zywy (mimo „Pending approval" z 21.10). Waluta EUR. Od 27.11.2026 konto 1464 i import 264 w seedzie
+        // (MK_SET_SEED). Panel 27.11: „Beliani SI" Open, EUR, cykle 000119 78.96 (= ta wplata, faktura 272580), 000120 1363.32
+        // (273658), 000121 2465.40 (274757) — kazdy w kontroli netto co do grosza (000121 ma 112 wierszy z dublem na styku stron).
         '7077': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz HR', cur: 'EUR' },
         '6254': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
@@ -51704,6 +51879,14 @@
         // „XXX Lutz CH" (CHF, konto 1379, booking 9, numer kol. 5, KWOTA kol. 14 — MK_KOL_KWOTA). HU (7163, bez cykli) i SK (7195) dalej nie wpisane.
         '6346': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
                   host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz CH', cur: 'CHF' },
+        // XXXLutz HU dopisane 27.11.2026: /_menu 7163 „Beliani HU" (Open), shops/current HUF. Import 270 „xxx LUTZ HU" (HUF od 27.11,
+        // konto 1466, sprzedawca Beliani HU). Nazwa jawna jak przy pozostalych krajach XXXL — klucz ustawien „XXXLutz HU" = seed.
+        '7163': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz HU', cur: 'HUF' },
+        // XXXLutz SK dopisane 27.11.2026: /_menu 7195 „Beliani SK" (Open), shops/current EUR. Konto 1467 „XXXLutz SK Beliani (DE) GmbH"
+        // (/accounts.php). Ustawienia importu dla SK w prologistics jeszcze NIE MA — seed z pustym bankiem, numer do wyboru w ⚙ Konta.
+        '7195': { mp: 'Mirakl (XXXLutz)', brand: 'XXXLutz', short: 'XXXLutz',
+                  host: 'marketplace.xxxlgroup.com', shop: 'XXXLutz SK', cur: 'EUR' },
         // Conforama: 3404 i 3406 to panel iberyjski (oba z tytulow przelewow, 3404
         // takze z naglowka mirakl-shop-uuid tego panelu), 2294 to panel francuski.
         // Ktory z iberyjskich jest ES, a ktory PT — z danych NIE WYNIKA, a konta sa
@@ -51866,7 +52049,22 @@
             const x = p[1];
             return x && x.host === h && x.shop && x.cur && mkNorm(x.shop) === n;
         })[0];
-        return w ? String(w[1].cur) : '';
+        if (w) return String(w[1].cur);
+        // Sklep BEZ jawnej nazwy (Vente: nazwe podaje panel, „Beliani DK") — po kraju z nazwy. Wpis musi miec „kraj"
+        // i „cur", a kraj ma wskazac DOKLADNIE jeden taki wpis tego hosta; inaczej nie zgadujemy (27.11.2026).
+        const k = mkKrajZ(nazwa);
+        if (!k) return '';
+        const wk = mkShopPary().filter(function (p){
+            const x = p[1];
+            return x && x.host === h && !x.shop && x.cur && String(x.kraj || '').toUpperCase() === k;
+        });
+        return wk.length === 1 ? String(wk[0][1].cur) : '';
+    }
+    // Waluta samego rozliczenia (cyklu) z panelu Mirakla: „currencyCode" (albo „currencyUnit") — np. NOK przy Vente NO,
+    // CHF przy XXXLutz CH. To najpewniejsze zrodlo: mowi o TEJ wyplacie, a nie o sklepie z mapy. Pusty wynik = brak wiedzy.
+    function mkWalutaCyklu(c){
+        const v = String((c && (c.currencyCode || c.currencyUnit)) || '').trim().toUpperCase();
+        return /^[A-Z]{3}$/.test(v) ? v : '';
     }
     // Zlecenie z JAWNYM sklepem tego panelu (cel z arkusza „Hobbybox SE" -> MK_SHOPID 4314) nie szuka rozliczenia
     // w INNYM sklepie tego panelu. Bez tej zapory poszlaka „jedyny cykl w oknie" brala cudzy cykl, a gdy ten nie mial
@@ -85123,8 +85321,11 @@
                 // wyplaca w CHF (zlecenie 833.50 z 06.11.2026 stalo na liscie jako EUR, cykl 6b02cebf jest w CHF). Gdy rozliczenie
                 // zostalo DOBRANE (numer, kwota albo wskazanie czlowieka) w sklepie z jawna waluta w MK_SHOPID, ta waluta wygrywa:
                 // poprawia tez zlecenia zalozone przed dopisaniem sklepu. Zlecenie z wyciagu ma walute z banku — tej nie ruszamy.
+                // Od 27.11.2026 pierwszenstwo ma waluta samego cyklu (mkWalutaCyklu) — dziala takze dla sklepow bez „cur" w mapie
+                // (Vente DK/NO, XXXLutz HU), a mapa zostaje zapasem, gdy panel waluty cyklu nie poda.
                 if (!manor && j.manual && cycIds.length === 1 && (reczny || byRef || byKwote)){
-                    const wSk = mkWalutaSklepu(host, shopName);
+                    const cObj = (cycles || []).filter(function (c){ return String(c && c.id) === String(cycIds[0]); })[0];
+                    const wSk = mkWalutaCyklu(cObj) || mkWalutaSklepu(host, shopName);
                     if (wSk && String(j.cur || '').toUpperCase() !== String(wSk).toUpperCase()){
                         mkLog('mirakl', 'waluta zlecenia ' + (j.cur || '—') + ' → ' + wSk + ' (sklep ' + shopName + ', cykl '
                               + String(cycIds[0]).slice(0, 8) + ')');
@@ -128584,7 +128785,7 @@
     // go na dole menu „Narzędzia" — po nim widac, ktora zmiana z gita jest zainstalowana.
     // Zmiany opisane w pamieci, ktorych nie bylo w pliku, przepadly wlasnie dlatego, ze nie
     // dalo sie tego sprawdzic (PULAPKI.md: „Zmiana opisana w pamieci moze nie istniec w pliku").
-    const HUB_BUDOWA = 'f1a9995 · 26.11.2026 13:48';
+    const HUB_BUDOWA = '29112d5 · 27.11.2026 10:28';
 
     // ============================================================
     //  Zwrot w EUR + autoryzacja (ticket / auftrag)
@@ -129117,7 +129318,13 @@
         // do 28.08.2026. Od września zespół księguje DHL wprost na auftragach (1093) — przed importem HUB sprawdza, czy auftragi
         // nie są już opłacone (mostOplacone), żeby nie zaksięgować drugi raz.
         dhlpl:  { nazwa: 'DHL PL', plik: 'DHL PL', waluta: 'PLN', bank: '160', booking: '2', konto: '1093',
-                  nazwaUst: /^cod\s*dhl\s*pl$/i,    kol: { opis: 3, kwota: 4 }, auf: true, sumaWPliku: true }
+                  nazwaUst: /^cod\s*dhl\s*pl$/i,    kol: { opis: 3, kwota: 4 }, auf: true, sumaWPliku: true },
+        // NoLimit (27.11.2026, tylko z Mailiani): zestawienie z treści maila — opis = tracking number NL… (prologistics go zna,
+        // P/…/LPOZ nie), auftrag z kolumny BORDERO (bywa go brak) służy do kontroli dopasowania. Import po przesyłce jak InPost
+        // 231 (numer;kwota, booking 3, przecinek), konto 1453 „COD NO LIMIT Beliani PL”. Ustawienie 273 „COD NO LIMIT” założył
+        // użytkownik 27.11.2026 jako kopię 231 (konto poprawione na 1453 tego dnia, odczyt API). Bez numeru ustawienie() odmawia.
+        nolimit: { nazwa: 'NoLimit', plik: 'NO LIMIT', waluta: 'PLN', bank: '273', booking: '3', konto: '1453',
+                  nazwaUst: /^cod\s*no\s*limit$/i,  kol: { opis: 1, kwota: 2 }, auf: true, track: true, przecinek: true, sumaWPliku: true }
     };
     var COD_KOLEJ = ['ambro', 'glspl', 'inpost', 'ptt', 'glshu', 'futar', 'hdt'];
     var COD_BLOCK = 'booking_without_assign';           // = przycisk „Book on main account"
@@ -129615,6 +129822,7 @@
     var COD_UST = {};
     async function ustawienie(id){
         var P = COD_PRZEW[id];
+        if (!P.bank) throw new Error(P.nazwa + ': w prologistics nie ma jeszcze ustawienia importu (konto ' + P.konto + ') — nie wysyłam');
         if (COD_UST[id] && Date.now() - COD_UST[id].t < 600000) return COD_UST[id];
         var r = await fetch('/api/bankSettings/index/' + encodeURIComponent(P.bank) + '/', {
             credentials: 'same-origin', headers: { 'accept': '*/*', 'x-requested-with': 'XMLHttpRequest' } });
@@ -129738,6 +129946,21 @@
         return zapis('file_id=' + encodeURIComponent(impId) + '&block=' + COD_BLOCK
                    + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join(''));
     }
+    // „Book on sub-account” — reszta auftragu zaksięgowanego wiersza na subkonto ustawienia importu. Wszystkie ustawienia COD
+    // (125, 126, 221, 134, 74, 231, 207, 208, 251, 75, 160) mają subkonto 575 = 8100 (odczyt /api/bankSettings/index/ 27.11.2026).
+    // Tak zamyka końcówki zespół: GLS HU 2366278 (25.11) — wiersze na 1086 o 14:19, potem 8100 ±1/±2 Ft na 327 auftragach
+    // w dwie sekundy (14:24:40–41). Resztki zawsze BEZ przypisania (decyzja 14.09.2026, jak Marketplace i Bank Import).
+    var COD_BLOCK_SUB = 'booking_sub_without_assign';
+    function ksiegujSub(impId, ids){
+        return zapis('file_id=' + encodeURIComponent(impId) + '&block=' + COD_BLOCK_SUB
+                   + ids.map(function (x){ return '&row_ids%5B%5D=' + encodeURIComponent(x); }).join(''));
+    }
+    // Reszta na auftragu zaksięgowanego wiersza: open_amount z paczki („Ft -2.00”, „0”). Przed zapisem pole jest puste → null.
+    function codReszta(x){
+        var v = x ? x.open_amount : null;
+        if (v == null || String(v).trim() === '') return null;
+        return liczba(v);
+    }
     // Zmiana statusu wiersza (ten sam zapis, co w Marketplace: block=state) — do recznego CHECK→OK.
     function ustawStan(impId, rowId, stan){
         return zapis('id=' + encodeURIComponent(rowId) + '&state=' + encodeURIComponent(stan)
@@ -129827,7 +130050,11 @@
     function analiza(z, d){
         var plik = {}, P = COD_PRZEW[z.przew] || {};
         (z.poz || []).forEach(function (p){ var k = klucz(p.opis); (plik[k] = plik[k] || []).push(p); });
-        var out = { ok: [], check: [], nf: [], zaks: [], niezgodne: [], zlyZaks: [], nfAuf: [], nfTrack: [], doKs: [], bezPliku: [], inne: [], inna: [] };
+        // reszta: wiersze JUŻ zaksięgowane, które prologistics pokazuje jako CHECK — na auftragu została reszta (open_amount
+        // wiersza po zapisie, np. „Ft -2.00”). To nie jest robota „do ręcznego” — zamyka ją codPoKsiegowaniu (8100 albo CS).
+        // czeka: wiersze bez statusu — prologistics jeszcze dopasowuje paczkę (2372613: statusy 14 s po imporcie).
+        var out = { ok: [], check: [], nf: [], zaks: [], niezgodne: [], zlyZaks: [], nfAuf: [], nfTrack: [], doKs: [], bezPliku: [], inne: [], inna: [],
+                    reszta: [], czeka: [] };
         var zp = zlecenie(z.id) || z, zt = zp.track || {}, zpp = zp.przep || {};
         // Auftrag PEWNY: ten sam co w pliku albo wskazany przez HUB jednoznacznie (wyszukiwarka po numerze przesyłki,
         // przepięcie potwierdzone odczytem). Dopasowanie prologistics po samym nazwisku pewnym nie jest (paczka 2342876).
@@ -129847,9 +130074,9 @@
             if (zly && zaksiegowany(x)) out.zlyZaks.push(w);
             else if (zly) out.niezgodne.push(w);
             if (st === 'OK') out.ok.push(w);
-            else if (st === 'CHECK') out.check.push(w);
+            else if (st === 'CHECK'){ if (zaksiegowany(x)) out.reszta.push(w); else out.check.push(w); }
             else if (st === 'NOT FOUND'){ out.nf.push(w); if (fp.auf && !a) out.nfAuf.push(w); else if (P.track && !a && !fp.auf) out.nfTrack.push(w); }
-            else out.inne.push(w);
+            else { out.inne.push(w); if (!st) out.czeka.push(w); }
             if (st === 'OK' && !zaksiegowany(x) && !zly) out.doKs.push(w);
             // Inna kwota niż open amount przy pewnym auftragu (decyzja 26.11.2026): księgujemy całość (status → OK),
             // a open amount, który zostanie, odbijamy na CS Finance rynku auftragu.
@@ -130103,6 +130330,8 @@
             g += '<button data-cod-szukaj="' + esc(z.id) + '" style="' + GUZ + '">🔍 Szukaj paczki</button>';
         if (z.impId && !z.lekki) g += '<button data-cod-spr="' + esc(z.id) + '" style="' + GUZ + '">↻ Sprawdź paczkę</button>';
         if (z.lekki) g += '<span style="font-size:10px;color:#888">starsze niż 14 dni — HUB pamięta już tylko odcisk pliku</span>';
+        var poKsN = (a && z.impId && !a.doKs.length && !a.inna.length) ? codPoKsDoZrobienia(z, a).length : 0;
+        if (poKsN) g += '<button data-cod-ks="' + esc(z.id) + '" style="' + GUZ_GL + ';padding:3px 10px;font-size:11px">▶ Dokończ: reszta na ' + poKsN + ' auftragach (8100 / CS)</button>';
         if (a && (a.doKs.length || a.inna.length) && z.impId){
             var innaS = r2(a.inna.reduce(function (s, w){ return s + (liczba(w.x.amount) || 0); }, 0));
             g += '<button data-cod-ks="' + esc(z.id) + '" style="' + GUZ_GL + ';padding:3px 10px;font-size:11px" title="'
@@ -130125,9 +130354,11 @@
     function rysujAnalize(z, a){
         var P = COD_PRZEW[z.przew] || {}, h = '<div style="margin-top:5px;font-size:11px">';
         var ile = function (t, n, k){ return n ? (' · <span style="color:' + k + '">' + t + ' ' + n + '</span>') : ''; };
-        h += 'W paczce: <b>' + (a.ok.length + a.check.length + a.nf.length + a.inne.length + a.bezPliku.length) + '</b> wierszy'
+        h += 'W paczce: <b>' + (a.ok.length + a.check.length + a.reszta.length + a.nf.length + a.inne.length + a.bezPliku.length) + '</b> wierszy'
            + ile('OK', a.ok.length, '#15803d') + ile('CHECK', a.check.length, '#c47f00') + ile('NOT FOUND', a.nf.length, '#c00')
-           + ile('zaksięgowane', a.zaks.length, '#15803d') + (P.auf ? '' : ' · <span style="color:#666">plik nie niesie numerów auftragu — dopasowanie robi prologistics</span>');
+           + ile('zaksięgowane', a.zaks.length, '#15803d') + ile('w tym z resztą na auftragu (CHECK po zapisie)', a.reszta.length, '#1d4ed8')
+           + (P.auf ? '' : ' · <span style="color:#666">plik nie niesie numerów auftragu — dopasowanie robi prologistics</span>');
+        if (a.czeka.length) h += '<div style="margin-top:3px;color:#c47f00">⏳ Prologistics jeszcze dopasowuje ' + a.czeka.length + ' wierszy (bez statusu) — „↻ Sprawdź paczkę” za chwilę.</div>';
         var przep = zlecenie(z.id) && zlecenie(z.id).przep || {};
         var pk = Object.keys(przep);
         if (pk.length){
@@ -130152,17 +130383,25 @@
             });
             h += '<div style="margin-top:3px;color:#c47f00">🔍 NOT FOUND po numerze przesyłki (' + a.nfTrack.length + ') — wskaż auftrag ręcznie: ' + szczeg.join('; ') + '</div>';
         }
-        if (a.inna.length) h += '<div style="color:#1d4ed8;margin-top:3px">💱 Inna kwota przy pewnym auftragu (' + a.inna.length + ') — „▶ Zaksięguj OK” ustawi OK, '
-            + 'zaksięguje całą kwotę i odbije open amount na CS Finance rynku: '
-            + a.inna.map(function (w){ return linkAuf(w.a) + ' (wpłata ' + tys(liczba(w.x.amount)) + ', open ' + esc(txt(w.x.open_amount) || '—') + ')'; }).join(', ') + '</div>';
-        var innZ = (zlecenie(z.id) || {}).inna || {};
-        var innW = Object.keys(innZ).map(function (k){ return innZ[k]; }).filter(function (e){ return e.odbite || e.koncowka || e.bladOdb || e.k8100; });
-        if (innW.length) h += '<div style="margin-top:3px;color:#374151">↩ Po księgowaniu z inną kwotą: ' + innW.map(function (e){
+        if (a.inna.length) h += '<div style="color:#1d4ed8;margin-top:3px">💱 Inna kwota przy pewnym auftragu (' + a.inna.length + ') — „▶ Zaksięguj OK” ustawi OK '
+            + 'i zaksięguje całą kwotę; reszta na auftragu do 2 EUR pójdzie na 8100 („Book on sub-account”), większa — odbita na CS Finance rynku: '
+            + a.inna.slice(0, 12).map(function (w){ return linkAuf(w.a) + ' (wpłata ' + tys(liczba(w.x.amount)) + ')'; }).join(', ')
+            + (a.inna.length > 12 ? (' i ' + (a.inna.length - 12) + ' innych') : '') + '</div>';
+        var zz = zlecenie(z.id) || {}, innZ = zz.inna || {}, konZ = zz.konc || {};
+        var konOk = Object.keys(konZ).filter(function (k){ return konZ[k].stan === 'ok'; });
+        var konNie = Object.keys(konZ).filter(function (k){ return konZ[k].stan !== 'ok'; });
+        if (konOk.length) h += '<div style="margin-top:3px;color:#15803d">✔ Końcówki na 8100 („Book on sub-account”): ' + konOk.length + ' auftragów, razem '
+            + tys(r2(konOk.reduce(function (s, k){ return s + (konZ[k].open || 0); }, 0))) + ' ' + esc((COD_PRZEW[z.przew] || {}).waluta || '') + '</div>';
+        if (konNie.length) h += '<div style="margin-top:3px;color:#c00">✖ Końcówka na 8100 bez potwierdzenia — sprawdź w paczce (drugi raz nie wysyłam): '
+            + konNie.map(function (k){ return linkAuf(konZ[k].auf) + ' (' + tys(konZ[k].open) + (konZ[k].blad ? (' — ' + esc(konZ[k].blad)) : '') + ')'; }).join(', ') + '</div>';
+        var innW = Object.keys(innZ).map(function (k){ return innZ[k]; }).filter(function (e){ return e.odbite || e.bladOdb; });
+        if (innW.length) h += '<div style="margin-top:3px;color:#374151">↩ Reszta ponad 2 EUR przy innej kwocie: ' + innW.map(function (e){
             return linkAuf(e.auf) + ' — ' + (e.odbite ? ('open ' + tys(e.odbite.open) + ' odbity na ' + esc(e.odbite.kto))
-                 : e.koncowka ? ('końcówka ' + tys((e.k8100 && e.k8100.kwota) != null ? e.k8100.kwota : e.openPo) + ' → 8100')
-                 : (e.k8100 && e.k8100.stan !== 'ok') ? ('<span style="color:#c00">końcówka ' + tys(e.k8100.kwota) + ' NIE weszła na 8100: ' + esc(e.k8100.blad || 'bez potwierdzenia') + '</span>')
                  : ('<span style="color:#c00">odbicie NIE wyszło: ' + esc(e.bladOdb) + ' — odbij ręcznie</span>'));
         }).join('; ') + '</div>';
+        var poKsZ = codPoKsDoZrobienia(zz.id ? zz : z, a);
+        if (poKsZ.length) h += '<div style="margin-top:3px;color:#c47f00">↩ Zaksięgowane, a na ' + poKsZ.length + ' auftragach została reszta bez 8100/CS — '
+            + '„▶ Zaksięguj OK” dokończy: ' + poKsZ.slice(0, 10).map(function (w){ return linkAuf(w.a) + ' (' + esc(txt(w.x.open_amount)) + ')'; }).join(', ') + '</div>';
         if (a.zlyZaks.length) h += '<div style="color:#c00;margin-top:3px">✖ Zaksięgowane na INNYM auftragu niż w pliku — popraw ręcznie: '
             + a.zlyZaks.map(function (w){ return esc(w.fp.opis) + ': ' + linkAuf(w.a) + ' zamiast ' + linkAuf(w.fp.auf) + ' (' + tys(liczba(w.x.amount)) + ')'; }).join(', ') + '</div>';
         if (a.niezgodne.length) h += '<div style="color:#c00;margin-top:3px">✖ Auftrag inny niż w pliku (nie księguję): '
@@ -130185,7 +130424,7 @@
         h += tab('CHECK — kwota inna niż open amount (nie księguję)', a.check, '#c47f00');
         h += tab('NOT FOUND — prologistics nie znalazł auftragu', a.nf, '#c00');
         if (a.inne.length) h += tab('inny stan', a.inne, '#666');
-        if (!a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length && !a.bezPliku.length)
+        if (!a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length && !a.bezPliku.length && !a.czeka.length && !poKsZ.length && !konNie.length)
             h += '<div style="color:#15803d;margin-top:3px">✔ Nic nie zostało do zrobienia w tej paczce.</div>';
         return h + '</div>';
     }
@@ -130313,7 +130552,9 @@
                 }
             }
             S.anal[id] = a; S.d[id] = d;
-            if (z.stan !== 'zaksiegowane' && a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length){
+            codKoncPotwierdz(id, d); z = zlecenie(id) || z;
+            if (z.stan !== 'zaksiegowane' && a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length
+                && !a.czeka.length && !codPoKsDoZrobienia(z, a).length){
                 z.stan = 'zaksiegowane'; zapiszZ(z);
             }
             if (!d.rows.length) mow(id, '⚠ Paczka ' + esc(z.impId) + ' nie ma (jeszcze) wierszy — sprawdź ją za chwilę jeszcze raz.', '#c47f00');
@@ -130342,7 +130583,8 @@
         try {
             var d = await paczka(z.impId), a = analiza(z, d);
             S.anal[id] = a; S.d[id] = d;
-            if (a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length){
+            codKoncPotwierdz(id, d); z = zlecenie(id) || z;
+            if (a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length && !a.czeka.length && !codPoKsDoZrobienia(z, a).length){
                 z.stan = 'zaksiegowane'; zapiszZ(z);
             }
         } catch (e){ /* milczkiem — zostaje „zaimportowane", czlowiek moze kliknac „↻ Sprawdź paczkę" */ }
@@ -130468,56 +130710,124 @@
         if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : '?') + ' przy odbiciu na CS');
         return r.text();
     }
-    // Po księgowaniu: każdy zaksięgowany wiersz z inną kwotą → odczyt auftragu → open 0: nic; |open| ≤ 2 EUR (MOST_PROG):
-    // końcówka zostaje (8100 — osobno); więcej: komentarz z saldem i odpowiedzialny „CS<KRAJ>Finance”. Każdy auftrag raz.
-    async function codOdbijInne(id, po){
+    // ---------- po księgowaniu: reszta na 8100 (Book on sub-account) albo odbicie na CS ----------
+    // Zaksięgowany wiersz z pliku, na którego auftragu została reszta (open_amount wiersza po zapisie):
+    //  · |reszta| ≤ 2 EUR (MOST_PROG) → status OK + „Book on sub-account” (8100) jednym zapisem dla całej paczki — jak zespół.
+    //    HUF w gotówce zaokrągla się do 5 Ft: GLS HU 2372613 — 159 z 224 wierszy CHECK, różnice 1–2 Ft (użytkownik 27.11.2026:
+    //    „zmienić wszędzie statusy i zaksięgować, bo kwoty często się nie zgadzają, a później resztę na 8100”).
+    //  · większa reszta przy wierszu z inną kwotą (z.inna) → komentarz z saldem i odpowiedzialny „CS<KRAJ>Finance” (26.11.2026).
+    // Ślad z.konc[rid] PRZED zapisem; po zapisie reszta w paczce ma zejść na 0 — inaczej „nie wiem, czy weszło” i drugi raz
+    // nie wysyłamy (reszta bywa widoczna z opóźnieniem, jak w Marketplace 20.11). Każdy auftrag raz: dwa wiersze jednego
+    // auftragu pokazują tę samą resztę. Do 26.11 końcówka szła formularzem „Make payment” na stronie auftragu (ramka) —
+    // na 159 auftragów to 159 przeładowań strony, a zespół robi to jednym guzikiem paczki.
+    async function codSwiezo(impId, rids){
+        var d = await paczka(impId);
+        for (var p = 0; p < 3; p++){
+            var m = codMapa(d);
+            if (!rids.some(function (r){ return zaksiegowany(m[r]) && codReszta(m[r]) == null; })) break;
+            await czekaj(5000);
+            d = await paczka(impId);
+        }
+        return d;
+    }
+    function codMapa(d){ var m = {}; d.rows.forEach(function (x){ m[String(x.id)] = x; }); return m; }
+    // Końcówka „bez potwierdzenia”, której reszta zeszła później (prologistics pokazuje ją z opóźnieniem) — sam odczyt, bez zapisu.
+    function codKoncPotwierdz(id, d){
+        var z = zlecenie(id); if (!z || !z.konc || !d) return;
+        var po = codMapa(d), zm = false;
+        Object.keys(z.konc).forEach(function (rid){
+            var e = z.konc[rid], r = codReszta(po[rid]);
+            if (e.stan !== 'ok' && r != null && Math.abs(r) < 0.005){ e.stan = 'ok'; delete e.blad; zm = true; }
+        });
+        if (zm) zapiszZ(z);
+    }
+    function codNasze(a){
+        return a.zaks.filter(function (w){ return w.fp && !(w.fp.auf && w.a && w.a !== w.fp.auf); }).map(function (w){ return String(w.x.id); });
+    }
+    async function codPoKsiegowaniu(id){
         var z = zlecenie(id), P = COD_PRZEW[(z || {}).przew] || {}, prog = MOST_PROG[P.waluta] || 0;
-        var wynik = { odbite: [], koncowki: [], bledy: [], bledy8100: [] };
-        if (!z || !z.inna) return wynik;
+        var wynik = { odbite: [], koncowki: [], bledy: [], bledy8100: [], d: null };
+        if (!z || !z.impId) return wynik;
+        var d = await paczka(z.impId), nasze = codNasze(analiza(z, d));
+        d = await codSwiezo(z.impId, nasze);
+        var po = codMapa(d);
+        z = zlecenie(id) || z; z.konc = z.konc || {}; z.inna = z.inna || {};
+        // 0) zapis bez potwierdzenia z poprzedniego razu: reszta zeszła → weszło
+        codKoncPotwierdz(id, d);
+        z = zlecenie(id) || z; z.konc = z.konc || {}; z.inna = z.inna || {};
+        // 1) końcówki → subkonto (8100)
+        var maAuf = {}, kon = [];
+        Object.keys(z.konc).forEach(function (rid){ if (z.konc[rid].auf) maAuf[z.konc[rid].auf] = 1; });
+        nasze.forEach(function (rid){
+            var x = po[rid];
+            if (!x || !zaksiegowany(x)) return;
+            var r = codReszta(x), auf = nrAuf(x);
+            if (r == null || Math.abs(r) < 0.005 || Math.abs(r) > prog) return;
+            if (z.konc[rid] || !auf || maAuf[auf]) return;
+            maAuf[auf] = 1;
+            kon.push({ rid: rid, auf: auf, open: r, st: String(x.state || '').trim().toUpperCase() });
+        });
+        if (kon.length){
+            kon.forEach(function (k){ z.konc[k.rid] = { auf: k.auf, open: k.open, stan: 'wysylka', czas: czas() }; });
+            zapiszZ(z);
+            var sumaK = r2(kon.reduce(function (s, k){ return s + k.open; }, 0));
+            hubDz('COD', 'start', 'paczka ' + z.impId + ': końcówki na 8100 (Book on sub-account), auftragów ' + kon.length + ', razem ' + f2c(sumaK));
+            var blS = '';
+            try {
+                for (var s = 0; s < kon.length; s++){
+                    if (kon[s].st !== 'OK') await ustawStan(z.impId, kon[s].rid, 'OK');
+                    if (s % 20 === 19){ S.zajete[id] = 'końcówki na 8100: status OK ' + (s + 1) + ' z ' + kon.length + '…'; rysuj(); }
+                }
+                await ksiegujSub(z.impId, kon.map(function (k){ return k.rid; }));
+            } catch (exS){ blS = (exS && exS.message) || String(exS); }
+            // reszta ma zejść na 0 — do 4 odczytów (po 2, 5, 5, 5 s)
+            for (var v = 0; v < 4; v++){
+                await czekaj(v ? 5000 : 2000);
+                try { d = await paczka(z.impId); po = codMapa(d); } catch (exR){ continue; }
+                if (kon.every(function (k){ var r = codReszta(po[k.rid]); return r != null && Math.abs(r) < 0.005; })) break;
+            }
+            z = zlecenie(id) || z; z.konc = z.konc || {};
+            kon.forEach(function (k){
+                var e = z.konc[k.rid] || (z.konc[k.rid] = { auf: k.auf, open: k.open }), r = codReszta(po[k.rid]);
+                if (r != null && Math.abs(r) < 0.005){ e.stan = 'ok'; delete e.blad; wynik.koncowki.push({ auf: k.auf, open: k.open }); }
+                else {
+                    e.stan = 'niepewne';
+                    e.blad = (blS ? blS : ('po zapisie na auftragu dalej ' + f2c(r))) + ' — nie wiem, czy weszło';
+                    wynik.bledy8100.push({ auf: k.auf, open: k.open, blad: e.blad });
+                }
+            });
+            zapiszZ(z);
+            log('paczka', z.impId, 'końcówki na 8100:', wynik.koncowki.length, 'z', kon.length, blS ? ('✖ ' + blS) : '');
+        }
+        // 2) wiersz z inną kwotą, reszta ponad próg → CS Finance rynku auftragu
         var rids = Object.keys(z.inna);
         for (var i = 0; i < rids.length; i++){
             var rid = rids[i], e = z.inna[rid];
-            if (e.odbite || e.zero || e.koncowka || e.bladOdb === 'stop') continue;
-            if (e.k8100 && e.k8100.stan === 'blad' && (e.k8100.proby || 0) >= 2) continue;   // dwie nieudane próby — tylko ręcznie
-            if (!po[rid] || !zaksiegowany(po[rid])) continue;           // wiersz nie wszedł — nie ma czego odbijać
+            if (e.odbite || e.zero || e.bladOdb === 'stop') continue;
+            var x = po[rid];
+            if (!x || !zaksiegowany(x)) continue;           // wiersz nie wszedł — nie ma czego odbijać
+            var r0 = codReszta(x);
+            if (r0 != null && Math.abs(r0) <= prog){
+                if (Math.abs(r0) < 0.005 || (z.konc[rid] && z.konc[rid].stan === 'ok')) e.zero = true; else e.koncowka = true;
+                zapiszZ(z);
+                continue;
+            }
             try {
                 var html = await (await fetch('/auction.php?number=' + encodeURIComponent(e.auf) + '&txnid=3', { credentials: 'same-origin' })).text();
                 var doc = new DOMParser().parseFromString(html, 'text/html');
                 var open = codOpenStrony(doc);
+                if (open == null) open = r0;
                 if (open == null) throw new Error('nie odczytałem open amount auftragu');
                 e.openPo = open;
-                if (Math.abs(open) < 0.005){
-                    if (e.k8100 && e.k8100.stan !== 'ok'){ e.k8100.stan = 'ok'; e.koncowka = true; }   // poprzedni zapis 8100 jednak wszedł
-                    else e.zero = true;
-                    zapiszZ(z);
-                    continue;
-                }
-                if (Math.abs(open) <= prog){
-                    // Końcówka w progu 2 EUR → 8100 na auftragu. Ślad PRZED zapisem; po zapisie odczyt musi pokazać open 0.
-                    e.k8100 = { stan: 'wysylka', czas: czas(), kwota: open, proby: ((e.k8100 && e.k8100.proby) || 0) + 1 };
-                    zapiszZ(z);
-                    try {
-                        await codNa8100(e.auf, open, z.data, 'COD ' + (P.nazwa || z.przew) + ' paczka ' + z.impId + ' — końcówka ' + f2c(open) + ' na 8100');
-                        var html2 = await (await fetch('/auction.php?number=' + encodeURIComponent(e.auf) + '&txnid=3', { credentials: 'same-origin' })).text();
-                        var open2 = codOpenStrony(new DOMParser().parseFromString(html2, 'text/html'));
-                        if (open2 == null || Math.abs(open2) >= 0.005) throw new Error('po zapisie open amount dalej ' + f2c(open2));
-                        e.k8100.stan = 'ok'; e.koncowka = true;
-                        wynik.koncowki.push({ auf: e.auf, open: open });
-                        log('paczka', z.impId, 'auftrag', e.auf, 'końcówka', f2c(open), '→ 8100');
-                    } catch (ex8){
-                        e.k8100.stan = 'blad'; e.k8100.blad = (ex8 && ex8.message) || String(ex8);
-                        wynik.bledy8100.push({ auf: e.auf, open: open, blad: e.k8100.blad });
-                        log('✖ paczka', z.impId, 'auftrag', e.auf, 'końcówka na 8100:', e.k8100.blad);
-                    }
-                    zapiszZ(z);
-                    continue;
-                }
+                if (Math.abs(open) < 0.005){ e.zero = true; zapiszZ(z); continue; }
+                if (Math.abs(open) <= prog){ e.koncowka = true; zapiszZ(z); continue; }
                 var kraj = codKrajAuftragu(html), kto = COD_CS_RYNEK[kraj] || '';
                 if (!kto) throw new Error('nie znam CS Finance rynku „' + (kraj || '?') + '”');
                 var oid = codObjId(doc, html);
                 if (!oid) throw new Error('nie odczytałem obj_id auftragu');
+                var przed = e.openPrzed != null ? e.openPrzed : (e.kwota != null ? r2(open + e.kwota) : null);
                 var tekst = 'COD ' + (P.nazwa || z.przew) + ' (paczka ' + z.impId + '): wpłata ' + f2c(e.kwota) + ' ' + (P.waluta || '')
-                          + ' zaksięgowana przy open ' + (e.openPrzed == null ? '?' : f2c(e.openPrzed))
+                          + ' zaksięgowana przy open ' + f2c(przed)
                           + ' — Auftrag value - Total of Payments: ' + f2c(open);
                 await codOdbij(tekst, oid, kto);
                 e.odbite = { kto: kto, czas: czas(), open: open };
@@ -130530,63 +130840,39 @@
             }
             zapiszZ(z);
         }
+        z = zlecenie(id) || z; delete z.poKs; zapiszZ(z);
+        try { wynik.d = await paczka(z.impId); } catch (exD){ wynik.d = d; }
         return wynik;
     }
-    function f2c(v){ return (v == null || !isFinite(v)) ? '?' : Number(v).toFixed(2); }
-
-    // ---------- końcówka do 2 EUR na 8100 (26.11.2026) ----------
-    // Tak jak moduł Księgowanie (submitBookPayment, w init_ksieg — z COD go nie widać): strona auftragu w ukrytej ramce,
-    // formularz #book „Make payment” (sprawdzony odczytem na 16238495: Date_Month/Day/Year, account z „8100, Non-operating
-    // Income penalties”, amount, paycomment, #make-payment). Kwota = open amount ze znakiem, więc auftrag schodzi na 0.
-    var COD_RAMKA = null;
-    function codUrlAuftragu(auf){ return '/auction.php?number=' + encodeURIComponent(auf) + '&txnid=3'; }
-    function codRamka(){
-        if (COD_RAMKA && COD_RAMKA.parentNode) return COD_RAMKA;
-        var f = document.createElement('iframe');
-        f.style.cssText = 'position:fixed;left:-2000px;top:-2000px;width:1200px;height:900px;opacity:0;pointer-events:none;z-index:-1';
-        document.body.appendChild(f);
-        COD_RAMKA = f;
-        return f;
-    }
-    function codRamkaLaduj(f, url, ms){
-        return new Promise(function (ok, nie){
-            var t = setTimeout(function (){ f.onload = null; nie(new Error('strona auftragu nie przeładowała się w ' + Math.round(ms / 1000) + ' s')); }, ms);
-            f.onload = function (){ clearTimeout(t); f.onload = null; ok(); };
-            if (url) f.src = url;
+    // Co zostało po księgowaniu (bez zapisu): końcówki w progu bez śladu i wiersze z inną kwotą jeszcze nieodbite.
+    function codPoKsDoZrobienia(z, a){
+        var P = COD_PRZEW[z.przew] || {}, prog = MOST_PROG[P.waluta] || 0, konc = z.konc || {}, inn = z.inna || {};
+        var aufK = {};
+        Object.keys(konc).forEach(function (k){ if (konc[k].auf) aufK[konc[k].auf] = 1; });
+        return a.zaks.filter(function (w){
+            if (!w.fp || (w.fp.auf && w.a && w.a !== w.fp.auf)) return false;
+            var rid = String(w.x.id), r = codReszta(w.x);
+            if (r == null || Math.abs(r) < 0.005) return false;
+            if (Math.abs(r) <= prog) return !konc[rid] && !aufK[w.a];
+            var e = inn[rid];
+            return !!(e && !e.odbite && !e.zero && !e.bladOdb);
         });
     }
-    function codUstaw(win, el, v){
-        if (!el) return false;
-        var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
-        if (d && d.set) d.set.call(el, v); else el.value = v;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        try { if (win && win.$) win.$(el).trigger('change'); } catch (e){}
-        return String(el.value) === String(v);
+    function codPoKsOpis(odb, waluta){
+        var t = '';
+        if (odb.koncowki.length){
+            var s = r2(odb.koncowki.reduce(function (x, o){ return x + o.open; }, 0));
+            t += ' Końcówki na 8100 (Book on sub-account): ' + odb.koncowki.length + ' auftragów, razem ' + tys(s) + ' ' + (waluta || '')
+               + (odb.koncowki.length <= 5 ? (' (' + odb.koncowki.map(function (o){ return o.auf + ': ' + tys(o.open); }).join(', ') + ')') : '') + '.';
+        }
+        if (odb.bledy8100.length) t += ' ✖ Końcówka na 8100 bez potwierdzenia: '
+            + odb.bledy8100.slice(0, 8).map(function (o){ return o.auf + ' (' + tys(o.open) + ')'; }).join(', ')
+            + (odb.bledy8100.length > 8 ? (' i ' + (odb.bledy8100.length - 8) + ' innych') : '') + ' — sprawdź w paczce, drugi raz nie wysyłam.';
+        if (odb.odbite.length) t += ' Open amount odbity na CS: ' + odb.odbite.map(function (o){ return o.auf + ' (' + tys(o.open) + ' → ' + o.kto + ')'; }).join(', ') + '.';
+        if (odb.bledy.length) t += ' ✖ Odbicie NIE wyszło: ' + odb.bledy.map(function (o){ return o.auf + ' — ' + o.blad; }).join('; ') + ' — odbij ręcznie.';
+        return t;
     }
-    async function codNa8100(auf, kwota, dataIso, komentarz){
-        var f = codRamka();
-        await codRamkaLaduj(f, codUrlAuftragu(auf), 30000);
-        var doc = f.contentDocument, win = f.contentWindow;
-        var form = doc && (doc.querySelector('form#book') || Array.prototype.find.call(doc.querySelectorAll('form'), function (x){ return x.querySelector('#make-payment'); }));
-        if (!form) throw new Error('na auftragu nie ma formularza „Make payment”');
-        var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dataIso || ''));
-        if (!m) throw new Error('zła data: ' + dataIso);
-        var okD = codUstaw(win, form.querySelector('select[name="Date_Month"]'), m[2]) || codUstaw(win, form.querySelector('select[name="Date_Month"]'), String(parseInt(m[2], 10)));
-        okD = codUstaw(win, form.querySelector('select[name="Date_Day"]'), String(parseInt(m[3], 10))) && okD;
-        okD = codUstaw(win, form.querySelector('select[name="Date_Year"]'), m[1]) && okD;
-        if (!okD) throw new Error('formularz nie przyjął daty ' + isoPl(dataIso));
-        var acc = form.querySelector('select[name="account"]');
-        if (!acc || !Array.prototype.some.call(acc.options, function (o){ return o.value === '8100'; })) throw new Error('konta 8100 nie ma na liście formularza');
-        codUstaw(win, acc, '8100');
-        if (!codUstaw(win, form.querySelector('input[name="amount"]'), Number(kwota).toFixed(2))) throw new Error('formularz nie przyjął kwoty');
-        codUstaw(win, form.querySelector('input[name="paycomment"]'), komentarz || '');
-        var guz = form.querySelector('#make-payment');
-        if (!guz) throw new Error('brak przycisku „Make payment”');
-        var przeladowanie = codRamkaLaduj(f, null, 30000);
-        guz.click();
-        await przeladowanie;
-    }
+    function f2c(v){ return (v == null || !isFinite(v)) ? '?' : Number(v).toFixed(2); }
 
     // bezPytania = import z Mailiani z „księguj od razu” — te same kontrole i blokady, tylko bez okna potwierdzenia
     async function zaksieguj(id, bezPytania){
@@ -130614,14 +130900,46 @@
                 if (n1 !== n2){ mow(id, '✖ Prologistics dalej księguje tę paczkę (' + n1 + ' → ' + n2 + ' zaksięgowanych) — kliknij za chwilę jeszcze raz.', '#c00'); return; }
                 z = zlecenie(id) || z; delete z.ksWToku; zapiszZ(z);
             }
+            // Prologistics dopasowuje wiersze kilka-kilkanaście sekund po imporcie (2372613: statusy 14 s po wysyłce). Wiersz bez
+            // statusu to nie „nic do księgowania” — czekamy, zamiast zgłaszać problem (27.11.2026 poszedł przez to zbędny mail).
+            var bezSt = d.rows.filter(function (x){ return !String(x.state || '').trim(); }).length;
+            if (bezSt){ mow(id, '⏳ Prologistics jeszcze dopasowuje wiersze paczki (' + bezSt + ' bez statusu) — spróbuj za chwilę.', '#c47f00'); return; }
+            codKoncPotwierdz(id, d); z = zlecenie(id) || z;
             var a = analiza(z, d);
             if (a.niezgodne.length){
                 d = await przepnij(z, d, a.niezgodne.filter(function (w){ var e = ((zlecenie(id) || {}).przep || {})[String(w.x.id)]; return !e || (e.proby || 0) < 2; }), 'auftrag inny niż w pliku (przed księgowaniem)');
                 z = zlecenie(id) || z; a = analiza(z, d);
             }
             S.anal[id] = a; S.d[id] = d;
-            if (!a.doKs.length && !a.inna.length){ mow(id, 'Nie ma czego księgować: brak wierszy OK bez płatności z auftragiem zgodnym z plikiem.', '#c47f00'); return; }
             var P = COD_PRZEW[z.przew] || {};
+            if (!a.doKs.length && !a.inna.length){
+                // Wiersze już zaksięgowane, a reszta na auftragach została (przerwany przebieg, starsza kopia HUB-a) — tylko ten krok.
+                var zost0 = codPoKsDoZrobienia(z, a);
+                if (!zost0.length){
+                    if (z.poKs){ z = zlecenie(id) || z; delete z.poKs; zapiszZ(z); }
+                    // Wszystko z pliku już zaksięgowane — ręcznie albo poza HUB-em (2372613: 27.11.2026 z karty, gdy HUB jeszcze
+                    // wisiał na „zaimportowane”). To nie porażka: zamykamy zlecenie, żeby dogrywka nie zgłaszała „NIE zaksięgowane”.
+                    if (a.zaks.length && !a.doKs.length && !a.check.length && !a.nf.length && !a.niezgodne.length && !a.czeka.length && !a.bezPliku.length){
+                        z = zlecenie(id) || z; z.booked = true; z.stan = 'zaksiegowane'; zapiszZ(z);
+                        mow(id, '✔ Paczka jest już zaksięgowana (' + a.zaks.length + ' wierszy) — nic do zrobienia.', '#15803d'); return;
+                    }
+                    mow(id, 'Nie ma czego księgować: brak wierszy OK bez płatności z auftragiem zgodnym z plikiem.', '#c47f00'); return;
+                }
+                S.zajete[id] = 'czekam na potwierdzenie…'; rysuj();
+                if (bezPytania !== true && !confirm('Paczka ' + z.impId + ' jest zaksięgowana, ale na ' + zost0.length + ' auftragach została reszta.\n\n'
+                    + 'Reszta do 2 EUR pójdzie na 8100 („Book on sub-account”), większa przy wpłacie z inną kwotą — odbita na CS Finance rynku. Dalej?')) return;
+                S.zajete[id] = 'końcówki na 8100 i odbicia na CS…'; rysuj();
+                var odb0 = await codPoKsiegowaniu(id);
+                z = zlecenie(id) || z; z.booked = true; zapiszZ(z);
+                var d0 = odb0.d || d, a0 = analiza(z, d0);
+                S.anal[id] = a0; S.d[id] = d0;
+                if (!a0.doKs.length && !a0.check.length && !a0.nf.length && !a0.niezgodne.length){ z.stan = 'zaksiegowane'; zapiszZ(z); }
+                var opis0 = codPoKsOpis(odb0, P.waluta);
+                if (z.mailiani) mostWynik(z.mailiani, z.impId, 'po księgowaniu paczki ' + z.impId + ':' + (opis0 || ' nic do zrobienia'), true, true);
+                hubDz('COD', 'koniec', 'paczka ' + z.impId + ': po księgowaniu' + (opis0 || ' — nic'));
+                mow(id, (odb0.bledy.length || odb0.bledy8100.length ? '⚠' : '✔') + esc(opis0 || ' Nic nie zostało.'), (odb0.bledy.length || odb0.bledy8100.length) ? '#c47f00' : '#15803d');
+                return;
+            }
             var innaN = a.inna.length, innaSuma = r2(a.inna.reduce(function (s, w){ return s + (liczba(w.x.amount) || 0); }, 0));
             // Paczka zostaje zajeta takze na czas pytania — przerysowanie nie wystawia w tym czasie aktywnego guzika.
             S.zajete[id] = 'czekam na potwierdzenie…'; rysuj();
@@ -130629,8 +130947,9 @@
             var resztaNf = a.nf.length - a.inna.filter(function (w){ return w.st === 'NOT FOUND'; }).length;
             if (bezPytania !== true && !confirm('Zaksięgować ' + (a.doKs.length + innaN) + ' wierszy z paczki ' + z.impId + ' („' + COD_BLOCK_OPIS + '”)?\n\n'
                 + 'Przewoźnik: ' + P.nazwa + '\nSuma: ' + tys(r2(a.sumaKs + innaSuma)) + ' ' + (P.waluta || '') + '\nData paczki: ' + isoPl(z.data)
-                + (innaN ? ('\n\nW tym ' + innaN + ' z INNĄ KWOTĄ niż open amount (auftrag pewny — z pliku albo po numerze przesyłki): ustawię je na OK, '
-                           + 'zaksięguję całą kwotę, a open amount, który zostanie, odbiję na CS Finance rynku auftragu:\n'
+                + (innaN ? ('\n\nW tym ' + innaN + ' z INNĄ KWOTĄ niż open amount (auftrag pewny — z pliku albo po numerze przesyłki): ustawię je na OK '
+                           + 'i zaksięguję całą kwotę. Reszta na auftragu do 2 EUR pójdzie potem na 8100 („Book on sub-account”), '
+                           + 'większa — odbita na CS Finance rynku auftragu:\n'
                            + a.inna.slice(0, 10).map(function (w){ return '  • ' + w.a + ': wpłata ' + tys(liczba(w.x.amount)) + ', open ' + (txt(w.x.open_amount) || '—'); }).join('\n')) : '')
                 + ((resztaCh > 0 || resztaNf > 0) ? ('\n\nZostaje w paczce: CHECK ' + Math.max(0, resztaCh) + ', NOT FOUND ' + Math.max(0, resztaNf) + ' (auftrag niepewny).') : '')
                 + (a.niezgodne.length ? ('\n\n' + a.niezgodne.length + ' wierszy z auftragiem innym niż w pliku też zostaje.') : ''))) return;
@@ -130648,6 +130967,7 @@
                 for (var iI = 0; iI < a.inna.length; iI++){
                     var xi = a.inna[iI].x;
                     if (String(xi.state || '').trim().toUpperCase() !== 'OK') await ustawStan(z.impId, String(xi.id), 'OK');
+                    if (iI % 20 === 19){ S.zajete[id] = 'ustawiam wiersze z inną kwotą na OK: ' + (iI + 1) + ' z ' + innaN + '…'; rysuj(); }
                 }
                 d = await paczka(z.impId); a = analiza(z, d); S.anal[id] = a; S.d[id] = d;
                 log('paczka', z.impId, 'inna kwota → OK:', innaN, '| do księgowania teraz:', a.doKs.length);
@@ -130669,34 +130989,34 @@
             var d3 = await paczka(z.impId), po = {};
             d3.rows.forEach(function (x){ po[String(x.id)] = x; });
             var weszlo = ids.filter(function (rid){ return zaksiegowany(po[rid]); }).length;
-            var a3 = analiza(z, d3);
-            S.anal[id] = a3; S.d[id] = d3;
-            if (!a3.doKs.length && !a3.check.length && !a3.nf.length && !a3.niezgodne.length){ z.stan = 'zaksiegowane'; }
-            z.booked = true; zapiszZ(z);
-            // Inna kwota: open amount, który został na auftragu, idzie na CS Finance rynku (komentarz z saldem)
-            var odb = { odbite: [], koncowki: [], bledy: [] };
-            if (Object.keys((zlecenie(id) || {}).inna || {}).length){
-                S.zajete[id] = 'odbijam open amount na CS rynku…'; rysuj();
-                odb = await codOdbijInne(id, po);
+            // poKs = 'do': księgowanie weszło, krok „po księgowaniu” jeszcze nie skończony — dogrywka mostu go dokończy,
+            // gdyby karta zamknęła się w środku (codPoKsiegowaniu zdejmuje znacznik na końcu).
+            z.booked = true; if (weszlo) z.poKs = 'do'; zapiszZ(z);
+            // Reszta na auftragach: do 2 EUR → 8100 („Book on sub-account”), większa przy innej kwocie → CS Finance rynku
+            var odb = { odbite: [], koncowki: [], bledy: [], bledy8100: [], d: null };
+            if (weszlo){
+                S.zajete[id] = 'końcówki na 8100 i odbicia na CS…'; rysuj();
+                try { odb = await codPoKsiegowaniu(id); }
+                catch (exP){ odb.bledy.push({ auf: '—', blad: 'krok po księgowaniu przerwany: ' + ((exP && exP.message) || exP) }); }
                 z = zlecenie(id) || z;
             }
-            var odbOpis = (odb.odbite.length ? (' Open amount odbity na CS: ' + odb.odbite.map(function (o){ return o.auf + ' (' + tys(o.open) + ' → ' + o.kto + ')'; }).join(', ') + '.') : '')
-                        + (odb.koncowki.length ? (' Końcówki do 2 EUR na 8100: ' + odb.koncowki.map(function (o){ return o.auf + ' (' + tys(o.open) + ')'; }).join(', ') + '.') : '')
-                        + ((odb.bledy8100 || []).length ? (' ✖ Końcówka na 8100 NIE weszła: ' + odb.bledy8100.map(function (o){ return o.auf + ' (' + tys(o.open) + ') — ' + o.blad; }).join('; ') + ' — zaksięguj ręcznie.') : '')
-                        + (odb.bledy.length ? (' ✖ Odbicie NIE wyszło: ' + odb.bledy.map(function (o){ return o.auf + ' — ' + o.blad; }).join('; ') + ' — odbij ręcznie.') : '');
+            var a3 = analiza(z, odb.d || d3);
+            S.anal[id] = a3; S.d[id] = odb.d || d3;
+            if (!a3.doKs.length && !a3.check.length && !a3.nf.length && !a3.niezgodne.length){ z.stan = 'zaksiegowane'; zapiszZ(z); }
+            var odbOpis = codPoKsOpis(odb, P.waluta);
             if (z.mailiani && weszlo){
                 var zost = [];
                 if (a3.check.length) zost.push('CHECK ' + a3.check.length);
                 if (a3.nf.length) zost.push('NOT FOUND ' + a3.nf.length);
                 if (a3.niezgodne.length) zost.push('auftrag inny niż w pliku ' + a3.niezgodne.length);
                 mostWynik(z.mailiani, z.impId, 'zaksięgowane ' + weszlo + ' z ' + ids.length + ' wierszy (paczka ' + z.impId + ', data ' + isoPl(z.data) + ')'
-                    + (zost.length ? (' — zostało do ręcznego w panelu COD: ' + zost.join(', ')) : '') + odbOpis, true, true);
+                    + (zost.length ? (' — zostało do ręcznego w panelu COD: ' + zost.join(', ')) : '') + '.' + odbOpis, true, true);
             }
             log('✔ paczka', z.impId, 'zaksięgowane', weszlo, 'z', ids.length, 'po', Math.round((Date.now() - t0) / 1000), 's', odbOpis);
             hubDz('COD', 'koniec', 'paczka ' + z.impId + ': zaksięgowane ' + weszlo + ' z ' + ids.length + odbOpis);
             mow(id, (weszlo === ids.length ? '✔ ' : '⚠ ') + 'Zaksięgowane ' + weszlo + ' z ' + ids.length + ' wierszy.'
                 + (weszlo < ids.length ? ' Pozostałe nie mają płatności po odczycie — sprawdź paczkę w prologistics.' : '') + esc(odbOpis),
-                (weszlo === ids.length && !odb.bledy.length) ? '#15803d' : '#c47f00');
+                (weszlo === ids.length && !odb.bledy.length && !odb.bledy8100.length) ? '#15803d' : '#c47f00');
         } catch (e){
             mow(id, '✖ ' + esc((e && e.message) || e) + ' — jeśli zapis poszedł, przy następnym kliknięciu najpierw sprawdzę, czy paczka się uspokoiła.', '#c00');
             log('✖ księgowanie', z.impId, (e && e.message) || e);
@@ -130767,7 +131087,7 @@
                     var html = await (await fetch('/auction.php?number=' + encodeURIComponent(nr[i]) + '&txnid=3', { credentials: 'same-origin' })).text();
                     e = MOST_CACHE.auf[nr[i]] = { t: Date.now(), open: codOpenStrony(new DOMParser().parseFromString(html, 'text/html')) };
                 } catch (ex){ e = { t: Date.now(), open: null }; }
-                await czekaj(150);
+                if (!document.hidden) await czekaj(150);   // w tle pauza trwa do minuty (dławione minutniki) — wtedy bez niej
             }
             if (e.open == null) continue;
             wynik.z++;
@@ -130778,7 +131098,8 @@
     var MOST_NADAWCA = { ambro: /ambro/i, glspl: /general\s*logistics|\bgls\b/i, inpost: /inpost/i, dhlpl: /\bdhl\b/i,
                          glshu: /\bgls\b|general\s*log/i, hdt: /\bhdt\b|ge\s*logisztika/i, futar: /fut[aá]r/i,
                          ptt: /posta\s*tabita|\bptt\b/i, glsro: /\bgls\b|general\s*logistics/i, zadbano: /zadbano|\bdts\b/i,
-                         zadbanopl: /zadbano|\bdts\b/i };   // Zadbano PL (26.11.2026): wpłata na BNP SP, bez importu — tylko wpłata i IRENKA
+                         zadbanopl: /zadbano|\bdts\b/i,   // Zadbano PL (26.11.2026): wpłata na BNP SP, bez importu — tylko wpłata i IRENKA
+                         nolimit: /no\s*-?\s*limit/i };   // NoLimit (27.11.2026): „NO LIMIT SPÓŁKA Z OGR…”, tytuł „COD WEDŁUG ZESTAWIENIA”
     var MOST_AUTO_MAX = 10;                        // najwyżej tyle plików jednym automatycznym przebiegiem
     var MOST_BYLY = {};                            // zestawienia z Mailiani już raz wstawione na listę w tej karcie
 
@@ -130805,7 +131126,9 @@
             try {
                 GM_xmlhttpRequest({
                     method: metoda, url: MOST_URL + sciezka, timeout: 20000,
-                    headers: { 'X-Mailiani-Klucz': u.klucz || MOST_KLUCZ_WBUD, 'Content-Type': 'application/json' },
+                    // X-Mailiani-Karta: Mailiani wydaje pracę jednej karcie naraz (dzierżawa po swojej stronie) — blokada
+                    // w GM między kartami spóźnia się i 27.11.2026 dwie karty zaimportowały HDT dwa razy (2372733/2372734)
+                    headers: { 'X-Mailiani-Klucz': u.klucz || MOST_KLUCZ_WBUD, 'X-Mailiani-Karta': COD_KARTA, 'Content-Type': 'application/json' },
                     data: cialo ? JSON.stringify(cialo) : undefined,
                     onload: function (r){
                         var j = null; try { j = JSON.parse(r.responseText); } catch (e){}
@@ -130842,13 +131165,25 @@
         var d = await paczka(fileId);
         MOST_CACHE.wiersze[fileId] = { t: Date.now(), rows: d.rows };
         jSet(MOST_LOCK, { karta: COD_KARTA, t: Date.now() });   // długi pierwszy przebieg — druga karta nie wchodzi w środek
-        await czekaj(120);
+        if (!document.hidden) await czekaj(120);   // karta w tle: Chrome dławi minutniki do 1/min — 20 paczek = 20 minut
         return d.rows;
     }
     // 1) czy zestawienie jest już w prologistics — trzy zapory jak w duble(), ale z pamięcią paczek między zestawieniami
     async function mostCzyJest(wyn){
         var P = COD_PRZEW[wyn.przew];
         if (!P) return { paczka: '', opis: 'HUB nie zna ustawienia importu przewoźnika ' + wyn.przew };
+        if (!P.bank){
+            // Bez ustawienia importu (NoLimit, 27.11.2026): w imporcie tego nie ma. Zespół księguje ręcznie na auftragach —
+            // gdy auftragi z zestawienia (BORDERO) są już opłacone, to „zaksięgowane bez importu”, jak DHL od września.
+            if (P.auf){
+                var op0 = await mostOplacone(wyn);
+                if (op0.z && op0.n >= Math.max(1, Math.ceil(op0.z / 2)))
+                    return { paczka: '', poza: true, stop: true, n: op0.n, z: op0.z,
+                             opis: 'auftragi z zestawienia są już opłacone (' + op0.n + ' z ' + op0.z + ' sprawdzonych: ' + op0.nr.join(', ')
+                                   + ') — zaksięgowane ręcznie, bez paczki importu' };
+            }
+            return { paczka: '', n: 0, z: wyn.n, opis: P.nazwa + ': w prologistics nie ma jeszcze ustawienia importu (konto ' + P.konto + ')' };
+        }
         var m = zlecenia(), ks = Object.keys(m), usun = await nieaktywneBezpiecznie(P.bank);
         for (var i = 0; i < ks.length; i++){
             var z = m[ks[i]];
@@ -130970,11 +131305,19 @@
         try {
             var j = await mostReq('GET', '/most/zlecenia' + (szybki ? '?tylko=zlecenia' : ''));
             if (MOST.brak){ MOST.brak = false; log('Mailiani: połączono'); }
+            // Most obsługuje inna karta prologistics — tu nic: ani importu, ani wpłat, ani dogrywki księgowania
+            if (j.inna_karta){ MOST.blad = ''; MOST.auto = j.auto || null; MOST.czas = czas(); MOST.stan = 'zlecenia Mailiani obsługuje inna karta prologistics — ta czeka'; return; }
             if (!szybki && j.konfig) await mostKonfig(j.konfig);
             if (szybki && !(j.zlecenia || []).length){ MOST.blad = ''; MOST.stan = poprz.stan; return; }
             MOST.auto = j.auto || null;
             var autoWl = !!(j.auto && j.auto.wl), autoPrzew = (j.auto && j.auto.przew) || [];
             var ksieguj = !!(j.auto && j.auto.ksieguj);      // „po imporcie od razu księguj wiersze OK” (ustawienie w Mailiani)
+            // Dogrywka NA POCZĄTKU pełnego przebiegu i z własnym try: dalej są pętle po paczkach z krótkimi pauzami, a karta
+            // w tle ma minutniki dławione do 1/min — na końcu przebiegu dogrywka nie przyszła przez 14 min (2372613, 27.11.2026).
+            if (!szybki && ksieguj && !S.wysylam){
+                try { licz.ks += await mostDokoncz(); }
+                catch (eD){ log('✖ Mailiani: dokańczanie księgowania:', (eD && eD.message) || eD); }
+            }
             // wpływy przypisane już innym zestawieniom (Mailiani pamięta je między przebiegami) — dwa zestawienia
             // z tą samą kwotą (np. dwa PTT po 29 869) nie dostaną jednego wpływu
             var uzyte = {}, zrobione = {}, doAuto = [];
@@ -131081,25 +131424,6 @@
                     }
                 }
             }
-            // Dokończenie: import z Mailiani z ostatniej doby, który nie został zaksięgowany (starsza kopia HUB-a, zamknięta
-            // karta, przerwa w połączeniu) — przy włączonym „księguj od razu”, najwyżej 3 próby na paczkę.
-            if (!szybki && ksieguj && !S.wysylam){
-                var mz2 = zlecenia(), gr24 = Date.now() - 86400000;
-                var dok = Object.keys(mz2).filter(function (k){
-                    var z = mz2[k], t = Date.parse(z.czas || '');
-                    return z.mailiani && z.impId && z.stan === 'import' && !z.booked && (z.ksProby || 0) < 3
-                        && isFinite(t) && t >= gr24 && !S.zajete[k];
-                });
-                for (var d0 = 0; d0 < dok.length; d0++){
-                    var zd = zlecenie(dok[d0]); if (!zd) continue;
-                    var Pd = COD_PRZEW[zd.przew];
-                    if (Pd && (await nieaktywneBezpiecznie(Pd.bank))[String(zd.impId)]){ zd.stan = 'usunieta'; zapiszZ(zd); continue; }
-                    zd.ksProby = (zd.ksProby || 0) + 1; zapiszZ(zd);
-                    MOST.stan = 'dokańczam księgowanie paczki ' + zd.impId;
-                    log('Mailiani: dokańczam księgowanie paczki', zd.impId, '(próba ' + zd.ksProby + ' z 3)');
-                    if (await mostZaksieguj(zd.mailiani, dok[d0])) licz.ks++;
-                }
-            }
             MOST.czas = czas();
             MOST.stan = szybki
                 ? ('import z Mailiani: wysłane ' + licz.auto + (licz.ks ? (', zaksięgowane ' + licz.ks) : '') + (licz.jest ? (', już w imporcie ' + licz.jest) : '') + (licz.lista ? (', na listę ' + licz.lista) : ''))
@@ -131126,6 +131450,26 @@
             if (zmiana && panel.style.display === 'block') rysuj();
         }
     }
+    // Dokończenie: import z Mailiani z ostatniej doby, który nie został zaksięgowany (prologistics dopasowywał, starsza kopia
+    // HUB-a, zamknięta karta) albo zaksięgowany bez kroku „po księgowaniu” (poKs) — najwyżej 3 próby na paczkę.
+    async function mostDokoncz(){
+        var mz2 = zlecenia(), gr24 = Date.now() - 86400000, n = 0;
+        var dok = Object.keys(mz2).filter(function (k){
+            var z = mz2[k], t = Date.parse(z.czas || '');
+            return z.mailiani && z.impId && z.stan === 'import' && (!z.booked || z.poKs === 'do') && (z.ksProby || 0) < 3
+                && isFinite(t) && t >= gr24 && !S.zajete[k];
+        });
+        for (var d0 = 0; d0 < dok.length; d0++){
+            var zd = zlecenie(dok[d0]); if (!zd) continue;
+            var Pd = COD_PRZEW[zd.przew];
+            if (Pd && (await nieaktywneBezpiecznie(Pd.bank))[String(zd.impId)]){ zd.stan = 'usunieta'; zapiszZ(zd); continue; }
+            zd.ksProby = (zd.ksProby || 0) + 1; zapiszZ(zd);
+            MOST.stan = 'dokańczam księgowanie paczki ' + zd.impId;
+            log('Mailiani: dokańczam księgowanie paczki', zd.impId, '(próba ' + zd.ksProby + ' z 3)');
+            if (await mostZaksieguj(zd.mailiani, dok[d0])) n++;
+        }
+        return n;
+    }
     // Księgowanie paczki zaraz po imporcie z Mailiani: czeka, aż HUB skończy sprawdzać paczkę (sprawdzZ po imporcie)
     // i aż prologistics pokaże wiersze, potem zaksieguj(…, true). Zwraca true, gdy coś weszło.
     async function mostZaksieguj(mailianiId, zidPodany){
@@ -131134,13 +131478,23 @@
         if (!zid) return false;
         var z = m[zid];
         for (var i = 0; i < 60 && S.zajete[zid]; i++) await czekaj(1000);
+        // Wiersze muszą mieć status: prologistics dopasowuje paczkę po imporcie kilka-kilkanaście sekund (2372613: wiersze
+        // od razu, statusy 14 s później — HUB czytał po 5 s, uznał „nic do księgowania” i wysłał zbędny mail). Do ~3 min.
+        var bezSt = -1;
         try {
-            for (var k = 0; k < 6; k++){
+            for (var k = 0; k < 18; k++){
                 var d = await paczka(z.impId);
-                if (d.rows.length) break;
+                bezSt = d.rows.length ? d.rows.filter(function (x){ return !String(x.state || '').trim(); }).length : -1;
+                if (bezSt === 0) break;
                 await czekaj(10000);
             }
         } catch (e){}
+        if (bezSt !== 0){
+            // bez maila: dogrywka mostu (pełny przebieg) spróbuje jeszcze dwa razy
+            mostWynik(mailianiId, z.impId, 'zaimportowane (paczka ' + z.impId + '), prologistics jeszcze dopasowuje wiersze'
+                + (bezSt > 0 ? (' (' + bezSt + ' bez statusu)') : ' (paczka bez wierszy)') + ' — zaksięguję przy następnym przebiegu', true, false);
+            return false;
+        }
         await zaksieguj(zid, true);
         var po = zlecenie(zid) || {}, pow = '';
         if (!po.booked){
@@ -131175,12 +131529,29 @@
         a.niezgodne.forEach(function (w){
             poz('dopasowanie', w, 'złe dopasowanie: w pliku auftrag ' + w.fp.auf + ', prologistics podpiął ' + w.a + ' — HUB nie zdołał przepiąć, wiersz niezaksięgowany');
         });
+        // CHECK niezaksięgowany = auftrag niepewny (pewny poszedłby jako „inna kwota”). open_amount przed zapisem bywa pusty.
         a.check.forEach(function (w){
-            var kw = liczba(w.x.amount), op = liczba(w.x.open_amount), r = (kw != null && op != null) ? r2(op - kw) : null;
+            var kw = liczba(w.x.amount), op = codReszta(w.x), r = (kw != null && op != null) ? r2(op - kw) : null;
             if (r != null && Math.abs(r) <= prog) return;           // końcówka w progu 2 EUR — bez maila
-            poz('open', w, (op === 0 ? 'auftrag jest już opłacony (open amount 0), a z pliku przyszło ' + tys(kw) + ' ' + (P.waluta || '')
+            poz('open', w, op == null ? ('CHECK: kwota z pliku ' + tys(kw) + ' ' + (P.waluta || '') + ' nie zgadza się z open amount, a auftrag '
+                                         + (w.a || '—') + ' nie jest pewny (dopasowanie prologistics po nazwisku) — nie księguję, sprawdź')
+                         : (op === 0 ? 'auftrag jest już opłacony (open amount 0), a z pliku przyszło ' + tys(kw) + ' ' + (P.waluta || '')
                                      : 'open amount ' + tys(op) + ' ≠ kwota z pliku ' + tys(kw) + ' ' + (P.waluta || '') + ' (różnica ' + tys(r) + ')')
                            + ' — ponad 2 EUR, do odbicia na CS', { open: op, roznica: r });
+        });
+        // Zaksięgowane z resztą: do 2 EUR zamyka 8100 (ślad z.konc), większą przy innej kwocie — odbicie na CS (z.inna). Mail tylko
+        // o tym, czego automat nie domknął.
+        var zk = zlecenie(zid) || {}, konc = zk.konc || {}, inn0 = zk.inna || {}, aufOk = {};
+        Object.keys(konc).forEach(function (k){ if (konc[k].stan === 'ok') aufOk[konc[k].auf] = 1; });
+        a.reszta.forEach(function (w){
+            var rid = String(w.x.id), r = codReszta(w.x), e = inn0[rid];
+            if (r == null || Math.abs(r) < 0.005 || aufOk[w.a]) return;
+            if (Math.abs(r) <= prog){
+                if (!konc[rid]) poz('8100', w, 'zaksięgowane, na auftragu została końcówka ' + tys(r) + ' ' + (P.waluta || '') + ' — nie poszła na 8100, zaksięguj ręcznie');
+                return;
+            }
+            if (e && (e.odbite || e.bladOdb)) return;               // odbite na CS albo zgłoszone niżej jako „odbicie”
+            poz('open', w, 'zaksięgowane, na auftragu zostało ' + tys(r) + ' ' + (P.waluta || '') + ' (ponad 2 EUR) — do sprawdzenia', { open: r });
         });
         a.nf.forEach(function (w){
             poz('notfound', w, 'NOT FOUND — prologistics nie znalazł auftragu ' + ((w.fp && w.fp.auf) || txt(w.x.payment_descr)));
@@ -131190,11 +131561,14 @@
         Object.keys(inn).forEach(function (rid){
             var e = inn[rid];
             if (e.bladOdb && !e.odbite) out.push({ rodzaj: 'odbicie', auf: e.auf, aufPaczka: e.auf, kwota: e.kwota, opis: '',
-                tekst: 'zaksięgowane ' + tys(e.kwota) + ' ' + (P.waluta || '') + ' przy open ' + (e.openPrzed == null ? '?' : tys(e.openPrzed))
+                tekst: 'zaksięgowane ' + tys(e.kwota) + ' ' + (P.waluta || '') + (e.openPo != null ? (', na auftragu zostało ' + tys(e.openPo)) : '')
                        + ', ale odbicie open amount na CS Finance rynku NIE wyszło (' + e.bladOdb + ') — odbij ręcznie' });
-            if (e.k8100 && e.k8100.stan !== 'ok') out.push({ rodzaj: '8100', auf: e.auf, aufPaczka: e.auf, kwota: e.kwota, opis: '',
-                tekst: 'końcówka ' + tys(e.k8100.kwota) + ' ' + (P.waluta || '') + ' (do 2 EUR) NIE weszła na 8100 (' + (e.k8100.blad || 'zapis bez potwierdzenia')
-                       + ') — zaksięguj ręcznie na auftragu, konto 8100' });
+        });
+        Object.keys(konc).forEach(function (rid){
+            var e = konc[rid];
+            if (e.stan !== 'ok') out.push({ rodzaj: '8100', auf: e.auf, aufPaczka: e.auf, kwota: e.open, opis: '',
+                tekst: 'końcówka ' + tys(e.open) + ' ' + (P.waluta || '') + ' (do 2 EUR) wysłana na 8100 („Book on sub-account”) bez potwierdzenia ('
+                       + (e.blad || 'zapis bez odpowiedzi') + ') — sprawdź auftrag; jeśli reszta dalej jest, zaksięguj ręcznie na 8100' });
         });
         a.bezPliku.forEach(function (w){
             poz('bezpliku', w, 'w paczce jest wiersz spoza pliku: „' + txt(w.x.payment_descr) + '” ' + tys(liczba(w.x.amount)));
